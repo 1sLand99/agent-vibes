@@ -804,12 +804,6 @@ type OverviewMsg = {
   bridgeRunning: string
   bridgeTodo: string
   bridgeAction: string
-  forwardingLabel: string
-  forwardingTodo: string
-  forwardingAction: string
-  forwardingRelay: string
-  forwardingPortproxy: string
-  forwardingIptables: string
   setupHeadline: string
   setupSummary: string
   readyHeadline: string
@@ -834,12 +828,6 @@ const OVERVIEW_EN: OverviewMsg = {
   bridgeRunning: "Bridge is running on port {port}.",
   bridgeTodo: "Launch the local bridge.",
   bridgeAction: "Start bridge",
-  forwardingLabel: "Enable traffic forwarding",
-  forwardingTodo: "Redirect Cursor domains to the local bridge.",
-  forwardingAction: "Enable forwarding",
-  forwardingRelay: "Hosts mapping and TCP relay appear active.",
-  forwardingPortproxy: "Hosts mapping and port proxy appear active.",
-  forwardingIptables: "Hosts mapping and iptables appear active.",
   setupHeadline: "Setup required",
   setupSummary:
     "Finish the remaining setup steps to route Cursor traffic through Agent Vibes.",
@@ -865,12 +853,6 @@ const OVERVIEW_ZH: OverviewMsg = {
   bridgeRunning: "桥接正在端口 {port} 上运行。",
   bridgeTodo: "启动本地桥接服务。",
   bridgeAction: "启动桥接",
-  forwardingLabel: "启用流量转发",
-  forwardingTodo: "将 Cursor 相关域名指向本地桥接。",
-  forwardingAction: "启用转发",
-  forwardingRelay: "Hosts 映射与 TCP 中继似乎已生效。",
-  forwardingPortproxy: "Hosts 映射与端口代理似乎已生效。",
-  forwardingIptables: "Hosts 映射与 iptables 似乎已生效。",
   setupHeadline: "需要完成设置",
   setupSummary: "完成以下步骤，以便通过 Agent Vibes 路由 Cursor 流量。",
   readyHeadline: "已就绪",

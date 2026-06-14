@@ -20,12 +20,6 @@
   与 <strong>Kiro (AWS)</strong> AI 后端。
 </p>
 
-> [!WARNING]
-> **dev** 分支正在基于 **Claude Code** 源码架构进行大规模重构和密集测试，
-> **不建议用于生产环境的编码任务。** 稳定后将发布 LTS 版本。
-> **Agent Vibes v0.1.10 (Cursor 3.0.16)** 之前的版本存在许多已知缺陷，
-> 建议及时更新至 v0.1.10 或更高版本。
-
 ## 概览
 
 Agent Vibes 是一个统一的 AI Agent 网关。它不只是做客户端与后端之间的协议转换，还完整实现了 Cursor 原生 ConnectRPC/gRPC Agent 通道与流式工具调用循环，并在 Antigravity、Claude 兼容、Codex、OpenAI-compatible 与 Kiro (AWS CodeWhisperer) 等后端之间进行请求路由。
@@ -84,16 +78,6 @@ Agent Vibes 是一个统一的 AI Agent 网关。它不只是做客户端与后�
 
 <!-- markdownlint-enable MD060 -->
 
-## 与 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的差异
-
-CLIProxyAPI 是这个项目最接近的参考项目，但两者重心不同。
-CLIProxyAPI 更偏 API-first 和 CLI 场景；Agent Vibes 则把主要精力放在 Cursor 的原生客户端兼容性，以及 Antigravity 的原生上游保真度上。
-
-- **Cursor：** Agent Vibes 并不止步于 OpenAI / Claude 兼容接口，而是直接实现了 Cursor 原生 ConnectRPC/gRPC Agent 通道，以协议兼容的 protobuf 定义实现了互操作性，并直接实现流式工具循环。
-- **Antigravity：** 本仓库当前的主路径是较新的 worker-native 方案，围绕运行 Antigravity 自身运行时与模块来构建，使 Cloud Code 请求保持协议兼容，并在此基础上实现配额感知的 worker 轮转。
-- **致谢：** 本项目借鉴和移植了大量开源项目的代码与思路，其中 Claude Code CLI 和 Codex CLI 主要参考
-  CLIProxyAPI，在 TypeScript/NestJS 架构下重写。Cursor 原生协议层和 Antigravity worker 池为原创实现。
-
 ## 快速开始
 
 ### 安装方式一：Prompt 安装（推荐非开发者使用）
@@ -118,8 +102,9 @@ CLIProxyAPI 更偏 API-first 和 CLI 场景；Agent Vibes 则把主要精力放�
 
 3. 首次启动与 forwarding
    - 安装完成后，提醒我打开或完全重启 Cursor。
-   - 扩展应自动启动本地服务。
-   - 指导我完成 forwarding 相关提示和设置。
+   - 扩展应自动启动本地 bridge（仅启动服务，不会自动开启 Cursor 转发）。
+   - 由于 Cursor IDE 需要拦截流量，指导我从 Dashboard > API > Cursor IDE Protocol
+     （Wire 开关）开启转发，或通过命令面板 > Agent Vibes: Enable Port Forwarding 开启。
 
 4. 完全重启 Cursor
    - 在 forwarding 完成后，明确提醒我：必须完整重启 Cursor 一次，然后再继续下一步。
@@ -207,7 +192,9 @@ Invoke-WebRequest -Uri "https://github.com/funny-vibes/agent-vibes/releases/down
 cursor --install-extension agent-vibes-win32-x64-0.1.45.vsix --force
 ```
 
-安装后重启 Cursor，扩展会自动启动代理服务器并引导你完成首次配置（SSL 证书、账号同步、网络转发等均可在命令面板中操作）。
+安装后重启 Cursor，扩展会自动启动代理服务器（仅启动 bridge，不会自动开启 Cursor 转发），
+并引导你完成首次配置（SSL 证书与账号同步均可在命令面板中操作）。Cursor 流量转发是独立的可选步骤：
+仅当你希望让 Cursor IDE 走 bridge 时，才从 Dashboard > API > Cursor IDE Protocol（Wire 开关）开启。
 
 ### 安装方式三：源码安装（全平台）
 
@@ -293,7 +280,7 @@ Kiro（AWS Builder ID / IdC / Kiro IDE）：
 | 3    | Agent Vibes: Open Claude API Accounts JSON        | `agentVibes.openClaudeApiAccounts`    | 打开 `claude-api-accounts.json` 进行手动配置。                           |
 | 3    | Agent Vibes: Open Kiro Accounts JSON              | `agentVibes.openKiroAccounts`         | 打开 `kiro-accounts.json` 进行手动配置。                                 |
 | 3    | Agent Vibes: Sync Kiro IDE Credentials            | `agentVibes.syncKiroIDE`              | 导入 Kiro IDE 或 AWS CLI 在本地缓存的 Kiro / AWS SSO token。             |
-| 4    | Agent Vibes: Start Server                         | `agentVibes.startServer`              | 在证书和至少一个账号准备完成后启动本地 bridge。                          |
+| 4    | Agent Vibes: Start Server                         | `agentVibes.startServer`              | 在证书和至少一个账号准备完成后仅启动本地 bridge（不开启转发）。          |
 | 5    | Agent Vibes: Enable Port Forwarding               | `agentVibes.enableForwarding`         | 启用 Cursor 流量拦截所需的本地转发。                                     |
 | 5    | Agent Vibes: Disable Port Forwarding              | `agentVibes.disableForwarding`        | 关闭本地转发。                                                           |
 | 6    | Agent Vibes: Port Forwarding Status               | `agentVibes.forwardingStatus`         | 检查 forwarding 与 hosts 配置状态。                                      |
@@ -302,21 +289,23 @@ Kiro（AWS Builder ID / IdC / Kiro IDE）：
 
 #### Dashboard tabs
 
-| Tab             | 用途                                           |
-| --------------- | ---------------------------------------------- |
-| **Overview**    | 安装状态、快捷操作、后端概览                   |
-| **Accounts**    | 账号管理、OAuth、token 导入、pool / quota 详情 |
-| **Analytics**   | usage summary 与后端 / 运行期统计              |
-| **Settings**    | 扩展设置与路径覆盖                             |
-| **Diagnostics** | 内置检查项                                     |
-| **Logs**        | bridge 日志与 debug 开关                       |
+| Tab             | 用途                                                                                      |
+| --------------- | ----------------------------------------------------------------------------------------- |
+| **Overview**    | 安装状态、快捷操作（启动 / 停止 / 重启）、后端概览                                        |
+| **API**         | 暴露的 HTTP 端点；Cursor IDE Protocol 转发（Wire）开关、Claude Code CLI 接入、复制 / 测试 |
+| **Accounts**    | 账号管理、OAuth、token 导入、pool / quota 详情                                            |
+| **Analytics**   | usage summary 与后端 / 运行期统计                                                         |
+| **Settings**    | 扩展设置与路径覆盖                                                                        |
+| **Diagnostics** | 内置检查项                                                                                |
+| **Logs**        | bridge 日志与 debug 开关                                                                  |
 
 ### 日常使用
 
 #### Cursor IDE
 
-- 打开 Cursor，扩展会自动启动本地 bridge。
-- 如需确认运行状态，打开 Dashboard 查看 Overview、Accounts、Logs 与 Diagnostics。
+- 打开 Cursor，扩展会自动启动本地 bridge（仅启动服务）。
+- 如需让 Cursor IDE 走 bridge，请单独从 Dashboard > API > Cursor IDE Protocol（Wire 开关）开启 Cursor 流量转发。若仅把 bridge 当作 Claude Code CLI / API 客户端的中转，可跳过此步。
+- 如需确认运行状态，打开 Dashboard 查看 Overview、API、Accounts、Logs 与 Diagnostics。
 - 在 Cursor 中直接发起一次真实请求，验证账号、路由与工具调用是否正常。
 
 #### Claude Code CLI（可选）

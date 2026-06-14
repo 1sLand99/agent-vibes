@@ -20,11 +20,6 @@ const EN: Record<string, string> = {
     "Forwarding is enabled. Fully restart Cursor to apply DNS/hosts changes.",
   "forwarding.action.quit": "Quit Cursor Now",
   "forwarding.alreadyActive": "Forwarding is already active.",
-  "forwarding.bridgeStartedAlready":
-    "Bridge started! Forwarding already active.",
-  "forwarding.promptEnable":
-    "Bridge is running! Enable network forwarding? (requires sudo)",
-  "forwarding.action.enable": "Enable",
   "forwarding.statusLine":
     "Forwarding: {state} | Hosts: {hosts}{loopback} | {backendLabel}: {backend}",
   "forwarding.state.active": "✅ Active",
@@ -172,13 +167,16 @@ const EN: Record<string, string> = {
   "cacheClear.failed": "Cache clear failed: {error}",
   "cacheClear.warning": "Cache clear was refused: {warning}",
 
-  // ── Status bar tooltips ──
-  "status.tooltip.running": "Agent Vibes — Running (click to open dashboard)",
-  "status.tooltip.starting": "Agent Vibes — Starting...",
-  "status.tooltip.error": "Agent Vibes — Error (click to open dashboard)",
-  "status.tooltip.stopped": "Agent Vibes — Stopped (click to open dashboard)",
+  // ── Status bar ──
+  "status.svc.running": "Running",
+  "status.svc.starting": "Starting…",
+  "status.svc.error": "Error",
+  "status.svc.stopped": "Stopped",
+  "status.cursor.wired": "Wired",
+  "status.cursor.unwired": "Not wired",
+  "status.tooltip.combined":
+    "Agent Vibes\nService: {service}\nCursor forwarding: {cursor}\n(click to open dashboard)",
   "status.tooltip.busy": "Agent Vibes — {label}",
-  "status.text.starting": "Starting…",
 }
 
 const ZH: Record<string, string> = {
@@ -195,9 +193,6 @@ const ZH: Record<string, string> = {
     "已启用流量转发。请完整重启 Cursor 以应用 DNS / hosts 改动。",
   "forwarding.action.quit": "立即退出 Cursor",
   "forwarding.alreadyActive": "流量转发已经处于启用状态。",
-  "forwarding.bridgeStartedAlready": "桥接已启动，流量转发也已生效。",
-  "forwarding.promptEnable": "桥接已运行，是否启用网络转发？（需要 sudo）",
-  "forwarding.action.enable": "启用",
   "forwarding.statusLine":
     "转发：{state} | Hosts：{hosts}{loopback} | {backendLabel}：{backend}",
   "forwarding.state.active": "✅ 已生效",
@@ -329,13 +324,16 @@ const ZH: Record<string, string> = {
   "cacheClear.failed": "清除缓存失败：{error}",
   "cacheClear.warning": "本次缓存清理被拒绝：{warning}",
 
-  // ── Status bar tooltips ──
-  "status.tooltip.running": "Agent Vibes — 运行中（点击打开控制台）",
-  "status.tooltip.starting": "Agent Vibes — 启动中…",
-  "status.tooltip.error": "Agent Vibes — 出现错误（点击打开控制台）",
-  "status.tooltip.stopped": "Agent Vibes — 已停止（点击打开控制台）",
+  // ── Status bar ──
+  "status.svc.running": "运行中",
+  "status.svc.starting": "启动中…",
+  "status.svc.error": "出现错误",
+  "status.svc.stopped": "已停止",
+  "status.cursor.wired": "已接入",
+  "status.cursor.unwired": "未接入",
+  "status.tooltip.combined":
+    "Agent Vibes\n服务：{service}\nCursor 转发：{cursor}\n（点击打开控制台）",
   "status.tooltip.busy": "Agent Vibes — {label}",
-  "status.text.starting": "启动中…",
 }
 
 function format(

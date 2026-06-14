@@ -20,14 +20,6 @@ English | [中文](README_zh.md)
   <strong>Claude Code CLI</strong> and <strong>Cursor IDE</strong>.
 </p>
 
-> [!WARNING]
-> The **dev** branch is currently undergoing a major refactoring based on
-> the **Claude Code** source architecture, along with extensive testing.
-> **Not recommended for production coding tasks.**
-> A stable LTS release will be published once testing is complete.
-> Versions prior to **Agent Vibes v0.1.10 (Cursor 3.0.16)** contain
-> numerous known defects. Please update to v0.1.10 or later.
-
 ## Overview
 
 Agent Vibes is a unified agent gateway for AI coding clients.
@@ -85,25 +77,6 @@ while routing requests across Antigravity, Claude-compatible, Codex, OpenAI-comp
 | Extension and operations         | Dashboard, account management, OAuth / token import, manual account JSON editing, SSL certificate generation, forwarding setup, logs, built-in diagnostics, usage / analytics, and update checks.                                                          |
 | Sessions, context, and toolchain | Session state management, context compaction / projection / summary, tool integrity handling, knowledge base support, semantic search, MCP tool integration, and related persistence.                                                                      |
 
-## Compared with [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
-
-CLIProxyAPI is the closest reference project for this repo, but the focus is different.
-CLIProxyAPI is primarily API-first and CLI-oriented. Agent Vibes puts its main weight on
-native client compatibility for Cursor and native upstream fidelity for Antigravity.
-
-- **Cursor:** instead of stopping at OpenAI/Claude-compatible endpoints,
-  Agent Vibes implements Cursor's native ConnectRPC/gRPC agent channel
-  with protocol-compatible protobuf definitions for interoperability,
-  and implements the streaming tool loop directly.
-- **Antigravity:** this repo's main Antigravity path is a newer
-  worker-native approach, built around running Antigravity's own runtime
-  and modules so Cloud Code requests stay protocol-compliant,
-  with quota-aware worker rotation around that model.
-- **Credits:** this project ports and adapts code from many open-source projects.
-  The Claude Code CLI and Codex CLI integrations are primarily based on
-  CLIProxyAPI, rebuilt in a TypeScript/NestJS architecture. The Cursor native
-  protocol layer and Antigravity worker pool are original implementations.
-
 ## Quick Start
 
 ### Install Option 1: Prompt Install (Recommended for non-developers)
@@ -129,8 +102,11 @@ Follow these steps in order:
 
 3. First launch and forwarding setup
    - After installation, tell me to open or fully restart Cursor.
-   - The extension should auto-start the local service.
-   - Guide me through the forwarding setup prompts.
+   - The extension should auto-start the local bridge (start only — it does
+     not enable Cursor forwarding automatically).
+   - Because Cursor IDE needs its traffic intercepted, guide me to enable
+     forwarding from Dashboard > API > Cursor IDE Protocol (the Wire toggle),
+     or via Command Palette > Agent Vibes: Enable Port Forwarding.
 
 4. Full Cursor restart
    - After forwarding is completed, explicitly remind me that I must fully restart Cursor once before continuing.
@@ -223,8 +199,12 @@ cursor --install-extension agent-vibes-win32-x64-0.1.45.vsix --force
 ```
 
 Restart Cursor after installation.
-The extension auto-starts the proxy server and guides you through first-run setup
-(SSL certificates, account sync, network forwarding — all from the Command Palette).
+The extension auto-starts the proxy server (the bridge only — it does not
+enable Cursor forwarding automatically) and guides you through first-run setup
+(SSL certificates and account sync from the Command Palette). Cursor traffic
+forwarding is an independent, opt-in step: enable it from Dashboard > API >
+Cursor IDE Protocol (the Wire toggle) only when you want to drive Cursor IDE
+through the bridge.
 
 ### Install Option 3: From Source (All Platforms)
 
@@ -310,7 +290,7 @@ The extension keeps a small set of installation / configuration commands in the 
 | 3    | Agent Vibes: Open Claude API Accounts JSON        | `agentVibes.openClaudeApiAccounts`    | Open `claude-api-accounts.json` for manual configuration.                                  |
 | 3    | Agent Vibes: Open Kiro Accounts JSON              | `agentVibes.openKiroAccounts`         | Open `kiro-accounts.json` for manual configuration.                                        |
 | 3    | Agent Vibes: Sync Kiro IDE Credentials            | `agentVibes.syncKiroIDE`              | Import Kiro / AWS SSO tokens cached locally by Kiro IDE or AWS CLI.                        |
-| 4    | Agent Vibes: Start Server                         | `agentVibes.startServer`              | Start the local bridge after certificates and at least one account are ready.              |
+| 4    | Agent Vibes: Start Server                         | `agentVibes.startServer`              | Start the local bridge only (no forwarding) after certs and one account are ready.         |
 | 5    | Agent Vibes: Enable Port Forwarding               | `agentVibes.enableForwarding`         | Enable local forwarding required for Cursor traffic interception.                          |
 | 5    | Agent Vibes: Disable Port Forwarding              | `agentVibes.disableForwarding`        | Disable local forwarding.                                                                  |
 | 6    | Agent Vibes: Port Forwarding Status               | `agentVibes.forwardingStatus`         | Check forwarding and hosts setup status.                                                   |
@@ -319,21 +299,25 @@ The extension keeps a small set of installation / configuration commands in the 
 
 #### Dashboard tabs
 
-| Tab             | Purpose                                                         |
-| --------------- | --------------------------------------------------------------- |
-| **Overview**    | Setup status, quick actions, backend summary                    |
-| **Accounts**    | Account management, OAuth, token import, pool and quota details |
-| **Analytics**   | Usage summary and backend/runtime statistics                    |
-| **Settings**    | Extension settings and path overrides                           |
-| **Diagnostics** | Built-in checks                                                 |
-| **Logs**        | Bridge logs and debug toggles                                   |
+| Tab             | Purpose                                                                                                 |
+| --------------- | ------------------------------------------------------------------------------------------------------- |
+| **Overview**    | Setup status, quick actions (start/stop/restart), backend summary                                       |
+| **API**         | Exposed HTTP endpoints; Cursor IDE Protocol forwarding (Wire) toggle, Claude Code CLI wiring, copy/test |
+| **Accounts**    | Account management, OAuth, token import, pool and quota details                                         |
+| **Analytics**   | Usage summary and backend/runtime statistics                                                            |
+| **Settings**    | Extension settings and path overrides                                                                   |
+| **Diagnostics** | Built-in checks                                                                                         |
+| **Logs**        | Bridge logs and debug toggles                                                                           |
 
 ### Daily Use
 
 #### Cursor IDE
 
-- Open Cursor; the extension will auto-start the local bridge.
-- To confirm runtime status, open the Dashboard and check Overview, Accounts, Logs, and Diagnostics.
+- Open Cursor; the extension will auto-start the local bridge (start only).
+- To drive Cursor IDE through the bridge, enable Cursor traffic forwarding
+  separately from Dashboard > API > Cursor IDE Protocol (the Wire toggle).
+  Skip this if you only use the bridge as a relay for Claude Code CLI / API clients.
+- To confirm runtime status, open the Dashboard and check Overview, API, Accounts, Logs, and Diagnostics.
 - Send a real request in Cursor to verify that account setup, routing, and tool calls are working.
 
 #### Claude Code CLI (optional)

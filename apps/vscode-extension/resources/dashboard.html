@@ -2565,7 +2565,6 @@
         const pendingDisplayCommand = getPendingDisplayCommand(s)
         const renderedCommands = new Set()
         const baseActions = []
-        const routingActive = Boolean(s.routingActive)
 
         const isRunning = s.bridge === "Running"
         if (isRunning) {
@@ -2588,19 +2587,9 @@
           disabled: !isRunning,
         })
 
-        if (routingActive) {
-          baseActions.push({
-            label: L("action.disableForwarding"),
-            command: "agentVibes.disableForwarding",
-            tone: "secondary",
-          })
-        } else {
-          baseActions.push({
-            label: L("action.enableForwarding"),
-            command: "agentVibes.enableForwarding",
-            tone: isRunning ? "primary" : "secondary",
-          })
-        }
+        // Cursor traffic forwarding is controlled from the API tab's Cursor
+        // IDE Protocol toggle, not from the Overview actions — start/stop
+        // here only manage the bridge process.
 
         baseActions.push({
           label: L("action.clearCache"),
@@ -2712,7 +2701,7 @@
 
         // Progress bar — always visible
         const completed = setup?.completedSteps ?? 0
-        const total = setup?.totalSteps ?? 4
+        const total = setup?.totalSteps ?? 3
         const progressBar = document.getElementById("status-progress-bar")
         const progressText = document.getElementById("status-progress-text")
         progressBar.style.display = ""
@@ -4804,7 +4793,9 @@
         // pair. The toggle itself is the status indicator: green/on means
         // wired, off means ready, disabled means the bridge isn't running.
         var cursorActions = ""
-        if (!bridgeRunning) {
+        if (!bridgeRunning && !fwd) {
+          // Bridge offline and not forwarding: enabling forwarding would
+          // point Cursor at a dead port, so the toggle stays disabled.
           cursorActions += endpointToggle({
             on: false,
             label: L("clients.status.wire", "Wire"),
@@ -4812,6 +4803,9 @@
             state: { disabled: true },
           })
         } else if (fwd) {
+          // Forwarding is independent of the bridge process: keep it
+          // toggle-able even when the bridge is stopped so the user can
+          // always unwire Cursor instead of getting stuck.
           cursorActions += endpointToggle({
             on: true,
             kind: "good",

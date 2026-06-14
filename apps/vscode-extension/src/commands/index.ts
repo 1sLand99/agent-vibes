@@ -199,36 +199,18 @@ export function registerCommands(
 
   context.subscriptions.push(
     vscode.commands.registerCommand(CMD.START_SERVER, async () => {
+      // Start only manages the bridge process. Cursor traffic forwarding is
+      // an independent concern controlled from the API tab's Cursor IDE
+      // Protocol toggle, so the service can run purely as a relay without
+      // intercepting Cursor.
       await bridge.start()
-
-      // Auto-enable TCP relay forwarding once Bridge is healthy
-      if (bridge.state === "running") {
-        if (network.isForwardingActive()) {
-          logger.info("Forwarding already active from previous session")
-          vscode.window.showInformationMessage(
-            t("forwarding.bridgeStartedAlready")
-          )
-          return
-        }
-        // Execute forwarding in terminal (requires sudo)
-        executePrivileged(
-          network.getEnableCommand(),
-          t("terminal.enableForwarding")
-        )
-        void promptReloadAfterForwardingEnabled()
-      }
     })
   )
 
   context.subscriptions.push(
     vscode.commands.registerCommand(CMD.STOP_SERVER, async () => {
-      // Disable forwarding before stopping Bridge
-      if (network.isForwardingActive()) {
-        executePrivileged(
-          network.getDisableCommand(),
-          t("terminal.disableForwarding")
-        )
-      }
+      // Stop only manages the bridge process. Forwarding stays under the
+      // user's control via the API tab toggle and is not auto-disabled here.
       await bridge.stop()
     })
   )

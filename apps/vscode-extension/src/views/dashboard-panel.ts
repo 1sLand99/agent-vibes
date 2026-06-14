@@ -1201,7 +1201,6 @@ export class DashboardPanel {
       bridge: this.bridge.state === "running" ? "Running" : this.bridge.state,
       port: this.config.port,
       forwarding: forwardingActive,
-      routingActive: forwardingActive,
       hasCertificates: this.config.hasCertificates(),
       totalAccounts,
       defaultProxyUrl: this.getDefaultProxyUrl(),
@@ -1455,20 +1454,15 @@ export class DashboardPanel {
     const o = getOverviewMessages(locale)
     const hasCertificates = this.config.hasCertificates()
     const bridgeRunning = this.bridge.state === "running"
-    const forwardingActive = this.network.isForwardingActive()
     const totalAccounts = Object.values(accountsData).reduce(
       (sum, channel) => sum + channel.accounts.length,
       0
     )
 
-    const fwd = this.network.getForwardingBackend()
-    const forwardingActiveDesc =
-      fwd === "relay"
-        ? o.forwardingRelay
-        : fwd === "portproxy"
-          ? o.forwardingPortproxy
-          : o.forwardingIptables
-
+    // Cursor traffic forwarding is intentionally excluded from the setup
+    // steps: the bridge can run purely as a relay (e.g. Claude Code CLI /
+    // API clients) without intercepting Cursor. Forwarding is controlled
+    // independently from the API tab's Cursor IDE Protocol toggle.
     const steps: DashboardOverviewStep[] = [
       {
         id: "certs",
@@ -1508,22 +1502,6 @@ export class DashboardPanel {
             ? undefined
             : CMD.START_SERVER,
       },
-      {
-        id: "forwarding",
-        label: o.forwardingLabel,
-        description: forwardingActive ? forwardingActiveDesc : o.forwardingTodo,
-        status: forwardingActive
-          ? "done"
-          : bridgeRunning
-            ? "action"
-            : "pending",
-        actionLabel:
-          forwardingActive || !bridgeRunning ? undefined : o.forwardingAction,
-        command:
-          forwardingActive || !bridgeRunning
-            ? undefined
-            : CMD.ENABLE_FORWARDING,
-      },
     ]
 
     const completedSteps = steps.filter((step) => step.status === "done").length
@@ -1535,10 +1513,7 @@ export class DashboardPanel {
 
     if (
       completedSteps === steps.length ||
-      (bridgeRunning &&
-        forwardingActive &&
-        totalAccounts > 0 &&
-        hasCertificates)
+      (bridgeRunning && totalAccounts > 0 && hasCertificates)
     ) {
       overallState = "ready"
       headline = o.readyHeadline

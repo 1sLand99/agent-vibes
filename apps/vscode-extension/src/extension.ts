@@ -1,6 +1,6 @@
 import * as vscode from "vscode"
 import { registerCommands } from "./commands"
-import { CMD, STATE, type ServerState } from "./constants"
+import { CMD, type ServerState } from "./constants"
 import { t, tFmt } from "./i18n/messages-i18n"
 import { BridgeManager } from "./services/bridge-manager"
 import { CertManager } from "./services/cert-manager"
@@ -36,7 +36,7 @@ export async function activate(
   const updater = new ExtensionUpdateService(context)
 
   // Create UI
-  statusIndicator = new StatusIndicator()
+  statusIndicator = new StatusIndicator(() => network!.isForwardingActive())
 
   // Update status bar when server state changes
   bridge.on("stateChanged", (state: ServerState) => {
@@ -140,54 +140,16 @@ export async function activate(
     }
   }
 
-  const promptReloadAfterForwardingEnabled = async (): Promise<void> => {
-    if (!network) return
-    if (context.globalState.get<boolean>(STATE.FORWARDING_RELOAD_PROMPTED)) {
-      return
-    }
-
-    const becameActive = await network.waitForForwardingActive()
-    if (!becameActive) return
-
-    await context.globalState.update(STATE.FORWARDING_RELOAD_PROMPTED, true)
-
-    const action = await vscode.window.showInformationMessage(
-      t("forwarding.enabledRestart"),
-      t("forwarding.action.quit"),
-      t("setup.action.later")
-    )
-
-    if (action === t("forwarding.action.quit")) {
-      await vscode.commands.executeCommand("workbench.action.quit")
-    }
-  }
-
-  // Auto-start if configured
+  // Auto-start if configured — starts the bridge only. Cursor traffic
+  // forwarding is an independent, user-driven action managed from the
+  // Dashboard API tab, so auto-start never prompts to enable forwarding.
   if (config.autoStart) {
     logger.info("Auto-start enabled, starting server...")
     bridge
       .start()
-      .then(async () => {
+      .then(() => {
         if (bridge!.state === "running") {
           logger.info("Bridge auto-started successfully")
-          // Check if forwarding is already active (from previous session)
-          if (network!.isForwardingActive()) {
-            logger.info("Forwarding already active from previous session")
-          } else {
-            // Prompt user to enable forwarding via sudo terminal
-            const action = await vscode.window.showInformationMessage(
-              t("forwarding.promptEnable"),
-              t("forwarding.action.enable"),
-              t("setup.action.later")
-            )
-            if (action === t("forwarding.action.enable")) {
-              executePrivileged(
-                network!.getEnableCommand(),
-                t("terminal.enableForwarding")
-              )
-              void promptReloadAfterForwardingEnabled()
-            }
-          }
         }
       })
       .catch((err) => {
