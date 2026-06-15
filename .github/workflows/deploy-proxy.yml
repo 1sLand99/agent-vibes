@@ -29,21 +29,20 @@ jobs:
         working-directory: apps/protocol-bridge
         run: |
           mkdir -p data
-          if [ -n "$ANTIGRAVITY_ACCOUNTS" ]; then
-            printf "%s" "$ANTIGRAVITY_ACCOUNTS" > data/antigravity-accounts.json
-          fi
-          if [ -n "$CODEX_ACCOUNTS" ]; then
-            printf "%s" "$CODEX_ACCOUNTS" > data/codex-accounts.json
-          fi
-          if [ -n "$OPENAI_COMPAT_ACCOUNTS" ]; then
-            printf "%s" "$OPENAI_COMPAT_ACCOUNTS" > data/openai-compat-accounts.json
-          fi
-          if [ -n "$CLAUDE_API_ACCOUNTS" ]; then
-            printf "%s" "$CLAUDE_API_ACCOUNTS" > data/claude-api-accounts.json
-          fi
-          if [ -n "$KIRO_ACCOUNTS" ]; then
-            printf "%s" "$KIRO_ACCOUNTS" > data/kiro-accounts.json
-          fi
+          write_secret_file() {
+            local value="$1"
+            local dest="$2"
+            if [ -z "$value" ]; then
+              return
+            fi
+            printf '%s' "$value" | base64 -d > "$dest"
+          }
+          write_secret_file "$ANTIGRAVITY_ACCOUNTS" data/antigravity-accounts.json
+          write_secret_file "$CODEX_ACCOUNTS" data/codex-accounts.json
+          write_secret_file "$OPENAI_COMPAT_ACCOUNTS" data/openai-compat-accounts.json
+          write_secret_file "$CLAUDE_API_ACCOUNTS" data/claude-api-accounts.json
+          write_secret_file "$KIRO_ACCOUNTS" data/kiro-accounts.json
+          wc -c data/*-accounts.json 2>/dev/null || true
         env:
           ANTIGRAVITY_ACCOUNTS: ${{ secrets.ANTIGRAVITY_ACCOUNTS }}
           CODEX_ACCOUNTS: ${{ secrets.CODEX_ACCOUNTS }}
@@ -125,7 +124,7 @@ jobs:
           script: |
             cd /opt/protocol-bridge
             if [ -n "$PROXY_ENV_PRODUCTION" ]; then
-              printf "%s" "$PROXY_ENV_PRODUCTION" > .env
+              printf '%s' "$PROXY_ENV_PRODUCTION" | base64 -d > .env
             elif [ -f .env.production ]; then
               cp .env.production .env
             else

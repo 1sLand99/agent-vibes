@@ -50,8 +50,9 @@ function checkGhCli() {
 
 function setSecret(secretName, value) {
   try {
+    const payload = Buffer.from(value, "utf8").toString("base64")
     execSync(`gh secret set ${secretName} --repo ${REPO} --body -`, {
-      input: value,
+      input: payload,
       stdio: ["pipe", "pipe", "pipe"],
     })
     return true
