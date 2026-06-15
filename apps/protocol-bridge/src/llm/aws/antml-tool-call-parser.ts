@@ -36,6 +36,35 @@ const INVOKE_CLOSE = "</invoke>"
 // Markers whose partial prefixes must be held back across chunk boundaries.
 const START_MARKERS: readonly string[] = [FUNCTION_CALLS_OPEN, INVOKE_OPEN]
 
+// Kiro / CodeWhisperer delivers Claude tool calls with the `<function_calls>`
+// wrapper token degraded to the bare word "call" (verified from live request
+// history: assistant turns arrive as `…\n\ncall\n<invoke name="Bash">…`). The
+// inner `<invoke>` survives and is recovered normally; this matches the
+// leftover wrapper word so it is not emitted as visible assistant text. Only a
+// standalone token at a word boundary is matched, so prose like "recall" or
+// "please call me" is never touched.
+const MANGLED_WRAPPER_REMNANT = /(^|\s)(?:function_calls|call)\s*$/i
+
+// Word forms the mangled `<function_calls>` wrapper can take. A trailing
+// (possibly partial) occurrence at a word boundary is held back during
+// streaming until we know whether an `<invoke>` follows.
+const WRAPPER_WORDS: readonly string[] = ["function_calls", "call"]
+
+/**
+ * Length of the trailing run of word characters in `s` when that run sits at a
+ * word boundary and is a prefix of a wrapper word (e.g. "c", "cal", "call",
+ * "function_cal"). Returns 0 otherwise, so ordinary words are not held.
+ */
+function trailingWrapperWordLength(s: string): number {
+  const match = s.match(/[A-Za-z_]+$/)
+  if (!match) return 0
+  const run = match[0]
+  const startIdx = s.length - run.length
+  if (startIdx > 0 && !/\s/.test(s[startIdx - 1]!)) return 0
+  const lower = run.toLowerCase()
+  return WRAPPER_WORDS.some((word) => word.startsWith(lower)) ? run.length : 0
+}
+
 export interface AntmlParserCallbacks {
   onText: (text: string) => void
   onToolUse: (toolUse: KiroToolUse) => void
@@ -72,7 +101,17 @@ export class AntmlToolCallParser {
         return
       }
       if (start > 0) {
-        this.callbacks.onText(this.buffer.slice(0, start))
+        let preamble = this.buffer.slice(0, start)
+        // A bare `<invoke>` (no surviving `<function_calls>` wrapper) means the
+        // wrapper was mangled to the word "call"; strip that trailing remnant
+        // so it never shows as assistant text. A real `<function_calls>` start
+        // is left untouched.
+        if (this.buffer.startsWith(INVOKE_OPEN, start)) {
+          preamble = preamble.replace(MANGLED_WRAPPER_REMNANT, "$1")
+        }
+        if (preamble.length > 0) {
+          this.callbacks.onText(preamble)
+        }
         this.buffer = this.buffer.slice(start)
       }
       if (this.consumeCompleteBlock()) {
@@ -141,9 +180,9 @@ export class AntmlToolCallParser {
       this.buffer = ""
       return
     }
-    const hold = this.partialStartMarkerSuffixLength()
+    const hold = this.computeHoldbackLength()
     if (hold >= this.buffer.length) {
-      // Entire buffer is a partial marker; wait for more input.
+      // Entire buffer is held (partial marker / pending wrapper word); wait.
       return
     }
     if (hold > 0) {
@@ -153,6 +192,33 @@ export class AntmlToolCallParser {
     }
     this.callbacks.onText(this.buffer)
     this.buffer = ""
+  }
+
+  /**
+   * Number of trailing characters to withhold from plain-text emission until
+   * more input arrives. Combines two cases that may complete in the next
+   * chunk: (1) a partial start marker (e.g. "<", "<inv"), and (2) a standalone
+   * wrapper word ("call" / "function_calls") that may be the mangled
+   * `<function_calls>` opening immediately preceding an `<invoke>`. Holding the
+   * wrapper word lets `drain` strip it once the `<invoke>` arrives; if plain
+   * text follows instead, it is released verbatim on the next pass.
+   */
+  private computeHoldbackLength(): number {
+    const buf = this.buffer
+    const partial = this.partialStartMarkerSuffixLength()
+    // Skip whitespace between a pending wrapper word and a partial start
+    // marker (e.g. the "\n" in "call\n<inv").
+    let boundary = buf.length - partial
+    while (boundary > 0 && /\s/.test(buf[boundary - 1]!)) {
+      boundary--
+    }
+    const wrapperLen = trailingWrapperWordLength(buf.slice(0, boundary))
+    if (wrapperLen > 0) {
+      // Hold the wrapper word plus any whitespace and the partial marker after
+      // it, so `drain` can strip the whole remnant once `<invoke>` arrives.
+      return buf.length - (boundary - wrapperLen)
+    }
+    return partial
   }
 
   /**
