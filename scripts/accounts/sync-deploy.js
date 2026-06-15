@@ -51,7 +51,7 @@ function checkGhCli() {
 function setSecret(secretName, value) {
   try {
     const payload = Buffer.from(value, "utf8").toString("base64")
-    execSync(`gh secret set ${secretName} --repo ${REPO} --body -`, {
+    execSync(`gh secret set ${secretName} --repo ${REPO}`, {
       input: payload,
       stdio: ["pipe", "pipe", "pipe"],
     })
@@ -66,17 +66,73 @@ function setSecret(secretName, value) {
 // Also sync .env.local as PROXY_ENV_PRODUCTION (non-credential config)
 // ---------------------------------------------------------------------------
 
+function ensureProductionEnvContent(rawContent) {
+  const lines = rawContent.replace(/\r\n/g, "\n").split("\n")
+  const values = new Map()
+
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue
+    }
+    const idx = trimmed.indexOf("=")
+    if (idx <= 0) {
+      continue
+    }
+    values.set(trimmed.slice(0, idx), trimmed.slice(idx + 1))
+  }
+
+  values.set("AGENT_VIBES_DATA_DIR", "/opt/protocol-bridge")
+  if (!values.get("PORT")) {
+    values.set("PORT", "2026")
+  }
+
+  const proxyApiKey = values.get("PROXY_API_KEY")?.trim()
+  if (!proxyApiKey) {
+    throw new Error(
+      "PROXY_API_KEY is required in apps/protocol-bridge/.env.local for production deploy"
+    )
+  }
+
+  const orderedKeys = ["PORT", "PROXY_API_KEY", "AGENT_VIBES_DATA_DIR"]
+  const body = []
+  for (const key of orderedKeys) {
+    if (values.has(key)) {
+      body.push(`${key}=${values.get(key)}`)
+      values.delete(key)
+    }
+  }
+  for (const [key, value] of values.entries()) {
+    body.push(`${key}=${value}`)
+  }
+
+  return `${body.join("\n")}\n`
+}
+
 function syncEnvConfig() {
   const envPath = path.join(BRIDGE_DIR, ".env.local")
   if (!fs.existsSync(envPath)) {
+    if (triggerDeploy) {
+      console.error(
+        "❌ Missing apps/protocol-bridge/.env.local (copy from .env.local.example and set PROXY_API_KEY)"
+      )
+      process.exit(1)
+    }
     console.log("   ⏭️  No .env.local found, skipping PROXY_ENV_PRODUCTION")
     return true
   }
 
-  const content = fs.readFileSync(envPath, "utf-8")
+  let content = fs.readFileSync(envPath, "utf-8")
   if (!content.trim()) {
-    console.log("   ⏭️  .env.local is empty, skipping PROXY_ENV_PRODUCTION")
-    return true
+    console.error("❌ apps/protocol-bridge/.env.local is empty")
+    process.exit(1)
+  }
+
+  try {
+    content = ensureProductionEnvContent(content)
+  } catch (error) {
+    console.error(`   ❌ ${error.message}`)
+    process.exit(1)
   }
 
   process.stdout.write("   📄 PROXY_ENV_PRODUCTION (.env.local)... ")

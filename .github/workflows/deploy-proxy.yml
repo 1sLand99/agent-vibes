@@ -135,6 +135,20 @@ jobs:
             else
               cp .env.production.example .env
             fi
+            ensure_env_var() {
+              key="$1"
+              value="$2"
+              if grep -q "^${key}=" .env 2>/dev/null; then
+                sed -i "s|^${key}=.*|${key}=${value}|" .env
+              else
+                printf '%s=%s\n' "$key" "$value" >> .env
+              fi
+            }
+            ensure_env_var AGENT_VIBES_DATA_DIR /opt/protocol-bridge
+            if ! grep -q '^PROXY_API_KEY=.' .env 2>/dev/null; then
+              echo "PROXY_API_KEY is required in PROXY_ENV_PRODUCTION"
+              exit 1
+            fi
             # Ensure Node.js 24 is installed
             if ! node --version 2>/dev/null | grep -q '^v24'; then
               curl -fsSL https://deb.nodesource.com/setup_24.x | bash -

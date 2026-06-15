@@ -53,7 +53,13 @@ const MODEL_MAP_ORDERED: readonly ModelMappingPair[] = [
 
 const MAX_TOOL_DESCRIPTION_LENGTH = 10_237
 const MAX_TOOL_NAME_LENGTH = 64
-const MINIMAL_FALLBACK_USER_CONTENT = "."
+// Placeholder content for a completely empty user turn (no text, images, or
+// tool_results). Kiro rejects an empty `userInputMessage.content`, so we must
+// send something. A bare "." reads to the model as the user literally typing
+// ".", which it can echo back as a lone "." in the reply. An empty turn from
+// the client means "continue", so we send that intent explicitly: the model
+// acts on it (continues the task) instead of mirroring a meaningless token.
+const MINIMAL_FALLBACK_USER_CONTENT = "Please continue."
 
 export interface ClaudeToKiroOptions {
   /**
@@ -246,7 +252,7 @@ export function claudeToKiro(
   //   - 文本消息：(可选 SYSTEM PROMPT) + 用户文本
   //   - 仅 tool_result：留空字符串 ""（关键修正，参考抓包）
   //   - 仅 image：图片占位说明
-  //   - 其它：占位 "."
+  //   - 空轮（继续）：占位 "Please continue."（避免模型回声裸 "."）
   let finalContent: string
   if (safeCurrentToolResults.length > 0 && !currentContent) {
     // 仅 tool_result 的延续请求。content 必须为空，
