@@ -35,7 +35,10 @@ jobs:
             if [ -z "$value" ]; then
               return
             fi
-            printf '%s' "$value" | base64 -d > "$dest"
+            if printf '%s' "$value" | base64 -d > "$dest" 2>/dev/null; then
+              return
+            fi
+            printf '%s' "$value" > "$dest"
           }
           write_secret_file "$ANTIGRAVITY_ACCOUNTS" data/antigravity-accounts.json
           write_secret_file "$CODEX_ACCOUNTS" data/codex-accounts.json
@@ -124,7 +127,9 @@ jobs:
           script: |
             cd /opt/protocol-bridge
             if [ -n "$PROXY_ENV_PRODUCTION" ]; then
-              printf '%s' "$PROXY_ENV_PRODUCTION" | base64 -d > .env
+              if ! printf '%s' "$PROXY_ENV_PRODUCTION" | base64 -d > .env 2>/dev/null; then
+                printf '%s' "$PROXY_ENV_PRODUCTION" > .env
+              fi
             elif [ -f .env.production ]; then
               cp .env.production .env
             else
