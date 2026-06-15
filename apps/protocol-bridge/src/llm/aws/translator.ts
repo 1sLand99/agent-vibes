@@ -861,63 +861,94 @@ function convertClaudeTools(
   return result
 }
 
+/**
+ * JSON-schema keys the Kiro / CodeWhisperer `inputSchema.json` validator
+ * accepts. The backend uses a Smithy-validated schema that is far stricter
+ * than Anthropic's: it rejects the whole request with
+ * `{"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}`
+ * (or, on the `q.` endpoint, `"Improperly formed request."`) when the
+ * payload carries draft-2020-12 meta/validation keywords such as `$schema`,
+ * `additionalProperties`, `default`, `format`, `exclusiveMinimum`,
+ * `propertyNames`, etc.
+ *
+ * Claude Code CLI and Cursor emit full draft-2020-12 tool schemas (every CC
+ * CLI tool ships `$schema` + `additionalProperties: false`), so we MUST
+ * down-convert to the conservative subset before sending. This mirrors the
+ * proven sanitizers used by the other backends in this repo
+ * (`GoogleService.sanitizeSchema`, Codex `compactToolSchemaForCodex` /
+ * `delete result.$schema`); the only Kiro-specific difference is that the
+ * CodeWhisperer wire format uses lowercase JSON-schema type names
+ * ("object" / "string"), verified against captured Kiro IDE traffic.
+ */
+const KIRO_SCHEMA_ALLOWED_KEYS: ReadonlySet<string> = new Set([
+  "type",
+  "description",
+  "properties",
+  "required",
+  "items",
+  "enum",
+  "title",
+])
+
 function ensureObjectSchema(schema: unknown): Record<string, unknown> {
+  const sanitized = sanitizeKiroToolSchema(schema)
+  if (!("type" in sanitized)) {
+    sanitized.type = "object"
+  }
+  return sanitized
+}
+
+/**
+ * Recursively rebuild a tool input schema using only the keys CodeWhisperer
+ * accepts. Unknown / unsupported keywords are dropped, `const` is folded into
+ * a single-value `enum`, and `required` is emitted only when it is a
+ * non-empty array. Building a fresh object (rather than deleting keys in
+ * place) guarantees no stray meta keyword survives at any nesting depth.
+ */
+function sanitizeKiroToolSchema(schema: unknown): Record<string, unknown> {
   if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
     return { type: "object" }
   }
-  const cloned = JSON.parse(JSON.stringify(schema)) as Record<string, unknown>
-  cleanSchema(cloned)
-  if (!("type" in cloned)) {
-    cloned.type = "object"
-  }
-  return cloned
-}
+  const src = schema as Record<string, unknown>
+  const out: Record<string, unknown> = {}
 
-function cleanSchema(node: Record<string, unknown>): void {
-  if ("required" in node) {
-    const req = node.required
-    if (req == null) {
-      delete node.required
-    } else if (Array.isArray(req) && req.length === 0) {
-      delete node.required
+  for (const [key, value] of Object.entries(src)) {
+    // `const` is not accepted; represent it as a single-member enum.
+    if (key === "const") {
+      out.enum = [value]
+      continue
+    }
+    if (!KIRO_SCHEMA_ALLOWED_KEYS.has(key)) {
+      continue
+    }
+
+    if (
+      key === "properties" &&
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value)
+    ) {
+      const props: Record<string, unknown> = {}
+      for (const [propKey, propValue] of Object.entries(
+        value as Record<string, unknown>
+      )) {
+        props[propKey] = sanitizeKiroToolSchema(propValue)
+      }
+      out.properties = props
+    } else if (key === "items") {
+      out.items = Array.isArray(value)
+        ? value.map((item) => sanitizeKiroToolSchema(item))
+        : sanitizeKiroToolSchema(value)
+    } else if (key === "required") {
+      if (Array.isArray(value) && value.length > 0) {
+        out.required = value
+      }
+    } else {
+      out[key] = value
     }
   }
 
-  if (
-    node.properties &&
-    typeof node.properties === "object" &&
-    !Array.isArray(node.properties)
-  ) {
-    for (const value of Object.values(node.properties)) {
-      if (value && typeof value === "object" && !Array.isArray(value)) {
-        cleanSchema(value as Record<string, unknown>)
-      }
-    }
-  }
-  if (
-    node.items &&
-    typeof node.items === "object" &&
-    !Array.isArray(node.items)
-  ) {
-    cleanSchema(node.items as Record<string, unknown>)
-  }
-  if (
-    node.additionalProperties &&
-    typeof node.additionalProperties === "object" &&
-    !Array.isArray(node.additionalProperties)
-  ) {
-    cleanSchema(node.additionalProperties as Record<string, unknown>)
-  }
-  for (const key of ["allOf", "oneOf", "anyOf"]) {
-    const arr = node[key]
-    if (Array.isArray(arr)) {
-      for (const sub of arr) {
-        if (sub && typeof sub === "object" && !Array.isArray(sub)) {
-          cleanSchema(sub as Record<string, unknown>)
-        }
-      }
-    }
-  }
+  return out
 }
 
 /**
@@ -941,4 +972,7 @@ function enforceToolNameLength(name: string): string {
 export const __TEST__ = {
   enforceToolNameLength,
   trimLeadingAssistantHistory,
+  ensureObjectSchema,
+  sanitizeKiroToolSchema,
+  convertClaudeTools,
 }

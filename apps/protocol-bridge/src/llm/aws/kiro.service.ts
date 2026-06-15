@@ -2267,6 +2267,11 @@ export class KiroService implements OnModuleInit {
 
     let currentAccount = account
     const model = this.resolveCooldownModel(dto.model)
+    // Only recover inline antml tool-call text when the request actually
+    // declared tools; otherwise prose that mentions the syntax must pass
+    // through untouched.
+    const recoverInlineToolCalls =
+      Array.isArray(dto.tools) && dto.tools.length > 0
     let lastError: Error | null = null
     const MAX_RETRIES = 10
     const BASE_DELAY_MS = 3000
@@ -2577,7 +2582,8 @@ export class KiroService implements OnModuleInit {
                         retryResponse.body,
                         callback,
                         streamGuard.signal,
-                        () => streamGuard.noteActivity()
+                        () => streamGuard.noteActivity(),
+                        { recoverInlineToolCalls }
                       )
                     } catch (parseError) {
                       throw this.tagKiroStreamParseError(parseError)
@@ -2676,7 +2682,8 @@ export class KiroService implements OnModuleInit {
               response.body,
               callback,
               streamGuard.signal,
-              () => streamGuard.noteActivity()
+              () => streamGuard.noteActivity(),
+              { recoverInlineToolCalls }
             )
           } catch (parseError) {
             throw this.tagKiroStreamParseError(parseError)

@@ -16,6 +16,17 @@ import type {
   KiroStreamCallback,
   KiroToolUse,
 } from "./protocol-types"
+import { AntmlToolCallParser } from "./antml-tool-call-parser"
+
+export interface KiroEventStreamOptions {
+  /**
+   * Recover inline antml `<function_calls>` / `<invoke>` tool calls that the
+   * model emits as assistant text into native `onToolUse` callbacks. Enabled
+   * by the caller only when the request declared tools, so legitimate prose
+   * that mentions the syntax is never stripped.
+   */
+  recoverInlineToolCalls?: boolean
+}
 
 interface ToolUseState {
   toolUseId: string
@@ -33,7 +44,8 @@ export async function parseKiroEventStream(
   body: ReadableStream<Uint8Array>,
   callback: KiroStreamCallback,
   abortSignal?: AbortSignal,
-  onActivity?: () => void
+  onActivity?: () => void,
+  options?: KiroEventStreamOptions
 ): Promise<void> {
   const reader = body.getReader()
   let pending = new Uint8Array(0)
@@ -43,6 +55,16 @@ export async function parseKiroEventStream(
   let totalCredits = 0
   let currentToolUse: ToolUseState | null = null
   let producedContent = false
+
+  // Per-stream recovery for tool calls the model emits as antml text instead
+  // of native `toolUseEvent` frames. Constructed only when the request
+  // declared tools so prose mentioning the syntax is never stripped.
+  const inlineToolParser = options?.recoverInlineToolCalls
+    ? new AntmlToolCallParser({
+        onText: (text) => callback.onText?.(text, false),
+        onToolUse: (toolUse) => callback.onToolUse?.(toolUse),
+      })
+    : null
 
   const append = (chunk: Uint8Array): void => {
     if (pending.length === 0) {
@@ -133,13 +155,20 @@ export async function parseKiroEventStream(
         switch (eventType) {
           case "assistantResponseEvent": {
             const content = readString(event, "content")
-            if (content && callback.onText) {
+            if (content) {
               // AWS CodeWhisperer streams text with HTML entities encoded
               // (&quot;, &apos;, &amp;, &lt;, &gt;, plus numeric forms).
               // The official Kiro client decodes per-chunk via unescape3()
               // before yielding to consumers — match that behavior exactly.
               // No dedup/overlap handling: each event is a clean delta.
-              callback.onText(unescapeHtmlEntities(content), false)
+              const decoded = unescapeHtmlEntities(content)
+              if (inlineToolParser) {
+                // Recovery parser forwards plain text to onText and converts
+                // any inline antml tool call into an onToolUse callback.
+                inlineToolParser.push(decoded)
+              } else {
+                callback.onText?.(decoded, false)
+              }
               producedContent = true
             }
             break
@@ -212,6 +241,12 @@ export async function parseKiroEventStream(
             break
         }
       }
+    }
+
+    // Flush any inline antml tool call / trailing text still held by the
+    // recovery parser before deciding whether the stream produced content.
+    if (inlineToolParser) {
+      inlineToolParser.flush()
     }
 
     // Flush any tool_use that the upstream finished without a final
