@@ -128,6 +128,15 @@ const CREDENTIAL_FILES = [
     secretName: "CLAUDE_API_ACCOUNTS",
     label: "Claude API accounts",
   },
+  {
+    localPath: resolveDefaultAccountConfigPath(
+      PROJECT_ROOT,
+      "kiro-accounts.json",
+      []
+    ),
+    secretName: "KIRO_ACCOUNTS",
+    label: "Kiro accounts",
+  },
 ]
 
 console.log("🚀 Deploying credentials to GitHub Secrets...\n")
@@ -147,12 +156,17 @@ for (const { localPath, secretName, label } of CREDENTIAL_FILES) {
 
   const content = fs.readFileSync(localPath, "utf-8")
 
-  // Validate JSON
+  // Validate JSON and skip empty pools (avoid overwriting server secrets)
+  let accountCount = 0
   try {
     const parsed = JSON.parse(content)
-    const count = Array.isArray(parsed.accounts) ? parsed.accounts.length : 0
+    accountCount = Array.isArray(parsed.accounts) ? parsed.accounts.length : 0
+    if (accountCount === 0) {
+      console.log(`   ⏭️  ${label}: no accounts configured, skipping`)
+      continue
+    }
     process.stdout.write(
-      `   🔑 ${label} (${count} account${count !== 1 ? "s" : ""})... `
+      `   🔑 ${label} (${accountCount} account${accountCount !== 1 ? "s" : ""})... `
     )
   } catch {
     console.log(`   ❌ ${label}: invalid JSON, skipping`)
@@ -176,16 +190,19 @@ console.log("")
 
 if (uploadedCount === 0) {
   console.log("⚠️  No credentials were uploaded.")
-  console.log("   Run sync commands first:")
-  console.log("     npm run antigravity:sync -- --tools")
-  console.log("     npm run claude:sync")
-  console.log("     npm run codex:sync")
-  process.exit(1)
+  if (!triggerDeploy) {
+    console.log("   Run sync commands first:")
+    console.log("     npm run antigravity:sync -- --tools")
+    console.log("     npm run claude:sync")
+    console.log("     npm run codex:sync")
+    process.exit(1)
+  }
+  console.log("   Continuing with deploy trigger only.")
+} else {
+  console.log(
+    `✅ ${uploadedCount} credential file(s) uploaded to GitHub Secrets.`
+  )
 }
-
-console.log(
-  `✅ ${uploadedCount} credential file(s) uploaded to GitHub Secrets.`
-)
 
 if (triggerDeploy) {
   console.log("\n🔄 Triggering deployment workflow...")

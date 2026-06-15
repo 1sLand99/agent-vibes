@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "apps/protocol-bridge/**"
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -19,10 +20,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
 
       - name: Install dependencies
-        working-directory: apps/protocol-bridge
-        run: npm install --ignore-scripts
+        run: npm ci
 
       - name: Restore credentials from secrets
         working-directory: apps/protocol-bridge
@@ -40,15 +41,66 @@ jobs:
           if [ -n "$CLAUDE_API_ACCOUNTS" ]; then
             printf "%s" "$CLAUDE_API_ACCOUNTS" > data/claude-api-accounts.json
           fi
+          if [ -n "$KIRO_ACCOUNTS" ]; then
+            printf "%s" "$KIRO_ACCOUNTS" > data/kiro-accounts.json
+          fi
         env:
           ANTIGRAVITY_ACCOUNTS: ${{ secrets.ANTIGRAVITY_ACCOUNTS }}
           CODEX_ACCOUNTS: ${{ secrets.CODEX_ACCOUNTS }}
           OPENAI_COMPAT_ACCOUNTS: ${{ secrets.OPENAI_COMPAT_ACCOUNTS }}
           CLAUDE_API_ACCOUNTS: ${{ secrets.CLAUDE_API_ACCOUNTS }}
+          KIRO_ACCOUNTS: ${{ secrets.KIRO_ACCOUNTS }}
 
       - name: Build
         working-directory: apps/protocol-bridge
         run: npm run build
+
+      - name: Prepare production bundle
+        run: |
+          node <<'NODE'
+          const fs = require("fs")
+          const path = require("path")
+
+          const sourceDir = path.join("apps", "protocol-bridge")
+          const bundleDir = path.join(".deploy-bundle")
+          fs.rmSync(bundleDir, { recursive: true, force: true })
+          fs.mkdirSync(bundleDir, { recursive: true })
+
+          const pkg = JSON.parse(
+            fs.readFileSync(path.join(sourceDir, "package.json"), "utf8")
+          )
+          delete pkg.devDependencies
+          fs.writeFileSync(
+            path.join(bundleDir, "package.json"),
+            `${JSON.stringify(pkg, null, 2)}\n`
+          )
+
+          fs.cpSync(path.join(sourceDir, "dist"), path.join(bundleDir, "dist"), {
+            recursive: true,
+          })
+          const dataDir = path.join(sourceDir, "data")
+          if (fs.existsSync(dataDir)) {
+            fs.cpSync(dataDir, path.join(bundleDir, "data"), {
+              recursive: true,
+            })
+          } else {
+            fs.mkdirSync(path.join(bundleDir, "data"), { recursive: true })
+          }
+          const envExample = [
+            ".env.production.example",
+            ".env.example",
+          ]
+            .map((name) => path.join(sourceDir, name))
+            .find((filePath) => fs.existsSync(filePath))
+          if (envExample) {
+            fs.copyFileSync(
+              envExample,
+              path.join(bundleDir, ".env.production.example")
+            )
+          }
+          NODE
+          cd .deploy-bundle
+          npm install --omit=dev --ignore-scripts
 
       - name: Deploy to server
         uses: appleboy/scp-action@v0.1.7
@@ -56,9 +108,9 @@ jobs:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          source: "apps/protocol-bridge/dist/,apps/protocol-bridge/package.json,apps/protocol-bridge/.env.production.example,apps/protocol-bridge/data/"
+          source: ".deploy-bundle/dist/,.deploy-bundle/package.json,.deploy-bundle/node_modules/,.deploy-bundle/.env.production.example,.deploy-bundle/data/"
           target: "/opt/protocol-bridge"
-          strip_components: 2
+          strip_components: 1
 
       - name: Restart service
         uses: appleboy/ssh-action@v1.0.3
@@ -84,7 +136,8 @@ jobs:
               curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
               apt-get install -y nodejs
             fi
-            npm install --production --ignore-scripts
+            # node_modules are bundled from CI (monorepo workspace deps cannot install on server)
+            rm -f package-lock.json
             # Setup SSL certificates for HTTPS/HTTP2
             mkdir -p /opt/protocol-bridge/certs
             ln -sf /etc/letsencrypt/live/$DEPLOY_DOMAIN/fullchain.pem /opt/protocol-bridge/certs/localhost.crt

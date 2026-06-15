@@ -5,6 +5,7 @@ node_modules
 dist
 .playwright-mcp
 .turbo
+.deploy-bundle/
 .cursor
 cursor.log
 .log/

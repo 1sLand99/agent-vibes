@@ -16,6 +16,7 @@ function parseArgs(argv) {
     bump: "patch", // patch | minor | major | current
     cursorVersion: "",
     noTag: false,
+    noDeploy: false,
     help: false,
   }
 
@@ -61,6 +62,10 @@ function parseArgs(argv) {
       parsed.noTag = true
       continue
     }
+    if (arg === "--no-deploy") {
+      parsed.noDeploy = true
+      continue
+    }
 
     throw new Error(`Unknown argument: ${arg}`)
   }
@@ -76,7 +81,8 @@ Steps:
   2. Commit version bump on source branch and push
   3. Merge source into target and push
   4. Create and push version tag (triggers release CI)
-  5. Switch back to source branch
+  5. Sync credentials to GitHub Secrets and deploy to recronin server
+  6. Switch back to source branch
 
 Options:
   --patch     Bump patch version (default)  e.g. 0.1.0 → 0.1.1
@@ -84,6 +90,7 @@ Options:
   --major     Bump major version            e.g. 0.1.0 → 1.0.0
   --current   Use current version as-is, no bump
   --no-tag    Merge only, skip version bump and tag
+  --no-deploy Skip syncing credentials and remote server deploy
   --source    Source branch (default: dev)
   --target    Target branch (default: main)
   --remote    Git remote (default: origin)
@@ -379,6 +386,11 @@ function main() {
       runGit(["push", remote, tag])
 
       console.log(`\n✅ Released ${tag} — workflow will start shortly.`)
+    }
+
+    if (!args.noDeploy) {
+      step("Syncing credentials and deploying to recronin server")
+      runNode(path.join("scripts", "accounts", "sync-deploy.js"), ["--run"])
     }
 
     console.log(`\nDone. Merged ${source} → ${target}.`)
