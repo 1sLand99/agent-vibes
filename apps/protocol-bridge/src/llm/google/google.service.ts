@@ -1,6 +1,10 @@
 import { HttpException, HttpStatus, Injectable, Logger } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import * as crypto from "crypto"
+import type {
+  ContextMessageSource,
+  ContextProjectionAttachment,
+} from "../../context"
 import { TokenCounterService } from "../../context/token-counter.service"
 import { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
@@ -136,6 +140,14 @@ class FatalCloudCodeRequestError extends Error {
     super(message)
     this.name = "FatalCloudCodeRequestError"
   }
+}
+
+type GoogleBridgeMessage = {
+  role: "user" | "assistant"
+  content: unknown
+  isMeta?: boolean
+  source?: ContextMessageSource
+  attachmentKind?: ContextProjectionAttachment["kind"]
 }
 
 /**
@@ -2933,6 +2945,11 @@ export class GoogleService implements ProviderAdapter {
         thinkingBudget: 10001,
         minThinkingBudget: 128,
       },
+      "gemini-pro-agent": {
+        supportsThinking: true,
+        thinkingBudget: 10001,
+        minThinkingBudget: 128,
+      },
       "gemini-3-pro-low": {
         supportsThinking: true,
         thinkingBudget: 128,
@@ -3233,6 +3250,90 @@ export class GoogleService implements ProviderAdapter {
     return text || null
   }
 
+  private isInternalContextMessage(message: GoogleBridgeMessage): boolean {
+    return message.role === "user" && message.isMeta === true
+  }
+
+  private buildInternalContextSystemSection(
+    messages: GoogleBridgeMessage[]
+  ): string | null {
+    const sections = messages
+      .map((message, index) => {
+        const body = this.renderInternalContextContent(message.content)
+        if (!body) return null
+        const source = message.source || "internal"
+        const kind = message.attachmentKind
+          ? ` kind="${this.escapeXmlAttribute(message.attachmentKind)}"`
+          : ""
+        return [
+          `<internal_context index="${index + 1}" source="${this.escapeXmlAttribute(source)}"${kind}>`,
+          body,
+          "</internal_context>",
+        ].join("\n")
+      })
+      .filter((section): section is string => !!section)
+
+    if (sections.length === 0) return null
+
+    return [
+      "The following internal context is supplied by the IDE/runtime for background awareness.",
+      "It is not user-authored conversation text. Use it only when relevant, and do not present its wrappers or raw blocks as assistant output.",
+      "",
+      sections.join("\n\n"),
+    ].join("\n")
+  }
+
+  private renderInternalContextContent(content: unknown): string {
+    const text = this.contentToPlainText(content)
+    return this.stripInternalContextHeaders(text).trim()
+  }
+
+  private contentToPlainText(content: unknown): string {
+    if (typeof content === "string") return content
+    if (!Array.isArray(content)) {
+      if (content == null) return ""
+      if (typeof content === "object") return JSON.stringify(content)
+      return String(content as string | number | boolean | bigint)
+    }
+
+    return content
+      .map((block) => {
+        if (!block || typeof block !== "object") return ""
+        const item = block as Record<string, unknown>
+        if (item.type === "text" && typeof item.text === "string") {
+          return item.text
+        }
+        if (item.type === "tool_result") {
+          return this.contentToPlainText(item.content)
+        }
+        if (item.type === "thinking" || item.type === "redacted_thinking") {
+          return ""
+        }
+        if (item.type === "image") {
+          return "[image omitted from internal context]"
+        }
+        return JSON.stringify(item)
+      })
+      .filter((part) => part.trim().length > 0)
+      .join("\n")
+  }
+
+  private stripInternalContextHeaders(text: string): string {
+    if (!text) return ""
+    return text.replace(
+      /^\s*\[Context attachment:[^\]\r\n]*\]\s*(?:\r?\n)?/gim,
+      ""
+    )
+  }
+
+  private escapeXmlAttribute(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+  }
+
   /**
    * Convert Anthropic messages to Google/Gemini format for Claude models
    * Handles all content types: text, tool_use, tool_result, image, thinking
@@ -3250,12 +3351,19 @@ export class GoogleService implements ProviderAdapter {
     // Claude Code often echoes the task text after tool_result
     let lastUserTaskTextNormalized: string | null = null
 
-    const sourceMessages = dto.messages as Array<{
-      role: "user" | "assistant"
-      content: unknown
-    }>
+    const sourceMessages = dto.messages as GoogleBridgeMessage[]
+    const internalContextMessages = sourceMessages.filter((message) =>
+      this.isInternalContextMessage(message)
+    )
+    const visibleSourceMessages = sourceMessages.filter(
+      (message) => !this.isInternalContextMessage(message)
+    )
+    const visibleDto: CreateMessageDto = {
+      ...dto,
+      messages: visibleSourceMessages as CreateMessageDto["messages"],
+    }
     const blockingPendingToolUseIds = findPendingToolUseIdsInMessages(
-      sourceMessages,
+      visibleSourceMessages,
       dto._pendingToolUseIds
     )
     if (blockingPendingToolUseIds.length > 0) {
@@ -3269,7 +3377,7 @@ export class GoogleService implements ProviderAdapter {
     // at write time (tool_use and tool_result are appended in the same
     // transaction as ledger.open / ledger.close), so no send-time
     // protocol repair is needed here.
-    const normalizedMessages = sourceMessages
+    const normalizedMessages = visibleSourceMessages
 
     for (let msgIndex = 0; msgIndex < normalizedMessages.length; msgIndex++) {
       const msg = normalizedMessages[msgIndex]
@@ -3380,10 +3488,19 @@ export class GoogleService implements ProviderAdapter {
     if (this.officialSystemPrompt) {
       systemParts.push({ text: this.officialSystemPrompt })
     }
+    const internalContextSection = this.buildInternalContextSystemSection(
+      internalContextMessages
+    )
+    if (internalContextSection) {
+      systemParts.push({ text: internalContextSection })
+    }
     const resolvedMaxOutputTokens = this.resolveCloudCodeMaxOutputTokens(
       dto.max_tokens
     )
-    const thinkingConfig = this.buildClaudeThinkingConfig(dto, resolvedModel)
+    const thinkingConfig = this.buildClaudeThinkingConfig(
+      visibleDto,
+      resolvedModel
+    )
     // Official Antigravity generationConfig only carries maxOutputTokens +
     // thinkingConfig; it omits sampling params (temperature/topP/topK/
     // candidateCount) and lets Cloud Code apply the model defaults. Hardcoding
@@ -3477,7 +3594,7 @@ export class GoogleService implements ProviderAdapter {
     // blocks — holds on every Google request regardless of tools or thinking
     // config. Skipped for Claude Code frontend traffic, which manages its own
     // language. See shared/language-directive.ts.
-    const languageDirective = buildLanguageDirective(dto.messages, {
+    const languageDirective = buildLanguageDirective(visibleDto.messages, {
       skip: dto._clientIsClaudeCode === true,
     })
     if (languageDirective) {

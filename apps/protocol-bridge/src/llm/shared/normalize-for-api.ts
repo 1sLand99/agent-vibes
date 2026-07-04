@@ -42,6 +42,8 @@
 
 import type {
   ContentBlock,
+  ContextMessageSource,
+  ContextProjectionAttachment,
   LooseMessageContent,
   UnifiedMessage,
 } from "../../context/types"
@@ -89,6 +91,8 @@ interface FlatAssistant {
   uuid: string
   /** Anthropic message id — split-sibling merge key. */
   messageId?: string
+  source?: ContextMessageSource
+  attachmentKind?: ContextProjectionAttachment["kind"]
   content: LooseMessageContent
 }
 
@@ -96,6 +100,8 @@ interface FlatUser {
   type: "user"
   uuid: string
   isMeta?: boolean
+  source?: ContextMessageSource
+  attachmentKind?: ContextProjectionAttachment["kind"]
   content: LooseMessageContent
 }
 
@@ -104,11 +110,17 @@ type FlatMessage = FlatAssistant | FlatUser
 function lift(messages: ReadonlyArray<SessionMessage>): FlatMessage[] {
   const out: FlatMessage[] = []
   for (const msg of messages) {
+    const metadata = msg.message as {
+      source?: ContextMessageSource
+      attachmentKind?: ContextProjectionAttachment["kind"]
+    }
     if (msg.type === "assistant") {
       out.push({
         type: "assistant",
         uuid: msg.uuid,
         messageId: msg.message.id,
+        source: metadata.source,
+        attachmentKind: metadata.attachmentKind,
         content: msg.message.content,
       })
     } else {
@@ -116,6 +128,8 @@ function lift(messages: ReadonlyArray<SessionMessage>): FlatMessage[] {
         type: "user",
         uuid: msg.uuid,
         isMeta: msg.isMeta,
+        source: metadata.source,
+        attachmentKind: metadata.attachmentKind,
         content: msg.message.content,
       })
     }
@@ -129,6 +143,12 @@ function project(messages: ReadonlyArray<FlatMessage>): UnifiedMessage[] {
     out.push({
       role: msg.type === "assistant" ? "assistant" : "user",
       content: msg.content as string | ContentBlock[],
+      ...(msg.type === "assistant" && msg.messageId
+        ? { messageId: msg.messageId }
+        : {}),
+      ...(msg.type === "user" && msg.isMeta ? { isMeta: true } : {}),
+      ...(msg.source ? { source: msg.source } : {}),
+      ...(msg.attachmentKind ? { attachmentKind: msg.attachmentKind } : {}),
     })
   }
   return out
@@ -317,24 +337,38 @@ export function mergeUserMessages(a: FlatUser, b: FlatUser): FlatUser {
   const bBlocks = toTextBlocks(b.content)
   const joined = joinTextAtSeam(aBlocks, bBlocks)
   const merged = hoistToolResults(joined)
+  const isMeta = a.isMeta && b.isMeta ? true : undefined
   return {
     ...a,
     // If `a` is meta and `b` is not, the merged message represents real
     // user content; surface b's uuid so downstream consumers (e.g. id tags)
     // bind to the visible turn.
     uuid: a.isMeta && !b.isMeta ? b.uuid : a.uuid,
-    isMeta: a.isMeta && b.isMeta ? true : undefined,
+    isMeta,
+    source: isMeta && a.source === b.source ? a.source : undefined,
+    attachmentKind:
+      isMeta && a.attachmentKind === b.attachmentKind
+        ? a.attachmentKind
+        : undefined,
     content: merged,
   }
 }
 
 function mergeAdjacentUserMessages(
-  messages: ReadonlyArray<FlatMessage>
+  messages: ReadonlyArray<FlatMessage>,
+  opts?: { preserveMetaBoundaries?: boolean }
 ): FlatMessage[] {
   const out: FlatMessage[] = []
   for (const msg of messages) {
     const prev = out.at(-1)
     if (msg.type === "user" && prev?.type === "user") {
+      if (
+        opts?.preserveMetaBoundaries &&
+        Boolean(prev.isMeta) !== Boolean(msg.isMeta)
+      ) {
+        out.push(msg)
+        continue
+      }
       out[out.length - 1] = mergeUserMessages(prev, msg)
     } else {
       out.push(msg)
@@ -781,7 +815,9 @@ export function normalizeMessagesForAPI(
   let pipeline: FlatMessage[] = lift(messages)
   pipeline = reorderAttachmentsForAPI(pipeline)
   pipeline = mergeAssistantMessagesById(pipeline)
-  pipeline = mergeAdjacentUserMessages(pipeline)
+  pipeline = mergeAdjacentUserMessages(pipeline, {
+    preserveMetaBoundaries: opts.backend === "google",
+  })
   pipeline = relocateToolReferenceSiblings(pipeline)
   pipeline = filterOrphanedThinkingOnlyMessages(pipeline)
   pipeline = filterTrailingThinkingFromLastAssistant(pipeline)
@@ -796,7 +832,9 @@ export function normalizeMessagesForAPI(
   // cc messages.ts:2633 does this gated; we run it unconditionally because
   // we don't have the snip / chair_sermon gates that change the merge
   // semantics there.
-  pipeline = mergeAdjacentUserMessages(pipeline)
+  pipeline = mergeAdjacentUserMessages(pipeline, {
+    preserveMetaBoundaries: opts.backend === "google",
+  })
 
   return project(pipeline)
 }
@@ -824,6 +862,8 @@ export function normalizeFlatMessagesForAPI(
      *  mergeUserMessages step to prefer the non-meta uuid when fusing
      *  adjacent users. */
     isMeta?: boolean
+    source?: ContextMessageSource
+    attachmentKind?: ContextProjectionAttachment["kind"]
   }>,
   opts: NormalizeOptions
 ): UnifiedMessage[] {
@@ -839,6 +879,8 @@ export function normalizeFlatMessagesForAPI(
           // (cursor-connect-stream.service.ts:persistSplitSiblingAssistantBlock,
           // commit 4745a63). Mirrors cc claude.ts:2281-2300.
           ...(msg.messageId ? { messageId: msg.messageId } : {}),
+          ...(msg.source ? { source: msg.source } : {}),
+          ...(msg.attachmentKind ? { attachmentKind: msg.attachmentKind } : {}),
           content: msg.content as LooseMessageContent,
         } as FlatAssistant)
       : ({
@@ -848,12 +890,16 @@ export function normalizeFlatMessagesForAPI(
           // (line 325-326) can apply the cc uuid-preference rule when
           // fusing adjacent user messages.
           ...(msg.isMeta ? { isMeta: true as const } : {}),
+          ...(msg.source ? { source: msg.source } : {}),
+          ...(msg.attachmentKind ? { attachmentKind: msg.attachmentKind } : {}),
           content: msg.content as LooseMessageContent,
         } as FlatUser)
   )
   pipeline = reorderAttachmentsForAPI(pipeline)
   pipeline = mergeAssistantMessagesById(pipeline)
-  pipeline = mergeAdjacentUserMessages(pipeline)
+  pipeline = mergeAdjacentUserMessages(pipeline, {
+    preserveMetaBoundaries: opts.backend === "google",
+  })
   pipeline = relocateToolReferenceSiblings(pipeline)
   pipeline = filterOrphanedThinkingOnlyMessages(pipeline)
   pipeline = filterTrailingThinkingFromLastAssistant(pipeline)
@@ -862,7 +908,9 @@ export function normalizeFlatMessagesForAPI(
   pipeline = sanitizeErrorToolResultContent(pipeline)
   pipeline = hoistInUserMessages(pipeline)
   pipeline = applyBackendThinkingRules(pipeline, opts)
-  pipeline = mergeAdjacentUserMessages(pipeline)
+  pipeline = mergeAdjacentUserMessages(pipeline, {
+    preserveMetaBoundaries: opts.backend === "google",
+  })
   return project(pipeline)
 }
 

@@ -135,6 +135,7 @@ export function buildMcpDispatchInput(
       "providerIdentifier",
       "provider_identifier",
       "serverName",
+      "server",
       "server_name",
     ]) ||
     mcpToolDef.providerIdentifier ||
@@ -153,7 +154,12 @@ export function resolveMcpCallFields(
   args: Record<string, unknown>
 ): ResolvedMcpCallFields {
   const serverName =
-    pickFirstString(args, ["serverName", "server_name", "provider"]) || ""
+    pickFirstString(args, [
+      "serverName",
+      "server",
+      "server_name",
+      "provider",
+    ]) || ""
   const providerIdentifier =
     pickFirstString(args, ["providerIdentifier", "provider_identifier"]) ||
     serverName

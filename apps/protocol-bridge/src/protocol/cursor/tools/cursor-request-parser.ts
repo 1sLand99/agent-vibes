@@ -2183,6 +2183,7 @@ export class CursorRequestParser {
       webSearchEnabled: requestContext?.webSearchEnabled,
       webFetchEnabled: requestContext?.webFetchEnabled,
       readLintsEnabled: requestContext?.readLintsEnabled,
+      sendToUserEnabled: req.clientSupportsSendToUser === true,
     }
     const defaultBuiltInTools = getDefaultAgentToolNames(
       builtInToolCapabilityOptions

@@ -9,7 +9,11 @@ import {
   ValidateNested,
 } from "class-validator"
 import type { ThinkingIntent } from "../../../llm/shared/thinking-types"
-import type { ContextNativeManagementConfig } from "../../../context"
+import type {
+  ContextMessageSource,
+  ContextNativeManagementConfig,
+  ContextProjectionAttachment,
+} from "../../../context"
 
 class MessageContentDto {
   @ApiProperty()
@@ -61,6 +65,18 @@ class MessageDto {
   @ApiProperty({ oneOf: [{ type: "string" }, { type: "array" }] })
   @IsOptional()
   content: string | MessageContentDto[]
+
+  @IsOptional()
+  @IsBoolean()
+  isMeta?: boolean
+
+  @IsOptional()
+  @IsString()
+  source?: ContextMessageSource
+
+  @IsOptional()
+  @IsString()
+  attachmentKind?: ContextProjectionAttachment["kind"]
 }
 
 class ToolDto {

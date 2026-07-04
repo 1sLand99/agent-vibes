@@ -256,6 +256,12 @@ import {
   SendFinalSummaryResultSchema,
   SendFinalSummarySuccessSchema,
   SendFinalSummaryToolCallSchema,
+  SendToUserArgsSchema,
+  SendToUserErrorSchema,
+  type SendToUserResult,
+  SendToUserResultSchema,
+  SendToUserSuccessSchema,
+  SendToUserToolCallSchema,
   SetActiveBranchArgsSchema,
   SetActiveBranchErrorSchema,
   SetActiveBranchResultSchema,
@@ -897,6 +903,7 @@ type ToolFamily =
   // 新增 ToolCall 级工具（有正式 ToolCall oneof case）
   | "communicate_update"
   | "send_final_summary"
+  | "send_to_user"
   // ExecServerMessage 补齐
   | "request_context"
   | "redacted_read"
@@ -1112,6 +1119,7 @@ export class CursorGrpcService {
       // 新增 ToolCall 级工具
       "communicate_update",
       "send_final_summary",
+      "send_to_user",
     ])
 
   // Active blob ID list (for KV storage)
@@ -2337,6 +2345,8 @@ export class CursorGrpcService {
           return "start_grind_planning"
         case "CLIENT_SIDE_TOOL_V2_REFLECT":
           return "reflect"
+        case "CLIENT_SIDE_TOOL_V2_SEND_TO_USER":
+          return "send_to_user"
       }
       // 注意：force_background_shell/subagent、canvas_*、mcp_state_exec、subagent_await
       // 没有对应的 ClientSideToolV2 枚举——它们是纯 ExecServerMessage 工具，
@@ -2370,6 +2380,8 @@ export class CursorGrpcService {
     if (normalized.includes("viewimage")) return "read"
     // Bridge-internal tools with no proto representation
     if (normalized === "discovertool" || normalized === "discover_tool")
+      return "truncated"
+    if (normalized === "snipmessages" || normalized === "snip_messages")
       return "truncated"
     // Cursor's current protobuf does not expose exact Codex-native oneofs for
     // sub-agent lifecycle or apply_patch. Project them onto the closest native
@@ -2531,6 +2543,11 @@ export class CursorGrpcService {
       normalized.includes("send_final_summary")
     )
       return "send_final_summary"
+    if (
+      normalized.includes("sendtouser") ||
+      normalized.includes("send_to_user")
+    )
+      return "send_to_user"
     // ExecServerMessage 补齐模糊匹配
     if (
       normalized.includes("requestcontext") ||
@@ -2648,6 +2665,7 @@ export class CursorGrpcService {
     if (family === "ai_attribution") return "ai_attribution_tool_call"
     if (family === "mcp_auth") return "mcp_auth_tool_call"
     if (family === "pr_management") return "pr_management_tool_call"
+    if (family === "send_to_user") return "send_to_user_tool_call"
     return undefined
   }
 
@@ -4526,6 +4544,7 @@ export class CursorGrpcService {
             (a as Record<string, unknown>).providerIdentifier ||
               (a as Record<string, unknown>).provider_identifier ||
               (a as Record<string, unknown>).serverName ||
+              (a as Record<string, unknown>).server ||
               (a as Record<string, unknown>).server_name
           )
           mcpExecRawArgs = { ...(a as unknown as Record<string, unknown>) }
@@ -4845,6 +4864,8 @@ export class CursorGrpcService {
     return (
       normalized === "discovertool" ||
       normalized === "discover_tool" ||
+      normalized === "snipmessages" ||
+      normalized === "snip_messages" ||
       normalized.includes("killagent") ||
       normalized === "kill_agent" ||
       normalized.includes("backgroundcomposerfollowup") ||
@@ -4944,6 +4965,7 @@ export class CursorGrpcService {
       // 有专用 ToolCall oneof case 的新工具
       communicate_update: "communicateUpdateToolCall",
       send_final_summary: "sendFinalSummaryToolCall",
+      send_to_user: "sendToUserToolCall",
       unknown: "truncatedToolCall",
     }
     const matchedCase = familyToCase[family] || "truncatedToolCall"
@@ -5181,6 +5203,11 @@ export class CursorGrpcService {
         return {
           case: "sendFinalSummaryToolCall",
           value: create(SendFinalSummaryToolCallSchema, {}),
+        }
+      case "sendToUserToolCall":
+        return {
+          case: "sendToUserToolCall",
+          value: create(SendToUserToolCallSchema, {}),
         }
       case "truncatedToolCall":
       default:
@@ -5902,6 +5929,15 @@ export class CursorGrpcService {
               finalSummary: safeString(
                 args.finalSummary || args.final_summary || args.summary
               ),
+            }),
+          }),
+        }
+      case "send_to_user":
+        return {
+          case: "sendToUserToolCall" as const,
+          value: create(SendToUserToolCallSchema, {
+            args: create(SendToUserArgsSchema, {
+              message: safeString(args.message || args.content || args.text),
             }),
           }),
         }
@@ -8327,6 +8363,36 @@ export class CursorGrpcService {
           }),
           result: create(SendFinalSummaryResultSchema, {
             result: sendFinalSummaryResultOneOf,
+          }),
+        }),
+      }
+    }
+
+    if (family === "send_to_user") {
+      const message = safeString(args.message || args.content || args.text)
+      let sendToUserResultOneOf: SendToUserResult["result"]
+      if (status === "success") {
+        sendToUserResultOneOf = {
+          case: "success" as const,
+          value: create(SendToUserSuccessSchema, {}),
+        }
+      } else {
+        sendToUserResultOneOf = {
+          case: "error" as const,
+          value: create(SendToUserErrorSchema, {
+            error: statusMessage || "send_to_user failed",
+          }),
+        }
+      }
+
+      return {
+        case: "sendToUserToolCall" as const,
+        value: create(SendToUserToolCallSchema, {
+          args: create(SendToUserArgsSchema, {
+            message,
+          }),
+          result: create(SendToUserResultSchema, {
+            result: sendToUserResultOneOf,
           }),
         }),
       }

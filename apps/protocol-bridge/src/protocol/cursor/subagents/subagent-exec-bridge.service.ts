@@ -58,6 +58,8 @@ export interface SubagentExecResult {
    * `streamed_shell` so downstream formatting code keeps working
    * uniformly. */
   resultCase: string
+  /** Bridge-synthesized tool text for inline timeout/error results. */
+  inlineContent?: string
   /** Populated only for streamed_shell. Concatenated stdout. */
   streamedStdout?: string
   /** Populated only for streamed_shell. Concatenated stderr. */

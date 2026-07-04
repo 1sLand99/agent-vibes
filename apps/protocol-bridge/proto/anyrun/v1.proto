@@ -9,12 +9,18 @@ enum BlobStorageFormat {
   BLOB_STORAGE_FORMAT_VM_SNAPSHOT_V1 = 2;
   BLOB_STORAGE_FORMAT_V2 = 3;
   BLOB_STORAGE_FORMAT_V2_LAYERED = 4;
+  BLOB_STORAGE_FORMAT_V3 = 5;
 }
 
 enum ClonePurpose {
   CLONE_PURPOSE_UNSPECIFIED = 0;
   CLONE_PURPOSE_DOCKER_BUILD = 1;
   CLONE_PURPOSE_WORKSPACE_SETUP = 2;
+}
+
+enum ContainerRuntime {
+  CONTAINER_RUNTIME_DOCKERD_UNSPECIFIED = 0;
+  CONTAINER_RUNTIME_ISOD_RUNC = 1;
 }
 
 enum DrainingReason {
@@ -80,6 +86,12 @@ enum RestartPolicy {
   RESTART_POLICY_ALWAYS = 3;
 }
 
+enum RestartReason {
+  RESTART_REASON_UNSPECIFIED = 0;
+  RESTART_REASON_PROCESS_EXITED = 1;
+  RESTART_REASON_HEALTH_CHECK_FAILED = 2;
+}
+
 enum SnapshotState {
   SNAPSHOT_STATE_UNSPECIFIED = 0;
   SNAPSHOT_STATE_CREATING = 1;
@@ -87,8 +99,28 @@ enum SnapshotState {
   SNAPSHOT_STATE_FAILED = 3;
 }
 
+enum WorkspaceGitSetupMode {
+  WORKSPACE_GIT_SETUP_MODE_UNSPECIFIED = 0;
+  WORKSPACE_GIT_SETUP_MODE_REUSE = 1;
+}
+
+message AgentStoreConfig {
+  bool enabled = 1;
+  string self_store_id = 2;
+  repeated string additional_store_ids = 3;
+  PodAgentStoreGrant pod_grant = 4;
+  string bcs_endpoint = 6;
+  uint32 vsock_port = 7;
+  string mount_root = 8;
+}
+
 message AllowedDomain {
   string domain = 1;
+}
+
+message AllowedTcpDestination {
+  string cidr = 1;
+  uint32 port = 2;
 }
 
 message AnygressLocalPodDenyRules {
@@ -173,6 +205,7 @@ message DaemonPod {
   optional string started_from_checkpoint_group_id = 5;
   optional PodStartCacheSource started_from_cache_source = 6;
   optional uint64 started_from_checkpoint_creation_timestamp = 7;
+  optional string started_from_checkpoint_id = 8;
 }
 
 message DefaultPortConfig {
@@ -231,6 +264,9 @@ message DevContainerConfig {
   optional bool build_container = 29;
   optional bool enable_cgroup_subtree_control = 30;
   optional bool enable_checkpoint_scratch_drive = 34;
+  optional bool blob_client_resilience_enabled = 35;
+  optional bool skip_workspace_source_checkout = 36;
+  ContainerRuntime container_runtime = 37;
 }
 
 message DevContainerEnv {
@@ -277,6 +313,7 @@ message DevContainerSpec {
   optional EgressPolicy egress_policy = 26;
   repeated string low_cardinality_pod_labels = 27;
   optional AnygressPerPodDenyRules anygress_per_pod_deny_rules = 28;
+  optional AgentStoreConfig agent_store_config = 30;
 }
 
 message DirectoryEntry {
@@ -327,6 +364,7 @@ message DockerContainerPersistentState {
   bool removed = 4;
   bool leaked = 5;
   optional uint64 post_pause_unpause_delay_ms = 6;
+  optional string isod_container_name = 8;
 }
 
 message DockerDevContainerPersistentState {
@@ -372,6 +410,7 @@ message EgressPolicy {
 
 message EgressRestricted {
   repeated AllowedDomain allowed_domains = 1;
+  repeated AllowedTcpDestination allowed_tcp_destinations = 2;
 }
 
 message ExternalSnapshot {
@@ -514,12 +553,19 @@ message IsoDevContainerMetadata {
   IsoEnvConfig env_config = 3;
 }
 
+message IsoEnvBalloonConfig {
+  uint32 amount_mib = 1;
+  bool deflate_on_oom = 2;
+  optional uint32 stats_polling_interval_s = 3;
+}
+
 message IsoEnvConfig {
   uint32 vcpu_count = 1;
   uint32 mem_size_mib = 2;
   optional uint32 swap_size_mib = 3;
   optional uint32 rootfs_size_mib = 4;
   repeated IsoEnvExtraDriveConfig extra_drives = 5;
+  optional IsoEnvBalloonConfig balloon = 6;
 }
 
 message IsoEnvExtraDriveConfig {
@@ -528,6 +574,18 @@ message IsoEnvExtraDriveConfig {
   string drive_id = 4;
   string guest_device = 5;
   string guest_mount_path = 6;
+}
+
+message LifecycleProcessExited {
+  int32 exit_code = 1;
+  string command_name = 2;
+}
+
+message LifecycleProcessRestarted {
+  uint32 attempt = 1;
+  int32 previous_exit_code = 2;
+  RestartReason reason = 3;
+  string command_name = 4;
 }
 
 message ListDirectoryRequest {
@@ -609,6 +667,8 @@ message PersistedDevContainerConfig {
   repeated DevContainerExecCommand verify_commands = 19;
   optional bool build_container = 22;
   optional bool enable_checkpoint_scratch_drive = 25;
+  optional bool blob_client_resilience_enabled = 26;
+  ContainerRuntime container_runtime = 27;
 }
 
 message PersistedEnvVar {
@@ -684,6 +744,17 @@ message Pod {
   optional string started_from_checkpoint_group_id = 27;
   optional PodStartCacheSource started_from_cache_source = 28;
   optional uint64 started_from_checkpoint_creation_timestamp = 29;
+  optional string started_from_checkpoint_id = 30;
+}
+
+message PodAgentStoreGrant {
+  string pod_id = 1;
+  string self_store_id = 2;
+  int64 team_id = 3;
+  int64 issued_at_ms = 4;
+  int64 expires_at_ms = 5;
+  string grant_id = 6;
+  string token = 7;
 }
 
 message PodCollection {
@@ -693,6 +764,13 @@ message PodCollection {
 
 message PodCreatingStatus {
   PodCreatingPhase phase = 1;
+}
+
+message PodDiskUsage {
+  string device = 1;
+  uint64 usage_bytes = 2;
+  uint64 limit_bytes = 3;
+  string path = 4;
 }
 
 message PodErrorEvent {
@@ -754,6 +832,8 @@ message PodEvent {
     WaitingForWorkerStatus waiting_for_worker = 54;
     SpanStarted span_started = 55;
     SpanEnded span_ended = 56;
+    LifecycleProcessRestarted lifecycle_process_restarted = 57;
+    LifecycleProcessExited lifecycle_process_exited = 58;
   }
   uint64 creation_timestamp = 49;
 }
@@ -788,6 +868,22 @@ message PodMetricsSample {
   uint64 cpu_limit_mcores = 2;
   uint64 memory_usage_bytes = 3;
   uint64 memory_limit_bytes = 4;
+  uint64 cgroup_memory_current_bytes = 5;
+  uint64 cgroup_memory_max_bytes = 6;
+  uint64 oom_kill_count = 7;
+  uint64 pids_current = 8;
+  uint64 pids_max = 9;
+  uint64 process_count = 10;
+  uint64 new_procs_this_interval = 12;
+  uint64 procs_seen_total = 13;
+  map<string, uint64> process_state_counts = 14;
+  map<string, uint64> top_procs_by_name = 15;
+  repeated TopProcess top_procs = 16;
+  double memory_psi_full_avg10 = 17;
+  int64 oom_victim_pid = 18;
+  string oom_victim_comm = 19;
+  uint64 oom_victim_rss_kb = 20;
+  repeated PodDiskUsage disk_usage_by_device = 21;
 }
 
 message PodPorts {
@@ -867,6 +963,7 @@ message ProcessExited {
 message ProcessRestarted {
   uint32 attempt = 1;
   int32 previous_exit_code = 2;
+  RestartReason reason = 3;
 }
 
 message ProcessSupervision {
@@ -1019,6 +1116,17 @@ message TarGzipUrlSourceReference {
 message TarRepoSourceReference {
   string name = 1;
   bytes tar_archive = 2;
+}
+
+message TopProcess {
+  int64 pid = 1;
+  int64 ppid = 2;
+  string comm = 3;
+  string state = 4;
+  uint64 rss_kb = 5;
+  uint64 threads = 6;
+  uint64 num_fds = 7;
+  uint64 cpu_ticks_delta = 8;
 }
 
 message WaitingForWorkerStatus {

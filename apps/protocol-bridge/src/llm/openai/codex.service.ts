@@ -92,7 +92,10 @@ import {
   type CodexInputMessage,
   type CodexRequest,
 } from "./codex-request-builder"
-import { getCodexIncrementalInput } from "./codex-incremental"
+import {
+  prepareCodexContinuationRequest,
+  type CodexContinuationDecision,
+} from "./codex-incremental"
 import { createCodexExecutionRequestFromClaude } from "./codex-request-translator"
 import {
   createStreamState,
@@ -202,7 +205,7 @@ interface ConversationSlotBinding {
 /**
  * Mirrors the official Codex CLI ModelClientSession.
  *
- * Turn-scoped management of WebSocket connection + previous_response_id + request signature.
+ * Turn-scoped management of WebSocket transport plus response-chain state.
  * Each turn (executeStreamWithCooldownRetry call) creates a fresh context and disposes
  * it in the finally block, returning the WS connection to cachedWsSessions.
  *
@@ -212,8 +215,8 @@ interface ConversationSlotBinding {
  *     turn, which violates the client/server contract" (client.rs:209-211)
  *
  * Cross-turn state preservation:
- *   - lastResponseId is carried across turns (via cachedWsSessions) for incremental append
- *   - request signature is carried with it so the next request can send only the delta
+ *   - lastResponseId is carried across turns for incremental append
+ *   - request baseline is carried with it so the next request can send only the delta
  *
  * Lifecycle:
  *   - Turn start: getOrCreateTurnContext() takes connection from cachedWsSessions
@@ -1250,76 +1253,83 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
    * Automatically inject previous_response_id before sending a request.
    * Mirrors official prepare_websocket_request() + get_incremental_items().
    *
-   * We only use previous_response_id when the new full request is a strict extension
-   * of the previous full request plus server-returned output items. This avoids sending
-   * a fabricated delta when the transcript was truncated, compacted, or otherwise rebuilt.
+   * The semantic response chain is independent from the physical WebSocket
+   * connection. A server-side close after response.completed only means the next
+   * turn needs a fresh socket; it does not invalidate previous_response_id.
    */
   private prepareRequestWithTurnContext(
     codexRequest: Record<string, unknown>,
     context: CodexTurnContext,
     conversationId: string
   ): Record<string, unknown> {
-    if (!context.lastResponse?.responseId || !context.lastRequest) {
-      context.lastRequest = codexRequest
-      return codexRequest
-    }
-
-    const incrementalInput = this.getIncrementalItems(
+    const decision = prepareCodexContinuationRequest(
       codexRequest,
-      context.lastRequest,
-      context.lastResponse,
+      {
+        lastRequest: context.lastRequest,
+        lastResponse: context.lastResponse,
+      },
       true
     )
-    if (!incrementalInput) {
+
+    context.lastRequest = decision.nextState.lastRequest
+    context.lastResponse = decision.nextState.lastResponse
+    this.logCodexContinuationDecision(conversationId, decision)
+    return decision.request
+  }
+
+  private logCodexContinuationDecision(
+    conversationId: string,
+    decision: CodexContinuationDecision
+  ): void {
+    if (decision.mode === "full") {
       this.logger.debug(
-        `[Codex][TurnContext] Discarding response_id=${context.lastResponse.responseId} ` +
-          `for ${conversationId}: request is not a strict incremental extension`
+        `[Codex][TurnContext] Starting full response chain for ${conversationId}: ${decision.reason}`
       )
-      context.lastRequest = codexRequest
-      return codexRequest
+      return
+    }
+
+    if (decision.mode === "full_reset") {
+      const detail =
+        decision.reason === "static_fields_changed"
+          ? ` keys=${decision.changedStaticKeys.join(",") || "unknown"}`
+          : ` baseline=${decision.inputMismatch.baselineLength} request=${decision.inputMismatch.requestLength}` +
+            (typeof decision.inputMismatch.mismatchIndex === "number"
+              ? ` mismatch_index=${decision.inputMismatch.mismatchIndex}` +
+                ` baseline_type=${decision.inputMismatch.baselineType || "unknown"}` +
+                ` request_type=${decision.inputMismatch.requestType || "unknown"}`
+              : "")
+      this.logger.debug(
+        `[Codex][TurnContext] Incremental request unavailable: ${decision.reason}${detail}; ` +
+          `resetting response chain for ${conversationId}`
+      )
+      return
     }
 
     this.logger.debug(
-      `[Codex][TurnContext] Injected previous_response_id=${context.lastResponse.responseId} ` +
-        `for conversation=${conversationId}; incremental_items=${incrementalInput.length}`
+      `[Codex][TurnContext] Injected previous_response_id=${decision.previousResponseId} ` +
+        `for conversation=${conversationId}; incremental_items=${decision.incrementalItemCount}`
     )
-    context.lastRequest = codexRequest
-    return {
-      ...codexRequest,
-      input: incrementalInput,
-      previous_response_id: context.lastResponse.responseId,
-    }
   }
 
-  private getIncrementalItems(
-    request: Record<string, unknown>,
-    previousRequest: Record<string, unknown>,
-    lastResponse: CodexLastResponse,
-    allowEmptyDelta: boolean
-  ): CodexInputItem[] | undefined {
-    const result = getCodexIncrementalInput(
-      request,
-      previousRequest,
-      lastResponse,
-      allowEmptyDelta
-    )
-    if (!result.ok) {
-      const detail =
-        result.reason === "static_fields_changed"
-          ? ` keys=${result.changedStaticKeys.join(",") || "unknown"}`
-          : ` baseline=${result.inputMismatch.baselineLength} request=${result.inputMismatch.requestLength}` +
-            (typeof result.inputMismatch.mismatchIndex === "number"
-              ? ` mismatch_index=${result.inputMismatch.mismatchIndex}` +
-                ` baseline_type=${result.inputMismatch.baselineType || "unknown"}` +
-                ` request_type=${result.inputMismatch.requestType || "unknown"}`
-              : "")
-      this.logger.debug(
-        `[Codex][TurnContext] Incremental request unavailable: ${result.reason}${detail}`
-      )
-      return undefined
+  private beginFullCodexResponseChain(
+    context: CodexTurnContext | undefined,
+    conversationId: string | undefined,
+    codexRequest: Record<string, unknown>,
+    reason: string
+  ): void {
+    if (!context) {
+      return
     }
 
-    return result.input
+    const previousResponseId = context.lastResponse?.responseId
+    context.lastRequest = codexRequest
+    context.lastResponse = undefined
+    if (conversationId && previousResponseId) {
+      this.logger.debug(
+        `[Codex][TurnContext] Reset response chain for ${conversationId}: ${reason}; ` +
+          `discarded previous_response_id=${previousResponseId}`
+      )
+    }
   }
 
   private convertResponseOutputItemToInputItem(
@@ -5467,21 +5477,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       )
       this.captureCodexTurnStateFromConnection(turnContext, ws)
 
-      if (!hadOpenConnection && turnContext && conversationId) {
-        const previousResponseId = turnContext.lastResponse?.responseId
-        this.resetTurnContextResponseState(
-          conversationId,
-          "WebSocket connection was rebuilt before request"
-        )
+      if (!hadOpenConnection && turnContext?.lastResponse?.responseId) {
         this.logger.debug(
-          previousResponseId
-            ? `[Codex][TurnContext] Connection was rebuilt before stream request for ${conversationId}; cleared previous_response_id=${previousResponseId}`
-            : `[Codex][TurnContext] Connection was rebuilt before stream request for ${conversationId}; no previous_response_id`
+          `[Codex][TurnContext] WebSocket connection rebuilt before request for ${conversationId}; ` +
+            `preserving response chain previous_response_id=${turnContext.lastResponse.responseId}`
         )
       }
 
-      // NOW inject previous_response_id — only after we know the connection is valid.
-      // Mirrors prepare_websocket_request() + get_incremental_items().
+      // NOW inject previous_response_id — only after a usable socket exists.
+      // The response chain survives transport reconnects; only transcript
+      // rewrites/static request changes/server stale-id rejections reset it.
       const originalCodexRequest = codexRequest
       if (turnContext && conversationId) {
         codexRequest = this.prepareRequestWithTurnContext(
@@ -5532,8 +5537,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             `[Codex] Previous response_id rejected by server for ${conversationId}, ` +
               `retrying without previous_response_id (full input)`
           )
-          this.resetTurnContextResponseState(
+          this.beginFullCodexResponseChain(
+            turnContext,
             conversationId,
+            originalCodexRequest,
             "Server rejected stale previous_response_id"
           )
           codexRequest = originalCodexRequest
@@ -5579,19 +5586,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           `[Codex] Reconnecting stale WebSocket session ${sessionId} before streamed retry`
         )
         this.wsService.invalidateSessionConnection(sessionId, ws)
-        if (conversationId && turnContext) {
-          const previousResponseId = turnContext.lastResponse?.responseId
-          this.resetTurnContextResponseState(
-            conversationId,
-            "WebSocket connection was rebuilt before streamed retry"
-          )
-          if (previousResponseId) {
-            this.logger.debug(
-              `[Codex][TurnContext] Connection was rebuilt for streamed retry for ${conversationId}; cleared previous_response_id=${previousResponseId}`
-            )
-          }
-        }
-        codexRequest = originalCodexRequest
         this.applyCodexTurnStateHeader(wsHeaders, turnContext)
         ws = await this.wsService.ensureSessionConnection(
           sessionId,
@@ -5600,19 +5594,66 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           slot.proxyUrl || undefined
         )
         this.captureCodexTurnStateFromConnection(turnContext, ws)
-        yield* this.streamViaWebSocketConnection(
-          ws,
-          slot,
-          modelName,
-          reverseToolMap,
-          cacheId,
-          codexRequest,
-          requestStartedAt,
-          sessionId,
-          abortSignal,
-          conversationId,
-          prewarmConfig
-        )
+        try {
+          yield* this.streamViaWebSocketConnection(
+            ws,
+            slot,
+            modelName,
+            reverseToolMap,
+            cacheId,
+            codexRequest,
+            requestStartedAt,
+            sessionId,
+            abortSignal,
+            conversationId,
+            prewarmConfig
+          )
+        } catch (retryError) {
+          if (
+            conversationId &&
+            this.isStaleResponseIdError(retryError) &&
+            codexRequest !== originalCodexRequest
+          ) {
+            this.logger.warn(
+              `[Codex] Previous response_id rejected by server for ${conversationId} after WebSocket retry, ` +
+                `retrying without previous_response_id (full input)`
+            )
+            this.beginFullCodexResponseChain(
+              turnContext,
+              conversationId,
+              originalCodexRequest,
+              "Server rejected stale previous_response_id after WebSocket retry"
+            )
+            codexRequest = originalCodexRequest
+            const wsStillUsable = ws.readyState === WebSocket.OPEN
+            if (!wsStillUsable) {
+              this.wsService.invalidateSessionConnection(sessionId, ws)
+              this.applyCodexTurnStateHeader(wsHeaders, turnContext)
+              ws = await this.wsService.ensureSessionConnection(
+                sessionId,
+                wsUrl,
+                wsHeaders,
+                slot.proxyUrl || undefined
+              )
+              this.captureCodexTurnStateFromConnection(turnContext, ws)
+            }
+            yield* this.streamViaWebSocketConnection(
+              ws,
+              slot,
+              modelName,
+              reverseToolMap,
+              cacheId,
+              codexRequest,
+              Date.now(),
+              sessionId,
+              abortSignal,
+              conversationId,
+              prewarmConfig
+            )
+            return
+          }
+          throw retryError
+        }
       }
     } finally {
       release()

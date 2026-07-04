@@ -133,6 +133,9 @@ const schema = {
   },
   // varName -> fullTypeName 映射
   varToType: {},
+  // bundle basename -> varName -> fullTypeName 映射
+  // Minified identifiers are not globally unique across Cursor bundles.
+  varToTypeByBundle: {},
   // fullTypeName -> varName 映射
   typeToVar: {},
   // fullTypeName -> { fields: [...], sourceBundle }
@@ -143,6 +146,133 @@ const schema = {
   services: {},
   // 统计信息
   stats: {},
+}
+
+function getBundleMap(bundleKey) {
+  if (!schema.varToTypeByBundle[bundleKey]) {
+    schema.varToTypeByBundle[bundleKey] = {}
+  }
+  return schema.varToTypeByBundle[bundleKey]
+}
+
+function recordVarType(
+  varToBundle,
+  bundleKey,
+  bundleId,
+  varName,
+  fullName,
+  options = {}
+) {
+  if (!varName || !fullName) return
+  const bundleMap = getBundleMap(bundleKey)
+  if (options.force || !bundleMap[varName]) {
+    bundleMap[varName] = fullName
+  }
+
+  if (
+    options.forceGlobal ||
+    !schema.varToType[varName] ||
+    varToBundle[varName] === bundleId
+  ) {
+    schema.varToType[varName] = fullName
+    schema.typeToVar[fullName] = varName
+    varToBundle[varName] = bundleId
+  } else if (!schema.typeToVar[fullName]) {
+    schema.typeToVar[fullName] = varName
+  }
+}
+
+function resolveVarInBundle(bundleKey, varName) {
+  const bundleMap = schema.varToTypeByBundle[bundleKey]
+  return (bundleMap && bundleMap[varName]) || schema.varToType[varName]
+}
+
+function applyAliasMappings(content, bundleKey, bundleId, varToBundle) {
+  const aliasPairs = []
+  const aliasRx =
+    /(?:^|[;,])\s*(?:(?:let|var|const)\s+)?([\w$]+)\s*=\s*([\w$]+)(?=[,;}])/g
+  let m
+  while ((m = aliasRx.exec(content)) !== null) {
+    if (m[1] === m[2]) continue
+    aliasPairs.push([m[1], m[2]])
+  }
+
+  let changed = true
+  let passes = 0
+  while (changed && passes < 20) {
+    changed = false
+    passes++
+    const bundleMap = getBundleMap(bundleKey)
+    for (const [alias, target] of aliasPairs) {
+      const targetType = bundleMap[target]
+      if (!targetType || bundleMap[alias] === targetType) continue
+      if (bundleMap[alias] && bundleMap[alias] !== targetType) continue
+      recordVarType(varToBundle, bundleKey, bundleId, alias, targetType)
+      changed = true
+    }
+  }
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function findLocalTypeInModule(moduleBody, localVar) {
+  const name = escapeRegExp(localVar)
+  const patterns = [
+    new RegExp(
+      `class\\s+${name}\\s+extends\\s+[\\w$.]+[\\s\\S]{0,2500}?typeName\\s*=\\s*"([^"]+)"`
+    ),
+    new RegExp(
+      `${name}\\s*=\\s*class(?:\\s+[\\w$]+)?\\s+extends\\s+[\\w$.]+[\\s\\S]{0,2500}?typeName\\s*=\\s*"([^"]+)"`
+    ),
+  ]
+  for (const pattern of patterns) {
+    const match = moduleBody.match(pattern)
+    if (match) return match[1]
+  }
+  return null
+}
+
+function applyModuleMemberMappings(content, bundleKey, bundleId, varToBundle) {
+  const moduleExports = new Map()
+  const moduleRx = /(\d+):\([^)]*\)=>\{([\s\S]*?)(?=,\d+:\([^)]*\)=>|\}\)\(\{)/g
+  let moduleMatch
+  while ((moduleMatch = moduleRx.exec(content)) !== null) {
+    const moduleId = moduleMatch[1]
+    const moduleBody = moduleMatch[2]
+    const exportMatch = moduleBody.match(/[\w$]+\.d\([\w$]+,\{([^}]+)\}\)/)
+    if (!exportMatch) continue
+
+    const exportsForModule = {}
+    const exportRx = /([\w$]+):\s*\(\)\s*=>\s*([\w$]+)/g
+    let exportEntry
+    while ((exportEntry = exportRx.exec(exportMatch[1])) !== null) {
+      const exportName = exportEntry[1]
+      const localVar = exportEntry[2]
+      const typeName = findLocalTypeInModule(moduleBody, localVar)
+      if (typeName) exportsForModule[exportName] = typeName
+    }
+    if (Object.keys(exportsForModule).length > 0) {
+      moduleExports.set(moduleId, exportsForModule)
+    }
+  }
+
+  const importRx =
+    /(?:^|[;,])\s*(?:(?:let|var|const)\s+)?([\w$]+)\s*=\s*[\w$]+\((\d+)\)/g
+  let importMatch
+  while ((importMatch = importRx.exec(content)) !== null) {
+    const alias = importMatch[1]
+    const moduleId = importMatch[2]
+    const exportsForModule = moduleExports.get(moduleId)
+    if (!exportsForModule) continue
+
+    for (const [exportName, typeName] of Object.entries(exportsForModule)) {
+      const memberRef = `${alias}.${exportName}`
+      if (resolveVarInBundle(bundleKey, memberRef)) continue
+      recordVarType(varToBundle, bundleKey, bundleId, memberRef, typeName)
+    }
+  }
 }
 
 // ============================================================
@@ -177,6 +307,7 @@ function buildVarTypeMapping(bundles) {
   for (const bundle of bundles) {
     const content = bundle.content
     const bundleId = bundle.path || bundle.name || "unknown"
+    const bundleKey = bundle.basename || bundleId
     let m
 
     // 策略 1: fromBinary 模式（最可靠）
@@ -187,9 +318,7 @@ function buildVarTypeMapping(bundles) {
       const fullName = m[1]
       const varName = m[2]
       if (!schema.varToType[varName]) {
-        schema.varToType[varName] = fullName
-        schema.typeToVar[fullName] = varName
-        varToBundle[varName] = bundleId
+        recordVarType(varToBundle, bundleKey, bundleId, varName, fullName)
       }
     }
 
@@ -199,20 +328,17 @@ function buildVarTypeMapping(bundles) {
       /typeName="([^"]+)"[\s\S]{0,800}?fromJsonString\(e,t\)\{return new (\w+)\(\)/g
     while ((m = rx2.exec(content)) !== null) {
       if (!schema.varToType[m[2]]) {
-        schema.varToType[m[2]] = m[1]
-        schema.typeToVar[m[1]] = m[2]
-        varToBundle[m[2]] = bundleId
+        recordVarType(varToBundle, bundleKey, bundleId, m[2], m[1])
       }
     }
 
     // 策略 3: setEnumType 模式（enum 变量映射）
     // setEnumType(VarName, "pkg.EnumName", [...])
-    const enumVarRx = /setEnumType\(([\w$]+)\s*,\s*"([^"]+)"/g
+    const enumVarRx =
+      /(?:[\w$]+(?:\.[\w$]+)*\.)?setEnumType\(([\w$]+)\s*,\s*"([^"]+)"/g
     while ((m = enumVarRx.exec(content)) !== null) {
       if (!schema.varToType[m[1]]) {
-        schema.varToType[m[1]] = m[2]
-        schema.typeToVar[m[2]] = m[1]
-        varToBundle[m[1]] = bundleId
+        recordVarType(varToBundle, bundleKey, bundleId, m[1], m[2])
       }
     }
 
@@ -228,13 +354,13 @@ function buildVarTypeMapping(bundles) {
       if (!schema.varToType[m[1]]) {
         // 在 setEnumType 中也搜索一下这个变量
         const enumDefRx = new RegExp(
-          "setEnumType\\(" + m[1] + '\\s*,\\s*"([^"]+)"'
+          "(?:[\\w$]+(?:\\.[\\w$]+)*\\.)?setEnumType\\(" +
+            m[1] +
+            '\\s*,\\s*"([^"]+)"'
         )
         const enumMatch = content.match(enumDefRx)
         if (enumMatch) {
-          schema.varToType[m[1]] = enumMatch[1]
-          schema.typeToVar[enumMatch[1]] = m[1]
-          varToBundle[m[1]] = bundleId
+          recordVarType(varToBundle, bundleKey, bundleId, m[1], enumMatch[1])
         }
       }
     }
@@ -246,9 +372,7 @@ function buildVarTypeMapping(bundles) {
       /typeName="([^"]+)"[\s\S]{0,800}?equals\(\w+,\w+\)\{return \w+\.util\.equals\((\w+)/g
     while ((m = equalsRx.exec(content)) !== null) {
       if (!schema.varToType[m[2]]) {
-        schema.varToType[m[2]] = m[1]
-        schema.typeToVar[m[1]] = m[2]
-        varToBundle[m[2]] = bundleId
+        recordVarType(varToBundle, bundleKey, bundleId, m[2], m[1])
       }
     }
 
@@ -284,9 +408,9 @@ function buildVarTypeMapping(bundles) {
         // 1. varName 尚无映射
         // 2. varName 已有映射但来自同一 bundle（修正 InternalName → VarName）
         if (!schema.varToType[varName] || varToBundle[varName] === bundleId) {
-          schema.varToType[varName] = fullName
-          schema.typeToVar[fullName] = varName
-          varToBundle[varName] = bundleId
+          recordVarType(varToBundle, bundleKey, bundleId, varName, fullName, {
+            force: true,
+          })
         }
         continue
       }
@@ -302,9 +426,7 @@ function buildVarTypeMapping(bundles) {
         const lastMatch = classMatches[classMatches.length - 1]
         const varName = lastMatch[1]
         if (!schema.varToType[varName]) {
-          schema.varToType[varName] = fullName
-          schema.typeToVar[fullName] = varName
-          varToBundle[varName] = bundleId
+          recordVarType(varToBundle, bundleKey, bundleId, varName, fullName)
         }
         continue
       }
@@ -319,12 +441,13 @@ function buildVarTypeMapping(bundles) {
         const lastMatch = letAssignMatches[letAssignMatches.length - 1]
         const varName = lastMatch[1]
         if (!schema.varToType[varName]) {
-          schema.varToType[varName] = fullName
-          schema.typeToVar[fullName] = varName
-          varToBundle[varName] = bundleId
+          recordVarType(varToBundle, bundleKey, bundleId, varName, fullName)
         }
       }
     }
+
+    applyAliasMappings(content, bundleKey, bundleId, varToBundle)
+    applyModuleMemberMappings(content, bundleKey, bundleId, varToBundle)
   }
 
   if (VERBOSE)
@@ -390,7 +513,9 @@ function parseFieldObject(fieldStr) {
   // 格式 3: T:()=>VarName (延迟加载引用)
   // 格式 4: T:9 (scalar 编号)
   // 注意: minified 变量名可以包含 $ 字符（如 $Z, $xe, e$u）
-  const enumTMatch = fieldStr.match(/\bT:\s*[\w$]+\.getEnumType\(([\w$]+)\)/)
+  const enumTMatch = fieldStr.match(
+    /\bT:\s*[\w$]+(?:\.[\w$]+)*\.getEnumType\(([\w$]+)\)/
+  )
   const lazyTMatch = fieldStr.match(/\bT:\s*\(\)\s*=>\s*([\w$]+)/)
   const directTMatch = fieldStr.match(/\bT:\s*([\w$]+(?:\.[\w$]+)*)/)
   if (enumTMatch) {
@@ -637,10 +762,11 @@ function extractServices(bundles) {
       if (schema.services[serviceName]) continue
 
       // 步骤 4: 解析每个 method，解引用 I/O 变量名
+      const bundleKey = bundle.basename || bundle.path || "unknown"
       const methods = group.map((m) => ({
         name: m.name,
-        inputType: schema.varToType[m.inputVar] || m.inputVar,
-        outputType: schema.varToType[m.outputVar] || m.outputVar,
+        inputType: resolveVarInBundle(bundleKey, m.inputVar) || m.inputVar,
+        outputType: resolveVarInBundle(bundleKey, m.outputVar) || m.outputVar,
         inputVar: m.inputVar,
         outputVar: m.outputVar,
         kind: METHOD_KINDS[m.kind] || `kind_${m.kind}`,
@@ -670,6 +796,7 @@ function extractServices(bundles) {
 function resolveTypes() {
   // 遍历所有 message 的所有字段，解引用 T 值
   for (const [msgName, msgDef] of Object.entries(schema.messages)) {
+    const bundleKey = msgDef.sourceBundle
     for (const field of msgDef.fields) {
       if (field.kind === "scalar" && field.T) {
         const num = parseInt(field.T)
@@ -677,11 +804,11 @@ function resolveTypes() {
           field.resolvedType = SCALAR_TYPES[num] || `scalar_${field.T}`
         }
       } else if (field.kind === "message" && field.T) {
-        field.resolvedType = schema.varToType[field.T] || field.T
+        field.resolvedType = resolveVarInBundle(bundleKey, field.T) || field.T
       } else if (field.kind === "enum" && field.T) {
         // enum 字段的 T 通常是 b.getEnumType(VarName) 调用的结果
         // 但在 minified 代码中直接存的是 var 引用
-        field.resolvedType = schema.varToType[field.T] || field.T
+        field.resolvedType = resolveVarInBundle(bundleKey, field.T) || field.T
       } else if (field.kind === "map") {
         // map key
         if (field.mapKeyType !== undefined) {
@@ -701,13 +828,15 @@ function resolveTypes() {
             field.mapValueType.T
           ) {
             field.resolvedMapValueType =
-              schema.varToType[field.mapValueType.T] || field.mapValueType.T
+              resolveVarInBundle(bundleKey, field.mapValueType.T) ||
+              field.mapValueType.T
           } else if (
             field.mapValueType.kind === "enum" &&
             field.mapValueType.T
           ) {
             field.resolvedMapValueType =
-              schema.varToType[field.mapValueType.T] || field.mapValueType.T
+              resolveVarInBundle(bundleKey, field.mapValueType.T) ||
+              field.mapValueType.T
           }
         }
       }
@@ -750,11 +879,12 @@ function computeStats() {
   // 未解引用的类型（仍然是混淆变量名）
   let unresolvedCount = 0
   for (const msgDef of Object.values(schema.messages)) {
+    const bundleKey = msgDef.sourceBundle
     for (const field of msgDef.fields) {
       if (
         (field.kind === "message" || field.kind === "enum") &&
         field.T &&
-        !schema.varToType[field.T] &&
+        !resolveVarInBundle(bundleKey, field.T) &&
         isNaN(parseInt(field.T))
       ) {
         unresolvedCount++
@@ -1148,11 +1278,13 @@ function main() {
         enums: schema.enums,
         services: schema.services,
         varToType: schema.varToType,
+        varToTypeByBundle: schema.varToTypeByBundle,
       }
       // 精简 message 输出（去掉 sourceBundle）
       for (const [name, def] of Object.entries(schema.messages)) {
         jsonOutput.messages[name] = {
           fields: def.fields,
+          sourceBundle: def.sourceBundle,
           isEmpty: def.isEmpty,
         }
       }

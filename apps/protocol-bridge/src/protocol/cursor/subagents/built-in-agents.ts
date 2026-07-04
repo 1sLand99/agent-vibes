@@ -190,8 +190,8 @@ Standard browser workflow:
 1. \`get_mcp_tools\` once at the start of a task to confirm the browser
    server is mounted and to list the browser_* tools available in this
    session.
-2. \`mcp_tool\` with server="cursor-ide-browser", tool_name="browser_navigate",
-   args={ url, ... } to open the target page.
+2. \`mcp_tool\` with server_name="cursor-ide-browser",
+   tool_name="browser_navigate", args={ url, ... } to open the target page.
 3. Use \`mcp_tool\` with \`browser_snapshot\` (preferred over screenshots
    for action planning — it returns an accessibility tree with stable
    element refs) to read the page state.

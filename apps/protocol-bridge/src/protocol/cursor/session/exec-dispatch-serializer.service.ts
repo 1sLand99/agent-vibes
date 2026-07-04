@@ -171,6 +171,70 @@ export class ExecDispatchSerializerService {
   }
 
   /**
+   * Cancel one or more exec ids that will never receive an IDE-side
+   * terminal control message. Unlike repeatedly calling `release`, this
+   * first drops matching queued frames, so cancelling a whole interrupted
+   * turn cannot accidentally flush another stale frame from that same
+   * turn before its pending state is cleared.
+   */
+  cancel(
+    conversationId: string,
+    execIds: Iterable<number>,
+    emit: (frame: Buffer) => void
+  ): number | undefined {
+    const ids = new Set<number>()
+    for (const execId of execIds) {
+      if (!Number.isFinite(execId) || execId <= 0) continue
+      ids.add(Math.floor(execId))
+    }
+    if (ids.size === 0) return undefined
+
+    const state = this.stateByConversation.get(conversationId)
+    if (!state) return undefined
+
+    const beforeQueueDepth = state.queue.length
+    state.queue = state.queue.filter((entry) => !ids.has(entry.execId))
+    const droppedQueued = beforeQueueDepth - state.queue.length
+
+    if (!state.inFlight || !ids.has(state.inFlight.execId)) {
+      if (droppedQueued > 0) {
+        this.logger.debug(
+          `ExecDispatch cancel queued: conversation=${conversationId} ` +
+            `execIds=${Array.from(ids).join(",")} droppedQueued=${droppedQueued} ` +
+            `queueDepth=${state.queue.length}`
+        )
+      }
+      this.maybeCleanup(conversationId, state)
+      return undefined
+    }
+
+    const cancelled = state.inFlight
+    state.inFlight = undefined
+    this.logger.debug(
+      `ExecDispatch cancelled: conversation=${conversationId} execId=${cancelled.execId} ` +
+        `label=${cancelled.label} held_ms=${Date.now() - cancelled.sentAt.getTime()} ` +
+        `droppedQueued=${droppedQueued} queueDepth=${state.queue.length}`
+    )
+
+    const next = state.queue.shift()
+    if (!next) {
+      this.maybeCleanup(conversationId, state)
+      return undefined
+    }
+
+    state.inFlight = {
+      execId: next.execId,
+      label: next.label,
+      sentAt: new Date(),
+    }
+    this.logger.debug(
+      `ExecDispatch dispatch (after cancel): conversation=${conversationId} execId=${next.execId} label=${next.label}`
+    )
+    emit(next.frame)
+    return next.execId
+  }
+
+  /**
    * Drop everything tracked for a conversation. Called on BiDi
    * teardown, supersede, or session deletion. Frames currently parked
    * on the queue are NOT emitted — the IDE has either gone away or is

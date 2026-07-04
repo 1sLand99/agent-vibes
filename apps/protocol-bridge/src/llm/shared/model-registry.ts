@@ -104,7 +104,7 @@ const GEMINI_MODELS: Record<
     isThinking: false,
   },
   "gemini-3.1-pro-high": {
-    cloudCodeId: "gemini-3.1-pro-high",
+    cloudCodeId: "gemini-pro-agent",
     displayName: "Gemini 3.1 Pro High",
     isThinking: true,
   },

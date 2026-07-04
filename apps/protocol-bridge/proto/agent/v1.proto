@@ -1,11 +1,6 @@
 syntax = "proto3";
 package agent.v1;
 
-import "google/protobuf/descriptor.proto";
-import "google/protobuf/duration.proto";
-import "google/protobuf/empty.proto";
-import "google/protobuf/field_mask.proto";
-import "google/protobuf/timestamp.proto";
 import "google/protobuf/value.proto";
 
 enum AgentMode {
@@ -206,6 +201,13 @@ enum RecordingMode {
   RECORDING_MODE_DISCARD_RECORDING = 3;
 }
 
+enum ReplaceEnvMode {
+  REPLACE_ENV_MODE_UNSPECIFIED = 0;
+  REPLACE_ENV_MODE_CUSTOM = 1;
+  REPLACE_ENV_MODE_CLEAN_SLATE = 2;
+  REPLACE_ENV_MODE_DEFAULT = 3;
+}
+
 enum RequestedFilePathRejectedReason {
   REQUESTED_FILE_PATH_REJECTED_REASON_UNSPECIFIED = 0;
   REQUESTED_FILE_PATH_REJECTED_REASON_SLASHES_NOT_ALLOWED = 1;
@@ -260,7 +262,13 @@ enum SimulatedMsgReason {
   SIMULATED_MSG_REASON_CHECKOUT_BRANCH = 18;
   SIMULATED_MSG_REASON_DIFF_TAB_UPDATE_BRANCH = 19;
   SIMULATED_MSG_REASON_PR_TAB_BUGBOT_FIX = 20;
-  SIMULATED_MSG_REASON_SESSION_GOAL_FOLLOWUP = 21;
+  SIMULATED_MSG_REASON_RUN_BUGBOT_REVIEW = 22;
+  SIMULATED_MSG_REASON_RUN_SECURITY_REVIEW = 23;
+  SIMULATED_MSG_REASON_FSD_APPLY_FINDING = 24;
+  SIMULATED_MSG_REASON_FSD_UNDO_FINDING = 25;
+  SIMULATED_MSG_REASON_FSD_START = 26;
+  SIMULATED_MSG_REASON_FSD_PR_INTERRUPT = 27;
+  SIMULATED_MSG_REASON_SUBSCRIPTION = 28;
 }
 
 enum SmartModeClassifierDecision {
@@ -280,6 +288,21 @@ enum SubagentExecutionEnvironment {
   SUBAGENT_EXECUTION_ENVIRONMENT_UNSPECIFIED = 0;
   SUBAGENT_EXECUTION_ENVIRONMENT_LOCAL = 1;
   SUBAGENT_EXECUTION_ENVIRONMENT_CLOUD = 2;
+}
+
+enum SubagentRunStatus {
+  SUBAGENT_RUN_STATUS_UNSPECIFIED = 0;
+  SUBAGENT_RUN_STATUS_RUNNING = 1;
+  SUBAGENT_RUN_STATUS_BACKGROUNDED = 2;
+  SUBAGENT_RUN_STATUS_SUCCESS = 3;
+  SUBAGENT_RUN_STATUS_ERROR = 4;
+  SUBAGENT_RUN_STATUS_ABORTED = 5;
+}
+
+enum SubscriptionSource {
+  SUBSCRIPTION_SOURCE_UNSPECIFIED = 0;
+  SUBSCRIPTION_SOURCE_SLACK = 1;
+  SUBSCRIPTION_SOURCE_GITHUB = 2;
 }
 
 enum TaskMode {
@@ -376,6 +399,7 @@ message AgentRunRequest {
   repeated SubagentModelOverride subagent_model_overrides = 20;
   optional bool can_create_cloud_subagents = 21;
   optional bool suppress_subagent_progress_update_tool = 22;
+  optional bool client_supports_send_to_user = 23;
 }
 
 message AgentServerMessage {
@@ -403,6 +427,7 @@ message AgentSkill {
   optional string plugin_id = 11;
   optional string marketplace_id = 12;
   repeated string globs = 13;
+  repeated string scoped_to = 14;
 }
 
 message AgentSkillMetadata {
@@ -418,6 +443,7 @@ message AgentSkillMetadata {
   optional string plugin_id = 10;
   optional string marketplace_id = 11;
   repeated string globs = 12;
+  repeated string scoped_to = 13;
 }
 
 message AiAttributionArgs {
@@ -695,6 +721,7 @@ message BackgroundShellSpawnArgs {
   optional SmartModeApproval smart_mode_approval = 10;
   optional ShellHookApprovalRequirement hook_approval_requirement = 11;
   bool skip_approval = 12;
+  optional string conversation_id = 13;
 }
 
 message BackgroundShellSpawnError {
@@ -869,7 +896,7 @@ message ClickEffectKeyframe {
   int64 video_timestamp_ms = 1;
   int32 x = 2;
   int32 y = 3;
-  PH_l_proto3_getEnumType click_type = 4;
+  SubagentTypeCursorGuide click_type = 4;
   int32 action_index = 5;
   bool has_modifiers = 6;
 }
@@ -1075,6 +1102,7 @@ message ConversationHistoryToolMessage {
   string tool_name = 2;
   repeated ConversationHistoryToolResultContent content = 3;
   optional bool is_error = 4;
+  repeated HookAdditionalContext hook_additional_contexts = 5;
 }
 
 message ConversationHistoryToolResultContent {
@@ -1146,6 +1174,7 @@ message ConversationStateStructure {
   optional string conversation_started_time_zone = 27;
   optional string communicate_update_completed_subtitle = 28;
   map<string, CommunicateUpdateTurnState> communicate_update_states_by_parent_tool_call_id = 29;
+  map<string, SubagentRunState> subagent_runs_by_parent_tool_call_id = 30;
 }
 
 message ConversationStep {
@@ -1239,6 +1268,7 @@ message CreatePrAction {
   string branch_name = 5;
   repeated string add_labels = 6;
   optional string repo_url = 7;
+  optional bool skip_branch_prefix_check = 8;
 }
 
 message CreateTmuxSessionRequest {
@@ -1279,15 +1309,15 @@ message CursorPackagePrompt {
 }
 
 message CursorPath {
-  PH_l_proto3_getEnumType style = 1;
-  repeated PH_aiserver_v1_FindBugsResponse keyframes = 2;
+  SubagentTypeCustom style = 1;
+  repeated LsDirectoryTreeNode.File keyframes = 2;
 }
 
 message CursorPathKeyframe {
   int64 video_timestamp_ms = 1;
   int32 x = 2;
   int32 y = 3;
-  PH_l_proto3_getEnumType cursor_type = 4;
+  SubagentTypeWatchVideo cursor_type = 4;
   float velocity = 5;
 }
 
@@ -1307,6 +1337,9 @@ message CursorRule {
   optional string marketplace = 10;
   optional string plugin_id = 11;
   optional string marketplace_id = 12;
+  repeated string scoped_to = 13;
+  string frontmatter = 14;
+  optional bool is_required = 15;
 }
 
 message CursorRuleType {
@@ -1361,21 +1394,21 @@ message DecisionInput {
   int32 video_width = 3;
   int32 video_height = 4;
   int32 action_count = 5;
-  repeated PH_aiserver_v1_FindBugsResponse_Bug zoom_candidates = 10;
-  repeated PH_aiserver_v1_WriteGitCommitMessageRequest idle_periods = 11;
-  repeated PH_aiserver_v1_WriteGitBranchNameRequest click_effects = 12;
-  repeated PH_aiserver_v1_WriteGitBranchNameResponse keystroke_events = 13;
-  repeated PH_aiserver_v1_WriteGitCommitMessageResponse cursor_paths = 20;
+  repeated LsError zoom_candidates = 10;
+  repeated LsRejected idle_periods = 11;
+  repeated TerminalMetadata click_effects = 12;
+  repeated PH_aiserver_v1_ComposerCapabilityRequest_LoopOnTestsCapability keystroke_events = 13;
+  repeated LsTimeout cursor_paths = 20;
 }
 
 message DecisionOutput {
-  PH_l_proto3_getEnumType cursor_style = 1;
-  repeated PH_aiserver_v1_GetDiffReviewRequest selected_zooms = 2;
-  repeated PH_aiserver_v1_GetDiffReviewRequest_SimpleFileDiff selected_speedups = 3;
+  SubagentTypeCustom cursor_style = 1;
+  repeated PH_aiserver_v1_ComposerCapabilityRequest_ToolCallCapability selected_zooms = 2;
+  repeated MouseMoveAction selected_speedups = 3;
   bool show_click_effects = 4;
   repeated int32 selected_click_effects = 5;
   bool show_keystrokes = 6;
-  repeated PH_aiserver_v1_KeepComposerCacheWarmRequest cuts = 7;
+  repeated TypeAction cuts = 7;
 }
 
 message DeleteArgs {
@@ -1658,10 +1691,19 @@ message ExecClientMessage {
     ShellAllowlistPrecheckResult shell_allowlist_precheck_result = 41;
     McpAllowlistPrecheckResult mcp_allowlist_precheck_result = 42;
     WebFetchAllowlistPrecheckResult web_fetch_allowlist_precheck_result = 43;
+    PH_aiserver_v1_GetDiffResponse git_diff_response = 44;
+    PiReadExecResult pi_read_result = 46;
+    PiBashExecResult pi_bash_result = 47;
+    PiEditExecResult pi_edit_result = 48;
+    PiWriteExecResult pi_write_result = 49;
+    PiGrepExecResult pi_grep_result = 50;
+    PiFindExecResult pi_find_result = 51;
+    PiLsExecResult pi_ls_result = 52;
   }
   uint32 id = 1;
   string exec_id = 15;
   optional int32 local_execution_time_ms = 39;
+  repeated HookAdditionalContext hook_additional_contexts = 45;
 }
 
 message ExecClientStreamClose {
@@ -1731,6 +1773,14 @@ message ExecServerMessage {
     ShellAllowlistPrecheckArgs shell_allowlist_precheck_args = 41;
     McpAllowlistPrecheckArgs mcp_allowlist_precheck_args = 42;
     WebFetchAllowlistPrecheckArgs web_fetch_allowlist_precheck_args = 43;
+    PH_aiserver_v1_GetDiffRequest git_diff_request = 44;
+    PiReadExecArgs pi_read_args = 45;
+    PiBashExecArgs pi_bash_args = 46;
+    PiEditExecArgs pi_edit_args = 47;
+    PiWriteExecArgs pi_write_args = 48;
+    PiGrepExecArgs pi_grep_args = 49;
+    PiFindExecArgs pi_find_args = 50;
+    PiLsExecArgs pi_ls_args = 51;
   }
   uint32 id = 1;
   string exec_id = 15;
@@ -1818,11 +1868,48 @@ message FeedbackRequestUpdate {
   repeated FeedbackRequestCategory categories = 3;
   repeated FeedbackRequestCategoryGroup category_groups = 4;
   bool show_form_immediately = 5;
+  optional string title = 6;
+  optional string negative_title = 7;
+  optional string comment_placeholder = 8;
 }
 
 message FetchArgs {
   string url = 1;
   string tool_call_id = 2;
+}
+
+message FetchCloudAgentDataArgs {
+  repeated string bc_ids = 4;
+  repeated string sources = 6;
+  repeated string statuses = 7;
+  bool include_team_wide = 8;
+  bool include_archived = 9;
+  optional int32 limit = 10;
+  bool include_transcript = 12;
+  string active_since = 13;
+}
+
+message FetchCloudAgentDataError {
+  string error = 1;
+}
+
+message FetchCloudAgentDataResult {
+  oneof result {
+    FetchCloudAgentDataSuccess success = 1;
+    FetchCloudAgentDataError error = 2;
+  }
+}
+
+message FetchCloudAgentDataSuccess {
+  string summary = 1;
+  int32 agent_count = 2;
+  repeated string written_paths = 3;
+  repeated string unavailable_bc_ids = 4;
+}
+
+message FetchCloudAgentDataToolCall {
+  FetchCloudAgentDataArgs args = 1;
+  FetchCloudAgentDataResult result = 2;
 }
 
 message FetchError {
@@ -2206,6 +2293,11 @@ message GrepUnionResult {
 message HeartbeatUpdate {
 }
 
+message HookAdditionalContext {
+  string hook_event_name = 1;
+  string content = 2;
+}
+
 message HooksConfigInfo {
   repeated string configured_steps = 1;
 }
@@ -2227,7 +2319,7 @@ message IdlePeriod {
   int64 start_ms = 1;
   int64 end_ms = 2;
   int64 duration_ms = 3;
-  PH_l_proto3_getEnumType classification = 4;
+  PH_aiserver_v1_McpAuthResult classification = 4;
   float suggested_speed = 5;
   string preceding_action_type = 6;
   string following_action_type = 7;
@@ -2249,11 +2341,11 @@ message ImageProto {
 
 message InputEvent {
   int64 execution_timestamp_ms = 1;
-  PH_c_ho action = 2;
+  ComputerUseAction action = 2;
   int64 command_duration_ms = 3;
-  PH_c_xp position_before = 4;
-  PH_c_xp position_after = 5;
-  PH_l_proto3_getEnumType cursor_type_after = 6;
+  Coordinate position_before = 4;
+  Coordinate position_after = 5;
+  SubagentTypeWatchVideo cursor_type_after = 6;
 }
 
 message InstallPluginArtifactRequest {
@@ -2403,7 +2495,7 @@ message KeyAction {
 message KeystrokeEvent {
   int64 video_timestamp_ms = 1;
   string display_text = 2;
-  PH_l_proto3_getEnumType event_type = 3;
+  LsArgs event_type = 3;
   int64 display_duration_ms = 4;
   int32 action_index = 5;
 }
@@ -2753,6 +2845,7 @@ message McpTextContent {
 message McpToolCall {
   McpArgs args = 1;
   McpToolResult result = 2;
+  optional string description = 3;
 }
 
 message McpToolDefinition {
@@ -2910,15 +3003,416 @@ message PartialToolCallUpdate {
   string model_call_id = 4;
 }
 
+message PermissionsAutoRunInstructions {
+  repeated string allow_instructions = 1;
+  repeated string block_instructions = 2;
+}
+
 message Phase {
   string name = 1;
   repeated TodoItem todos = 2;
+}
+
+message PiBashExecArgs {
+  string command = 1;
+  optional double timeout = 2;
+}
+
+message PiBashExecError {
+  string error = 1;
+  optional PiTruncation truncation = 2;
+  optional string full_output_path = 3;
+}
+
+message PiBashExecResult {
+  oneof result {
+    PiBashExecSuccess success = 1;
+    PiBashExecError error = 2;
+  }
+}
+
+message PiBashExecSuccess {
+  string output = 1;
+  optional PiTruncation truncation = 2;
+  optional string full_output_path = 3;
+}
+
+message PiBashToolArgs {
+  string command = 1;
+  optional double timeout = 2;
+}
+
+message PiBashToolCall {
+  PiBashToolArgs args = 1;
+  PiBashToolResult result = 2;
+}
+
+message PiBashToolError {
+  string error = 1;
+  optional PiTruncation truncation = 2;
+  optional string full_output_path = 3;
+}
+
+message PiBashToolResult {
+  oneof result {
+    PiBashToolSuccess success = 1;
+    PiBashToolError error = 2;
+  }
+}
+
+message PiBashToolSuccess {
+  string output = 1;
+  optional PiTruncation truncation = 2;
+  optional string full_output_path = 3;
+}
+
+message PiEditExecArgs {
+  string path = 1;
+  repeated PiEditReplacement edits = 2;
+}
+
+message PiEditExecError {
+  string error = 1;
+}
+
+message PiEditExecRejected {
+  string reason = 1;
+}
+
+message PiEditExecResult {
+  oneof result {
+    PiEditExecSuccess success = 1;
+    PiEditExecError error = 2;
+    PiEditExecRejected rejected = 3;
+  }
+}
+
+message PiEditExecSuccess {
+  string output = 1;
+  string diff = 2;
+  string patch = 3;
+  optional uint32 first_changed_line = 4;
+}
+
+message PiEditReplacement {
+  string old_text = 1;
+  string new_text = 2;
+}
+
+message PiEditToolArgs {
+  string path = 1;
+  repeated PiEditReplacement edits = 2;
+}
+
+message PiEditToolCall {
+  PiEditToolArgs args = 1;
+  PiEditToolResult result = 2;
+}
+
+message PiEditToolError {
+  string error = 1;
+}
+
+message PiEditToolRejected {
+  string reason = 1;
+}
+
+message PiEditToolResult {
+  oneof result {
+    PiEditToolSuccess success = 1;
+    PiEditToolError error = 2;
+    PiEditToolRejected rejected = 3;
+  }
+}
+
+message PiEditToolSuccess {
+  string output = 1;
+  string diff = 2;
+  string patch = 3;
+  optional uint32 first_changed_line = 4;
+}
+
+message PiFindExecArgs {
+  string pattern = 1;
+  optional string path = 2;
+  optional int32 limit = 3;
+}
+
+message PiFindExecError {
+  string error = 1;
+}
+
+message PiFindExecResult {
+  oneof result {
+    PiFindExecSuccess success = 1;
+    PiFindExecError error = 2;
+  }
+}
+
+message PiFindExecSuccess {
+  string output = 1;
+  optional PiTruncation truncation = 2;
+  optional uint32 result_limit_reached = 3;
+}
+
+message PiFindToolArgs {
+  string pattern = 1;
+  optional string path = 2;
+  optional int32 limit = 3;
+}
+
+message PiFindToolCall {
+  PiFindToolArgs args = 1;
+  PiFindToolResult result = 2;
+}
+
+message PiFindToolError {
+  string error = 1;
+}
+
+message PiFindToolResult {
+  oneof result {
+    PiFindToolSuccess success = 1;
+    PiFindToolError error = 2;
+  }
+}
+
+message PiFindToolSuccess {
+  string output = 1;
+  optional PiTruncation truncation = 2;
+  optional uint32 result_limit_reached = 3;
+}
+
+message PiGrepExecArgs {
+  string pattern = 1;
+  optional string path = 2;
+  optional string glob = 3;
+  optional bool ignore_case = 4;
+  optional bool literal = 5;
+  optional int32 context = 6;
+  optional int32 limit = 7;
+}
+
+message PiGrepExecError {
+  string error = 1;
+}
+
+message PiGrepExecResult {
+  oneof result {
+    PiGrepExecSuccess success = 1;
+    PiGrepExecError error = 2;
+  }
+}
+
+message PiGrepExecSuccess {
+  string output = 1;
+  optional PiTruncation truncation = 2;
+  optional uint32 match_limit_reached = 3;
+  bool lines_truncated = 4;
+}
+
+message PiGrepToolArgs {
+  string pattern = 1;
+  optional string path = 2;
+  optional string glob = 3;
+  optional bool ignore_case = 4;
+  optional bool literal = 5;
+  optional int32 context = 6;
+  optional int32 limit = 7;
+}
+
+message PiGrepToolCall {
+  PiGrepToolArgs args = 1;
+  PiGrepToolResult result = 2;
+}
+
+message PiGrepToolError {
+  string error = 1;
+}
+
+message PiGrepToolResult {
+  oneof result {
+    PiGrepToolSuccess success = 1;
+    PiGrepToolError error = 2;
+  }
+}
+
+message PiGrepToolSuccess {
+  string output = 1;
+  optional PiTruncation truncation = 2;
+  optional uint32 match_limit_reached = 3;
+  bool lines_truncated = 4;
+}
+
+message PiLsExecArgs {
+  optional string path = 1;
+  optional int32 limit = 2;
+}
+
+message PiLsExecError {
+  string error = 1;
+}
+
+message PiLsExecResult {
+  oneof result {
+    PiLsExecSuccess success = 1;
+    PiLsExecError error = 2;
+  }
+}
+
+message PiLsExecSuccess {
+  string output = 1;
+  optional PiTruncation truncation = 2;
+  optional uint32 entry_limit_reached = 3;
+}
+
+message PiLsToolArgs {
+  optional string path = 1;
+  optional int32 limit = 2;
+}
+
+message PiLsToolCall {
+  PiLsToolArgs args = 1;
+  PiLsToolResult result = 2;
+}
+
+message PiLsToolError {
+  string error = 1;
+}
+
+message PiLsToolResult {
+  oneof result {
+    PiLsToolSuccess success = 1;
+    PiLsToolError error = 2;
+  }
+}
+
+message PiLsToolSuccess {
+  string output = 1;
+  optional PiTruncation truncation = 2;
+  optional uint32 entry_limit_reached = 3;
 }
 
 message PingRequest {
 }
 
 message PingResponse {
+}
+
+message PiReadExecArgs {
+  string path = 1;
+  optional int32 offset = 2;
+  optional int32 limit = 3;
+}
+
+message PiReadExecError {
+  string error = 1;
+}
+
+message PiReadExecResult {
+  oneof result {
+    PiReadExecSuccess success = 1;
+    PiReadExecError error = 2;
+  }
+}
+
+message PiReadExecSuccess {
+  string output = 1;
+  optional PiTruncation truncation = 2;
+}
+
+message PiReadToolArgs {
+  string path = 1;
+  optional int32 offset = 2;
+  optional int32 limit = 3;
+}
+
+message PiReadToolCall {
+  PiReadToolArgs args = 1;
+  PiReadToolResult result = 2;
+}
+
+message PiReadToolError {
+  string error = 1;
+}
+
+message PiReadToolResult {
+  oneof result {
+    PiReadToolSuccess success = 1;
+    PiReadToolError error = 2;
+  }
+}
+
+message PiReadToolSuccess {
+  string output = 1;
+  optional PiTruncation truncation = 2;
+}
+
+message PiTruncation {
+  bool truncated = 1;
+  string truncated_by = 2;
+  uint32 total_lines = 3;
+  uint32 output_lines = 4;
+  uint32 output_bytes = 5;
+  optional uint32 max_lines = 6;
+  optional uint32 max_bytes = 7;
+  bool first_line_exceeds_limit = 8;
+  bool last_line_partial = 9;
+}
+
+message PiWriteExecArgs {
+  string path = 1;
+  string content = 2;
+}
+
+message PiWriteExecError {
+  string error = 1;
+}
+
+message PiWriteExecRejected {
+  string reason = 1;
+}
+
+message PiWriteExecResult {
+  oneof result {
+    PiWriteExecSuccess success = 1;
+    PiWriteExecError error = 2;
+    PiWriteExecRejected rejected = 3;
+  }
+}
+
+message PiWriteExecSuccess {
+  string output = 1;
+}
+
+message PiWriteToolArgs {
+  string path = 1;
+  string content = 2;
+}
+
+message PiWriteToolCall {
+  PiWriteToolArgs args = 1;
+  PiWriteToolResult result = 2;
+}
+
+message PiWriteToolError {
+  string error = 1;
+}
+
+message PiWriteToolRejected {
+  string reason = 1;
+}
+
+message PiWriteToolResult {
+  oneof result {
+    PiWriteToolSuccess success = 1;
+    PiWriteToolError error = 2;
+    PiWriteToolRejected rejected = 3;
+  }
+}
+
+message PiWriteToolSuccess {
+  string output = 1;
 }
 
 message PlanRegistryEntry {
@@ -2954,6 +3448,7 @@ message PostToolUseFailureRequestQuery {
 }
 
 message PostToolUseFailureRequestResponse {
+  optional string additional_context = 1;
 }
 
 message PostToolUseRequestQuery {
@@ -3066,6 +3561,7 @@ message PreToolUseRequestResponse {
   optional string user_message = 2;
   optional string agent_message = 3;
   optional string updated_input = 4;
+  optional string additional_context = 5;
 }
 
 message PrewarmRequest {
@@ -3090,6 +3586,7 @@ message PrewarmRequest {
   repeated SubagentModelOverride subagent_model_overrides = 19;
   optional bool can_create_cloud_subagents = 20;
   optional bool suppress_subagent_progress_update_tool = 21;
+  optional bool client_supports_send_to_user = 22;
 }
 
 message PrManagementArgs {
@@ -3595,6 +4092,7 @@ message ReflectToolCall {
 message RefreshGithubAccessTokenRequest {
   string github_access_token = 1;
   string hostname = 2;
+  optional string repo_url = 3;
 }
 
 message RefreshGithubAccessTokenResponse {
@@ -3618,6 +4116,8 @@ message ReloadPluginsResponse {
 
 message ReplaceEnvArgs {
   ReplaceEnvConfig config = 1;
+  ReplaceEnvMode mode = 2;
+  repeated RepoCheckoutRefOverride checkout_ref_overrides = 3;
 }
 
 message ReplaceEnvConfig {
@@ -3649,6 +4149,11 @@ message ReplaceEnvToolCall {
 
 message ReplaceEnvToolCallDelta {
   string associated_pod_key = 1;
+}
+
+message RepoCheckoutRefOverride {
+  string repo_url = 1;
+  string ref = 2;
 }
 
 message ReportBugArgs {
@@ -3761,6 +4266,10 @@ message RequestContext {
   optional bool agent_skills_info_complete = 43;
   optional bool mcp_file_system_info_complete = 44;
   optional bool git_status_info_complete = 45;
+  optional PermissionsAutoRunInstructions user_permissions_auto_run = 46;
+  optional PermissionsAutoRunInstructions project_permissions_auto_run = 47;
+  optional PermissionsAutoRunInstructions admin_permissions_auto_run = 48;
+  repeated string disabled_team_rules = 49;
 }
 
 message RequestContextArgs {
@@ -3791,6 +4300,7 @@ message RequestContextEnv {
   optional string process_working_directory = 21;
   optional bool smart_mode_classifier_auto_mode_enabled = 22;
   optional string dev_force_next_smart_mode_classifier_block_token = 23;
+  optional string dev_delay_next_smart_mode_classifier_token = 24;
 }
 
 message RequestContextError {
@@ -4255,6 +4765,65 @@ message SendInputResponse {
   bool success = 1;
 }
 
+message SendMessageArgs {
+  oneof message {
+    SendMessageText text = 1;
+    SendMessageAttachment attachment = 2;
+  }
+}
+
+message SendMessageAttachment {
+  string url = 1;
+  optional string alt = 2;
+}
+
+message SendMessageError {
+  string error = 1;
+}
+
+message SendMessageResult {
+  oneof result {
+    SendMessageSuccess success = 1;
+    SendMessageError error = 2;
+  }
+}
+
+message SendMessageSuccess {
+  uint64 timestamp = 1;
+}
+
+message SendMessageText {
+  string content = 1;
+}
+
+message SendMessageToolCall {
+  SendMessageArgs args = 1;
+  SendMessageResult result = 2;
+}
+
+message SendToUserArgs {
+  string message = 1;
+}
+
+message SendToUserError {
+  string error = 1;
+}
+
+message SendToUserResult {
+  oneof result {
+    SendToUserSuccess success = 1;
+    SendToUserError error = 2;
+  }
+}
+
+message SendToUserSuccess {
+}
+
+message SendToUserToolCall {
+  SendToUserArgs args = 1;
+  SendToUserResult result = 2;
+}
+
 message SetActiveBranchArgs {
   string path = 1;
   string branch_name = 2;
@@ -4341,6 +4910,7 @@ message ShellArgs {
   optional ShellOutputNotificationConfig output_notification = 18;
   optional SmartModeApproval smart_mode_approval = 19;
   optional ShellHookApprovalRequirement hook_approval_requirement = 20;
+  optional string conversation_id = 21;
 }
 
 message ShellCommand {
@@ -4485,6 +5055,7 @@ message ShellStream {
     ShellRejected rejected = 5;
     ShellPermissionDenied permission_denied = 6;
     ShellStreamBackgrounded backgrounded = 7;
+    ShellStreamHookContext hook_context = 8;
   }
 }
 
@@ -4504,6 +5075,10 @@ message ShellStreamExit {
   bool aborted = 4;
   optional ShellAbortReason abort_reason = 5;
   optional int32 local_execution_time_ms = 6;
+}
+
+message ShellStreamHookContext {
+  repeated HookAdditionalContext hook_additional_contexts = 1;
 }
 
 message ShellStreamStart {
@@ -4756,14 +5331,14 @@ message StrReplaceRejected {
 
 message StrReplaceResult {
   oneof result {
-    google.protobuf.GeneratedCodeInfo success = 1;
-    google.protobuf.SourceCodeInfo.Location file_not_found = 2;
-    google.protobuf.Duration read_permission_denied = 3;
-    google.protobuf.Struct write_permission_denied = 4;
-    google.protobuf.GeneratedCodeInfo.Annotation no_match = 5;
-    google.protobuf.Empty multiple_matches = 6;
-    google.protobuf.FieldMask rejected = 7;
-    google.protobuf.Value error = 8;
+    PH_aiserver_v1_CppContextItem success = 1;
+    PH_aiserver_v1_CptFileDiffHistory file_not_found = 2;
+    PH_aiserver_v1_RemoveRepositoryResponse_Status read_permission_denied = 3;
+    PH_aiserver_v1_MarkCppRequest_RangeTransformation write_permission_denied = 4;
+    PH_aiserver_v1_AddTabRequestToEvalRequest no_match = 5;
+    PH_aiserver_v1_RefreshTabContextResponse multiple_matches = 6;
+    PH_aiserver_v1_AddTabRequestToEvalResponse rejected = 7;
+    PH_aiserver_v1_OneIndexedPosition error = 8;
   }
 }
 
@@ -4877,6 +5452,19 @@ message SubagentResult {
   }
 }
 
+message SubagentRunState {
+  string parent_tool_call_id = 1;
+  optional string subagent_id = 2;
+  SubagentExecutionEnvironment environment = 3;
+  SubagentRunStatus status = 4;
+  optional string title = 5;
+  optional string detail = 6;
+  optional string transcript_path = 7;
+  optional string output_path = 8;
+  optional uint64 completed_timestamp_ms = 9;
+  optional BackgroundTaskCompletionReason completion_reason = 10;
+}
+
 message SubagentStartRequestQuery {
   string subagent_id = 1;
   string subagent_type = 2;
@@ -4896,6 +5484,7 @@ message SubagentStartRequestQuery {
 message SubagentStartRequestResponse {
   optional string permission = 1;
   optional string user_message = 2;
+  optional string additional_context = 3;
 }
 
 message SubagentStopRequestQuery {
@@ -4922,6 +5511,7 @@ message SubagentStopRequestQuery {
 
 message SubagentStopRequestResponse {
   optional string followup_message = 1;
+  optional string additional_context = 2;
 }
 
 message SubagentSuccess {
@@ -5222,7 +5812,21 @@ message ToolCall {
     ReplaceEnvToolCall replace_env_tool_call = 51;
     EditPrLabelsToolCall edit_pr_labels_tool_call = 52;
     RecordCiInvestigationFindingsToolCall record_ci_investigation_findings_tool_call = 53;
+    SendMessageToolCall send_message_tool_call = 55;
+    FetchCloudAgentDataToolCall fetch_cloud_agent_data_tool_call = 56;
+    SendToUserToolCall send_to_user_tool_call = 58;
+    PiReadToolCall pi_read_tool_call = 61;
+    PiBashToolCall pi_bash_tool_call = 62;
+    PiEditToolCall pi_edit_tool_call = 63;
+    PiWriteToolCall pi_write_tool_call = 64;
+    PiGrepToolCall pi_grep_tool_call = 65;
+    PiFindToolCall pi_find_tool_call = 66;
+    PiLsToolCall pi_ls_tool_call = 67;
   }
+  repeated HookAdditionalContext hook_additional_contexts = 54;
+  optional string tool_call_id = 57;
+  optional uint64 started_at_ms = 59;
+  optional uint64 completed_at_ms = 60;
 }
 
 message ToolCallCompletedUpdate {
@@ -5290,6 +5894,7 @@ message TurnEndedUpdate {
   optional int64 output_tokens = 2;
   optional int64 cache_read_tokens = 3;
   optional int64 cache_write_tokens = 4;
+  optional int64 reasoning_tokens = 5;
 }
 
 message TypeAction {
@@ -5299,6 +5904,8 @@ message TypeAction {
 message UpdateConversationMetadataRequest {
   string conversation_id = 1;
   optional string name = 2;
+  optional bool only_set_name_if_empty = 3;
+  repeated string workspace_paths = 4;
 }
 
 message UpdateConversationMetadataResponse {
@@ -5413,6 +6020,9 @@ message UserMessage {
   message SimulatedMessageMetadata {
     optional string title = 1;
     optional string task_id = 2;
+    optional string fsd_finding_action = 3;
+    optional string url = 4;
+    optional SubscriptionSource subscription_source = 5;
   }
 
   string text = 1;
@@ -5433,6 +6043,7 @@ message UserMessage {
   optional string thread_id = 17;
   optional bytes text_blob_id = 18;
   optional bytes rich_text_blob_id = 19;
+  repeated HookAdditionalContext hook_additional_contexts = 21;
 }
 
 message UserMessageAction {
@@ -5700,216 +6311,39 @@ message ZoomSelection {
 }
 
 // ============================
-// Placeholder types (12 direct + 342 recursive-shell + 3 opaque)
+// Placeholder types (14 direct + 17 recursive-shell + 0 opaque)
 // ============================
 
-message PH_aiserver_v1_AiWebSearchResult {} // placeholder for aiserver.v1.AiWebSearchResult (recursive)
-
-message PH_aiserver_v1_ApplyAgentDiffParams {} // placeholder for aiserver.v1.ApplyAgentDiffParams (recursive)
-
-message PH_aiserver_v1_AskQuestionParams {} // placeholder for aiserver.v1.AskQuestionParams (recursive)
-
-message PH_aiserver_v1_AskQuestionParams_Option {} // placeholder for aiserver.v1.AskQuestionParams.Option (recursive)
-
-message PH_aiserver_v1_AskQuestionParams_Question {} // placeholder for aiserver.v1.AskQuestionParams.Question (recursive)
-
-message PH_aiserver_v1_AskQuestionResult {} // placeholder for aiserver.v1.AskQuestionResult (recursive)
-
-message PH_aiserver_v1_AskQuestionResult_Answer {} // placeholder for aiserver.v1.AskQuestionResult.Answer (recursive)
-
-message PH_aiserver_v1_AwaitTaskParams {} // placeholder for aiserver.v1.AwaitTaskParams (recursive)
-
-message PH_aiserver_v1_AwaitTaskResult {} // placeholder for aiserver.v1.AwaitTaskResult (recursive)
-
-message PH_aiserver_v1_AwaitTaskResult_TaskResultItem {} // placeholder for aiserver.v1.AwaitTaskResult.TaskResultItem (recursive)
-
-message PH_aiserver_v1_AzureState {} // placeholder for aiserver.v1.AzureState (recursive)
-
-message PH_aiserver_v1_BM25Chunk {} // placeholder for aiserver.v1.BM25Chunk (recursive)
-
-message PH_aiserver_v1_BackgroundComposerFollowupParams {} // placeholder for aiserver.v1.BackgroundComposerFollowupParams (recursive)
-
-message PH_aiserver_v1_BackgroundComposerFollowupResult {} // placeholder for aiserver.v1.BackgroundComposerFollowupResult (recursive)
-
-message PH_aiserver_v1_BedrockState {} // placeholder for aiserver.v1.BedrockState (recursive)
-
-message PH_aiserver_v1_CallMcpToolParams {} // placeholder for aiserver.v1.CallMcpToolParams (recursive)
-
-message PH_aiserver_v1_CallMcpToolResult {} // placeholder for aiserver.v1.CallMcpToolResult (recursive)
-
-message PH_aiserver_v1_ChatQuote {} // placeholder for aiserver.v1.ChatQuote (recursive)
-
-// placeholder for aiserver.v1.ClientSideToolV2 (recursive)
-enum PH_aiserver_v1_ClientSideToolV2 {
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_UNSPECIFIED = 0;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES = 1;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_RIPGREP_SEARCH = 3;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_READ_FILE = 5;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_LIST_DIR = 6;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_EDIT_FILE = 7;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_FILE_SEARCH = 8;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_SEMANTIC_SEARCH_FULL = 9;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_DELETE_FILE = 11;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_REAPPLY = 12;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2 = 15;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_FETCH_RULES = 16;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_WEB_SEARCH = 18;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_MCP = 19;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_SEARCH_SYMBOLS = 23;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP = 24;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_KNOWLEDGE_BASE = 25;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_FETCH_PULL_REQUEST = 26;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_DEEP_SEARCH = 27;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_CREATE_DIAGRAM = 28;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_FIX_LINTS = 29;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_READ_LINTS = 30;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION = 31;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_TASK = 32;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_AWAIT_TASK = 33;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_TODO_READ = 34;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_TODO_WRITE = 35;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2 = 38;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_LIST_DIR_V2 = 39;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_READ_FILE_V2 = 40;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_RIPGREP_RAW_SEARCH = 41;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_GLOB_FILE_SEARCH = 42;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_CREATE_PLAN = 43;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_LIST_MCP_RESOURCES = 44;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE = 45;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_READ_PROJECT = 46;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT = 47;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_TASK_V2 = 48;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL = 49;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF = 50;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_ASK_QUESTION = 51;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_SWITCH_MODE = 52;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE = 53;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_COMPUTER_USE = 54;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_WRITE_SHELL_STDIN = 55;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_RECORD_SCREEN = 56;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_WEB_FETCH = 57;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS = 58;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION = 59;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_MCP_AUTH = 60;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_REFLECT = 61;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_AWAIT = 62;
-  PH_AISERVER_V1_CLIENTSIDETOOLV2_CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS = 63;
+message PH_aiserver_v1_AddTabRequestToEvalRequest { // placeholder for aiserver.v1.AddTabRequestToEvalRequest
+  string request_id = 1;
+  string expected_behavior = 2;
 }
 
-message PH_aiserver_v1_ClientSideToolV2Call {} // placeholder for aiserver.v1.ClientSideToolV2Call (recursive)
-
-message PH_aiserver_v1_ClientSideToolV2Result {} // placeholder for aiserver.v1.ClientSideToolV2Result (recursive)
+message PH_aiserver_v1_AddTabRequestToEvalResponse {} // placeholder for aiserver.v1.AddTabRequestToEvalResponse
 
 message PH_aiserver_v1_CodeBlock {} // placeholder for aiserver.v1.CodeBlock (recursive)
 
 message PH_aiserver_v1_CodeBlock_Signatures {} // placeholder for aiserver.v1.CodeBlock.Signatures (recursive)
-
-message PH_aiserver_v1_CodeChunk {} // placeholder for aiserver.v1.CodeChunk (recursive)
-
-// placeholder for aiserver.v1.CodeChunk.Intent (recursive)
-enum PH_aiserver_v1_CodeChunk_Intent {
-  PH_AISERVER_V1_CODECHUNK_INTENT_INTENT_UNSPECIFIED = 0;
-  PH_AISERVER_V1_CODECHUNK_INTENT_INTENT_COMPOSER_FILE = 1;
-  PH_AISERVER_V1_CODECHUNK_INTENT_INTENT_COMPRESSED_COMPOSER_FILE = 2;
-}
-
-// placeholder for aiserver.v1.CodeChunk.SummarizationStrategy (recursive)
-enum PH_aiserver_v1_CodeChunk_SummarizationStrategy {
-  PH_AISERVER_V1_CODECHUNK_SUMMARIZATIONSTRATEGY_SUMMARIZATION_STRATEGY_NONE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_CODECHUNK_SUMMARIZATIONSTRATEGY_SUMMARIZATION_STRATEGY_SUMMARIZED = 1;
-  PH_AISERVER_V1_CODECHUNK_SUMMARIZATIONSTRATEGY_SUMMARIZATION_STRATEGY_EMBEDDED = 2;
-}
 
 message PH_aiserver_v1_CodeResult { // placeholder for aiserver.v1.CodeResult
   PH_aiserver_v1_CodeBlock code_block = 1;
   float score = 2;
 }
 
-message PH_aiserver_v1_CodeSearchResult {} // placeholder for aiserver.v1.CodeSearchResult (recursive)
-
-message PH_aiserver_v1_Commit {} // placeholder for aiserver.v1.Commit (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityContext {} // placeholder for aiserver.v1.ComposerCapabilityContext (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityContext_GithubPRContext {} // placeholder for aiserver.v1.ComposerCapabilityContext.GithubPRContext (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityContext_MicrosoftTeamsIntegrationContext {} // placeholder for aiserver.v1.ComposerCapabilityContext.MicrosoftTeamsIntegrationContext (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityContext_SlackIntegrationContext {} // placeholder for aiserver.v1.ComposerCapabilityContext.SlackIntegrationContext (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest {} // placeholder for aiserver.v1.ComposerCapabilityRequest (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_AutoContextCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.AutoContextCapability (recursive)
-
-// placeholder for aiserver.v1.ComposerCapabilityRequest.ComposerCapabilityType (recursive)
-enum PH_aiserver_v1_ComposerCapabilityRequest_ComposerCapabilityType {
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_LOOP_ON_LINTS = 1;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_LOOP_ON_TESTS = 2;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_MEGA_PLANNER = 3;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_LOOP_ON_COMMAND = 4;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_TOOL_CALL = 5;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_DIFF_REVIEW = 6;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_CONTEXT_PICKING = 7;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_EDIT_TRAIL = 8;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_AUTO_CONTEXT = 9;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_CONTEXT_PLANNER = 10;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_DIFF_HISTORY = 11;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_REMEMBER_THIS = 12;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_DECOMPOSER = 13;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_USES_CODEBASE = 14;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_TOOL_FORMER = 15;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_CURSOR_RULES = 16;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_TOKEN_COUNTER = 17;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_USAGE_DATA = 18;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_CHIMES = 19;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_CODE_DECAY_TRACKER = 20;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_BACKGROUND_COMPOSER = 21;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_SUMMARIZATION = 22;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_AI_CODE_TRACKING = 23;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_QUEUING = 24;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_MEMORIES = 25;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_RCP_LOGS = 26;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_KNOWLEDGE_FETCH = 27;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_SLACK_INTEGRATION = 28;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_SUB_COMPOSER = 29;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_THINKING = 30;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_CONTEXT_WINDOW = 31;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_ONLINE_METRICS = 32;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_NOTIFICATIONS = 33;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_SPEC = 34;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_COMPOSERCAPABILITYTYPE_COMPOSER_CAPABILITY_TYPE_BROWSER_AGENT = 35;
+message PH_aiserver_v1_ComposerCapabilityRequest_LoopOnTestsCapability { // placeholder for aiserver.v1.ComposerCapabilityRequest.LoopOnTestsCapability
+  repeated string test_names = 1;
+  optional string custom_instructions = 2;
 }
-
-message PH_aiserver_v1_ComposerCapabilityRequest_ContextPickingCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.ContextPickingCapability (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_ContextPlannerCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.ContextPlannerCapability (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_CursorRulesCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.CursorRulesCapability (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_DecomposerCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.DecomposerCapability (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_DiffReviewCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.DiffReviewCapability (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_DiffReviewCapability_SimpleFileDiff {} // placeholder for aiserver.v1.ComposerCapabilityRequest.DiffReviewCapability.SimpleFileDiff (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_DiffReviewCapability_SimpleFileDiff_Chunk {} // placeholder for aiserver.v1.ComposerCapabilityRequest.DiffReviewCapability.SimpleFileDiff.Chunk (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_EditTrailCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.EditTrailCapability (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_LoopOnCommandCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.LoopOnCommandCapability (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_LoopOnLintsCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.LoopOnLintsCapability (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_LoopOnTestsCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.LoopOnTestsCapability (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_MegaPlannerCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.MegaPlannerCapability (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_RememberThisCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.RememberThisCapability (recursive)
 
 message PH_aiserver_v1_ComposerCapabilityRequest_SchemaProperty {} // placeholder for aiserver.v1.ComposerCapabilityRequest.SchemaProperty (recursive)
 
-message PH_aiserver_v1_ComposerCapabilityRequest_ToolCallCapability {} // placeholder for aiserver.v1.ComposerCapabilityRequest.ToolCallCapability (recursive)
+message PH_aiserver_v1_ComposerCapabilityRequest_ToolCallCapability { // placeholder for aiserver.v1.ComposerCapabilityRequest.ToolCallCapability
+  optional string custom_instructions = 1;
+  repeated PH_aiserver_v1_ComposerCapabilityRequest_ToolSchema tool_schemas = 2;
+  repeated string relevant_files = 3;
+  repeated string files_in_context = 4;
+  repeated string semantic_search_files = 5;
+}
 
 message PH_aiserver_v1_ComposerCapabilityRequest_ToolSchema {} // placeholder for aiserver.v1.ComposerCapabilityRequest.ToolSchema (recursive)
 
@@ -5922,285 +6356,31 @@ enum PH_aiserver_v1_ComposerCapabilityRequest_ToolType {
   PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_TOOLTYPE_TOOL_TYPE_SEMANTIC_SEARCH_CODEBASE = 5;
 }
 
-message PH_aiserver_v1_ComposerExternalLink {} // placeholder for aiserver.v1.ComposerExternalLink (recursive)
-
-message PH_aiserver_v1_ComposerFileDiff {} // placeholder for aiserver.v1.ComposerFileDiff (recursive)
-
-message PH_aiserver_v1_ComposerFileDiff_ChunkDiff {} // placeholder for aiserver.v1.ComposerFileDiff.ChunkDiff (recursive)
-
-// placeholder for aiserver.v1.ComposerFileDiff.Editor (recursive)
-enum PH_aiserver_v1_ComposerFileDiff_Editor {
-  PH_AISERVER_V1_COMPOSERFILEDIFF_EDITOR_EDITOR_UNSPECIFIED = 0;
-  PH_AISERVER_V1_COMPOSERFILEDIFF_EDITOR_EDITOR_AI = 1;
-  PH_AISERVER_V1_COMPOSERFILEDIFF_EDITOR_EDITOR_HUMAN = 2;
+message PH_aiserver_v1_CppContextItem { // placeholder for aiserver.v1.CppContextItem
+  string contents = 1;
+  optional string symbol = 2;
+  string relative_workspace_path = 3;
+  float score = 4;
 }
 
-message PH_aiserver_v1_ComposerFileDiffHistory {} // placeholder for aiserver.v1.ComposerFileDiffHistory (recursive)
-
-message PH_aiserver_v1_ComputerUseParams {} // placeholder for aiserver.v1.ComputerUseParams (recursive)
-
-message PH_aiserver_v1_ComputerUseResult {} // placeholder for aiserver.v1.ComputerUseResult (recursive)
-
-message PH_aiserver_v1_ContextPiece {} // placeholder for aiserver.v1.ContextPiece (recursive)
-
-message PH_aiserver_v1_ContextToRank {} // placeholder for aiserver.v1.ContextToRank (recursive)
-
-message PH_aiserver_v1_ContextWindowStatus {} // placeholder for aiserver.v1.ContextWindowStatus (recursive)
-
-message PH_aiserver_v1_ConversationMessage {} // placeholder for aiserver.v1.ConversationMessage (recursive)
-
-message PH_aiserver_v1_ConversationMessage_ApproximateLintError {} // placeholder for aiserver.v1.ConversationMessage.ApproximateLintError (recursive)
-
-message PH_aiserver_v1_ConversationMessage_CodeChunk {} // placeholder for aiserver.v1.ConversationMessage.CodeChunk (recursive)
-
-message PH_aiserver_v1_ConversationMessage_CodeChunk_CodeChunkGitContext {} // placeholder for aiserver.v1.ConversationMessage.CodeChunk.CodeChunkGitContext (recursive)
-
-message PH_aiserver_v1_ConversationMessage_CodeChunk_CodeChunkGitContext_CodeChunkGitInfo {} // placeholder for aiserver.v1.ConversationMessage.CodeChunk.CodeChunkGitContext.CodeChunkGitInfo (recursive)
-
-// placeholder for aiserver.v1.ConversationMessage.CodeChunk.Intent (recursive)
-enum PH_aiserver_v1_ConversationMessage_CodeChunk_Intent {
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_INTENT_INTENT_UNSPECIFIED = 0;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_INTENT_INTENT_COMPOSER_FILE = 1;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_INTENT_INTENT_COMPRESSED_COMPOSER_FILE = 2;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_INTENT_INTENT_RECENTLY_VIEWED_FILE = 3;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_INTENT_INTENT_OUTLINE = 4;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_INTENT_INTENT_MENTIONED_FILE = 5;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_INTENT_INTENT_CODE_SELECTION = 6;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_INTENT_INTENT_AI_EDITED_FILE = 7;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_INTENT_INTENT_VISIBLE_FILE = 8;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_INTENT_INTENT_TERMINAL_SELECTION = 9;
+message PH_aiserver_v1_CptFileDiffHistory { // placeholder for aiserver.v1.CptFileDiffHistory
+  string file_name = 1;
+  repeated PH_aiserver_v1_EditPatch edit_patches = 2;
 }
-
-// placeholder for aiserver.v1.ConversationMessage.CodeChunk.SummarizationStrategy (recursive)
-enum PH_aiserver_v1_ConversationMessage_CodeChunk_SummarizationStrategy {
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_SUMMARIZATIONSTRATEGY_SUMMARIZATION_STRATEGY_NONE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_SUMMARIZATIONSTRATEGY_SUMMARIZATION_STRATEGY_SUMMARIZED = 1;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_CODECHUNK_SUMMARIZATIONSTRATEGY_SUMMARIZATION_STRATEGY_EMBEDDED = 2;
-}
-
-message PH_aiserver_v1_ConversationMessage_ComposerContext {} // placeholder for aiserver.v1.ConversationMessage.ComposerContext (recursive)
-
-message PH_aiserver_v1_ConversationMessage_DeletedFile {} // placeholder for aiserver.v1.ConversationMessage.DeletedFile (recursive)
-
-message PH_aiserver_v1_ConversationMessage_DiffSinceLastApply {} // placeholder for aiserver.v1.ConversationMessage.DiffSinceLastApply (recursive)
-
-message PH_aiserver_v1_ConversationMessage_DocumentationSelection {} // placeholder for aiserver.v1.ConversationMessage.DocumentationSelection (recursive)
-
-message PH_aiserver_v1_ConversationMessage_EditLocation {} // placeholder for aiserver.v1.ConversationMessage.EditLocation (recursive)
-
-message PH_aiserver_v1_ConversationMessage_EditTrailContext {} // placeholder for aiserver.v1.ConversationMessage.EditTrailContext (recursive)
-
-message PH_aiserver_v1_ConversationMessage_HumanChange {} // placeholder for aiserver.v1.ConversationMessage.HumanChange (recursive)
-
-message PH_aiserver_v1_ConversationMessage_IdeEditorsState {} // placeholder for aiserver.v1.ConversationMessage.IdeEditorsState (recursive)
-
-message PH_aiserver_v1_ConversationMessage_IdeEditorsState_File {} // placeholder for aiserver.v1.ConversationMessage.IdeEditorsState.File (recursive)
-
-message PH_aiserver_v1_ConversationMessage_KnowledgeItem {} // placeholder for aiserver.v1.ConversationMessage.KnowledgeItem (recursive)
-
-message PH_aiserver_v1_ConversationMessage_Lints {} // placeholder for aiserver.v1.ConversationMessage.Lints (recursive)
-
-message PH_aiserver_v1_ConversationMessage_McpDescriptor {} // placeholder for aiserver.v1.ConversationMessage.McpDescriptor (recursive)
-
-message PH_aiserver_v1_ConversationMessage_McpDescriptor_Tool {} // placeholder for aiserver.v1.ConversationMessage.McpDescriptor.Tool (recursive)
-
-// placeholder for aiserver.v1.ConversationMessage.MessageType (recursive)
-enum PH_aiserver_v1_ConversationMessage_MessageType {
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_MESSAGETYPE_MESSAGE_TYPE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_MESSAGETYPE_MESSAGE_TYPE_HUMAN = 1;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_MESSAGETYPE_MESSAGE_TYPE_AI = 2;
-}
-
-message PH_aiserver_v1_ConversationMessage_NotepadContext {} // placeholder for aiserver.v1.ConversationMessage.NotepadContext (recursive)
-
-message PH_aiserver_v1_ConversationMessage_PlanUpdate {} // placeholder for aiserver.v1.ConversationMessage.PlanUpdate (recursive)
-
-message PH_aiserver_v1_ConversationMessage_RecentLocation {} // placeholder for aiserver.v1.ConversationMessage.RecentLocation (recursive)
-
-message PH_aiserver_v1_ConversationMessage_RenderedDiff {} // placeholder for aiserver.v1.ConversationMessage.RenderedDiff (recursive)
-
-message PH_aiserver_v1_ConversationMessage_SimulatedMessageMetadata {} // placeholder for aiserver.v1.ConversationMessage.SimulatedMessageMetadata (recursive)
-
-message PH_aiserver_v1_ConversationMessage_Thinking {} // placeholder for aiserver.v1.ConversationMessage.Thinking (recursive)
-
-// placeholder for aiserver.v1.ConversationMessage.ThinkingStyle (recursive)
-enum PH_aiserver_v1_ConversationMessage_ThinkingStyle {
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_THINKINGSTYLE_THINKING_STYLE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_THINKINGSTYLE_THINKING_STYLE_DEFAULT = 1;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_THINKINGSTYLE_THINKING_STYLE_CODEX = 2;
-  PH_AISERVER_V1_CONVERSATIONMESSAGE_THINKINGSTYLE_THINKING_STYLE_GPT5 = 3;
-}
-
-message PH_aiserver_v1_ConversationMessage_ToolResult {} // placeholder for aiserver.v1.ConversationMessage.ToolResult (recursive)
-
-message PH_aiserver_v1_ConversationSummary {} // placeholder for aiserver.v1.ConversationSummary (recursive)
-
-message PH_aiserver_v1_CreateDiagramParams {} // placeholder for aiserver.v1.CreateDiagramParams (recursive)
-
-message PH_aiserver_v1_CreateDiagramResult {} // placeholder for aiserver.v1.CreateDiagramResult (recursive)
-
-message PH_aiserver_v1_CreatePlanParams {} // placeholder for aiserver.v1.CreatePlanParams (recursive)
-
-message PH_aiserver_v1_CreatePlanResult {} // placeholder for aiserver.v1.CreatePlanResult (recursive)
-
-message PH_aiserver_v1_CreatePlanResult_Accepted {} // placeholder for aiserver.v1.CreatePlanResult.Accepted (recursive)
-
-message PH_aiserver_v1_CreatePlanResult_Modified {} // placeholder for aiserver.v1.CreatePlanResult.Modified (recursive)
-
-message PH_aiserver_v1_CreatePlanResult_Rejected {} // placeholder for aiserver.v1.CreatePlanResult.Rejected (recursive)
-
-message PH_aiserver_v1_CurrentFileInfo {} // placeholder for aiserver.v1.CurrentFileInfo (recursive)
-
-message PH_aiserver_v1_CurrentFileInfo_NotebookCell {} // placeholder for aiserver.v1.CurrentFileInfo.NotebookCell (recursive)
-
-message PH_aiserver_v1_CurrentFileLocationData {} // placeholder for aiserver.v1.CurrentFileLocationData (recursive)
 
 message PH_aiserver_v1_CursorPosition {} // placeholder for aiserver.v1.CursorPosition (recursive)
 
 message PH_aiserver_v1_CursorRange {} // placeholder for aiserver.v1.CursorRange (recursive)
 
-message PH_aiserver_v1_CursorRule {} // placeholder for aiserver.v1.CursorRule (recursive)
-
-// placeholder for aiserver.v1.DatabaseProvider (recursive)
-enum PH_aiserver_v1_DatabaseProvider {
-  PH_AISERVER_V1_DATABASEPROVIDER_DATABASE_PROVIDER_UNSPECIFIED = 0;
-  PH_AISERVER_V1_DATABASEPROVIDER_DATABASE_PROVIDER_AURORA = 1;
-  PH_AISERVER_V1_DATABASEPROVIDER_DATABASE_PROVIDER_PLANETSCALE = 2;
-}
-
-message PH_aiserver_v1_DataframeInfo {} // placeholder for aiserver.v1.DataframeInfo (recursive)
-
-message PH_aiserver_v1_DataframeInfo_Column {} // placeholder for aiserver.v1.DataframeInfo.Column (recursive)
-
-message PH_aiserver_v1_DeepSearchParams {} // placeholder for aiserver.v1.DeepSearchParams (recursive)
-
-message PH_aiserver_v1_DeepSearchResult {} // placeholder for aiserver.v1.DeepSearchResult (recursive)
-
-message PH_aiserver_v1_DeepSearchSubagentReturnValue {} // placeholder for aiserver.v1.DeepSearchSubagentReturnValue (recursive)
-
-message PH_aiserver_v1_DeepSearchSubagentReturnValue_ContextItem {} // placeholder for aiserver.v1.DeepSearchSubagentReturnValue.ContextItem (recursive)
-
-message PH_aiserver_v1_DeleteFileParams {} // placeholder for aiserver.v1.DeleteFileParams (recursive)
-
-message PH_aiserver_v1_DeleteFileResult {} // placeholder for aiserver.v1.DeleteFileResult (recursive)
-
 message PH_aiserver_v1_DetailedLine {} // placeholder for aiserver.v1.DetailedLine (recursive)
 
-message PH_aiserver_v1_Diagnostic {} // placeholder for aiserver.v1.Diagnostic (recursive)
-
-// placeholder for aiserver.v1.Diagnostic.DiagnosticSeverity (recursive)
-enum PH_aiserver_v1_Diagnostic_DiagnosticSeverity {
-  PH_AISERVER_V1_DIAGNOSTIC_DIAGNOSTICSEVERITY_DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;
-  PH_AISERVER_V1_DIAGNOSTIC_DIAGNOSTICSEVERITY_DIAGNOSTIC_SEVERITY_ERROR = 1;
-  PH_AISERVER_V1_DIAGNOSTIC_DIAGNOSTICSEVERITY_DIAGNOSTIC_SEVERITY_WARNING = 2;
-  PH_AISERVER_V1_DIAGNOSTIC_DIAGNOSTICSEVERITY_DIAGNOSTIC_SEVERITY_INFORMATION = 3;
-  PH_AISERVER_V1_DIAGNOSTIC_DIAGNOSTICSEVERITY_DIAGNOSTIC_SEVERITY_HINT = 4;
-}
-
-message PH_aiserver_v1_Diagnostic_RelatedInformation {} // placeholder for aiserver.v1.Diagnostic.RelatedInformation (recursive)
-
-message PH_aiserver_v1_DiffFile {} // placeholder for aiserver.v1.DiffFile (recursive)
-
-message PH_aiserver_v1_DiffHistoryData {} // placeholder for aiserver.v1.DiffHistoryData (recursive)
-
-message PH_aiserver_v1_DocsReference {} // placeholder for aiserver.v1.DocsReference (recursive)
-
-message PH_aiserver_v1_EditFileParams {} // placeholder for aiserver.v1.EditFileParams (recursive)
-
-message PH_aiserver_v1_EditFileResult {} // placeholder for aiserver.v1.EditFileResult (recursive)
-
-message PH_aiserver_v1_EditFileResult_EditFileHumanReview {} // placeholder for aiserver.v1.EditFileResult.EditFileHumanReview (recursive)
-
-message PH_aiserver_v1_EditFileResult_FileDiff {} // placeholder for aiserver.v1.EditFileResult.FileDiff (recursive)
-
-message PH_aiserver_v1_EditFileResult_FileDiff_ChunkDiff {} // placeholder for aiserver.v1.EditFileResult.FileDiff.ChunkDiff (recursive)
-
-// placeholder for aiserver.v1.EditFileResult.FileDiff.Editor (recursive)
-enum PH_aiserver_v1_EditFileResult_FileDiff_Editor {
-  PH_AISERVER_V1_EDITFILERESULT_FILEDIFF_EDITOR_EDITOR_UNSPECIFIED = 0;
-  PH_AISERVER_V1_EDITFILERESULT_FILEDIFF_EDITOR_EDITOR_AI = 1;
-  PH_AISERVER_V1_EDITFILERESULT_FILEDIFF_EDITOR_EDITOR_HUMAN = 2;
-}
-
-message PH_aiserver_v1_EditFileResult_HumanFeedback {} // placeholder for aiserver.v1.EditFileResult.HumanFeedback (recursive)
-
-message PH_aiserver_v1_EditFileResult_RecoverableError {} // placeholder for aiserver.v1.EditFileResult.RecoverableError (recursive)
-
-// placeholder for aiserver.v1.EditFileResult.RecoverableError.RecoverableErrorType (recursive)
-enum PH_aiserver_v1_EditFileResult_RecoverableError_RecoverableErrorType {
-  PH_AISERVER_V1_EDITFILERESULT_RECOVERABLEERROR_RECOVERABLEERRORTYPE_RECOVERABLE_ERROR_TYPE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_EDITFILERESULT_RECOVERABLEERROR_RECOVERABLEERRORTYPE_RECOVERABLE_ERROR_TYPE_SEARCH_STRING_NOT_FOUND = 1;
-  PH_AISERVER_V1_EDITFILERESULT_RECOVERABLEERROR_RECOVERABLEERRORTYPE_RECOVERABLE_ERROR_TYPE_AMBIGUOUS_SEARCH_STRING = 2;
-}
-
-message PH_aiserver_v1_EditFileV2Params {} // placeholder for aiserver.v1.EditFileV2Params (recursive)
-
-message PH_aiserver_v1_EditFileV2Params_StreamingEditCode {} // placeholder for aiserver.v1.EditFileV2Params.StreamingEditCode (recursive)
-
-message PH_aiserver_v1_EditFileV2Params_StreamingEditText {} // placeholder for aiserver.v1.EditFileV2Params.StreamingEditText (recursive)
-
-message PH_aiserver_v1_EditFileV2Result {} // placeholder for aiserver.v1.EditFileV2Result (recursive)
-
-// placeholder for aiserver.v1.EmbeddingModel (recursive)
-enum PH_aiserver_v1_EmbeddingModel {
-  PH_AISERVER_V1_EMBEDDINGMODEL_EMBEDDING_MODEL_UNSPECIFIED = 0;
-  PH_AISERVER_V1_EMBEDDINGMODEL_EMBEDDING_MODEL_VOYAGE_CODE_2 = 1;
-  PH_AISERVER_V1_EMBEDDINGMODEL_EMBEDDING_MODEL_TEXT_EMBEDDINGS_LARGE_3 = 2;
-  PH_AISERVER_V1_EMBEDDINGMODEL_EMBEDDING_MODEL_QWEN_1_5B_CUSTOM = 3;
-  PH_AISERVER_V1_EMBEDDINGMODEL_EMBEDDING_MODEL_MOCK_CHUNKER_ERROR = 4;
-  PH_AISERVER_V1_EMBEDDINGMODEL_EMBEDDING_MODEL_QWEN_1_5B_0618_CUSTOM = 5;
-  PH_AISERVER_V1_EMBEDDINGMODEL_EMBEDDING_MODEL_QWEN_1_5B_0618_FP8_MM_CUSTOM = 6;
-}
-
-message PH_aiserver_v1_ExplicitContext {} // placeholder for aiserver.v1.ExplicitContext (recursive)
-
-message PH_aiserver_v1_FetchPullRequestParams {} // placeholder for aiserver.v1.FetchPullRequestParams (recursive)
-
-message PH_aiserver_v1_FetchPullRequestResult {} // placeholder for aiserver.v1.FetchPullRequestResult (recursive)
-
-message PH_aiserver_v1_FetchRulesParams {} // placeholder for aiserver.v1.FetchRulesParams (recursive)
-
-message PH_aiserver_v1_FetchRulesResult {} // placeholder for aiserver.v1.FetchRulesResult (recursive)
-
-message PH_aiserver_v1_File {} // placeholder for aiserver.v1.File (recursive)
+message PH_aiserver_v1_EditPatch {} // placeholder for aiserver.v1.EditPatch (recursive)
 
 message PH_aiserver_v1_FileDiff {} // placeholder for aiserver.v1.FileDiff (recursive)
 
 message PH_aiserver_v1_FileDiff_Chunk {} // placeholder for aiserver.v1.FileDiff.Chunk (recursive)
 
 message PH_aiserver_v1_FileGit {} // placeholder for aiserver.v1.FileGit (recursive)
-
-message PH_aiserver_v1_FindBugsResponse { // placeholder for aiserver.v1.FindBugsResponse
-  optional PH_aiserver_v1_FindBugsResponse_Bug bug = 1;
-}
-
-message PH_aiserver_v1_FindBugsResponse_Bug { // placeholder for aiserver.v1.FindBugsResponse.Bug
-  string description = 1;
-  int32 line_number = 2;
-  float confidence = 3;
-}
-
-message PH_aiserver_v1_FixLintsParams {} // placeholder for aiserver.v1.FixLintsParams (recursive)
-
-message PH_aiserver_v1_FixLintsResult {} // placeholder for aiserver.v1.FixLintsResult (recursive)
-
-message PH_aiserver_v1_FixLintsResult_FileResult {} // placeholder for aiserver.v1.FixLintsResult.FileResult (recursive)
-
-message PH_aiserver_v1_FixLintsSubagentReturnValue {} // placeholder for aiserver.v1.FixLintsSubagentReturnValue (recursive)
-
-message PH_aiserver_v1_FolderFileInfo {} // placeholder for aiserver.v1.FolderFileInfo (recursive)
-
-message PH_aiserver_v1_FolderInfo {} // placeholder for aiserver.v1.FolderInfo (recursive)
-
-message PH_aiserver_v1_GetComposerChatRequest {} // placeholder for aiserver.v1.GetComposerChatRequest (recursive)
-
-message PH_aiserver_v1_GetComposerChatRequest_RecentEdits {} // placeholder for aiserver.v1.GetComposerChatRequest.RecentEdits (recursive)
-
-message PH_aiserver_v1_GetComposerChatRequest_RecentEdits_CodeBlockInfo {} // placeholder for aiserver.v1.GetComposerChatRequest.RecentEdits.CodeBlockInfo (recursive)
-
-message PH_aiserver_v1_GetComposerChatRequest_RecentEdits_FileInfo {} // placeholder for aiserver.v1.GetComposerChatRequest.RecentEdits.FileInfo (recursive)
-
-message PH_aiserver_v1_GetComposerChatRequest_RedDiff {} // placeholder for aiserver.v1.GetComposerChatRequest.RedDiff (recursive)
 
 message PH_aiserver_v1_GetDiffRequest { // placeholder for aiserver.v1.GetDiffRequest
   string cwd = 1;
@@ -6214,6 +6394,9 @@ message PH_aiserver_v1_GetDiffRequest { // placeholder for aiserver.v1.GetDiffRe
   int32 submodule_recurse_depth = 9;
   bool include_space_changes = 10;
   bool committed_only = 11;
+  bool compute_patch_id = 12;
+  optional bool return_head_sha = 13;
+  optional int32 max_response_bytes = 14;
 }
 
 // placeholder for aiserver.v1.GetDiffRequest.OutputFormat (recursive)
@@ -6228,33 +6411,12 @@ enum PH_aiserver_v1_GetDiffRequest_OutputFormat {
 message PH_aiserver_v1_GetDiffResponse { // placeholder for aiserver.v1.GetDiffResponse
   PH_aiserver_v1_GitDiff diff = 1;
   repeated PH_aiserver_v1_GetDiffResponse_SubmoduleDiff submodule_diffs = 2;
+  optional string patch_id = 3;
+  optional string head_sha = 4;
+  optional bool has_uncommitted_changes = 5;
 }
 
 message PH_aiserver_v1_GetDiffResponse_SubmoduleDiff {} // placeholder for aiserver.v1.GetDiffResponse.SubmoduleDiff (recursive)
-
-message PH_aiserver_v1_GetDiffReviewRequest { // placeholder for aiserver.v1.GetDiffReviewRequest
-  repeated PH_aiserver_v1_GetDiffReviewRequest_SimpleFileDiff diffs = 1;
-  optional string model = 2;
-}
-
-message PH_aiserver_v1_GetDiffReviewRequest_SimpleFileDiff { // placeholder for aiserver.v1.GetDiffReviewRequest.SimpleFileDiff
-  string relative_workspace_path = 1;
-  repeated PH_aiserver_v1_GetDiffReviewRequest_SimpleFileDiff_Chunk chunks = 2;
-}
-
-message PH_aiserver_v1_GetDiffReviewRequest_SimpleFileDiff_Chunk {} // placeholder for aiserver.v1.GetDiffReviewRequest.SimpleFileDiff.Chunk (recursive)
-
-message PH_aiserver_v1_GetLintsForChangeResponse {} // placeholder for aiserver.v1.GetLintsForChangeResponse (recursive)
-
-message PH_aiserver_v1_GetLintsForChangeResponse_Lint {} // placeholder for aiserver.v1.GetLintsForChangeResponse.Lint (recursive)
-
-message PH_aiserver_v1_GetLintsForChangeResponse_Lint_QuickFix {} // placeholder for aiserver.v1.GetLintsForChangeResponse.Lint.QuickFix (recursive)
-
-message PH_aiserver_v1_GetLintsForChangeResponse_Lint_QuickFix_Edit {} // placeholder for aiserver.v1.GetLintsForChangeResponse.Lint.QuickFix.Edit (recursive)
-
-message PH_aiserver_v1_GetMcpToolsParams {} // placeholder for aiserver.v1.GetMcpToolsParams (recursive)
-
-message PH_aiserver_v1_GetMcpToolsResult {} // placeholder for aiserver.v1.GetMcpToolsResult (recursive)
 
 message PH_aiserver_v1_GitCommit {} // placeholder for aiserver.v1.GitCommit (recursive)
 
@@ -6267,455 +6429,30 @@ enum PH_aiserver_v1_GitDiff_DiffType {
   PH_AISERVER_V1_GITDIFF_DIFFTYPE_DIFF_TYPE_DIFF_FROM_BRANCH_TO_MAIN = 2;
 }
 
-message PH_aiserver_v1_GlobFileSearchParams {} // placeholder for aiserver.v1.GlobFileSearchParams (recursive)
-
-message PH_aiserver_v1_GlobFileSearchResult {} // placeholder for aiserver.v1.GlobFileSearchResult (recursive)
-
-message PH_aiserver_v1_GlobFileSearchResult_Directory {} // placeholder for aiserver.v1.GlobFileSearchResult.Directory (recursive)
-
-message PH_aiserver_v1_GlobFileSearchResult_File {} // placeholder for aiserver.v1.GlobFileSearchResult.File (recursive)
-
-message PH_aiserver_v1_GotodefDefinition {} // placeholder for aiserver.v1.GotodefDefinition (recursive)
-
-message PH_aiserver_v1_GotodefParams {} // placeholder for aiserver.v1.GotodefParams (recursive)
-
-message PH_aiserver_v1_GotodefResult {} // placeholder for aiserver.v1.GotodefResult (recursive)
-
-message PH_aiserver_v1_HumanReview {} // placeholder for aiserver.v1.HumanReview (recursive)
-
-message PH_aiserver_v1_ImageProto {} // placeholder for aiserver.v1.ImageProto (recursive)
-
-message PH_aiserver_v1_ImageProto_Dimension {} // placeholder for aiserver.v1.ImageProto.Dimension (recursive)
-
-message PH_aiserver_v1_InterpreterResult {} // placeholder for aiserver.v1.InterpreterResult (recursive)
-
-message PH_aiserver_v1_IssueComment {} // placeholder for aiserver.v1.IssueComment (recursive)
-
-message PH_aiserver_v1_KeepComposerCacheWarmRequest { // placeholder for aiserver.v1.KeepComposerCacheWarmRequest
-  PH_aiserver_v1_GetComposerChatRequest request = 1;
-  string request_id = 2;
-  bool is_composer_visible = 3;
+message PH_aiserver_v1_MarkCppRequest_RangeTransformation { // placeholder for aiserver.v1.MarkCppRequest.RangeTransformation
+  int32 start_line_number = 1;
+  int32 end_line_number = 2;
 }
 
-message PH_aiserver_v1_Knowledge {} // placeholder for aiserver.v1.Knowledge (recursive)
-
-message PH_aiserver_v1_KnowledgeBaseParams {} // placeholder for aiserver.v1.KnowledgeBaseParams (recursive)
-
-message PH_aiserver_v1_KnowledgeBaseResult {} // placeholder for aiserver.v1.KnowledgeBaseResult (recursive)
-
-message PH_aiserver_v1_LineRange {} // placeholder for aiserver.v1.LineRange (recursive)
-
-message PH_aiserver_v1_LinterError {} // placeholder for aiserver.v1.LinterError (recursive)
-
-message PH_aiserver_v1_LinterErrors {} // placeholder for aiserver.v1.LinterErrors (recursive)
-
-message PH_aiserver_v1_LinterErrorsWithoutFileContents {} // placeholder for aiserver.v1.LinterErrorsWithoutFileContents (recursive)
-
-message PH_aiserver_v1_ListDirParams {} // placeholder for aiserver.v1.ListDirParams (recursive)
-
-message PH_aiserver_v1_ListDirResult {} // placeholder for aiserver.v1.ListDirResult (recursive)
-
-message PH_aiserver_v1_ListDirResult_File {} // placeholder for aiserver.v1.ListDirResult.File (recursive)
-
-message PH_aiserver_v1_ListDirV2Params {} // placeholder for aiserver.v1.ListDirV2Params (recursive)
-
-message PH_aiserver_v1_ListDirV2Result {} // placeholder for aiserver.v1.ListDirV2Result (recursive)
-
-message PH_aiserver_v1_ListDirV2Result_DirectoryTreeNode {} // placeholder for aiserver.v1.ListDirV2Result.DirectoryTreeNode (recursive)
-
-message PH_aiserver_v1_ListDirV2Result_DirectoryTreeNode_File {} // placeholder for aiserver.v1.ListDirV2Result.DirectoryTreeNode.File (recursive)
-
-message PH_aiserver_v1_ListMcpResourcesParams {} // placeholder for aiserver.v1.ListMcpResourcesParams (recursive)
-
-message PH_aiserver_v1_ListMcpResourcesResult {} // placeholder for aiserver.v1.ListMcpResourcesResult (recursive)
-
-message PH_aiserver_v1_ListMcpResourcesResult_MCPResource {} // placeholder for aiserver.v1.ListMcpResourcesResult.MCPResource (recursive)
-
-message PH_aiserver_v1_MCPInstructions {} // placeholder for aiserver.v1.MCPInstructions (recursive)
-
-message PH_aiserver_v1_MCPParams {} // placeholder for aiserver.v1.MCPParams (recursive)
-
-message PH_aiserver_v1_MCPParams_Tool {} // placeholder for aiserver.v1.MCPParams.Tool (recursive)
-
-message PH_aiserver_v1_MCPResult {} // placeholder for aiserver.v1.MCPResult (recursive)
-
-message PH_aiserver_v1_MatchRange {} // placeholder for aiserver.v1.MatchRange (recursive)
-
-message PH_aiserver_v1_McpAuthParams {} // placeholder for aiserver.v1.McpAuthParams (recursive)
-
-message PH_aiserver_v1_McpAuthResult {} // placeholder for aiserver.v1.McpAuthResult (recursive)
-
-message PH_aiserver_v1_MissingFile {} // placeholder for aiserver.v1.MissingFile (recursive)
-
-// placeholder for aiserver.v1.MissingFile.MissingReason (recursive)
-enum PH_aiserver_v1_MissingFile_MissingReason {
-  PH_AISERVER_V1_MISSINGFILE_MISSINGREASON_MISSING_REASON_UNSPECIFIED = 0;
-  PH_AISERVER_V1_MISSINGFILE_MISSINGREASON_MISSING_REASON_TOO_LARGE = 1;
-  PH_AISERVER_V1_MISSINGFILE_MISSINGREASON_MISSING_REASON_NOT_FOUND = 2;
+message PH_aiserver_v1_McpAuthResult { // placeholder for aiserver.v1.McpAuthResult
+  bool success = 1;
+  string message = 2;
 }
 
-message PH_aiserver_v1_ModelDetails {} // placeholder for aiserver.v1.ModelDetails (recursive)
-
-message PH_aiserver_v1_ModelInfo {} // placeholder for aiserver.v1.ModelInfo (recursive)
-
-message PH_aiserver_v1_NudgeMessage {} // placeholder for aiserver.v1.NudgeMessage (recursive)
-
-message PH_aiserver_v1_OutputLocation {} // placeholder for aiserver.v1.OutputLocation (recursive)
-
-message PH_aiserver_v1_PlanPhase {} // placeholder for aiserver.v1.PlanPhase (recursive)
-
-message PH_aiserver_v1_ProjectLayout {} // placeholder for aiserver.v1.ProjectLayout (recursive)
-
-message PH_aiserver_v1_ProjectLayoutDirectory {} // placeholder for aiserver.v1.ProjectLayoutDirectory (recursive)
-
-message PH_aiserver_v1_ProjectLayoutDirectoryContent {} // placeholder for aiserver.v1.ProjectLayoutDirectoryContent (recursive)
-
-message PH_aiserver_v1_ProjectLayoutFile {} // placeholder for aiserver.v1.ProjectLayoutFile (recursive)
-
-message PH_aiserver_v1_PullRequest {} // placeholder for aiserver.v1.PullRequest (recursive)
-
-message PH_aiserver_v1_PullRequestReference {} // placeholder for aiserver.v1.PullRequestReference (recursive)
-
-message PH_aiserver_v1_RCPCallFrame {} // placeholder for aiserver.v1.RCPCallFrame (recursive)
-
-message PH_aiserver_v1_RCPLogEntry {} // placeholder for aiserver.v1.RCPLogEntry (recursive)
-
-message PH_aiserver_v1_RCPStackTrace {} // placeholder for aiserver.v1.RCPStackTrace (recursive)
-
-message PH_aiserver_v1_RCPUIElementPicked {} // placeholder for aiserver.v1.RCPUIElementPicked (recursive)
-
-message PH_aiserver_v1_Range {} // placeholder for aiserver.v1.Range (recursive)
-
-message PH_aiserver_v1_RankedContext {} // placeholder for aiserver.v1.RankedContext (recursive)
-
-message PH_aiserver_v1_ReadFileParams {} // placeholder for aiserver.v1.ReadFileParams (recursive)
-
-message PH_aiserver_v1_ReadFileResult {} // placeholder for aiserver.v1.ReadFileResult (recursive)
-
-message PH_aiserver_v1_ReadFileV2Params {} // placeholder for aiserver.v1.ReadFileV2Params (recursive)
-
-message PH_aiserver_v1_ReadFileV2Result {} // placeholder for aiserver.v1.ReadFileV2Result (recursive)
-
-message PH_aiserver_v1_ReadLintsParams {} // placeholder for aiserver.v1.ReadLintsParams (recursive)
-
-message PH_aiserver_v1_ReadLintsResult {} // placeholder for aiserver.v1.ReadLintsResult (recursive)
-
-message PH_aiserver_v1_ReadMcpResourceParams {} // placeholder for aiserver.v1.ReadMcpResourceParams (recursive)
-
-message PH_aiserver_v1_ReadMcpResourceResult {} // placeholder for aiserver.v1.ReadMcpResourceResult (recursive)
-
-message PH_aiserver_v1_ReadProjectParams {} // placeholder for aiserver.v1.ReadProjectParams (recursive)
-
-message PH_aiserver_v1_ReadProjectResult {} // placeholder for aiserver.v1.ReadProjectResult (recursive)
-
-message PH_aiserver_v1_ReadSemsearchFilesParams {} // placeholder for aiserver.v1.ReadSemsearchFilesParams (recursive)
-
-message PH_aiserver_v1_ReadSemsearchFilesResult {} // placeholder for aiserver.v1.ReadSemsearchFilesResult (recursive)
-
-message PH_aiserver_v1_ReapplyParams {} // placeholder for aiserver.v1.ReapplyParams (recursive)
-
-message PH_aiserver_v1_ReapplyResult {} // placeholder for aiserver.v1.ReapplyResult (recursive)
-
-message PH_aiserver_v1_RedDiff {} // placeholder for aiserver.v1.RedDiff (recursive)
-
-message PH_aiserver_v1_ReportBugfixResultsParams {} // placeholder for aiserver.v1.ReportBugfixResultsParams (recursive)
-
-message PH_aiserver_v1_ReportBugfixResultsResult {} // placeholder for aiserver.v1.ReportBugfixResultsResult (recursive)
-
-message PH_aiserver_v1_RepositoryInfo {} // placeholder for aiserver.v1.RepositoryInfo (recursive)
-
-message PH_aiserver_v1_RipgrepRawSearchContentMatch {} // placeholder for aiserver.v1.RipgrepRawSearchContentMatch (recursive)
-
-message PH_aiserver_v1_RipgrepRawSearchContentResult {} // placeholder for aiserver.v1.RipgrepRawSearchContentResult (recursive)
-
-message PH_aiserver_v1_RipgrepRawSearchCountResult {} // placeholder for aiserver.v1.RipgrepRawSearchCountResult (recursive)
-
-message PH_aiserver_v1_RipgrepRawSearchError {} // placeholder for aiserver.v1.RipgrepRawSearchError (recursive)
-
-message PH_aiserver_v1_RipgrepRawSearchFileCount {} // placeholder for aiserver.v1.RipgrepRawSearchFileCount (recursive)
-
-message PH_aiserver_v1_RipgrepRawSearchFileMatch {} // placeholder for aiserver.v1.RipgrepRawSearchFileMatch (recursive)
-
-message PH_aiserver_v1_RipgrepRawSearchFilesResult {} // placeholder for aiserver.v1.RipgrepRawSearchFilesResult (recursive)
-
-message PH_aiserver_v1_RipgrepRawSearchFilesResult_FileEntry {} // placeholder for aiserver.v1.RipgrepRawSearchFilesResult.FileEntry (recursive)
-
-message PH_aiserver_v1_RipgrepRawSearchParams {} // placeholder for aiserver.v1.RipgrepRawSearchParams (recursive)
-
-message PH_aiserver_v1_RipgrepRawSearchResult {} // placeholder for aiserver.v1.RipgrepRawSearchResult (recursive)
-
-message PH_aiserver_v1_RipgrepRawSearchSuccess {} // placeholder for aiserver.v1.RipgrepRawSearchSuccess (recursive)
-
-message PH_aiserver_v1_RipgrepRawSearchUnionResult {} // placeholder for aiserver.v1.RipgrepRawSearchUnionResult (recursive)
-
-message PH_aiserver_v1_RipgrepSearchParams {} // placeholder for aiserver.v1.RipgrepSearchParams (recursive)
-
-message PH_aiserver_v1_RipgrepSearchParams_IPatternInfoProto {} // placeholder for aiserver.v1.RipgrepSearchParams.IPatternInfoProto (recursive)
-
-message PH_aiserver_v1_RipgrepSearchParams_IPatternInfoProto_INotebookPatternInfoProto {} // placeholder for aiserver.v1.RipgrepSearchParams.IPatternInfoProto.INotebookPatternInfoProto (recursive)
-
-message PH_aiserver_v1_RipgrepSearchParams_ITextQueryBuilderOptionsProto {} // placeholder for aiserver.v1.RipgrepSearchParams.ITextQueryBuilderOptionsProto (recursive)
-
-message PH_aiserver_v1_RipgrepSearchParams_ITextQueryBuilderOptionsProto_ExcludePatternProto {} // placeholder for aiserver.v1.RipgrepSearchParams.ITextQueryBuilderOptionsProto.ExcludePatternProto (recursive)
-
-message PH_aiserver_v1_RipgrepSearchParams_ITextQueryBuilderOptionsProto_ExtraFileResourcesProto {} // placeholder for aiserver.v1.RipgrepSearchParams.ITextQueryBuilderOptionsProto.ExtraFileResourcesProto (recursive)
-
-message PH_aiserver_v1_RipgrepSearchParams_ITextQueryBuilderOptionsProto_INotebookSearchConfigProto {} // placeholder for aiserver.v1.RipgrepSearchParams.ITextQueryBuilderOptionsProto.INotebookSearchConfigProto (recursive)
-
-message PH_aiserver_v1_RipgrepSearchParams_ITextQueryBuilderOptionsProto_ISearchPathPatternBuilderProto {} // placeholder for aiserver.v1.RipgrepSearchParams.ITextQueryBuilderOptionsProto.ISearchPathPatternBuilderProto (recursive)
-
-message PH_aiserver_v1_RipgrepSearchParams_ITextQueryBuilderOptionsProto_ISearchPatternBuilderProto {} // placeholder for aiserver.v1.RipgrepSearchParams.ITextQueryBuilderOptionsProto.ISearchPatternBuilderProto (recursive)
-
-message PH_aiserver_v1_RipgrepSearchParams_ITextQueryBuilderOptionsProto_ITextSearchPreviewOptionsProto {} // placeholder for aiserver.v1.RipgrepSearchParams.ITextQueryBuilderOptionsProto.ITextSearchPreviewOptionsProto (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResult {} // placeholder for aiserver.v1.RipgrepSearchResult (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResultInternal {} // placeholder for aiserver.v1.RipgrepSearchResultInternal (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResultInternal_ICachedSearchStats {} // placeholder for aiserver.v1.RipgrepSearchResultInternal.ICachedSearchStats (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResultInternal_IFileMatch {} // placeholder for aiserver.v1.RipgrepSearchResultInternal.IFileMatch (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResultInternal_IFileSearchProviderStats {} // placeholder for aiserver.v1.RipgrepSearchResultInternal.IFileSearchProviderStats (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResultInternal_IFileSearchStats {} // placeholder for aiserver.v1.RipgrepSearchResultInternal.IFileSearchStats (recursive)
-
-// placeholder for aiserver.v1.RipgrepSearchResultInternal.IFileSearchStats.FileSearchProviderType (recursive)
-enum PH_aiserver_v1_RipgrepSearchResultInternal_IFileSearchStats_FileSearchProviderType {
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_IFILESEARCHSTATS_FILESEARCHPROVIDERTYPE_FILE_SEARCH_PROVIDER_TYPE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_IFILESEARCHSTATS_FILESEARCHPROVIDERTYPE_FILE_SEARCH_PROVIDER_TYPE_FILE_SEARCH_PROVIDER = 1;
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_IFILESEARCHSTATS_FILESEARCHPROVIDERTYPE_FILE_SEARCH_PROVIDER_TYPE_SEARCH_PROCESS = 2;
+message PH_aiserver_v1_OneIndexedPosition { // placeholder for aiserver.v1.OneIndexedPosition
+  int32 line_number_one_indexed = 1;
+  int32 column_one_indexed = 2;
 }
 
-message PH_aiserver_v1_RipgrepSearchResultInternal_ISearchEngineStats {} // placeholder for aiserver.v1.RipgrepSearchResultInternal.ISearchEngineStats (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResultInternal_ISearchRange {} // placeholder for aiserver.v1.RipgrepSearchResultInternal.ISearchRange (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResultInternal_ISearchRangeSetPairing {} // placeholder for aiserver.v1.RipgrepSearchResultInternal.ISearchRangeSetPairing (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResultInternal_ITextSearchCompleteMessage {} // placeholder for aiserver.v1.RipgrepSearchResultInternal.ITextSearchCompleteMessage (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResultInternal_ITextSearchContext {} // placeholder for aiserver.v1.RipgrepSearchResultInternal.ITextSearchContext (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResultInternal_ITextSearchMatch {} // placeholder for aiserver.v1.RipgrepSearchResultInternal.ITextSearchMatch (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResultInternal_ITextSearchResult {} // placeholder for aiserver.v1.RipgrepSearchResultInternal.ITextSearchResult (recursive)
-
-message PH_aiserver_v1_RipgrepSearchResultInternal_ITextSearchStats {} // placeholder for aiserver.v1.RipgrepSearchResultInternal.ITextSearchStats (recursive)
-
-// placeholder for aiserver.v1.RipgrepSearchResultInternal.ITextSearchStats.TextSearchProviderType (recursive)
-enum PH_aiserver_v1_RipgrepSearchResultInternal_ITextSearchStats_TextSearchProviderType {
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_ITEXTSEARCHSTATS_TEXTSEARCHPROVIDERTYPE_TEXT_SEARCH_PROVIDER_TYPE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_ITEXTSEARCHSTATS_TEXTSEARCHPROVIDERTYPE_TEXT_SEARCH_PROVIDER_TYPE_TEXT_SEARCH_PROVIDER = 1;
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_ITEXTSEARCHSTATS_TEXTSEARCHPROVIDERTYPE_TEXT_SEARCH_PROVIDER_TYPE_SEARCH_PROCESS = 2;
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_ITEXTSEARCHSTATS_TEXTSEARCHPROVIDERTYPE_TEXT_SEARCH_PROVIDER_TYPE_AI_TEXT_SEARCH_PROVIDER = 3;
+message PH_aiserver_v1_RefreshTabContextResponse { // placeholder for aiserver.v1.RefreshTabContextResponse
+  repeated PH_aiserver_v1_CodeResult code_results = 1;
 }
 
-// placeholder for aiserver.v1.RipgrepSearchResultInternal.SearchCompletionExitCode (recursive)
-enum PH_aiserver_v1_RipgrepSearchResultInternal_SearchCompletionExitCode {
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_SEARCHCOMPLETIONEXITCODE_SEARCH_COMPLETION_EXIT_CODE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_SEARCHCOMPLETIONEXITCODE_SEARCH_COMPLETION_EXIT_CODE_NORMAL = 1;
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_SEARCHCOMPLETIONEXITCODE_SEARCH_COMPLETION_EXIT_CODE_NEW_SEARCH_STARTED = 2;
+// placeholder for aiserver.v1.RemoveRepositoryResponse.Status
+enum PH_aiserver_v1_RemoveRepositoryResponse_Status {
+  PH_AISERVER_V1_REMOVEREPOSITORYRESPONSE_STATUS_STATUS_UNSPECIFIED = 0;
+  PH_AISERVER_V1_REMOVEREPOSITORYRESPONSE_STATUS_STATUS_NOT_FOUND = 1;
+  PH_AISERVER_V1_REMOVEREPOSITORYRESPONSE_STATUS_STATUS_NOT_AUTHORIZED = 2;
+  PH_AISERVER_V1_REMOVEREPOSITORYRESPONSE_STATUS_STATUS_STARTED = 3;
+  PH_AISERVER_V1_REMOVEREPOSITORYRESPONSE_STATUS_STATUS_SUCCESS = 4;
 }
-
-// placeholder for aiserver.v1.RipgrepSearchResultInternal.TextSearchCompleteMessageType (recursive)
-enum PH_aiserver_v1_RipgrepSearchResultInternal_TextSearchCompleteMessageType {
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_TEXTSEARCHCOMPLETEMESSAGETYPE_TEXT_SEARCH_COMPLETE_MESSAGE_TYPE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_TEXTSEARCHCOMPLETEMESSAGETYPE_TEXT_SEARCH_COMPLETE_MESSAGE_TYPE_INFORMATION = 1;
-  PH_AISERVER_V1_RIPGREPSEARCHRESULTINTERNAL_TEXTSEARCHCOMPLETEMESSAGETYPE_TEXT_SEARCH_COMPLETE_MESSAGE_TYPE_WARNING = 2;
-}
-
-// placeholder for aiserver.v1.RunTerminalCommandEndedReason (recursive)
-enum PH_aiserver_v1_RunTerminalCommandEndedReason {
-  PH_AISERVER_V1_RUNTERMINALCOMMANDENDEDREASON_RUN_TERMINAL_COMMAND_ENDED_REASON_UNSPECIFIED = 0;
-  PH_AISERVER_V1_RUNTERMINALCOMMANDENDEDREASON_RUN_TERMINAL_COMMAND_ENDED_REASON_EXECUTION_COMPLETED = 1;
-  PH_AISERVER_V1_RUNTERMINALCOMMANDENDEDREASON_RUN_TERMINAL_COMMAND_ENDED_REASON_EXECUTION_ABORTED = 2;
-  PH_AISERVER_V1_RUNTERMINALCOMMANDENDEDREASON_RUN_TERMINAL_COMMAND_ENDED_REASON_EXECUTION_FAILED = 3;
-  PH_AISERVER_V1_RUNTERMINALCOMMANDENDEDREASON_RUN_TERMINAL_COMMAND_ENDED_REASON_ERROR_OCCURRED_CHECKING_REASON = 4;
-  PH_AISERVER_V1_RUNTERMINALCOMMANDENDEDREASON_RUN_TERMINAL_COMMAND_ENDED_REASON_IDLE_TIMEOUT = 5;
-}
-
-message PH_aiserver_v1_RunTerminalCommandV2Params {} // placeholder for aiserver.v1.RunTerminalCommandV2Params (recursive)
-
-message PH_aiserver_v1_RunTerminalCommandV2Params_ExecutionOptions {} // placeholder for aiserver.v1.RunTerminalCommandV2Params.ExecutionOptions (recursive)
-
-message PH_aiserver_v1_RunTerminalCommandV2Result {} // placeholder for aiserver.v1.RunTerminalCommandV2Result (recursive)
-
-message PH_aiserver_v1_SearchSymbolsParams {} // placeholder for aiserver.v1.SearchSymbolsParams (recursive)
-
-message PH_aiserver_v1_SearchSymbolsResult {} // placeholder for aiserver.v1.SearchSymbolsResult (recursive)
-
-message PH_aiserver_v1_SearchSymbolsResult_SymbolMatch {} // placeholder for aiserver.v1.SearchSymbolsResult.SymbolMatch (recursive)
-
-message PH_aiserver_v1_SemanticSearchFullParams {} // placeholder for aiserver.v1.SemanticSearchFullParams (recursive)
-
-message PH_aiserver_v1_SemanticSearchFullResult {} // placeholder for aiserver.v1.SemanticSearchFullResult (recursive)
-
-message PH_aiserver_v1_ShellCommandParsingResult {} // placeholder for aiserver.v1.ShellCommandParsingResult (recursive)
-
-message PH_aiserver_v1_ShellCommandParsingResult_ExecutableCommand {} // placeholder for aiserver.v1.ShellCommandParsingResult.ExecutableCommand (recursive)
-
-message PH_aiserver_v1_ShellCommandParsingResult_ExecutableCommandArg {} // placeholder for aiserver.v1.ShellCommandParsingResult.ExecutableCommandArg (recursive)
-
-message PH_aiserver_v1_ShellCommandParsingResult_Redirect {} // placeholder for aiserver.v1.ShellCommandParsingResult.Redirect (recursive)
-
-message PH_aiserver_v1_SimpleFileDiff {} // placeholder for aiserver.v1.SimpleFileDiff (recursive)
-
-message PH_aiserver_v1_SimpleFileDiff_Chunk {} // placeholder for aiserver.v1.SimpleFileDiff.Chunk (recursive)
-
-message PH_aiserver_v1_SimplestRange {} // placeholder for aiserver.v1.SimplestRange (recursive)
-
-message PH_aiserver_v1_SpecSubagentReturnValue {} // placeholder for aiserver.v1.SpecSubagentReturnValue (recursive)
-
-message PH_aiserver_v1_Step {} // placeholder for aiserver.v1.Step (recursive)
-
-// placeholder for aiserver.v1.StreamUnifiedChatRequest.UnifiedMode (recursive)
-enum PH_aiserver_v1_StreamUnifiedChatRequest_UnifiedMode {
-  PH_AISERVER_V1_STREAMUNIFIEDCHATREQUEST_UNIFIEDMODE_UNIFIED_MODE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_STREAMUNIFIEDCHATREQUEST_UNIFIEDMODE_UNIFIED_MODE_CHAT = 1;
-  PH_AISERVER_V1_STREAMUNIFIEDCHATREQUEST_UNIFIEDMODE_UNIFIED_MODE_AGENT = 2;
-  PH_AISERVER_V1_STREAMUNIFIEDCHATREQUEST_UNIFIEDMODE_UNIFIED_MODE_EDIT = 3;
-  PH_AISERVER_V1_STREAMUNIFIEDCHATREQUEST_UNIFIEDMODE_UNIFIED_MODE_CUSTOM = 4;
-  PH_AISERVER_V1_STREAMUNIFIEDCHATREQUEST_UNIFIEDMODE_UNIFIED_MODE_PLAN = 5;
-  PH_AISERVER_V1_STREAMUNIFIEDCHATREQUEST_UNIFIEDMODE_UNIFIED_MODE_DEBUG = 6;
-}
-
-message PH_aiserver_v1_StringReplacement {} // placeholder for aiserver.v1.StringReplacement (recursive)
-
-message PH_aiserver_v1_SubagentReturnCall {} // placeholder for aiserver.v1.SubagentReturnCall (recursive)
-
-// placeholder for aiserver.v1.SubagentType (recursive)
-enum PH_aiserver_v1_SubagentType {
-  PH_AISERVER_V1_SUBAGENTTYPE_SUBAGENT_TYPE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_SUBAGENTTYPE_SUBAGENT_TYPE_DEEP_SEARCH = 1;
-  PH_AISERVER_V1_SUBAGENTTYPE_SUBAGENT_TYPE_FIX_LINTS = 2;
-  PH_AISERVER_V1_SUBAGENTTYPE_SUBAGENT_TYPE_TASK = 3;
-  PH_AISERVER_V1_SUBAGENTTYPE_SUBAGENT_TYPE_SPEC = 4;
-}
-
-message PH_aiserver_v1_SuggestedCodeBlock {} // placeholder for aiserver.v1.SuggestedCodeBlock (recursive)
-
-message PH_aiserver_v1_SwitchModeParams {} // placeholder for aiserver.v1.SwitchModeParams (recursive)
-
-message PH_aiserver_v1_SwitchModeResult {} // placeholder for aiserver.v1.SwitchModeResult (recursive)
-
-message PH_aiserver_v1_TaskParams {} // placeholder for aiserver.v1.TaskParams (recursive)
-
-message PH_aiserver_v1_TaskResult {} // placeholder for aiserver.v1.TaskResult (recursive)
-
-message PH_aiserver_v1_TaskResult_AsyncTaskResult {} // placeholder for aiserver.v1.TaskResult.AsyncTaskResult (recursive)
-
-message PH_aiserver_v1_TaskResult_CompletedTaskResult {} // placeholder for aiserver.v1.TaskResult.CompletedTaskResult (recursive)
-
-message PH_aiserver_v1_TaskSubagentReturnValue {} // placeholder for aiserver.v1.TaskSubagentReturnValue (recursive)
-
-message PH_aiserver_v1_TaskV2Params {} // placeholder for aiserver.v1.TaskV2Params (recursive)
-
-message PH_aiserver_v1_TaskV2Result {} // placeholder for aiserver.v1.TaskV2Result (recursive)
-
-message PH_aiserver_v1_TodoItem {} // placeholder for aiserver.v1.TodoItem (recursive)
-
-message PH_aiserver_v1_TodoReadParams {} // placeholder for aiserver.v1.TodoReadParams (recursive)
-
-message PH_aiserver_v1_TodoReadResult {} // placeholder for aiserver.v1.TodoReadResult (recursive)
-
-message PH_aiserver_v1_TodoWriteParams {} // placeholder for aiserver.v1.TodoWriteParams (recursive)
-
-message PH_aiserver_v1_TodoWriteResult {} // placeholder for aiserver.v1.TodoWriteResult (recursive)
-
-message PH_aiserver_v1_ToolCallFileSearchParams {} // placeholder for aiserver.v1.ToolCallFileSearchParams (recursive)
-
-message PH_aiserver_v1_ToolCallFileSearchResult {} // placeholder for aiserver.v1.ToolCallFileSearchResult (recursive)
-
-message PH_aiserver_v1_ToolCallFileSearchResult_File {} // placeholder for aiserver.v1.ToolCallFileSearchResult.File (recursive)
-
-message PH_aiserver_v1_ToolPullRequestResult {} // placeholder for aiserver.v1.ToolPullRequestResult (recursive)
-
-message PH_aiserver_v1_ToolResultAttachments {} // placeholder for aiserver.v1.ToolResultAttachments (recursive)
-
-message PH_aiserver_v1_ToolResultAttachments_DiscoveryBudgetReminder {} // placeholder for aiserver.v1.ToolResultAttachments.DiscoveryBudgetReminder (recursive)
-
-// placeholder for aiserver.v1.ToolResultAttachments.TodoReminderType (recursive)
-enum PH_aiserver_v1_ToolResultAttachments_TodoReminderType {
-  PH_AISERVER_V1_TOOLRESULTATTACHMENTS_TODOREMINDERTYPE_TODO_REMINDER_TYPE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_TOOLRESULTATTACHMENTS_TODOREMINDERTYPE_TODO_REMINDER_TYPE_EVERY_10_TURNS = 1;
-  PH_AISERVER_V1_TOOLRESULTATTACHMENTS_TODOREMINDERTYPE_TODO_REMINDER_TYPE_AFTER_EDIT = 2;
-}
-
-message PH_aiserver_v1_ToolResultError {} // placeholder for aiserver.v1.ToolResultError (recursive)
-
-message PH_aiserver_v1_ToolResultError_EditFileError {} // placeholder for aiserver.v1.ToolResultError.EditFileError (recursive)
-
-message PH_aiserver_v1_ToolResultError_SearchReplaceError {} // placeholder for aiserver.v1.ToolResultError.SearchReplaceError (recursive)
-
-message PH_aiserver_v1_UpdateProjectParams {} // placeholder for aiserver.v1.UpdateProjectParams (recursive)
-
-message PH_aiserver_v1_UpdateProjectResult {} // placeholder for aiserver.v1.UpdateProjectResult (recursive)
-
-message PH_aiserver_v1_UpdateProjectStringReplacement {} // placeholder for aiserver.v1.UpdateProjectStringReplacement (recursive)
-
-message PH_aiserver_v1_UserResponseToSuggestedCodeBlock {} // placeholder for aiserver.v1.UserResponseToSuggestedCodeBlock (recursive)
-
-// placeholder for aiserver.v1.UserResponseToSuggestedCodeBlock.UserResponseType (recursive)
-enum PH_aiserver_v1_UserResponseToSuggestedCodeBlock_UserResponseType {
-  PH_AISERVER_V1_USERRESPONSETOSUGGESTEDCODEBLOCK_USERRESPONSETYPE_USER_RESPONSE_TYPE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_USERRESPONSETOSUGGESTEDCODEBLOCK_USERRESPONSETYPE_USER_RESPONSE_TYPE_ACCEPT = 1;
-  PH_AISERVER_V1_USERRESPONSETOSUGGESTEDCODEBLOCK_USERRESPONSETYPE_USER_RESPONSE_TYPE_REJECT = 2;
-  PH_AISERVER_V1_USERRESPONSETOSUGGESTEDCODEBLOCK_USERRESPONSETYPE_USER_RESPONSE_TYPE_MODIFY = 3;
-}
-
-message PH_aiserver_v1_ViewableCommitProps {} // placeholder for aiserver.v1.ViewableCommitProps (recursive)
-
-message PH_aiserver_v1_ViewableDiffProps {} // placeholder for aiserver.v1.ViewableDiffProps (recursive)
-
-message PH_aiserver_v1_ViewableGitContext {} // placeholder for aiserver.v1.ViewableGitContext (recursive)
-
-message PH_aiserver_v1_ViewablePRProps {} // placeholder for aiserver.v1.ViewablePRProps (recursive)
-
-message PH_aiserver_v1_WebFetchParams {} // placeholder for aiserver.v1.WebFetchParams (recursive)
-
-message PH_aiserver_v1_WebFetchResult {} // placeholder for aiserver.v1.WebFetchResult (recursive)
-
-message PH_aiserver_v1_WebReference {} // placeholder for aiserver.v1.WebReference (recursive)
-
-message PH_aiserver_v1_WebSearchParams {} // placeholder for aiserver.v1.WebSearchParams (recursive)
-
-message PH_aiserver_v1_WebSearchResult {} // placeholder for aiserver.v1.WebSearchResult (recursive)
-
-message PH_aiserver_v1_WebSearchResult_WebReference {} // placeholder for aiserver.v1.WebSearchResult.WebReference (recursive)
-
-message PH_aiserver_v1_WriteGitBranchNameRequest { // placeholder for aiserver.v1.WriteGitBranchNameRequest
-  oneof credentials {
-    ApiKeyCredentials api_key_credentials = 4;
-    AzureCredentials azure_credentials = 5;
-    BedrockCredentials bedrock_credentials = 6;
-  }
-  string diffs = 1;
-  optional string context = 2;
-  optional string conversation_id = 3;
-}
-
-message PH_aiserver_v1_WriteGitBranchNameResponse { // placeholder for aiserver.v1.WriteGitBranchNameResponse
-  string branch_name = 1;
-}
-
-message PH_aiserver_v1_WriteGitCommitMessageRequest { // placeholder for aiserver.v1.WriteGitCommitMessageRequest
-  oneof credentials {
-    ApiKeyCredentials api_key_credentials = 4;
-    AzureCredentials azure_credentials = 5;
-    BedrockCredentials bedrock_credentials = 6;
-  }
-  repeated string diffs = 1;
-  repeated string previous_commit_messages = 2;
-  PH_aiserver_v1_ExplicitContext explicit_context = 3;
-}
-
-message PH_aiserver_v1_WriteGitCommitMessageResponse { // placeholder for aiserver.v1.WriteGitCommitMessageResponse
-  string commit_message = 1;
-}
-
-message PH_c_ho {} // opaque placeholder for c.ho
-
-message PH_c_xp {} // opaque placeholder for c.xp
-
-message PH_l_proto3_getEnumType {} // opaque placeholder for l.proto3.getEnumType

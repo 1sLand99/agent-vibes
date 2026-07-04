@@ -10,7 +10,7 @@ import { logger } from "../utils/logger"
  * 1. System trust store (macOS Keychain / Linux ca-certificates / Windows CertStore)
  *    → Needed for Chromium's BoringSSL network layer
  * 2. NODE_EXTRA_CA_CERTS environment variable
- *    → Needed for Node.js/OpenSSL gRPC connections (Electron Extension Host)
+ *    → Needed for Node.js/OpenSSL gRPC connections (Electron processes)
  *
  * Both layers run in a SINGLE sudo script to minimize password prompts.
  */
@@ -18,7 +18,7 @@ export class CertTrustService {
   /**
    * Generate a platform-specific shell script that:
    * 1. Adds CA to system trust store (requires sudo)
-   * 2. Injects NODE_EXTRA_CA_CERTS into shell profile (no sudo needed)
+   * 2. Injects NODE_EXTRA_CA_CERTS into the user environment
    *
    * Returns the path to the generated script.
    */
@@ -36,9 +36,34 @@ export class CertTrustService {
   }
 
   /**
-   * Check if NODE_EXTRA_CA_CERTS is already configured in shell profiles.
+   * Check if NODE_EXTRA_CA_CERTS is already configured for the platform.
    */
   static isNodeCaConfigured(caCertPath: string): boolean {
+    const shellProfileConfigured =
+      CertTrustService.isShellProfileNodeCaConfigured(caCertPath)
+
+    if (process.platform === "darwin") {
+      return (
+        shellProfileConfigured &&
+        CertTrustService.isLaunchdNodeCaConfigured(caCertPath)
+      )
+    }
+
+    if (process.platform === "win32") {
+      return CertTrustService.isWindowsNodeCaConfigured(caCertPath)
+    }
+
+    if (process.platform === "linux") {
+      return (
+        shellProfileConfigured &&
+        CertTrustService.isLinuxDesktopNodeCaConfigured(caCertPath)
+      )
+    }
+
+    return shellProfileConfigured
+  }
+
+  private static isShellProfileNodeCaConfigured(caCertPath: string): boolean {
     const home = os.homedir()
     const profiles = [
       path.join(home, ".zshrc"),
@@ -61,6 +86,68 @@ export class CertTrustService {
       }
     }
     return false
+  }
+
+  private static isLaunchdNodeCaConfigured(caCertPath: string): boolean {
+    if (process.platform !== "darwin") return false
+    try {
+      const childProcess =
+        require("child_process") as typeof import("child_process")
+      const result = childProcess.execFileSync(
+        "launchctl",
+        ["getenv", "NODE_EXTRA_CA_CERTS"],
+        {
+          encoding: "utf-8",
+          stdio: "pipe",
+        }
+      )
+      return result.trim() === caCertPath
+    } catch {
+      return false
+    }
+  }
+
+  private static isWindowsNodeCaConfigured(caCertPath: string): boolean {
+    if (process.platform !== "win32") return false
+    try {
+      const childProcess =
+        require("child_process") as typeof import("child_process")
+      const result = childProcess.execFileSync(
+        "powershell",
+        [
+          "-NoProfile",
+          "-Command",
+          "[Environment]::GetEnvironmentVariable('NODE_EXTRA_CA_CERTS','User')",
+        ],
+        {
+          encoding: "utf-8",
+          stdio: "pipe",
+        }
+      )
+      return result.trim() === caCertPath
+    } catch {
+      return false
+    }
+  }
+
+  private static isLinuxDesktopNodeCaConfigured(caCertPath: string): boolean {
+    if (process.platform !== "linux") return false
+    const envFilePath = path.join(
+      os.homedir(),
+      ".config",
+      "environment.d",
+      "agent-vibes.conf"
+    )
+
+    try {
+      if (!fs.existsSync(envFilePath)) return false
+      const content = fs.readFileSync(envFilePath, "utf-8")
+      return content
+        .split(/\r?\n/)
+        .some((line) => line.trim() === `NODE_EXTRA_CA_CERTS=${caCertPath}`)
+    } catch {
+      return false
+    }
   }
 
   /**
@@ -125,6 +212,7 @@ echo ""
       marker,
       exportLine
     )
+    script += CertTrustService.generateMacOSLaunchdInjection(caCertPath)
 
     script += `
 echo ""
@@ -172,11 +260,15 @@ echo ""
       marker,
       exportLine
     )
+    script += CertTrustService.generateLinuxDesktopEnvironmentInjection(
+      caCertPath,
+      home
+    )
 
     script += `
 echo ""
 echo "✅ Certificate trust setup complete!"
-echo "   Please restart Cursor for changes to take effect."
+echo "   Please restart Cursor. If it was launched from the desktop, log out and back in first."
 echo ""
 `
 
@@ -264,5 +356,38 @@ fi
     }
 
     return script
+  }
+
+  private static generateMacOSLaunchdInjection(caCertPath: string): string {
+    return `
+# ── Step 3: Configure Cursor GUI process environment ─────────────────
+echo "▸ Configuring NODE_EXTRA_CA_CERTS for Cursor launched from macOS UI..."
+if [ -n "\${SUDO_UID:-}" ]; then
+  launchctl asuser "\${SUDO_UID}" launchctl setenv NODE_EXTRA_CA_CERTS "${caCertPath}" && \\
+    echo "✓ NODE_EXTRA_CA_CERTS configured for the current macOS user session"
+else
+  launchctl setenv NODE_EXTRA_CA_CERTS "${caCertPath}" && \\
+    echo "✓ NODE_EXTRA_CA_CERTS configured for the current macOS user session"
+fi
+`
+  }
+
+  private static generateLinuxDesktopEnvironmentInjection(
+    caCertPath: string,
+    home: string
+  ): string {
+    const envDir = path.join(home, ".config", "environment.d")
+    const envFilePath = path.join(envDir, "agent-vibes.conf")
+
+    return `
+# ── Step 3: Configure desktop session environment ────────────────────
+echo "▸ Configuring NODE_EXTRA_CA_CERTS for Cursor launched from Linux desktop..."
+mkdir -p "${envDir}"
+printf '%s\\n' 'NODE_EXTRA_CA_CERTS=${caCertPath}' > "${envFilePath}"
+if [ -n "\${SUDO_UID:-}" ] && [ -n "\${SUDO_GID:-}" ]; then
+  chown "\${SUDO_UID}:\${SUDO_GID}" "${envDir}" "${envFilePath}" 2>/dev/null || true
+fi
+echo "✓ NODE_EXTRA_CA_CERTS configured in ${envFilePath}"
+`
   }
 }

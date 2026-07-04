@@ -1239,6 +1239,21 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
     },
   },
 
+  CLIENT_SIDE_TOOL_V2_SEND_TO_USER: {
+    name: "send_to_user",
+    description: "Send a message to the user without asking for a response",
+    input_schema: {
+      type: "object",
+      properties: {
+        message: {
+          type: "string",
+          description: "Message text to show to the user",
+        },
+      },
+      required: ["message"],
+    },
+  },
+
   CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS: {
     name: "report_bugfix_results",
     description:
@@ -1581,6 +1596,7 @@ const PREFERRED_CURSOR_KEY_BY_TOOL_NAME: Record<string, string> = {
   update_todos: "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
   apply_agent_diff: "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF",
   generate_image: "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
+  send_to_user: "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
   report_bugfix_results: "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
   read_semsearch_files: "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
   reapply: "CLIENT_SIDE_TOOL_V2_REAPPLY",
@@ -1626,6 +1642,7 @@ const TOOL_KEY_ALIASES: Record<string, string> = {
   client_side_tool_v2_todo_write: "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
   client_side_tool_v2_apply_agent_diff: "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF",
   client_side_tool_v2_generate_image: "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
+  client_side_tool_v2_send_to_user: "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
   client_side_tool_v2_report_bugfix_results:
     "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
   client_side_tool_v2_read_semsearch_files:
@@ -1677,6 +1694,7 @@ const TOOL_KEY_ALIASES: Record<string, string> = {
   todo_write: "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
   apply_agent_diff: "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF",
   generate_image: "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
+  send_to_user: "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
   report_bugfix_results: "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
   read_semsearch_files: "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
   reapply: "CLIENT_SIDE_TOOL_V2_REAPPLY",
@@ -1764,6 +1782,7 @@ const DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS = [
   // a VM environment broker, so we do not advertise it on the user-facing
   // surface to avoid wasting model tokens on a tool that always fails.
   "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
+  "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
   "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
   "CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION",
   "CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING",
@@ -1813,6 +1832,10 @@ const BUILTIN_WEB_FETCH_TOOL_KEYS = new Set<string>([
 const BUILTIN_LINT_TOOL_KEYS = new Set<string>([
   "CLIENT_SIDE_TOOL_V2_DIAGNOSTICS",
   "CLIENT_SIDE_TOOL_V2_READ_LINTS",
+])
+
+const BUILTIN_SEND_TO_USER_TOOL_KEYS = new Set<string>([
+  "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
 ])
 
 function normalizeToolIdentifier(raw: string): string {
@@ -1944,6 +1967,10 @@ function shouldIncludeBuiltInTool(
 
   if (BUILTIN_LINT_TOOL_KEYS.has(definitionKey)) {
     if (options?.readLintsEnabled === false) return false
+  }
+
+  if (BUILTIN_SEND_TO_USER_TOOL_KEYS.has(definitionKey)) {
+    return options?.sendToUserEnabled === true
   }
 
   return true
@@ -2114,6 +2141,7 @@ export interface CursorBuiltInToolCapabilityOptions {
   webSearchEnabled?: boolean
   webFetchEnabled?: boolean
   readLintsEnabled?: boolean
+  sendToUserEnabled?: boolean
 }
 
 export interface ToolDefinition {
@@ -2789,6 +2817,7 @@ function buildCodexToolsForApi(
     "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
     "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF",
     "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
+    "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
     "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
     "CLIENT_SIDE_TOOL_V2_FIX_LINTS",
     "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
@@ -3033,6 +3062,7 @@ export function buildToolsForApi(
     "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
     "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF",
     "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
+    "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
     "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
     "CLIENT_SIDE_TOOL_V2_FIX_LINTS",
     "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
@@ -3360,6 +3390,7 @@ export function getToolTypeEnumValue(toolName: string): number {
     CLIENT_SIDE_TOOL_V2_ASK_QUESTION: 51,
     CLIENT_SIDE_TOOL_V2_SWITCH_MODE: 52,
     CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE: 53,
+    CLIENT_SIDE_TOOL_V2_SEND_TO_USER: 65,
     CLIENT_SIDE_TOOL_V2_COMPUTER_USE: 54,
     CLIENT_SIDE_TOOL_V2_WRITE_SHELL_STDIN: 55,
     CLIENT_SIDE_TOOL_V2_RECORD_SCREEN: 56,

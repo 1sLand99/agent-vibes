@@ -390,7 +390,7 @@ export class ContextCompactionService {
         projectedMessages: candidate.map((message) => ({
           role: message.role === "assistant" ? "assistant" : "user",
           content: message.content,
-          source: "snip",
+          source: message.source ?? "snip",
           // Snip is a tail-truncate (no merging / re-wrapping); the
           // messageId on each retained record stays valid, so propagate
           // it for downstream send-time sibling merge.
@@ -399,6 +399,9 @@ export class ContextCompactionService {
           // surviving messages (e.g. a retained compaction summary
           // stays meta, a retained user turn stays not-meta).
           ...(message.isMeta ? { isMeta: true } : {}),
+          ...(message.attachmentKind
+            ? { attachmentKind: message.attachmentKind }
+            : {}),
         })),
         estimatedTokens,
         snipCompaction: {
@@ -1115,6 +1118,10 @@ export class ContextCompactionService {
       // wire layer / transcript bridge can hide them. Only set when
       // true; absent on real user/assistant turns.
       ...(message.isMeta ? { isMeta: true } : {}),
+      ...(message.source ? { source: message.source } : {}),
+      ...(message.attachmentKind
+        ? { attachmentKind: message.attachmentKind }
+        : {}),
     })) as UnifiedMessage[]
     // Repair tool_result blocks orphaned by partial compaction (their
     // tool_use was archived behind the boundary) AND tool_use blocks whose

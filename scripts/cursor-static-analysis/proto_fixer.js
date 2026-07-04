@@ -71,6 +71,9 @@ const GOOGLE_TYPE_TO_FILE = {
   "google.protobuf.GeneratedCodeInfo": "google/protobuf/descriptor.proto",
   "google.protobuf.GeneratedCodeInfo.Annotation":
     "google/protobuf/descriptor.proto",
+  "google.protobuf.MethodOptions": "google/protobuf/descriptor.proto",
+  "google.protobuf.MethodOptions.IdempotencyLevel":
+    "google/protobuf/descriptor.proto",
 }
 
 // Minimal WKT stubs
@@ -116,7 +119,14 @@ message GeneratedCodeInfo {
   }
   repeated Annotation annotation = 1;
 }
-`,
+message MethodOptions {
+  enum IdempotencyLevel {
+    IDEMPOTENCY_UNKNOWN = 0;
+    NO_SIDE_EFFECTS = 1;
+    IDEMPOTENT = 2;
+  }
+}
+	`,
 }
 
 // ============================================================
@@ -239,7 +249,7 @@ function fieldTypeStr(field) {
   if (field.kind === "enum" || field.kind === "message")
     return field.resolvedType || "bytes"
   if (field.kind === "map") {
-    const keyType = T_TO_SCALAR[field.K] || "string"
+    const keyType = T_TO_SCALAR[field.mapKeyType ?? field.K] || "string"
     let valType
     if (field.mapValueType) {
       if (field.mapValueType.kind === "scalar")
@@ -276,7 +286,13 @@ function needsPlaceholder(typeName, currentPkg) {
 
 // PH 名：将全限定名转为 PH_xxx_yyy_Type
 function toPlaceholderName(fullTypeName) {
-  return "PH_" + fullTypeName.replace(/\./g, "_")
+  const sanitized = fullTypeName
+    .replace(/\./g, "_")
+    .replace(/[^A-Za-z0-9_]/g, (char) => {
+      const hex = char.codePointAt(0).toString(16).toUpperCase()
+      return `_x${hex}_`
+    })
+  return "PH_" + sanitized
 }
 
 // 缩短跨包引用（考虑 placeholder）
@@ -768,6 +784,10 @@ function generatePackageProto(pkg, data, schema, imports) {
           Boolean
         )) {
           if (SCALAR_TYPES.has(ref) || ref.startsWith("map<")) continue
+          if (isOpaqueTypeName(ref)) {
+            ensureOpaquePlaceholder(pkg, ref)
+            continue
+          }
           const refPkg = getPackage(ref)
           if (
             refPkg !== pkg &&

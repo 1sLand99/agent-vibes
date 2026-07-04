@@ -109,6 +109,17 @@ export interface FunctionToolCall {
   }
 }
 
+export type ContextMessageSource =
+  | "record"
+  | "boundary"
+  | "summary"
+  | "context_collapse"
+  | "attachment"
+  | "snip"
+  | "microcompact"
+  | "hook"
+  | "protected_context"
+
 export type LooseMessageContent =
   | string
   | ContentBlock[]
@@ -157,6 +168,18 @@ export interface UnifiedMessage {
    * structural simplicity but writers should leave it absent there.
    */
   isMeta?: boolean
+
+  /**
+   * Origin of synthesized context messages. This must survive send-time
+   * normalization so provider adapters can keep internal context separate
+   * from user-authored conversation text.
+   */
+  source?: ContextMessageSource
+
+  /**
+   * More specific attachment classifier when source === "attachment".
+   */
+  attachmentKind?: ContextProjectionAttachment["kind"]
 }
 
 /**
@@ -500,15 +523,7 @@ export interface ContextConversationState {
 export interface ProjectedContextMessage {
   role: "user" | "assistant"
   content: LooseMessageContent
-  source:
-    | "record"
-    | "boundary"
-    | "summary"
-    | "context_collapse"
-    | "attachment"
-    | "snip"
-    | "microcompact"
-    | "hook"
+  source: ContextMessageSource
   recordId?: string
   /**
    * Anthropic message id (when source === "record" and the underlying

@@ -13,12 +13,19 @@ enum AdminNotificationRequestType {
   ADMIN_NOTIFICATION_REQUEST_TYPE_UNSPECIFIED = 0;
   ADMIN_NOTIFICATION_REQUEST_TYPE_PRIVACY_MODE = 1;
   ADMIN_NOTIFICATION_REQUEST_TYPE_BUGBOT = 2;
+  ADMIN_NOTIFICATION_REQUEST_TYPE_BUGBOT_ENABLE_REPOS = 3;
 }
 
 enum AgentStoreEntryKind {
   AGENT_STORE_ENTRY_KIND_UNSPECIFIED = 0;
   AGENT_STORE_ENTRY_KIND_DIRECTORY = 1;
   AGENT_STORE_ENTRY_KIND_FILE = 2;
+}
+
+enum AgentStoreKind {
+  AGENT_STORE_KIND_UNSPECIFIED = 0;
+  AGENT_STORE_KIND_CLOUD = 1;
+  AGENT_STORE_KIND_LOCAL = 2;
 }
 
 enum AgentStoreShareVisibility {
@@ -38,6 +45,13 @@ enum AllowlistConfig {
   ALLOWLIST_CONFIG_UNSPECIFIED = 0;
   ALLOWLIST_CONFIG_ALLOWLIST = 1;
   ALLOWLIST_CONFIG_BLOCKLIST = 2;
+}
+
+enum ApprovalDecision {
+  APPROVAL_DECISION_UNSPECIFIED = 0;
+  APPROVAL_DECISION_APPROVED = 1;
+  APPROVAL_DECISION_APPROVED_FOR_SESSION = 2;
+  APPROVAL_DECISION_DENIED = 3;
 }
 
 enum AutoCreatePrMode {
@@ -91,12 +105,27 @@ enum AutomationRunFailureCode {
   AUTOMATION_RUN_FAILURE_CODE_MODEL_BLOCKED = 12;
   AUTOMATION_RUN_FAILURE_CODE_PRIVATE_WORKERS_DISABLED = 13;
   AUTOMATION_RUN_FAILURE_CODE_PRIVATE_WORKER_RESOURCE_EXHAUSTED = 14;
+  AUTOMATION_RUN_FAILURE_CODE_GITHUB_IP_ALLOWLIST = 15;
+  AUTOMATION_RUN_FAILURE_CODE_INVALID_REQUEST = 16;
+  AUTOMATION_RUN_FAILURE_CODE_CLOUD_AGENT_PLAN_RESTRICTED = 17;
+  AUTOMATION_RUN_FAILURE_CODE_PRIVATE_WORKER_MISSING_REPO = 18;
+  AUTOMATION_RUN_FAILURE_CODE_ENVIRONMENT_BUILD_FAILED = 19;
+  AUTOMATION_RUN_FAILURE_CODE_FORK_PR_UNSUPPORTED = 20;
+  AUTOMATION_RUN_FAILURE_CODE_PROTECTED_SCOPE_BLOCKED = 21;
+  AUTOMATION_RUN_FAILURE_CODE_CANCELLED_SUPERSEDED_BY_NEWER_EVENT = 22;
+  AUTOMATION_RUN_FAILURE_CODE_USER_BLOCKED = 23;
 }
 
 enum AutomationRunListKind {
   AUTOMATION_RUN_LIST_KIND_UNSPECIFIED = 0;
   AUTOMATION_RUN_LIST_KIND_EXECUTION_RUNS = 1;
   AUTOMATION_RUN_LIST_KIND_FILTER_EVALUATIONS = 2;
+}
+
+enum AutomationRunRetryIneligibleReason {
+  AUTOMATION_RUN_RETRY_INELIGIBLE_REASON_UNSPECIFIED = 0;
+  AUTOMATION_RUN_RETRY_INELIGIBLE_REASON_LAUNCH_CONTEXT_MISSING = 1;
+  AUTOMATION_RUN_RETRY_INELIGIBLE_REASON_PERMISSION_DENIED = 2;
 }
 
 enum AutomationRunStatus {
@@ -177,6 +206,9 @@ enum BackgroundComposerSource {
   BACKGROUND_COMPOSER_SOURCE_QABOT_FRONTEND = 23;
   BACKGROUND_COMPOSER_SOURCE_AS_SUBAGENT_FROM_LOCAL = 24;
   BACKGROUND_COMPOSER_SOURCE_ENVIRONMENT_SETUP_GLASS = 25;
+  BACKGROUND_COMPOSER_SOURCE_SAND_CODING_SUBAGENT = 26;
+  BACKGROUND_COMPOSER_SOURCE_BITBUCKET = 27;
+  BACKGROUND_COMPOSER_SOURCE_CLOUD_META_AGENT = 28;
 }
 
 enum BackgroundComposerStatus {
@@ -229,6 +261,7 @@ enum BugbotMode {
   BUGBOT_MODE_DEFAULT = 1;
   BUGBOT_MODE_HIGH = 2;
   BUGBOT_MODE_AUTO = 3;
+  BUGBOT_MODE_FRONTIER = 4;
 }
 
 enum BugbotPlanType {
@@ -331,6 +364,7 @@ enum ClientOS {
   CLIENT_OS_WINDOWS = 1;
   CLIENT_OS_MACOS = 2;
   CLIENT_OS_LINUX = 3;
+  CLIENT_OS_IOS = 4;
 }
 
 enum ClientSideToolV2 {
@@ -387,6 +421,7 @@ enum ClientSideToolV2 {
   CLIENT_SIDE_TOOL_V2_REFLECT = 61;
   CLIENT_SIDE_TOOL_V2_AWAIT = 62;
   CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS = 63;
+  CLIENT_SIDE_TOOL_V2_SEND_TO_USER = 65;
 }
 
 enum ClientSurface {
@@ -413,6 +448,7 @@ enum CloudAgentEgressProtectionMode {
   CLOUD_AGENT_EGRESS_PROTECTION_MODE_ALLOW_ALL = 1;
   CLOUD_AGENT_EGRESS_PROTECTION_MODE_DEFAULT_WITH_NETWORK_SETTINGS = 2;
   CLOUD_AGENT_EGRESS_PROTECTION_MODE_NETWORK_SETTINGS_ONLY = 3;
+  CLOUD_AGENT_EGRESS_PROTECTION_MODE_PARENT_PLUS_NETWORK_SETTINGS = 4;
 }
 
 enum CloudAgentMemoryDbLogSource {
@@ -517,6 +553,12 @@ enum CppSource {
   CPP_SOURCE_LSP_SUGGESTIONS = 9;
 }
 
+enum CreateOrganizationTeamIdentityProviderMode {
+  CREATE_ORGANIZATION_TEAM_IDENTITY_PROVIDER_MODE_UNSPECIFIED = 0;
+  CREATE_ORGANIZATION_TEAM_IDENTITY_PROVIDER_MODE_USE_ORGANIZATION = 1;
+  CREATE_ORGANIZATION_TEAM_IDENTITY_PROVIDER_MODE_CREATE_NEW = 2;
+}
+
 enum CycleType {
   CYCLE_TYPE_UNSPECIFIED = 0;
   CYCLE_TYPE_MONTH = 1;
@@ -529,10 +571,65 @@ enum DatabaseProvider {
   DATABASE_PROVIDER_PLANETSCALE = 2;
 }
 
+enum DataOpsJobDbStatus {
+  DATA_OPS_JOB_DB_STATUS_UNSPECIFIED = 0;
+  DATA_OPS_JOB_DB_STATUS_PENDING = 1;
+  DATA_OPS_JOB_DB_STATUS_BUILDING = 2;
+  DATA_OPS_JOB_DB_STATUS_RUNNING_FINALIZE = 3;
+  DATA_OPS_JOB_DB_STATUS_RUNNING_SYNC_INDEX = 4;
+  DATA_OPS_JOB_DB_STATUS_RUNNING_ROLLOUT = 5;
+  DATA_OPS_JOB_DB_STATUS_COMPUTING_STATS = 6;
+  DATA_OPS_JOB_DB_STATUS_FINISHED = 7;
+  DATA_OPS_JOB_DB_STATUS_FAILED = 8;
+  DATA_OPS_JOB_DB_STATUS_CANCELED = 9;
+}
+
+enum DataOpsPhase {
+  DATA_OPS_PHASE_UNSPECIFIED = 0;
+  DATA_OPS_PHASE_FINALIZE = 1;
+  DATA_OPS_PHASE_SYNC_INDEX = 2;
+  DATA_OPS_PHASE_ROLLOUT = 3;
+  DATA_OPS_PHASE_STATS = 4;
+}
+
+enum DataOpsStepDbStatus {
+  DATA_OPS_STEP_DB_STATUS_UNSPECIFIED = 0;
+  DATA_OPS_STEP_DB_STATUS_PENDING = 1;
+  DATA_OPS_STEP_DB_STATUS_RUNNING = 2;
+  DATA_OPS_STEP_DB_STATUS_FINISHED = 3;
+  DATA_OPS_STEP_DB_STATUS_FAILED = 4;
+  DATA_OPS_STEP_DB_STATUS_SKIPPED = 5;
+  DATA_OPS_STEP_DB_STATUS_CANCELED = 6;
+}
+
 enum DeeplinkType {
   DEEPLINK_TYPE_UNSPECIFIED = 0;
   DEEPLINK_TYPE_PROMPT = 1;
   DEEPLINK_TYPE_SLASH_COMMAND = 2;
+}
+
+enum DesktopSignalCommandResult {
+  DESKTOP_SIGNAL_COMMAND_RESULT_UNSPECIFIED = 0;
+  DESKTOP_SIGNAL_COMMAND_RESULT_RECEIVED = 1;
+  DESKTOP_SIGNAL_COMMAND_RESULT_STARTED = 2;
+  DESKTOP_SIGNAL_COMMAND_RESULT_FAILED = 3;
+  DESKTOP_SIGNAL_COMMAND_RESULT_NOT_OWNED = 4;
+}
+
+enum DesktopSignalFailureReason {
+  DESKTOP_SIGNAL_FAILURE_REASON_UNSPECIFIED = 0;
+  DESKTOP_SIGNAL_FAILURE_REASON_UNSUPPORTED = 1;
+  DESKTOP_SIGNAL_FAILURE_REASON_INVALID_PAYLOAD = 2;
+  DESKTOP_SIGNAL_FAILURE_REASON_AGENT_NOT_FOUND = 3;
+  DESKTOP_SIGNAL_FAILURE_REASON_AGENT_BUSY = 4;
+  DESKTOP_SIGNAL_FAILURE_REASON_INTERNAL = 5;
+  DESKTOP_SIGNAL_FAILURE_REASON_BLOB_UNRESOLVED = 6;
+}
+
+enum DiamondToBugbotMigrationMode {
+  DIAMOND_TO_BUGBOT_MIGRATION_MODE_UNSPECIFIED = 0;
+  DIAMOND_TO_BUGBOT_MIGRATION_MODE_DRY_RUN = 1;
+  DIAMOND_TO_BUGBOT_MIGRATION_MODE_APPLY = 2;
 }
 
 enum DisplayMode {
@@ -598,6 +695,7 @@ enum EvalKillReason {
   EVAL_KILL_REASON_UNSPECIFIED = 0;
   EVAL_KILL_REASON_USER_KILL = 1;
   EVAL_KILL_REASON_JOB_TIMEOUT = 2;
+  EVAL_KILL_REASON_STEP_FAILED = 3;
 }
 
 enum EvalRolloutStatus {
@@ -643,6 +741,22 @@ enum FirstPartyPluginMode {
   FIRST_PARTY_PLUGIN_MODE_ALLOWLIST = 2;
 }
 
+enum ForceHostUpgradeOutcome {
+  FORCE_HOST_UPGRADE_OUTCOME_UNSPECIFIED = 0;
+  FORCE_HOST_UPGRADE_OUTCOME_POKED = 1;
+  FORCE_HOST_UPGRADE_OUTCOME_ALREADY_CURRENT = 2;
+  FORCE_HOST_UPGRADE_OUTCOME_NO_BUNDLE = 3;
+  FORCE_HOST_UPGRADE_OUTCOME_NOT_SUPPORTED = 4;
+  FORCE_HOST_UPGRADE_OUTCOME_NO_BOX = 5;
+  FORCE_HOST_UPGRADE_OUTCOME_FAILED = 6;
+}
+
+enum FreeTrialCodePurpose {
+  FREE_TRIAL_CODE_PURPOSE_UNSPECIFIED = 0;
+  FREE_TRIAL_CODE_PURPOSE_FREE_TRIAL = 1;
+  FREE_TRIAL_CODE_PURPOSE_ORG_INVITE = 2;
+}
+
 enum FSSyncErrorType {
   FS_SYNC_ERROR_TYPE_UNSPECIFIED = 0;
   FS_SYNC_ERROR_TYPE_NON_EXISTANT = 1;
@@ -653,6 +767,12 @@ enum FSUploadErrorType {
   FS_UPLOAD_ERROR_TYPE_UNSPECIFIED = 0;
   FS_UPLOAD_ERROR_TYPE_NON_EXISTANT = 1;
   FS_UPLOAD_ERROR_TYPE_HASH_MISMATCH = 2;
+}
+
+enum FullSelfDrivingCloudCommandAction {
+  FULL_SELF_DRIVING_CLOUD_COMMAND_ACTION_UNSPECIFIED = 0;
+  FULL_SELF_DRIVING_CLOUD_COMMAND_ACTION_SPAWNED = 1;
+  FULL_SELF_DRIVING_CLOUD_COMMAND_ACTION_FOLLOWED_UP = 2;
 }
 
 enum FullSelfDrivingMode {
@@ -709,6 +829,14 @@ enum GitPullRequestAction {
   GIT_PULL_REQUEST_ACTION_UNLABELED = 7;
 }
 
+enum GitWorkflowRunConclusion {
+  GIT_WORKFLOW_RUN_CONCLUSION_UNSPECIFIED = 0;
+  GIT_WORKFLOW_RUN_CONCLUSION_ANY = 1;
+  GIT_WORKFLOW_RUN_CONCLUSION_SUCCESS = 2;
+  GIT_WORKFLOW_RUN_CONCLUSION_FAILURE = 3;
+  GIT_WORKFLOW_RUN_CONCLUSION_CANCELLED = 4;
+}
+
 enum GlobalCommandAvailability {
   GLOBAL_COMMAND_AVAILABILITY_UNSPECIFIED = 0;
   GLOBAL_COMMAND_AVAILABILITY_ALL_AGENTS = 1;
@@ -748,6 +876,7 @@ enum InAppAdTrigger {
   IN_APP_AD_TRIGGER_MOUNT = 1;
   IN_APP_AD_TRIGGER_FIND_ISSUES = 2;
   IN_APP_AD_TRIGGER_GIT_PUSH = 3;
+  IN_APP_AD_TRIGGER_COMMIT = 4;
 }
 
 enum IndividualLimitsOptOutOutcome {
@@ -803,6 +932,13 @@ enum LabelFilterMode {
   LABEL_FILTER_MODE_UNSPECIFIED = 0;
   LABEL_FILTER_MODE_AND = 1;
   LABEL_FILTER_MODE_OR = 2;
+}
+
+enum LimitHitStage {
+  LIMIT_HIT_STAGE_UNSPECIFIED = 0;
+  LIMIT_HIT_STAGE_AUTO_SWITCH = 1;
+  LIMIT_HIT_STAGE_SLOW_POOL = 2;
+  LIMIT_HIT_STAGE_HARD_BLOCK = 3;
 }
 
 enum LinearActor {
@@ -875,6 +1011,13 @@ enum LogLevel {
   LOG_LEVEL_WARN = 3;
   LOG_LEVEL_ERROR = 4;
   LOG_LEVEL_FATAL = 5;
+}
+
+enum McpAuthState {
+  MCP_AUTH_STATE_UNSPECIFIED = 0;
+  MCP_AUTH_STATE_UNKNOWN = 1;
+  MCP_AUTH_STATE_AUTHENTICATED = 2;
+  MCP_AUTH_STATE_NEEDS_AUTH = 3;
 }
 
 enum McpOAuthRefreshLockBeginOutcome {
@@ -1121,6 +1264,12 @@ enum PrReviewOpenDestinationMode {
   PR_REVIEW_OPEN_DESTINATION_MODE_REVIEW_CURSOR = 3;
 }
 
+enum PrReviewOpenSurfaceMode {
+  PR_REVIEW_OPEN_SURFACE_MODE_UNSPECIFIED = 0;
+  PR_REVIEW_OPEN_SURFACE_MODE_IN_APP = 1;
+  PR_REVIEW_OPEN_SURFACE_MODE_EXTERNAL_BROWSER = 2;
+}
+
 enum PRStatus {
   PR_STATUS_UNSPECIFIED = 0;
   PR_STATUS_OPEN = 1;
@@ -1168,6 +1317,23 @@ enum RemoteConnectionType {
   REMOTE_CONNECTION_TYPE_DEVCONTAINER = 4;
   REMOTE_CONNECTION_TYPE_DEVCONTAINER_SSH = 5;
   REMOTE_CONNECTION_TYPE_DEVCONTAINER_WSL = 6;
+}
+
+enum RemoteControlRequestRejectionReason {
+  REMOTE_CONTROL_REQUEST_REJECTION_REASON_UNSPECIFIED = 0;
+  REMOTE_CONTROL_REQUEST_REJECTION_REASON_NOT_OWNED = 1;
+  REMOTE_CONTROL_REQUEST_REJECTION_REASON_MACHINE_NOT_FOUND = 2;
+  REMOTE_CONTROL_REQUEST_REJECTION_REASON_REPO_MISMATCH = 3;
+  REMOTE_CONTROL_REQUEST_REJECTION_REASON_AMBIGUOUS = 4;
+  REMOTE_CONTROL_REQUEST_REJECTION_REASON_UNLINKED = 5;
+  REMOTE_CONTROL_REQUEST_REJECTION_REASON_WORKER_OFFLINE = 6;
+}
+
+enum RemoteControlRequestStatus {
+  REMOTE_CONTROL_REQUEST_STATUS_UNSPECIFIED = 0;
+  REMOTE_CONTROL_REQUEST_STATUS_DISPATCHED = 1;
+  REMOTE_CONTROL_REQUEST_STATUS_DESKTOP_UNREACHABLE = 2;
+  REMOTE_CONTROL_REQUEST_STATUS_REJECTED = 3;
 }
 
 enum RerankerAlgorithm {
@@ -1223,6 +1389,13 @@ enum SandboxingMode {
   SANDBOXING_MODE_UNSPECIFIED = 0;
   SANDBOXING_MODE_ENABLED = 1;
   SANDBOXING_MODE_DISABLED = 2;
+}
+
+enum SandBoxRunState {
+  SAND_BOX_RUN_STATE_UNSPECIFIED = 0;
+  SAND_BOX_RUN_STATE_ABSENT = 1;
+  SAND_BOX_RUN_STATE_HIBERNATED = 2;
+  SAND_BOX_RUN_STATE_RUNNING = 3;
 }
 
 enum ScenarioType {
@@ -1335,6 +1508,12 @@ enum SlackConversationType {
   SLACK_CONVERSATION_TYPE_CHANNEL = 1;
   SLACK_CONVERSATION_TYPE_DM = 2;
   SLACK_CONVERSATION_TYPE_GROUP_DM = 3;
+}
+
+enum SlackRoutingRuleTargetType {
+  SLACK_ROUTING_RULE_TARGET_TYPE_UNSPECIFIED = 0;
+  SLACK_ROUTING_RULE_TARGET_TYPE_REPOSITORY = 1;
+  SLACK_ROUTING_RULE_TARGET_TYPE_ENVIRONMENT = 2;
 }
 
 enum SpanKind {
@@ -1463,6 +1642,42 @@ enum UserOrganizationRole {
   USER_ORGANIZATION_ROLE_MEMBER = 2;
 }
 
+enum WaterfallLogLevel {
+  WATERFALL_LOG_LEVEL_UNSPECIFIED = 0;
+  WATERFALL_LOG_LEVEL_DEBUG = 1;
+  WATERFALL_LOG_LEVEL_INFO = 2;
+  WATERFALL_LOG_LEVEL_WARN = 3;
+  WATERFALL_LOG_LEVEL_ERROR = 4;
+}
+
+enum WaterfallPhaseType {
+  WATERFALL_PHASE_TYPE_UNSPECIFIED = 0;
+  WATERFALL_PHASE_TYPE_ENVIRONMENT = 1;
+  WATERFALL_PHASE_TYPE_CREATE_CLOUD_WORKSPACE = 2;
+  WATERFALL_PHASE_TYPE_PROVISION_SANDBOX = 3;
+  WATERFALL_PHASE_TYPE_RESTORE_WORKSPACE_FILES = 4;
+  WATERFALL_PHASE_TYPE_DOCKER_BUILD = 5;
+  WATERFALL_PHASE_TYPE_SETUP_REPOSITORY = 6;
+  WATERFALL_PHASE_TYPE_INSTALL_DEPENDENCIES = 7;
+  WATERFALL_PHASE_TYPE_RUN_WORKSPACE_SETUP = 8;
+  WATERFALL_PHASE_TYPE_START_AGENT_SERVICES = 9;
+  WATERFALL_PHASE_TYPE_INSTALL_EXTENSIONS = 10;
+  WATERFALL_PHASE_TYPE_COMPLETE = 11;
+}
+
+enum WaterfallSpanEndStatus {
+  WATERFALL_SPAN_END_STATUS_UNSPECIFIED = 0;
+  WATERFALL_SPAN_END_STATUS_SUCCESS = 1;
+  WATERFALL_SPAN_END_STATUS_FAILURE = 2;
+}
+
+enum WaterfallSpanStatusType {
+  WATERFALL_SPAN_STATUS_TYPE_UNSPECIFIED = 0;
+  WATERFALL_SPAN_STATUS_TYPE_MESSAGE = 1;
+  WATERFALL_SPAN_STATUS_TYPE_WARN = 2;
+  WATERFALL_SPAN_STATUS_TYPE_ERROR = 3;
+}
+
 message AcceptCursorPredictionEvent {
   CursorPrediction cursor_prediction = 1;
   PointInTimeModel point_in_time_model = 2;
@@ -1490,12 +1705,15 @@ message AcquireRequest {
   int64 timeout_ms = 5;
   string model = 6;
   string conversation_group_id = 7;
+  bool is_stream = 8;
+  string canonical_model = 9;
 }
 
 message AcquireResponse {
   bool granted = 1;
   RateLimitReason reason = 2;
   int32 replay_count = 3;
+  RouteResult route_result = 4;
 }
 
 message Action {
@@ -1604,6 +1822,7 @@ message AddAsyncFollowupBackgroundComposerRequest {
   optional string followup_system_reminder = 14;
   optional agent.v1.RequestedModel requested_model = 15;
   optional string mcp_config_json = 16;
+  repeated string requested_additional_store_ids = 17;
 }
 
 message AddAsyncFollowupBackgroundComposerResponse {
@@ -1686,6 +1905,12 @@ message AddOrganizationGroupMembersRequest {
 
 message AddOrganizationGroupMembersResponse {
   int32 added_count = 1;
+}
+
+message AddOrganizationIdentityProviderDomainJoinRequest {
+  string organization_id = 1;
+  string identity_provider_public_id = 2;
+  string domain = 3;
 }
 
 message AddPullRequestReviewCommentRequest {
@@ -1794,6 +2019,23 @@ message AdHeader {
   optional string banner_url_dark = 3;
 }
 
+message AdminListUserPrivateWorkersRequest {
+  optional string auth_id = 1;
+  optional int32 user_id = 2;
+  optional string email = 3;
+}
+
+message AdminListUserPrivateWorkersResponse {
+  int32 user_id = 1;
+  string auth_id = 2;
+  string email = 3;
+  repeated int32 team_ids = 4;
+  repeated PrivateWorker private_workers = 5;
+  repeated ConnectedMachine connected_machines = 6;
+  bool remote_control_enabled = 7;
+  bool team_remote_control_allowed = 8;
+}
+
 message AdminRemoveRepositoryRequest {
   int32 codebase_id = 1;
 }
@@ -1886,14 +2128,14 @@ message AgentStartupTraceEvent {
 
 message AgentStore {
   string store_id = 1;
-  string bc_id = 2;
-  string agent_name = 3;
   double created_at_ms = 4;
   double updated_at_ms = 5;
-  optional double last_message_activity_at_ms = 6;
-  bool is_owned_by_different_team_member = 7;
   repeated string repo_urls = 8;
   repeated SharedAgentStoreInfo shares = 9;
+  AgentStoreKind kind = 10;
+  optional double last_file_write_at_ms = 11;
+  string source_id = 12;
+  optional string source_display_name = 13;
 }
 
 message AgentStoreEntry {
@@ -2221,14 +2463,16 @@ message AllowedMCPConfiguration {
   repeated AllowedMCPServer allowed_mcp_servers = 2;
   optional bool require_mcp_servers_in_team_network_allowlist = 3;
   optional bool allow_user_override_mcp_servers = 4;
-  optional bool allow_user_override_mcp_tools = 5;
-  optional bool enable_mcp_network_controls = 6;
-  repeated string mcp_network_allowlist = 7;
+  repeated AllowedMCPServer denied_mcp_servers = 10;
 }
 
 message AllowedMCPServer {
   optional string command = 1;
   optional string server_url = 2;
+  optional string name = 3;
+  repeated string network_allowlist = 4;
+  repeated string tool_allowlist = 5;
+  optional string network_mode = 6;
 }
 
 message AnalyticsContext {
@@ -2278,6 +2522,7 @@ message ApiKey {
   int64 created_at = 4;
   optional string service_account_name = 5;
   repeated string scopes = 6;
+  optional int64 expires_at = 7;
 }
 
 message ApplyAgentDiffParams {
@@ -2347,6 +2592,14 @@ message ApplyTeamMarketplaceRequiredPluginsRequest {
 
 message ApplyTeamMarketplaceRequiredPluginsResponse {
   bool success = 1;
+}
+
+message ApprovalResponseCommand {
+  string request_id = 1;
+  string bc_id = 2;
+  string turn_id = 3;
+  string tool_call_id = 4;
+  ApprovalDecision decision = 5;
 }
 
 message ApprovePluginRequest {
@@ -2471,6 +2724,7 @@ message AttachBackgroundComposerLogsResponse {
   message Event {
     string event_id = 1;
     anyrun.v1.PodEvent event = 2;
+    WaterfallUpdate waterfall_update = 3;
   }
 
   AttachBackgroundComposerLogsResponse.Event event = 1;
@@ -2570,6 +2824,7 @@ message Automation {
   optional string deploy_last_apply_error = 14;
   optional string managed_type = 15;
   optional bool hidden = 16;
+  optional string template_id = 17;
 }
 
 message AutomationDeploySource {
@@ -2595,6 +2850,12 @@ message AutomationDeploySpec {
   optional AutomationManagedBy managed_by = 9;
 }
 
+message AutomationMcpAuthState {
+  optional int64 server_id = 1;
+  string server_name = 2;
+  McpAuthState auth_state = 3;
+}
+
 message AutomationRun {
   string background_composer_id = 3;
   string namespaced_workflow_id = 4;
@@ -2612,6 +2873,9 @@ message AutomationRun {
   optional AutomationFilterDecision filter_decision = 16;
   optional string filter_rationale = 17;
   optional string filter_error_message = 18;
+  bool can_retry = 19;
+  optional string retry_ineligible_reason = 20;
+  optional AutomationRunRetryIneligibleReason retry_ineligible_reason_code = 21;
 }
 
 message AutomationRunFailureDetails {
@@ -2622,10 +2886,26 @@ message AutomationRunFailureDetails {
   optional string cta_path = 5;
 }
 
+message AutomationRunLaunchContext {
+  string context_text = 1;
+  string trigger_context_json = 2;
+  string repo_url = 3;
+  string branch = 4;
+  string base_branch = 5;
+  repeated AutomationRunLaunchStartingRef starting_refs = 6;
+}
+
+message AutomationRunLaunchStartingRef {
+  string repo_url = 1;
+  string ref = 2;
+  optional string base_ref = 3;
+}
+
 message AutomationWithOwner {
   Automation workflow = 1;
   int32 user_id = 2;
   string owner_name = 3;
+  repeated AutomationMcpAuthState mcp_auth_states = 4;
 }
 
 message AutopilotActionRequest {
@@ -2716,6 +2996,11 @@ message AutopilotStreamThought {
   string thought = 1;
 }
 
+message AutoReviewInstructions {
+  repeated string allow_instructions = 1;
+  repeated string block_instructions = 2;
+}
+
 message AutoRunControls {
   bool enabled = 1;
   repeated string allowed = 2;
@@ -2726,6 +3011,8 @@ message AutoRunControls {
   repeated string mcp_tool_allowlist = 7;
   AutoRunSandboxingControls sandboxing_controls = 8;
   bool browser_protection = 9;
+  optional bool enable_smart_auto = 10;
+  optional bool enable_allowlist_mode = 11;
 }
 
 message AutoRunSandboxingControls {
@@ -2779,6 +3066,8 @@ message AvailableModelsRequest {
   optional bool for_automations = 9;
   optional AvailableModelsScope scope = 10;
   optional bool use_react_model_picker = 11;
+  optional bool use_cloud_agent_effort_modes = 12;
+  optional string admin_settings_group_public_id = 13;
 }
 
 message AvailableModelsResponse {
@@ -2843,6 +3132,10 @@ message AvailableModelsResponse {
     optional string vendor_name = 41;
     optional AvailableModelsResponse.ModelVendor vendor = 42;
     optional bool default_disabled_in_admin_allowlist = 43;
+    repeated CloudAgentEffortMode cloud_agent_effort_modes = 44;
+    optional bool supports_smart_mode_classifier = 45;
+    optional bool requires_data_retention = 46;
+    optional string reason_for_zdr_consent_block = 47;
   }
 
   message ConfirmationDialogue {
@@ -2988,6 +3281,7 @@ message BackgroundAgentSettings {
   optional bool ci_failure_followup_enabled = 18;
   DataRetentionPolicy data_retention = 19;
   optional bool restrict_team_environment_writes_to_admins = 20;
+  optional bool allow_remote_control = 21;
 }
 
 message BackgroundCmdKEvalRequest {
@@ -3195,6 +3489,7 @@ message BackgroundComposer {
   repeated string repo_urls = 62;
   optional string environment_name = 63;
   optional PrivateWorkspaceIdentifier private_workspace_identifier = 64;
+  optional string private_worker_display_name = 65;
 }
 
 message BackgroundComposerArtifact {
@@ -3393,7 +3688,7 @@ message BatchGetPluginMcpConfigRequest {
 }
 
 message BatchGetPluginMcpConfigResponse {
-  map<string, PluginMcpConfigEntry> configs = 1;
+  map<int64, PluginMcpConfigEntry> configs = 1;
 }
 
 message BatchGetPullRequestsRequest {
@@ -3473,6 +3768,10 @@ message BidiRequestId {
   string request_id = 1;
 }
 
+message BitbucketIntegrationSettings {
+  bool hidden = 1;
+}
+
 message BlockDiffPatch {
   message Change {
     string text = 1;
@@ -3502,6 +3801,12 @@ message BM25Chunk {
 message BootstrapStatsigRequest {
   optional bool ignore_dev_status = 1;
   optional ClientOS operating_system = 2;
+  optional string device_model = 3;
+  optional string os_version = 4;
+  optional string form_factor = 5;
+  optional string stable_id = 6;
+  optional string client_channel = 7;
+  optional string bundle_id = 8;
 }
 
 message BootstrapStatsigResponse {
@@ -4109,6 +4414,12 @@ message CallMcpToolResult {
 }
 
 message CallMcpToolStream {
+}
+
+message CallToAction {
+  oneof call_to_action {
+    OpenUrlCallToAction open_url = 1;
+  }
 }
 
 message CancelAllAutomationRunsRequest {
@@ -4756,11 +5067,13 @@ message ClientVisibleCreditGrant {
   int64 total_cents = 2;
   int64 expires_at_ms = 3;
   string display_name = 4;
+  optional int32 percent_used = 5;
 }
 
 message CliSettings {
   repeated string allowlist = 1;
   AllowlistConfig allowlist_config = 2;
+  bool disable_headless = 3;
 }
 
 message CloudAgentAnyrunPendingDockerBuildVmInfo {
@@ -4785,9 +5098,12 @@ message CloudAgentErrorDetails {
 }
 
 message CloudAgentMemoryDbLogEntry {
+  oneof log {
+    anyrun.v1.PodEvent event = 4;
+    WaterfallUpdate waterfall_update = 5;
+  }
   CloudAgentMemoryDbLogSource source = 2;
   optional uint32 worker_index = 3;
-  anyrun.v1.PodEvent event = 4;
 }
 
 message CloudAgentPluginSnapshot {
@@ -4862,6 +5178,16 @@ message CloudAgentStatePersistedMetadata {
   CloudAgentStatePersistedMetadata.PersistedMetadataVersion version = 5;
 }
 
+message CloudAgentSyntheticsScenarioInput {
+  string name = 1;
+  string prompt = 2;
+  string model = 3;
+  string repo_url = 4;
+  string repo_ref = 5;
+  bool canary = 6;
+  uint32 max_duration_sec = 7;
+}
+
 message CloudAgentTimingEvent {
   double timestamp_ms = 1;
   CloudAgentTimingEventType event = 2;
@@ -4899,6 +5225,8 @@ message CloudAgentWorkflowControlState {
   optional PausedInteractionStep paused_interaction_step = 13;
   repeated QueuedInteractionResponse pending_interaction_responses = 14;
   repeated uint32 completed_interaction_query_ids = 15;
+  repeated PendingIdleFollowup pending_idle_followups = 16;
+  repeated ConversationActionReference skipped_input_action_refs = 17;
 }
 
 message CloudSetupBlocker {
@@ -5370,6 +5698,7 @@ message CompleteMcpOAuthRequest {
 }
 
 message CompleteMcpOAuthResponse {
+  string post_auth_return_url = 1;
 }
 
 message CompletePackfileUploadRequest {
@@ -5698,6 +6027,27 @@ message ConflictedUser {
   bool is_current_group_scim = 6;
 }
 
+message ConnectDesktopSignalRequest {
+  string machine_id = 1;
+  repeated string worker_ids = 2;
+  string machine_display_name = 3;
+  repeated DesktopWorkspaceInfo workspaces = 4;
+}
+
+message ConnectedMachine {
+  string machine_id = 1;
+  string display_name = 2;
+  int64 last_seen_ms = 3;
+  repeated ConnectedMachineWorkspace workspaces = 4;
+}
+
+message ConnectedMachineWorkspace {
+  string workspace_key = 1;
+  string name = 2;
+  string repo_url = 3;
+  string root_path = 4;
+}
+
 message ConnectGithubCallbackRequest {
   enum Source {
     SOURCE_UNSPECIFIED = 0;
@@ -5719,6 +6069,21 @@ message ConnectGithubCallbackResponse {
   string confirmation_code = 3;
   string github_login = 4;
   bool pending_approval = 5;
+  string github_user_node_id = 6;
+  string github_user_database_id = 7;
+  string github_name = 8;
+  string github_avatar_url = 9;
+}
+
+message ConnectGoogleContactImportCallbackRequest {
+  string code = 1;
+  string state = 2;
+}
+
+message ConnectGoogleContactImportCallbackResponse {
+  int64 connection_id = 1;
+  int64 sync_run_id = 2;
+  int32 total_contacts = 3;
 }
 
 message ConnectLinearCallbackRequest {
@@ -6224,6 +6589,11 @@ message ContextWindowStatus {
   optional float percentage_remaining_float = 4;
 }
 
+message ConversationActionReference {
+  optional agent.v1.ConversationAction conversation_action = 1;
+  bytes conversation_action_blob_id = 2;
+}
+
 message ConversationMcp {
   string tool_name = 1;
   optional string mcp_server_name = 2;
@@ -6426,6 +6796,9 @@ message ConversationMessage {
   message SimulatedMessageMetadata {
     optional string title = 1;
     optional string task_id = 2;
+    optional string fsd_finding_action = 3;
+    optional string url = 4;
+    optional agent.v1.SubscriptionSource subscription_source = 5;
   }
 
   message Thinking {
@@ -6448,6 +6821,8 @@ message ConversationMessage {
     repeated ImageProto images = 10;
     optional ClientSideToolV2Call tool_call = 11;
     optional string model_call_id = 12;
+    optional uint64 started_at_ms = 13;
+    optional uint64 completed_at_ms = 14;
   }
 
   string text = 1;
@@ -6647,6 +7022,7 @@ message ConvertOALToNALResponse {
 
 message ConvertPullRequestFromDraftRequest {
   string bc_id = 1;
+  optional string pr_url = 2;
 }
 
 message ConvertPullRequestFromDraftResponse {
@@ -7115,6 +7491,7 @@ message CreateBugbotTeamRuleRequest {
   string content = 2;
   optional bool is_active = 3;
   optional bool is_required = 4;
+  optional int32 team_id = 5;
 }
 
 message CreateBugbotTeamRuleResponse {
@@ -7140,6 +7517,14 @@ message CreateContractExpansionRequest {
 
 message CreateContractExpansionResponse {
   EnterpriseContract contract = 1;
+}
+
+message CreateCrewRequest {
+  string name = 1;
+}
+
+message CreateCrewResponse {
+  Crew crew = 1;
 }
 
 message CreateDeeplinkRequest {
@@ -7268,6 +7653,16 @@ message CreateOrganizationApiKeyResponse {
   string api_key_id = 2;
 }
 
+message CreateOrganizationGroupAnthropicCyberEnrollmentUrlRequest {
+  string organization_id = 1;
+  int64 group_id = 2;
+}
+
+message CreateOrganizationGroupAnthropicCyberEnrollmentUrlResponse {
+  string enrollment_url = 1;
+  string user_profile_id = 2;
+}
+
 message CreateOrganizationGroupRequest {
   string organization_id = 1;
   string name = 2;
@@ -7289,6 +7684,7 @@ message CreateOrganizationTeamRequest {
   string slug = 3;
   int32 owner_user_id = 4;
   optional CreateOrganizationTeamScimMapping scim_mapping = 5;
+  CreateOrganizationTeamIdentityProviderMode identity_provider_mode = 6;
 }
 
 message CreateOrganizationTeamResponse {
@@ -7388,6 +7784,7 @@ message CreatePluginRequest {
   repeated TeamSkill inline_skills = 21;
   repeated TeamSubagent inline_subagents = 22;
   optional int64 marketplace_id = 23;
+  optional int32 team_id = 24;
 }
 
 message CreatePluginResponse {
@@ -7450,6 +7847,7 @@ message CreateRunRequest {
   optional string slack_channel = 11;
   optional string slack_thread_ts = 12;
   optional string slack_user_id = 13;
+  optional string slack_status_message_ts = 14;
 }
 
 message CreateRunResponse {
@@ -7483,6 +7881,8 @@ message CreateSlackRepoRoutingRuleRequest {
   int32 team_id = 1;
   string pattern = 2;
   string repo = 3;
+  SlackRoutingRuleTargetType target_type = 4;
+  optional string environment_public_id = 5;
 }
 
 message CreateSlackRepoRoutingRuleResponse {
@@ -7493,6 +7893,7 @@ message CreateTeamApiKeyRequest {
   int32 team_id = 1;
   string name = 2;
   repeated string scopes = 3;
+  optional int64 expires_at = 4;
 }
 
 message CreateTeamApiKeyResponse {
@@ -7504,6 +7905,7 @@ message CreateTeamCommandRequest {
   string content = 2;
   optional string description = 3;
   optional bool is_active = 4;
+  optional int32 team_id = 5;
 }
 
 message CreateTeamCommandResponse {
@@ -7512,6 +7914,7 @@ message CreateTeamCommandResponse {
 
 message CreateTeamFreeTrialCodeRequest {
   optional TrialType trial_type = 1;
+  optional FreeTrialCodePurpose code_purpose = 2;
 }
 
 message CreateTeamFreeTrialCodeResponse {
@@ -7527,6 +7930,7 @@ message CreateTeamHookRequest {
   optional string hook_type = 6;
   optional string prompt_content = 7;
   optional string prompt_model = 8;
+  optional int32 team_id = 9;
 }
 
 message CreateTeamHookResponse {
@@ -7560,6 +7964,7 @@ message CreateTeamRuleRequest {
   bool is_active = 3;
   bool is_required = 4;
   repeated string globs = 5;
+  optional int32 team_id = 6;
 }
 
 message CreateTeamRuleResponse {
@@ -7579,6 +7984,13 @@ message CreateTeamServiceAccountResponse {
   string api_key = 2;
 }
 
+message CreateTeamsTrialV2ReferralCodeRequest {
+}
+
+message CreateTeamsTrialV2ReferralCodeResponse {
+  string code = 1;
+}
+
 message CreateTeamWithFreeTrialRequest {
   string name = 1;
   optional bool privacy_mode_forced = 2;
@@ -7587,6 +7999,17 @@ message CreateTeamWithFreeTrialRequest {
 
 message CreateTeamWithFreeTrialResponse {
   int32 team_id = 1;
+}
+
+message CreateTeamWithOrgRequest {
+  string name = 1;
+  string invite_code = 2;
+  optional bool privacy_mode_forced = 3;
+}
+
+message CreateTeamWithOrgResponse {
+  int32 team_id = 1;
+  int64 org_id = 2;
 }
 
 message CreateUsageAlertsRequest {
@@ -7630,6 +8053,142 @@ message CreateWorkflowFromTemplateRequest {
 
 message CreateWorkflowFromTemplateResponse {
   Automation workflow = 1;
+}
+
+message Crew {
+  string id = 1;
+  string name = 2;
+  string vision = 3;
+  string goals = 4;
+  string slack_channel = 5;
+  repeated CrewAgent agents = 6;
+  string created_at = 7;
+  string updated_at = 8;
+  string standup_time = 9;
+  string datadog_dashboard_url = 10;
+  string notion_doc_url = 11;
+  string repo_url = 12;
+  string base_branch = 13;
+  string linear_project_url = 14;
+  string steering_note = 15;
+  string steering_note_updated_at = 16;
+}
+
+message CrewActivityRun {
+  string run_uuid = 1;
+  string status = 2;
+  int64 created_at = 3;
+  bool posted_to_slack = 4;
+  string slack_delivery = 5;
+  string slack_error = 6;
+  string background_composer_id = 7;
+  string summary = 8;
+}
+
+message CrewAgent {
+  string id = 1;
+  string name = 3;
+  string automation_id = 7;
+  string archetype = 9;
+  bool drifted = 10;
+  bool paused = 11;
+  string repo_mode = 12;
+  repeated CrewMcpToolStatus mcp_tool_statuses = 14;
+  string persona = 15;
+}
+
+message CrewArchetype {
+  string key = 1;
+  string label = 2;
+  string description = 3;
+  string repo_mode = 4;
+  repeated CrewRecommendedMcp recommended_mcp = 5;
+}
+
+message CrewMcpToolStatus {
+  string key = 1;
+  string label = 2;
+  string state = 3;
+  string server_name = 4;
+}
+
+message CrewMemberActivity {
+  string agent_id = 1;
+  string agent_name = 2;
+  string archetype = 3;
+  string automation_id = 4;
+  bool paused = 5;
+  repeated CrewActivityRun recent_runs = 6;
+  optional int64 next_run_at = 7;
+}
+
+message CrewMemberStats {
+  string agent_id = 1;
+  string agent_name = 2;
+  string automation_id = 3;
+  int32 runs = 4;
+  int32 prs_opened = 5;
+  int32 prs_merged = 6;
+  int32 files_changed = 7;
+  string last_activity_at = 8;
+  int32 runs_posted = 9;
+}
+
+message CrewPullRequest {
+  string pr_url = 1;
+  string title = 2;
+  string agent_id = 3;
+  string agent_name = 4;
+  bool is_draft = 5;
+  string created_at = 6;
+  string background_composer_id = 7;
+}
+
+message CrewRecommendedMcp {
+  string name = 1;
+  string label = 2;
+}
+
+message CrewScheduleStatus {
+  bool ok = 1;
+  string warning = 2;
+}
+
+message CrewSlackChannelStatus {
+  bool ok = 1;
+  bool bot_in_channel = 2;
+  string warning = 3;
+}
+
+message CrewStandupDigestEntry {
+  string agent_id = 1;
+  string agent_name = 2;
+  string archetype = 3;
+  string persona = 4;
+  string text = 5;
+  int64 posted_at = 6;
+}
+
+message CrewStandupTriggerResult {
+  string agent_id = 1;
+  string agent_name = 2;
+  bool success = 3;
+  string background_composer_id = 4;
+  string error = 5;
+}
+
+message CrewWriteBackRequest {
+  string token = 1;
+  string action = 2;
+  string kind = 3;
+  string url = 4;
+  string text = 5;
+}
+
+message CrewWriteBackResponse {
+  bool ok = 1;
+  bool updated = 2;
+  string reason = 3;
 }
 
 message CronSamplePayload {
@@ -7869,6 +8428,43 @@ message DataframeInfo {
   string index_column = 8;
 }
 
+message DataOpsJobRecord {
+  string id = 1;
+  DataOpsJobDbStatus status = 2;
+  string training_set = 3;
+  string dataset_name = 4;
+  string input_s3_uri = 5;
+  optional google.protobuf.Struct params_snapshot = 6;
+  string everysphere_branch = 7;
+  optional string everysphere_commit = 8;
+  optional string buildkite_build_id = 9;
+  optional int32 buildkite_build_number = 10;
+  optional string buildkite_build_url = 11;
+  optional string finalized_train_s3_uri = 12;
+  optional string finalized_eval_s3_uri = 13;
+  optional string manifest_s3_uri = 14;
+  optional string stats_s3_uri = 15;
+  optional string config_block_s3_uri = 16;
+  optional string error_message = 17;
+  optional string created_by = 18;
+  google.protobuf.Timestamp created_at = 19;
+  optional google.protobuf.Timestamp started_at = 20;
+  optional google.protobuf.Timestamp finished_at = 21;
+  repeated string tags = 22;
+  optional string folder = 23;
+  repeated DataOpsJobStepRecord steps = 24;
+}
+
+message DataOpsJobStepRecord {
+  string id = 1;
+  DataOpsPhase phase = 2;
+  DataOpsStepDbStatus status = 3;
+  optional string ray_job_name = 4;
+  optional string ray_job_namespace = 5;
+  optional google.protobuf.Timestamp started_at = 6;
+  optional google.protobuf.Timestamp finished_at = 7;
+}
+
 message DataRetentionPolicy {
   message Indefinite {
   }
@@ -7960,6 +8556,23 @@ message DeleteAccountRequest {
 message DeleteAccountResponse {
 }
 
+message DeleteAutomationMemoryRequest {
+  oneof expected {
+    string expected_version = 3;
+    bool expect_missing = 4;
+  }
+  string automation_id = 1;
+  string file = 2;
+}
+
+message DeleteAutomationMemoryResponse {
+  string file = 1;
+  bool conflict = 2;
+  string content = 3;
+  optional string version = 4;
+  repeated string files = 5;
+}
+
 message DeleteAutomationRequest {
   string automation_id = 2;
 }
@@ -8003,9 +8616,18 @@ message DeleteBugbotManualRepositoryRuleResponse {
 
 message DeleteBugbotTeamRuleRequest {
   string rule_id = 1;
+  optional int32 team_id = 2;
 }
 
 message DeleteBugbotTeamRuleResponse {
+}
+
+message DeleteCrewRequest {
+  string crew_id = 1;
+}
+
+message DeleteCrewResponse {
+  repeated Crew crews = 1;
 }
 
 message DeleteEvalCronJobByNameRequest {
@@ -8065,6 +8687,14 @@ message DeleteJiraRoutingRuleRequest {
 }
 
 message DeleteJiraRoutingRuleResponse {
+}
+
+message DeleteLiveActivityRequest {
+  string device_id = 1;
+  PushPlatform platform = 2;
+}
+
+message DeleteLiveActivityResponse {
 }
 
 message DeleteManualEnterpriseContractRequest {
@@ -8180,6 +8810,7 @@ message DeleteSlackRepoRoutingRuleResponse {
 
 message DeleteTeamCommandRequest {
   string command_id = 1;
+  optional int32 team_id = 2;
 }
 
 message DeleteTeamCommandResponse {
@@ -8195,6 +8826,7 @@ message DeleteTeamEnvironmentResponse {
 
 message DeleteTeamHookRequest {
   string hook_id = 1;
+  optional int32 team_id = 2;
 }
 
 message DeleteTeamHookResponse {
@@ -8210,6 +8842,7 @@ message DeleteTeamRepoResponse {
 
 message DeleteTeamRuleRequest {
   string rule_id = 1;
+  optional int32 team_id = 2;
 }
 
 message DeleteTeamRuleResponse {
@@ -8252,6 +8885,18 @@ message DeploymentDemand {
   string deployment = 2;
   repeated WorkloadDemand workloads = 3;
   string model = 4;
+  string canonical_model = 5;
+}
+
+message DeploymentInfo {
+  string endpoint = 1;
+  string url_path = 2;
+  string protocol = 3;
+  string api_key_env_var = 4;
+  string api_model_name = 5;
+  string auth_header = 6;
+  string auth_prefix = 7;
+  bool safe_tokenization = 8;
 }
 
 message DeprecatePluginRequest {
@@ -8262,6 +8907,49 @@ message DeprecatePluginRequest {
 
 message DeprecatePluginResponse {
   Plugin plugin = 1;
+}
+
+message DesktopSignalClientMessage {
+  oneof message {
+    ConnectDesktopSignalRequest register = 1;
+    DesktopSignalResponse ack = 2;
+    DesktopSignalKeepalive keepalive = 3;
+  }
+}
+
+message DesktopSignalCommand {
+  oneof command {
+    DesktopSignalHeartbeat heartbeat = 1;
+    MigrateLocalAgentCommand migrate_local_agent = 2;
+    StartLocalAgentCommand start_local_agent = 3;
+    FollowupLocalAgentCommand follow_up_local_agent = 4;
+    InterruptLocalAgentCommand interrupt_local_agent = 5;
+    ApprovalResponseCommand approval_response = 7;
+  }
+}
+
+message DesktopSignalHeartbeat {
+}
+
+message DesktopSignalKeepalive {
+}
+
+message DesktopSignalResponse {
+  oneof result {
+    StartLocalAgentResult start = 5;
+    MigrateLocalAgentResult migrate = 6;
+  }
+  string request_id = 1;
+  DesktopSignalCommandResult status = 2;
+  string message = 3;
+  DesktopSignalFailureReason failure_reason = 4;
+}
+
+message DesktopWorkspaceInfo {
+  string workspace_key = 1;
+  string name = 2;
+  string repo_url = 3;
+  string root_path = 4;
 }
 
 message DetachGroupFromDirectoryRequest {
@@ -8397,6 +9085,7 @@ message DirectoryGroup {
   AutoRunControls auto_run_controls = 5;
   string external_id = 6;
   int32 per_user_monthly_limit_dollars = 7;
+  AllowedMCPConfiguration allowed_mcp_configuration = 8;
 }
 
 message DisableAutomationForTeamShutdownRequest {
@@ -8415,6 +9104,13 @@ message DisablePullRequestAutoMergeResponse {
   bool success = 1;
   string error = 2;
   optional string pr_node_id = 3;
+}
+
+message DisconnectBitbucketForgeRequest {
+  int32 team_id = 1;
+}
+
+message DisconnectBitbucketForgeResponse {
 }
 
 message DisconnectContactImportConnectionRequest {
@@ -8664,6 +9360,22 @@ message DownloadUpdateResponse {
   bool can_download = 1;
 }
 
+message DraftCrewBriefMember {
+  string name = 1;
+  string archetype = 2;
+}
+
+message DraftCrewBriefRequest {
+  string goal = 1;
+}
+
+message DraftCrewBriefResponse {
+  string name = 1;
+  string vision = 2;
+  string goals = 3;
+  repeated DraftCrewBriefMember members = 4;
+}
+
 message Edit {
   string text = 1;
   IRange range = 2;
@@ -8906,6 +9618,7 @@ message EmbeddingResponse {
 }
 
 message EnableOnDemandSpendRequest {
+  optional int32 team_id = 1;
 }
 
 message EnableOnDemandSpendResponse {
@@ -8950,6 +9663,27 @@ message EnsureIndexCreatedRequest {
 }
 
 message EnsureIndexCreatedResponse {
+}
+
+message EnsureSandBoxRequest {
+}
+
+message EnsureSandBoxResponse {
+  string cluster = 1;
+  string tenant_id = 2;
+  string pod_id = 3;
+  string network_token = 4;
+  string exec_daemon_auth_token = 5;
+  string exec_daemon_url = 6;
+  string vnc_url = 7;
+  string terminals_folder = 8;
+  optional bool image_update_available = 9;
+  string gateway_url = 10;
+  string gateway_token = 11;
+}
+
+message EnsureSandBoxWindowRequest {
+  int32 window_index = 2;
 }
 
 message EnterpriseContract {
@@ -9779,6 +10513,24 @@ message FolderSizeLimit {
   int32 max_num_files = 2;
 }
 
+message FollowupLocalAgentCommand {
+  string request_id = 1;
+  string bc_id = 2;
+  agent.v1.ConversationAction message = 4;
+  agent.v1.RequestedModel requested_model = 5;
+  string mode = 6;
+  string message_id = 7;
+}
+
+message ForceHostUpgradeRequest {
+}
+
+message ForceHostUpgradeResponse {
+  ForceHostUpgradeOutcome outcome = 1;
+  string current_version = 2;
+  string target_version = 3;
+}
+
 message FSConfigRequest {
 }
 
@@ -9880,6 +10632,23 @@ message FullFileSearchResult {
   repeated FileResult results = 1;
 }
 
+message FullSelfDrivingActiveAgent {
+  string pr_url = 1;
+  string repo_url = 2;
+  int32 pull_number = 3;
+  string bc_id = 4;
+  bool enabled = 5;
+  FullSelfDrivingMode mode = 6;
+  int32 owner_user_id = 7;
+  optional string owner_display_name = 8;
+  optional string owner_email = 9;
+  optional string mergeable_state = 10;
+  optional bool is_mergeable = 11;
+  optional int32 visible_findings_count = 12;
+  optional FullSelfDrivingStatusUpdate latest_status_update = 13;
+  optional string pr_title = 14;
+}
+
 message FullSelfDrivingFinding {
   string event_id = 1;
   google.protobuf.Timestamp last_updated_at = 2;
@@ -9927,6 +10696,21 @@ message FullSelfDrivingRun {
   int32 files_changed = 7;
   string source = 8;
   string active_run_id = 9;
+  optional FullSelfDrivingRunLiveStatus latest_status_update = 10;
+}
+
+message FullSelfDrivingRunLiveStatus {
+  string state = 1;
+  string status = 2;
+  repeated string loading_messages = 3;
+  google.protobuf.Timestamp updated_at = 4;
+}
+
+message FullSelfDrivingStatusUpdate {
+  string state = 1;
+  string status = 2;
+  repeated string loading_messages = 3;
+  google.protobuf.Timestamp updated_at = 4;
 }
 
 message FullSelfDrivingTeamRepoSetting {
@@ -9943,6 +10727,7 @@ message FullSelfDrivingTeamSettings {
   FullSelfDrivingMode default_mode = 2;
   bool only_cloud_agent_prs = 3;
   bool globally_disabled = 4;
+  bool auto_create_on_first_pr_push = 5;
 }
 
 message GenerateTldrRequest {
@@ -9954,6 +10739,12 @@ message GenerateTldrResponse {
   string all = 2;
 }
 
+message GenericLogSpanUpdate {
+  google.protobuf.Timestamp timestamp = 1;
+  string message = 2;
+  WaterfallLogLevel level = 3;
+}
+
 message GetActivationCheckoutUrlRequest {
   int32 team_id = 1;
   int32 seats = 2;
@@ -9962,6 +10753,7 @@ message GetActivationCheckoutUrlRequest {
   optional string code = 5;
   optional string radar_session_id = 6;
   optional bool include_bugbot = 7;
+  optional TeamMemberBillingTier billing_tier = 8;
 }
 
 message GetActivationCheckoutUrlResponse {
@@ -9980,6 +10772,8 @@ message GetActiveOffboardingBannerResponse {
 message GetAdminNotificationStatusRequest {
   int32 team_id = 1;
   AdminNotificationRequestType request_type = 2;
+  repeated NotifyTeamAdminsRepo repos = 3;
+  optional string ghe_application = 4;
 }
 
 message GetAdminNotificationStatusResponse {
@@ -10061,6 +10855,17 @@ message GetAllSimulationsRequest {
 
 message GetAllSimulationsResponse {
   repeated SimulationWithUser simulations = 1;
+}
+
+message GetApprovalAgentAnalyticsRequest {
+  optional string automation_id = 1;
+  optional int32 team_id = 2;
+}
+
+message GetApprovalAgentAnalyticsResponse {
+  uint32 approved_pr_count = 1;
+  uint32 reviewed_pr_count = 2;
+  uint32 automation_count = 3;
 }
 
 message GetAtSymbolSuggestionsRequest {
@@ -10148,6 +10953,7 @@ message GetAvailableMcpServersResponse {
     optional bool user_has_access_token = 11;
     bool is_required = 12;
     bool managed_by_team_plugin_policy = 13;
+    bool disabled_by_team_admin_policy = 14;
   }
 
   repeated GetAvailableMcpServersResponse.McpServerInfo servers = 1;
@@ -10329,6 +11135,8 @@ message GetBackgroundComposerUserSettingsResponse {
   optional bool allow_private_workers = 12;
   optional string default_environment_public_id = 13;
   repeated BackgroundComposerDefaultEnvironmentSetting default_environment_settings = 14;
+  optional bool remote_control_enabled = 15;
+  optional PrReviewOpenSurfaceMode pr_review_open_surface = 16;
 }
 
 message GetBackgroundComposerVmUsageRequest {
@@ -10352,6 +11160,16 @@ message GetBedrockModelsRequest {
 message GetBedrockModelsResponse {
   repeated string models = 1;
   optional string error = 2;
+}
+
+message GetBitbucketForgeStatusRequest {
+  int32 team_id = 1;
+}
+
+message GetBitbucketForgeStatusResponse {
+  string status = 1;
+  optional string workspace_name = 2;
+  optional string base_url = 3;
 }
 
 message GetBlobForAgentKVRequest {
@@ -10430,12 +11248,48 @@ message GetBugbotManualRepositoryRulesResponse {
   repeated BugbotManualRepositoryRule rules = 1;
 }
 
+message GetBugbotMergedPrScanSummaryRequest {
+  int32 team_id = 1;
+}
+
+message GetBugbotMergedPrScanSummaryResponse {
+  message Finding {
+    string description = 1;
+    string severity = 2;
+    string category = 3;
+    string repo_owner = 4;
+    string repo_name = 5;
+    int32 pr_number = 6;
+    string pr_url = 7;
+    string file = 8;
+    int32 start_line = 9;
+    int32 end_line = 10;
+    repeated string code_lines = 11;
+    string installation_id = 12;
+    string repo_node_id = 13;
+    int64 pr_merged_at_epoch_millis = 14;
+    string pr_title = 15;
+    string diff_hunk = 16;
+  }
+
+  bool has_scan = 1;
+  int64 scanned_at_epoch_millis = 2;
+  int32 window_days = 3;
+  int32 prs_sampled = 4;
+  int32 prs_with_findings = 5;
+  int32 bugs_found = 6;
+  repeated GetBugbotMergedPrScanSummaryResponse.Finding findings = 7;
+  int32 total_merged_prs = 8;
+}
+
 message GetBugbotModeRequest {
 }
 
 message GetBugbotModeResponse {
   BugbotMode mode = 1;
   repeated BugbotModePrompt prompts = 2;
+  bool smart_frontier_enabled = 3;
+  bool frontier_available = 4;
 }
 
 message GetBugBotPRAnalyticsRequest {
@@ -10451,6 +11305,16 @@ message GetBugBotPRAnalyticsRequest {
 message GetBugBotPRAnalyticsResponse {
   repeated BugBotPRAnalytics prs = 2;
   repeated PRUserOption user_options = 3;
+}
+
+message GetBugBotProUserModeRequest {
+}
+
+message GetBugBotProUserModeResponse {
+  BugbotMode mode = 1;
+  repeated BugbotModePrompt prompts = 2;
+  bool smart_frontier_enabled = 3;
+  bool frontier_available = 4;
 }
 
 message GetBugBotProUserSettingsRequest {
@@ -10470,6 +11334,7 @@ message GetBugBotProUserSettingsResponse {
 message GetBugbotRuleAnalyticsRequest {
   optional string date_range_start = 1;
   optional string date_range_end = 2;
+  optional int32 team_id = 3;
 }
 
 message GetBugbotRuleAnalyticsResponse {
@@ -10478,6 +11343,7 @@ message GetBugbotRuleAnalyticsResponse {
 
 message GetBugbotRuleByIdRequest {
   string rule_id = 1;
+  optional int32 team_id = 2;
 }
 
 message GetBugbotRuleByIdResponse {
@@ -10507,8 +11373,28 @@ message GetBugbotSettingsResponse {
   repeated string pr_urls = 3;
 }
 
+message GetBugbotSuggestedReposRequest {
+  optional string ghe_application = 1;
+  optional int32 limit = 2;
+}
+
+message GetBugbotSuggestedReposResponse {
+  message SuggestedRepo {
+    int64 installation_id = 1;
+    string repo_node_id = 2;
+    string owner = 3;
+    string name = 4;
+    string html_url = 5;
+    int32 pr_count_last_week = 6;
+  }
+
+  repeated GetBugbotSuggestedReposResponse.SuggestedRepo repos = 1;
+  bool can_enable = 2;
+}
+
 message GetBugbotTeamRulesRequest {
   optional bool active_only = 1;
+  optional int32 team_id = 2;
 }
 
 message GetBugbotTeamRulesResponse {
@@ -10516,6 +11402,7 @@ message GetBugbotTeamRulesResponse {
 }
 
 message GetBugbotUserSettingsRequest {
+  optional int32 team_id = 1;
 }
 
 message GetBugbotUserSettingsResponse {
@@ -10532,6 +11419,8 @@ message GetBugbotUserSettingsResponse {
   optional bool installation_default_is_pr_summary_enabled = 11;
   BugbotAutofixMode installation_default_bugbot_autofix_mode = 12;
   repeated string installation_default_bugbot_autofix_severity_filter = 13;
+  optional bool is_incremental_review_enabled = 14;
+  optional bool team_default_is_incremental_review_enabled = 15;
 }
 
 message GetChatPromptResponse {
@@ -10648,6 +11537,7 @@ message GetCloudAgentMemoryDbLogsResponse {
 
 message GetCloudAgentPluginsSnapshotRequest {
   optional bool use_replica = 1;
+  optional int32 team_id = 2;
 }
 
 message GetCloudAgentPluginsSnapshotResponse {
@@ -10703,6 +11593,7 @@ message GetCommitMetricsByFilePathRequest {
   optional bool include_skills = 10;
   optional bool include_mcps = 11;
   optional ConversationSummarizationPromptOptions summarization_prompt_options = 12;
+  optional int32 team_id = 13;
 }
 
 message GetCommitMetricsRequest {
@@ -10713,6 +11604,7 @@ message GetCommitMetricsRequest {
   optional bool include_skills = 6;
   optional bool include_mcps = 7;
   optional ConversationSummarizationPromptOptions summarization_prompt_options = 12;
+  optional int32 team_id = 13;
 }
 
 message GetCommitMetricsResponse {
@@ -10804,6 +11696,16 @@ message GetComposerChatRequest {
   optional bytes context_bank_encryption_key = 31;
 }
 
+message GetContactImportAvatarRequest {
+  int64 contact_id = 1;
+}
+
+message GetContactImportAvatarResponse {
+  bytes bytes = 1;
+  string content_type = 2;
+  string etag = 3;
+}
+
 message GetCopyStatusRequest {
   string codebase_id = 1;
   string copy_task_handle = 2;
@@ -10866,6 +11768,50 @@ message GetCreditGrantsBalanceResponse {
   int64 credit_balance_cents = 2;
   int64 total_cents = 3;
   int64 used_cents = 4;
+}
+
+message GetCrewActivityRequest {
+  string crew_id = 1;
+}
+
+message GetCrewActivityResponse {
+  repeated CrewMemberActivity members = 1;
+}
+
+message GetCrewRequest {
+  string crew_id = 1;
+}
+
+message GetCrewResponse {
+  Crew crew = 1;
+  optional CrewSlackChannelStatus slack_channel_status = 2;
+  optional CrewScheduleStatus schedule_status = 3;
+}
+
+message GetCrewStandupDigestRequest {
+  string crew_id = 1;
+}
+
+message GetCrewStandupDigestResponse {
+  bool available = 1;
+  int64 posted_at = 2;
+  string thread_url = 3;
+  repeated CrewStandupDigestEntry entries = 4;
+}
+
+message GetCrewStatsRequest {
+  string crew_id = 1;
+}
+
+message GetCrewStatsResponse {
+  int32 runs = 1;
+  int32 prs_opened = 2;
+  int32 prs_merged = 3;
+  int32 files_changed = 4;
+  string last_activity_at = 5;
+  repeated CrewMemberStats members = 6;
+  int32 runs_posted = 7;
+  repeated CrewPullRequest open_prs = 8;
 }
 
 message GetCurrentBillingCycleRequest {
@@ -11002,6 +11948,14 @@ message GetDailySpendByCategoryResponse {
   optional int32 effective_limit_cents = 3;
 }
 
+message GetDataOpsJobRequest {
+  string job_id = 1;
+}
+
+message GetDataOpsJobResponse {
+  DataOpsJobRecord job = 1;
+}
+
 message GetDebuggingDataUploadUrlRequest {
 }
 
@@ -11097,6 +12051,9 @@ message GetDiffRequest {
   int32 submodule_recurse_depth = 9;
   bool include_space_changes = 10;
   bool committed_only = 11;
+  bool compute_patch_id = 12;
+  optional bool return_head_sha = 13;
+  optional int32 max_response_bytes = 14;
 }
 
 message GetDiffResponse {
@@ -11108,6 +12065,9 @@ message GetDiffResponse {
 
   GitDiff diff = 1;
   repeated GetDiffResponse.SubmoduleDiff submodule_diffs = 2;
+  optional string patch_id = 3;
+  optional string head_sha = 4;
+  optional bool has_uncommitted_changes = 5;
 }
 
 message GetDiffReviewRequest {
@@ -11163,6 +12123,13 @@ message GetEditorBugbotAutoRunStatusResponse {
   bool should_auto_run = 1;
 }
 
+message GetEffectiveMcpConfigForUserRequest {
+}
+
+message GetEffectiveMcpConfigForUserResponse {
+  string config_json = 1;
+}
+
 message GetEffectiveTokenLimitRequest {
   ModelDetails model_details = 1;
 }
@@ -11173,6 +12140,7 @@ message GetEffectiveTokenLimitResponse {
 
 message GetEffectiveUserPluginsRequest {
   optional bool use_replica = 1;
+  optional int32 team_id = 2;
 }
 
 message GetEffectiveUserPluginsResponse {
@@ -11195,6 +12163,7 @@ message GetEmailResponse {
   string email = 1;
   GetEmailResponse.SignUpType sign_up_type = 2;
   optional string job_role = 3;
+  optional bool is_recently_created_user = 4;
 }
 
 message GetEmbeddingsRequest {
@@ -11280,6 +12249,15 @@ message GetEnvironmentJsonCandidatesResponse {
   optional string repo_environment_json = 1;
   optional string personal_environment_json = 2;
   optional string team_environment_json = 3;
+}
+
+message GetEnvironmentRequest {
+  string public_id = 1;
+  optional bool include_environment_json = 2;
+}
+
+message GetEnvironmentResponse {
+  optional LogicalEnvironment environment = 1;
 }
 
 message GetEvalByNameRequest {
@@ -11443,6 +12421,10 @@ message GetFullSelfDrivingUserSettingsResponse {
   FullSelfDrivingMode default_mode = 1;
   bool only_cloud_agent_prs = 2;
   bool globally_disabled = 3;
+  bool auto_create_on_first_pr_push = 4;
+  bool slack_notifications_enabled = 5;
+  optional string fsd_slack_channel_id = 6;
+  optional string default_model = 7;
 }
 
 message GetGitGraphRelatedFilesRequest {
@@ -11546,6 +12528,14 @@ message GetGlobalLeaderboardOptInRequest {
 
 message GetGlobalLeaderboardOptInResponse {
   optional bool opted_in = 1;
+}
+
+message GetGoogleContactImportAuthUrlRequest {
+}
+
+message GetGoogleContactImportAuthUrlResponse {
+  string auth_url = 1;
+  string csrf_token = 2;
 }
 
 message GetGroupMembersRequest {
@@ -11691,6 +12681,16 @@ message GetLastDefaultModelNudgeRequest {
 
 message GetLastDefaultModelNudgeResponse {
   string nudge_date = 1;
+}
+
+message GetLastRolloutRequestIdRequest {
+  string run_id = 1;
+  int32 iteration_no = 2;
+  string data_point_id = 3;
+}
+
+message GetLastRolloutRequestIdResponse {
+  optional string rollout_request_id = 1;
 }
 
 message GetLatestAgentConversationStateRequest {
@@ -11962,6 +12962,7 @@ message GetMemberRemovalInsightsResponse {
 
 message GetMeRequest {
   optional int32 team_id = 1;
+  optional string source_site_hostname = 2;
 }
 
 message GetMeResponse {
@@ -11979,6 +12980,9 @@ message GetMeResponse {
   optional string country = 12;
   optional string profile_picture_url = 13;
   optional bool cursor_review_onboarding_use_cursor_github_app = 14;
+  optional int64 organization_id = 15;
+  optional string organization_public_id = 16;
+  optional bool is_team_admin = 17;
 }
 
 message GetMicrosoftTeamsLinkContextRequest {
@@ -12044,6 +13048,22 @@ message GetMonthlyInvoiceResponse {
   int64 period_end_ms = 8;
 }
 
+message GetNoZdrModelConsentStatusRequest {
+  enum Scope {
+    SCOPE_UNSPECIFIED = 0;
+    SCOPE_TEAM = 1;
+    SCOPE_TEAM_MEMBER = 2;
+    SCOPE_USER = 3;
+  }
+
+  GetNoZdrModelConsentStatusRequest.Scope scope = 1;
+  int32 team_id = 2;
+}
+
+message GetNoZdrModelConsentStatusResponse {
+  repeated NoZdrModelConsentStatusEntry consents = 1;
+}
+
 message GetNumFilesToSendRequest {
   RepositoryInfo repository = 1;
 }
@@ -12094,6 +13114,8 @@ message GetOrganizationGroupMembersRequest {
   optional int32 page = 4;
   optional int32 page_size = 5;
   optional string search_term = 6;
+  optional string sort_by = 7;
+  optional string sort_direction = 8;
 }
 
 message GetOrganizationGroupMembersResponse {
@@ -12133,6 +13155,16 @@ message GetOrganizationGroupsResponse {
   int32 total_pages = 3;
 }
 
+message GetOrganizationMemberRequest {
+  string organization_id = 1;
+  string member_public_id = 2;
+}
+
+message GetOrganizationMemberResponse {
+  OrganizationMember member = 1;
+  repeated OrganizationMemberGroup groups = 2;
+}
+
 message GetOrganizationMembersRequest {
   string organization_id = 1;
   optional int32 page = 2;
@@ -12140,6 +13172,7 @@ message GetOrganizationMembersRequest {
   optional string search_term = 4;
   optional string sort_by = 5;
   optional string sort_direction = 6;
+  optional UserOrganizationRole role_filter = 7;
 }
 
 message GetOrganizationMembersResponse {
@@ -12295,10 +13328,17 @@ message GetPlanInfoResponse {
   }
 
   message PlanInfo {
+    enum PlanOwner {
+      PLAN_OWNER_UNSPECIFIED = 0;
+      PLAN_OWNER_STRIPE = 1;
+      PLAN_OWNER_APPLE = 2;
+    }
+
     string plan_name = 1;
     int32 included_amount_cents = 2;
     optional string price = 3;
     optional int64 billing_cycle_end = 4;
+    GetPlanInfoResponse.PlanInfo.PlanOwner plan_owner = 5;
   }
 
   optional GetPlanInfoResponse.PlanInfo plan_info = 1;
@@ -12692,6 +13732,14 @@ message GetRlEvalJobResponse {
   RlEvalJobRecord job = 1;
 }
 
+message GetRlEvalStepKillSignalsRequest {
+  string job_id = 1;
+}
+
+message GetRlEvalStepKillSignalsResponse {
+  repeated int32 steps = 1;
+}
+
 message GetRunKillStatusRequest {
   string run_id = 1;
 }
@@ -12719,6 +13767,13 @@ message GetRunSummaryRequest {
 message GetRunSummaryResponse {
   repeated RunSummaryWindow windows = 1;
   repeated HistogramBucket histogram = 2;
+}
+
+message GetSandBoxRunStateRequest {
+}
+
+message GetSandBoxRunStateResponse {
+  SandBoxRunState state = 1;
 }
 
 message GetScimConfigurationLinksRequest {
@@ -13111,6 +14166,10 @@ message GetTeamAdminSettingsResponse {
   repeated string remote_permissions_file_paths = 46;
   optional bool permissions_file_overrides_auto_run = 47;
   optional ExtensionInstallCooldownSettings extension_install_cooldown_settings = 48;
+  AutoReviewInstructions auto_review = 49;
+  optional PublicProfileSettings public_profile_settings = 50;
+  optional BitbucketIntegrationSettings bitbucket_integration_settings = 51;
+  optional bool marketplace_leaderboard_disabled = 52;
 }
 
 message GetTeamAnalyticsRequest {
@@ -13155,10 +14214,13 @@ message GetTeamBugbotSettingsResponse {
   bool can_migrate_to_usage_based = 14;
   int32 seat_license_count = 15;
   bool bugbot_migration_credit_already_granted = 16;
+  bool is_incremental_review_enabled = 17;
+  bool merged_pr_scan_opted_out = 18;
 }
 
 message GetTeamCommandsRequest {
   optional bool active_only = 1;
+  optional int32 team_id = 2;
 }
 
 message GetTeamCommandsResponse {
@@ -13205,6 +14267,7 @@ message GetTeamHasValidPaymentMethodResponse {
 
 message GetTeamHooksRequest {
   optional bool active_only = 1;
+  optional int32 team_id = 2;
 }
 
 message GetTeamHooksResponse {
@@ -13230,12 +14293,33 @@ message GetTeamInviteLinkResponse {
   optional string invite_link = 1;
 }
 
+message GetTeamInviteMetadataRequest {
+  string invite_code = 1;
+}
+
+message GetTeamInviteMetadataResponse {
+  int32 team_id = 1;
+  string team_name = 2;
+  string inviter_name = 3;
+  string inviter_email = 4;
+  bool invitee_email_matches_authenticated_user = 5;
+}
+
 message GetTeamMemberDomainsRequest {
   int32 team_id = 1;
 }
 
 message GetTeamMemberDomainsResponse {
   repeated TeamMemberDomain domains = 1;
+}
+
+message GetTeamMemberProfileByHandleRequest {
+  string handle = 1;
+}
+
+message GetTeamMemberProfileByHandleResponse {
+  UserProfile profile = 1;
+  PublicProfileActivitySummary activity_summary = 2;
 }
 
 message GetTeamMembersRequest {
@@ -13290,6 +14374,14 @@ message GetTeamPrivacyModeForcedResponse {
   bool privacy_mode_migration_opted_out = 3;
 }
 
+message GetTeamPublicProfileSettingsRequest {
+  int32 team_id = 1;
+}
+
+message GetTeamPublicProfileSettingsResponse {
+  PublicProfileSettings settings = 1;
+}
+
 message GetTeamRawDataRequest {
   int32 team_id = 1;
   optional int64 start_date = 2;
@@ -13333,6 +14425,7 @@ message GetTeamReposResponse {
 
 message GetTeamRulesRequest {
   optional bool active_only = 1;
+  optional int32 team_id = 2;
 }
 
 message GetTeamRulesResponse {
@@ -13415,6 +14508,7 @@ message GetTeamSpendResponse {
 }
 
 message GetTeamsRequest {
+  optional bool active_only = 1;
 }
 
 message GetTeamsResponse {
@@ -13437,15 +14531,6 @@ message GetTeamUsageForDateRangeRequest {
 
 message GetTeamUsageForDateRangeResponse {
   int64 total_cents = 1;
-}
-
-message GetTeamUsageRequest {
-  int32 team_id = 1;
-}
-
-message GetTeamUsageResponse {
-  repeated TeamMemberUsage team_member_usage = 1;
-  bool analytics_degraded_warning = 2;
 }
 
 message GetTerminalCompletionRequest {
@@ -13538,6 +14623,18 @@ message GetUsageLimitPolicyStatusResponse {
   repeated string allowed_model_ids = 9;
   repeated string allowed_model_tags = 10;
   optional ErrorButton primary_button = 11;
+  LimitHitStage stage = 12;
+  optional string tray_label = 13;
+  optional string tray_description = 14;
+  optional string cta_label = 15;
+  optional bool dismissible = 16;
+  optional int64 reset_at_ms = 17;
+  optional int32 reset_days_remaining = 18;
+  optional bool can_adjust_on_demand = 19;
+  optional int64 recommended_on_demand_limit_cents = 20;
+  optional int64 on_demand_min_cents = 21;
+  optional int64 on_demand_max_cents = 22;
+  optional int64 current_on_demand_limit_cents = 23;
 }
 
 message GetUsageLimitStatusAndActiveGrantsRequest {
@@ -13556,6 +14653,18 @@ message GetUsageLimitStatusAndActiveGrantsResponse {
     repeated string allowed_model_ids = 9;
     repeated string allowed_model_tags = 10;
     optional ErrorButton primary_button = 11;
+    LimitHitStage stage = 12;
+    optional string tray_label = 13;
+    optional string tray_description = 14;
+    optional string cta_label = 15;
+    optional bool dismissible = 16;
+    optional int64 reset_at_ms = 17;
+    optional int32 reset_days_remaining = 18;
+    optional bool can_adjust_on_demand = 19;
+    optional int64 recommended_on_demand_limit_cents = 20;
+    optional int64 on_demand_min_cents = 21;
+    optional int64 on_demand_max_cents = 22;
+    optional int64 current_on_demand_limit_cents = 23;
   }
 
   GetUsageLimitStatusAndActiveGrantsResponse.UsageLimitPolicyStatus usage_limit_policy_status = 1;
@@ -13622,6 +14731,7 @@ message GetUserMetaResponse {
   GetEmailResponse.SignUpType sign_up_type = 2;
   int64 user_id = 3;
   optional string workos_id = 4;
+  optional string profile_picture_url = 5;
 }
 
 message GetUserOrganizationsRequest {
@@ -13642,6 +14752,8 @@ message GetUserOrganizationsResponse {
     string team_name = 2;
     string team_slug = 3;
     optional int64 team_organization_membership_created_at_ms = 4;
+    optional TeamRole viewer_team_role = 5;
+    optional int64 team_deleted_at_ms = 6;
   }
 
   repeated GetUserOrganizationsResponse.Organization organizations = 1;
@@ -13662,10 +14774,14 @@ message GetUserPrivacyModeResponse {
 }
 
 message GetUserProfileRequest {
+  bool include_activity_summary = 1;
 }
 
 message GetUserProfileResponse {
   optional UserProfile profile = 1;
+  PublicProfileActivitySummary activity_summary = 3;
+  optional bool public_visibility_allowed = 4;
+  optional string max_visibility = 5;
 }
 
 message GetUserPullRequestsRequest {
@@ -13702,6 +14818,16 @@ message GetUserReviewRequestsResponse {
   optional int32 total_count = 3;
   bool has_git_connection = 4;
   optional string current_user_login = 5;
+}
+
+message GetViewableProfileByHandleRequest {
+  string handle = 1;
+}
+
+message GetViewableProfileByHandleResponse {
+  UserProfile profile = 1;
+  PublicProfileActivitySummary activity_summary = 2;
+  string viewed_as = 3;
 }
 
 message GetWorkflowTemplateRequest {
@@ -13865,6 +14991,13 @@ message GitIndexingConfig {
   optional bool allow_index_copy_from_server = 10;
 }
 
+message GitIssueCommentEvent {
+  repeated string repos = 1;
+  repeated string commenter_allowlist = 2;
+  string comment_contains = 3;
+  bool comment_contains_is_regex = 4;
+}
+
 message GitIssueLabeledEvent {
   repeated string repos = 1;
   string label_name = 2;
@@ -13911,10 +15044,44 @@ message GitPullRequestEvent {
   bool comment_contains_is_regex = 10;
 }
 
+message GitPullRequestReviewCommentEvent {
+  repeated string repos = 1;
+  repeated string commenter_allowlist = 2;
+  string comment_contains = 3;
+  bool comment_contains_is_regex = 4;
+}
+
+message GitPullRequestReviewEvent {
+  repeated string repos = 1;
+  bool on_approved = 2;
+  bool on_changes_requested = 3;
+  bool on_commented = 4;
+}
+
 message GitPushEvent {
   string repo = 1;
   string branch = 2;
   repeated string repos = 3;
+}
+
+message GitRepoSetupSpanDetails {
+  string repo_display_name = 1;
+}
+
+message GitRepoSetupSpanState {
+  string repo_display_name = 1;
+}
+
+message GitReposSetupSpanDetails {
+}
+
+message GitReposSetupSpanState {
+}
+
+message GitReviewThreadEvent {
+  repeated string repos = 1;
+  bool on_resolved = 2;
+  bool on_unresolved = 3;
 }
 
 message GitTrigger {
@@ -13924,8 +15091,20 @@ message GitTrigger {
     GitCICompletedEvent ci_completed = 4;
     GitIssueLabeledEvent issue_labeled = 5;
     GitLabelEvent label = 6;
+    GitIssueCommentEvent issue_comment = 7;
+    GitPullRequestReviewCommentEvent pull_request_review_comment = 8;
+    GitPullRequestReviewEvent pull_request_review = 9;
+    GitReviewThreadEvent review_thread = 10;
+    GitWorkflowRunEvent workflow_run = 11;
   }
   repeated string user_allowlist = 3;
+}
+
+message GitWorkflowRunEvent {
+  repeated string repos = 1;
+  repeated string workflow_names = 2;
+  string branch = 3;
+  GitWorkflowRunConclusion conclusion = 4;
 }
 
 message GlassSettings {
@@ -14079,6 +15258,8 @@ message HeadlessAgenticComposerConfig {
   optional bool show_onboarding_setup_note_for_manual_testing = 15;
   optional agent.v1.RequestedModel requested_model = 16;
   optional CloudSubagentParentReference cloud_subagent_parent = 17;
+  optional bool enable_computer_use = 18;
+  optional bool is_slack_v2 = 19;
 }
 
 message HeadlessAgenticComposerPrompt {
@@ -14203,6 +15384,7 @@ message HeartbeatResponse {
   bool ok = 1;
   bool kill_requested = 2;
   optional EvalCleanupRequest cleanup_request = 3;
+  optional int32 concurrency_limit_override = 4;
 }
 
 message HeuristicsSelection {
@@ -14216,6 +15398,12 @@ message HeuristicsSelection {
   HeuristicsSelection.HeuristicsSelectionType type = 1;
   int32 start_line = 2;
   int32 end_line = 3;
+}
+
+message HibernateSandBoxRequest {
+}
+
+message HibernateSandBoxResponse {
 }
 
 message HistogramBucket {
@@ -14603,6 +15791,7 @@ message InferenceToolResultPart {
   string tool_name = 2;
   google.protobuf.Value result = 3;
   bool is_error = 4;
+  repeated InferenceContentPart experimental_content = 5;
 }
 
 message InferenceUsageInfo {
@@ -14847,6 +16036,12 @@ message InterfaceAgentStatus {
 message InterpreterResult {
   string output = 1;
   bool success = 2;
+}
+
+message InterruptLocalAgentCommand {
+  string request_id = 1;
+  string bc_id = 2;
+  string turn_id = 3;
 }
 
 message InviteLinkInfo {
@@ -15429,15 +16624,13 @@ message ListAgentStoreFilesResponse {
 
 message ListAgentStoresRequest {
   int32 n = 1;
-  bool include_team_wide = 2;
-  optional int32 team_id = 3;
-  optional double last_message_activity_at_ms_offset = 4;
+  optional string page_token = 5;
 }
 
 message ListAgentStoresResponse {
   repeated AgentStore stores = 1;
   bool has_more = 2;
-  optional double next_page_offset = 3;
+  optional string next_page_token = 4;
 }
 
 message ListAllRunsRequest {
@@ -15551,6 +16744,13 @@ message ListBackgroundComposersResponse {
   repeated BackgroundComposerParticipant participants = 5;
 }
 
+message ListConnectedMachinesRequest {
+}
+
+message ListConnectedMachinesResponse {
+  repeated ConnectedMachine machines = 1;
+}
+
 message ListContactImportConnectionsRequest {
 }
 
@@ -15568,6 +16768,34 @@ message ListContactImportContactsRequest {
 message ListContactImportContactsResponse {
   repeated ContactImportContactRow contacts = 1;
   int32 total_count = 2;
+}
+
+message ListCrewArchetypesRequest {
+}
+
+message ListCrewArchetypesResponse {
+  repeated CrewArchetype archetypes = 1;
+}
+
+message ListCrewsRequest {
+}
+
+message ListCrewsResponse {
+  repeated Crew crews = 1;
+}
+
+message ListDataOpsJobsRequest {
+  optional int32 limit = 1;
+  optional string cursor = 2;
+  optional DataOpsJobDbStatus status = 3;
+  optional string training_set = 4;
+  optional string created_by = 5;
+  optional bool include_hidden = 6;
+}
+
+message ListDataOpsJobsResponse {
+  repeated DataOpsJobRecord jobs = 1;
+  optional string next_cursor = 2;
 }
 
 message ListDeeplinksRequest {
@@ -15731,6 +16959,19 @@ message ListExperimentalIndexFilesResponse {
   repeated IndexFileData files = 2;
 }
 
+message ListFullSelfDrivingActiveAgentsRequest {
+  optional string search_query = 1;
+  optional int32 page = 2;
+  optional int32 page_size = 3;
+  optional bool archived = 4;
+  optional string status_visual = 5;
+}
+
+message ListFullSelfDrivingActiveAgentsResponse {
+  repeated FullSelfDrivingActiveAgent agents = 1;
+  int32 total_count = 2;
+}
+
 message ListFullSelfDrivingFindingsRequest {
   string pr_url = 1;
   string bc_id = 2;
@@ -15759,6 +17000,19 @@ message ListFullSelfDrivingRunsResponse {
   repeated FullSelfDrivingRun runs = 1;
 }
 
+message ListFullSelfDrivingTeamActiveAgentsRequest {
+  int32 team_id = 1;
+  optional string search_query = 2;
+  optional int32 page = 3;
+  optional int32 page_size = 4;
+  optional bool archived = 5;
+}
+
+message ListFullSelfDrivingTeamActiveAgentsResponse {
+  repeated FullSelfDrivingActiveAgent agents = 1;
+  int32 total_count = 2;
+}
+
 message ListFullSelfDrivingTeamRepoSettingsRequest {
   int32 team_id = 1;
 }
@@ -15779,6 +17033,7 @@ message ListGithubEnterpriseAppsResponse {
   }
 
   repeated ListGithubEnterpriseAppsResponse.GithubEnterpriseApp apps = 1;
+  bool can_manage = 2;
 }
 
 message ListGitlabEnterpriseInstancesRequest {
@@ -15922,6 +17177,14 @@ message ListOrganizationApiKeysResponse {
   repeated OrganizationApiKey api_keys = 1;
 }
 
+message ListOrganizationIdentityProvidersRequest {
+  string organization_id = 1;
+}
+
+message ListOrganizationIdentityProvidersResponse {
+  repeated OrganizationIdentityProvider providers = 1;
+}
+
 message ListPendingFollowupsRequest {
   string bc_id = 1;
 }
@@ -15982,6 +17245,13 @@ message ListRlEvalJobsRequest {
 message ListRlEvalJobsResponse {
   repeated RlEvalJobRecord jobs = 1;
   optional string next_cursor = 2;
+}
+
+message ListSandBoxesRequest {
+}
+
+message ListSandBoxesResponse {
+  repeated SandBoxDescriptor boxes = 1;
 }
 
 message ListScimDirectoriesRequest {
@@ -16051,6 +17321,7 @@ message ListSharedConversationsRequest {
   optional int32 creator_id = 2;
   optional string created_before = 3;
   repeated SharedConversationVisibility visibilities = 4;
+  optional int32 team_id = 5;
 }
 
 message ListSharedConversationsResponse {
@@ -16062,11 +17333,13 @@ message ListSlackConversationsRequest {
   optional string search = 1;
   optional bool include_private = 2;
   optional bool skip_cache = 3;
+  optional bool allow_partial = 4;
 }
 
 message ListSlackConversationsResponse {
   repeated SlackConversation conversations = 1;
   bool has_slack_auth = 2;
+  bool is_partial = 3;
 }
 
 message ListTeamApiKeysRequest {
@@ -16156,6 +17429,24 @@ message ListWorkflowTemplatesRequest {
 
 message ListWorkflowTemplatesResponse {
   repeated WorkflowTemplate templates = 1;
+}
+
+message LiveActivityAgentEntry {
+  string bc_id = 1;
+  string title = 2;
+  BackgroundComposerStatus status = 3;
+  int64 started_at_epoch_seconds = 4;
+  optional string repo_label = 5;
+  optional string branch_name = 6;
+  optional int64 finished_at_epoch_seconds = 7;
+  optional string result_type = 8;
+  optional int32 lines_added = 9;
+  optional int32 lines_removed = 10;
+  optional int32 changed_files = 11;
+}
+
+message LiveActivityContentState {
+  repeated LiveActivityAgentEntry agents = 1;
 }
 
 message LocalCodebaseFileInfo {
@@ -16372,6 +17663,24 @@ message MachineReference {
     PodReference pod = 1;
     WorkerReference worker = 2;
   }
+}
+
+message MakeGithubRequestRequest {
+  string method = 1;
+  string path = 2;
+  optional string body_json = 3;
+  string github_user_token = 4;
+  string caller = 5;
+  optional string host = 6;
+  optional string path_template = 7;
+  optional string accept_header = 8;
+}
+
+message MakeGithubRequestResponse {
+  int32 status = 1;
+  map<string, string> headers = 2;
+  string body = 3;
+  string status_text = 4;
 }
 
 message MakePRBackgroundComposerRequest {
@@ -16820,13 +18129,27 @@ message MicrosoftTeamsTriggerPayload {
 }
 
 message MigrateBugBotProUserToUsageBasedBillingRequest {
+  optional bool keep_high_effort_default = 1;
 }
 
 message MigrateBugBotProUserToUsageBasedBillingResponse {
 }
 
+message MigrateLocalAgentCommand {
+  string request_id = 1;
+  string bc_id = 2;
+  repeated string worker_labels = 3;
+  int64 owner_cursor_user_id = 4;
+  string worker_id = 5;
+}
+
+message MigrateLocalAgentResult {
+  string migrated_bc_id = 1;
+}
+
 message MigrateTeamBugbotToUsageBasedBillingRequest {
   int32 team_id = 1;
+  optional bool keep_high_effort_default = 2;
 }
 
 message MigrateTeamBugbotToUsageBasedBillingResponse {
@@ -16834,12 +18157,14 @@ message MigrateTeamBugbotToUsageBasedBillingResponse {
 
 message MintAgentStoreTokenRequest {
   string agent_id = 1;
+  optional string share_id = 2;
 }
 
 message MintAgentStoreTokenResponse {
   string token = 1;
   int64 expires_at_ms = 2;
   repeated string agent_ids = 3;
+  repeated string store_ids = 4;
 }
 
 message MissingContextItems {
@@ -16898,11 +18223,18 @@ message ModelAllowlistByok {
 
 message ModelAllowlistByokEntry {
   bool enabled = 1;
+  repeated string models = 2;
 }
 
 message ModelAllowlistModelEntry {
   bool enabled = 1;
   map<string, ModelAllowlistParameterRestriction> parameter_restrictions = 2;
+  map<string, ModelAllowlistParameterGrant> parameter_grants = 3;
+  repeated TeamAdminModelRef.ModelParameterValue default_parameter_values = 4;
+}
+
+message ModelAllowlistParameterGrant {
+  repeated string granted_values = 1;
 }
 
 message ModelAllowlistParameterRestriction {
@@ -16986,6 +18318,7 @@ message ModelParameterDefinition {
       string value = 1;
       optional string display_name = 2;
       optional bool increases_model_cost = 3;
+      optional bool blocked_by_admin_allowlist = 4;
     }
 
     repeated ModelParameterDefinition.EnumParameterDefinition.EnumParameterValue values = 1;
@@ -17088,6 +18421,7 @@ message NameTabRequest {
   }
   repeated ConversationMessage messages = 1;
   bool is_project = 2;
+  string conversation_id = 6;
 }
 
 message NameTabResponse {
@@ -17156,14 +18490,29 @@ message NotifyBackgroundComposerShownRequest {
 message NotifyBackgroundComposerShownResponse {
 }
 
+message NotifyTeamAdminsRepo {
+  int64 installation_id = 1;
+  string repo_node_id = 2;
+  string owner = 3;
+  string name = 4;
+}
+
 message NotifyTeamAdminsRequest {
   int32 team_id = 1;
   AdminNotificationRequestType request_type = 2;
+  repeated NotifyTeamAdminsRepo repos = 3;
+  optional string ghe_application = 4;
 }
 
 message NotifyTeamAdminsResponse {
   bool success = 1;
   optional string error_message = 2;
+}
+
+message NoZdrModelConsentStatusEntry {
+  string model_id = 1;
+  string consent_version = 2;
+  string accepted_at = 3;
 }
 
 message NtpEvent {
@@ -17240,6 +18589,11 @@ message OpenPRBackgroundComposerResponse {
   string base_branch = 4;
   bool success = 5;
   optional string error = 6;
+}
+
+message OpenUrlCallToAction {
+  string url = 1;
+  string button_text = 2;
 }
 
 message OptimizedDiffState {
@@ -17483,6 +18837,7 @@ message OrganizationGroup {
   int32 member_count = 6;
   string public_id = 7;
   optional int32 monthly_spending_limit_dollars = 8;
+  bool ant_cyber_approved = 9;
 }
 
 message OrganizationGroupMember {
@@ -17495,6 +18850,46 @@ message OrganizationGroupMember {
   optional int32 monthly_spending_limit_dollars = 7;
 }
 
+message OrganizationIdentityProvider {
+  string public_id = 1;
+  bool is_default = 2;
+  string status = 3;
+  repeated OrganizationIdentityProviderUsedByTeam used_by_teams = 4;
+  string description = 5;
+  OrganizationIdentityProviderSsoSettings sso = 6;
+  OrganizationIdentityProviderDomains domains = 7;
+  OrganizationIdentityProviderScimSettings scim = 8;
+  OrganizationIdentityProviderDomainJoinSettings domain_join = 9;
+}
+
+message OrganizationIdentityProviderDomainJoinSettings {
+  bool enabled = 1;
+  repeated string allowed_domains = 2;
+}
+
+message OrganizationIdentityProviderDomains {
+  repeated string verified = 1;
+  repeated string pending = 2;
+  string verify_link = 3;
+}
+
+message OrganizationIdentityProviderScimSettings {
+  bool connected = 1;
+  string summary = 2;
+  string manage_link = 3;
+}
+
+message OrganizationIdentityProviderSsoSettings {
+  bool connected = 1;
+  string summary = 2;
+  string manage_link = 3;
+}
+
+message OrganizationIdentityProviderUsedByTeam {
+  string team_public_id = 1;
+  string team_name = 2;
+}
+
 message OrganizationMember {
   int32 user_id = 1;
   string auth_id = 2;
@@ -17503,12 +18898,22 @@ message OrganizationMember {
   optional string last_name = 5;
   UserOrganizationRole role = 6;
   repeated OrganizationMemberTeam teams = 7;
+  string member_public_id = 8;
+}
+
+message OrganizationMemberGroup {
+  string group_public_id = 1;
+  string group_name = 2;
+  int64 joined_at = 3;
+  bool is_admin = 4;
+  optional int32 monthly_spending_limit_dollars = 5;
 }
 
 message OrganizationMemberTeam {
   int32 team_id = 1;
   string team_name = 2;
   string team_slug = 3;
+  TeamRole team_role = 4;
 }
 
 message OrganizationMemberTeamMove {
@@ -17665,6 +19070,20 @@ message ParseGitHubRepoForPluginsResponse {
   string commit_sha = 6;
 }
 
+message ParsePluginPublisherRepoInternalRequest {
+  string git_url = 1;
+  optional string git_ref = 2;
+  optional string release_tag = 3;
+  optional string release_asset = 4;
+}
+
+message ParsePluginPublisherRepoInternalResponse {
+  ParseGitHubRepoForPluginsResponse parsed_repo = 1;
+  optional string release_repo = 2;
+  optional string release_asset = 3;
+  optional string release_tag = 4;
+}
+
 message PartialPathItem {
   string relative_workspace_path = 1;
   string hash_of_node = 2;
@@ -17702,6 +19121,14 @@ message PendingFollowup {
   bool past_chats_explicitly_set = 9;
   optional agent.v1.ConversationAction conversation_action = 10;
   repeated internapi.v1.BlobData blob_data = 11;
+}
+
+message PendingIdleFollowup {
+  string grouping_identifier = 1;
+  string followup_id = 2;
+  BackgroundComposerSource source = 3;
+  agent.v1.ConversationAction conversation_action = 4;
+  repeated string merged_followup_ids = 5;
 }
 
 message PendingPrivateWorkerRequest {
@@ -17964,6 +19391,7 @@ message PRCheck {
   optional string rerun_disabled_reason = 10;
   repeated PRCheckAnnotation annotations = 11;
   bool annotations_truncated = 12;
+  bool is_required = 13;
 }
 
 message PRCheckAnnotation {
@@ -17984,6 +19412,8 @@ message PRCheckStatus {
   int32 skipped_count = 6;
   int32 total_count = 7;
   repeated PRCheck checks = 8;
+  optional int32 required_failure_count = 9;
+  optional int32 required_pending_count = 10;
 }
 
 message PrCommentAction {
@@ -17996,6 +19426,7 @@ message PrCommentAction {
 message PrCommentActionPayload {
   int32 pr_number = 1;
   string repo_url = 2;
+  optional string head_sha = 3;
 }
 
 message PRCommit {
@@ -18073,6 +19504,7 @@ message PrepareLocalFullSelfDrivingRunRequest {
   string pr_url = 1;
   FullSelfDrivingMode mode = 2;
   optional string trigger_description = 3;
+  optional string model_id = 4;
 }
 
 message PrepareLocalFullSelfDrivingRunResponse {
@@ -18082,6 +19514,7 @@ message PrepareLocalFullSelfDrivingRunResponse {
   FullSelfDrivingMode mode = 4;
   string model_id = 5;
   repeated string skill_ids = 6;
+  repeated agent.v1.AgentSkill skills = 7;
 }
 
 message PrepareSetupGithubEnterpriseAppRequest {
@@ -18212,6 +19645,7 @@ message PrivateWorker {
   repeated PrivateWorkerLabel labels = 11;
   optional string repo_url = 12;
   optional string display_name = 13;
+  optional string machine_id = 14;
 }
 
 message PrivateWorkerLabel {
@@ -18277,6 +19711,7 @@ message ProcessMetricsV2RowRequest {
   double session_peak_mem_mb = 9;
   double memory_during_sample_peak_mb = 10;
   double cpu_during_sample_peak_pct = 11;
+  repeated string argv = 12;
 }
 
 message ProfileConfig {
@@ -18386,6 +19821,30 @@ message ProvideTemporaryAccessTokenRequest {
 message ProvideTemporaryAccessTokenResponse {
 }
 
+message ProvisionedSyntheticsIdentity {
+  string identity_id = 1;
+  string service_account_id = 2;
+  string service_account_name = 3;
+  string masked_api_key = 4;
+  string repo_url = 5;
+  string repo_ref = 6;
+}
+
+message ProvisionSyntheticsServiceAccountsRequest {
+  int32 team_id = 1;
+  int32 count = 2;
+  string name_prefix = 3;
+  string pool_name = 4;
+  string created_by = 5;
+  bool provision_origin_repos = 6;
+  string origin_namespace = 7;
+}
+
+message ProvisionSyntheticsServiceAccountsResponse {
+  repeated ProvisionedSyntheticsIdentity identities = 1;
+  string pool_id = 2;
+}
+
 message PRRequestedReviewer {
   string login = 1;
   optional string name = 2;
@@ -18463,6 +19922,7 @@ message PseudocodeTarget {
 message PublicProfileActivityCount {
   string date = 1;
   int32 count = 2;
+  int64 value = 3;
 }
 
 message PublicProfileActivitySummary {
@@ -18473,11 +19933,38 @@ message PublicProfileActivitySummary {
   repeated string active_dates = 5;
   repeated PublicProfileDailyAgentCount daily_agent_counts = 6;
   repeated PublicProfileActivityCount activity_counts = 7;
+  repeated PublicProfileModelUsage top_models = 8;
+  int32 agents_local = 10;
+  int32 agents_cloud = 11;
+  int64 longest_agent_seconds = 12;
+  repeated PublicProfileTokensPerDay tokens_over_time = 13;
+  repeated PublicProfileAgentsPerDay agents_over_time = 14;
+}
+
+message PublicProfileAgentsPerDay {
+  string date = 1;
+  int32 local_count = 2;
+  int32 cloud_count = 3;
 }
 
 message PublicProfileDailyAgentCount {
   string date = 1;
   int32 agent_count = 2;
+}
+
+message PublicProfileModelUsage {
+  string name = 1;
+  int32 agent_requests = 2;
+}
+
+message PublicProfileSettings {
+  bool public_visibility_allowed = 1;
+  string policy = 2;
+}
+
+message PublicProfileTokensPerDay {
+  string date = 1;
+  int64 tokens = 2;
 }
 
 message PublicSharedCanvasPreview {
@@ -18645,6 +20132,8 @@ message QueuedFollowup {
   optional string run_id = 12;
   optional agent.v1.RequestedModel requested_model = 13;
   optional int64 turn_start_unix_ms = 14;
+  optional int64 not_before_unix_ms = 15;
+  bytes conversation_action_blob_id = 16;
 }
 
 message QueuedInteractionResponse {
@@ -19106,6 +20595,15 @@ message RecoverableCppData {
   OneIndexedPosition position = 4;
 }
 
+message RecreateSandBoxRequest {
+  bool preserve_data = 1;
+}
+
+message RecreateSandBoxResponse {
+  bool started = 1;
+  string reason = 2;
+}
+
 message RedDiff {
   string relative_workspace_path = 1;
   repeated SimplestRange red_ranges = 2;
@@ -19160,6 +20658,7 @@ message RefreshGitHubAccessTokenResponse {
 
 message RefreshMarketplaceRequest {
   int64 marketplace_id = 1;
+  optional int32 team_id = 2;
 }
 
 message RefreshMarketplaceResponse {
@@ -19298,6 +20797,7 @@ message ReindexAndApplyTeamMarketplaceChangesRequest {
   int64 marketplace_id = 1;
   optional string git_ref = 2;
   optional string commit_sha = 3;
+  optional int32 team_id = 4;
 }
 
 message ReindexAndApplyTeamMarketplaceChangesResponse {
@@ -19370,6 +20870,7 @@ message RemoveGroupMembersResponse {
 
 message RemoveMarketplaceRequest {
   int64 marketplace_id = 1;
+  optional int32 team_id = 2;
 }
 
 message RemoveMarketplaceResponse {
@@ -19393,6 +20894,12 @@ message RemoveOrganizationGroupMembersRequest {
 
 message RemoveOrganizationGroupMembersResponse {
   int32 removed_count = 1;
+}
+
+message RemoveOrganizationIdentityProviderDomainJoinRequest {
+  string organization_id = 1;
+  string identity_provider_public_id = 2;
+  string domain = 3;
 }
 
 message RemoveRepoHistoryRequest {
@@ -19583,6 +21090,19 @@ message ReportAgentFeedbackRequest {
     SENTIMENT_UNSPECIFIED = 0;
     SENTIMENT_UP = 1;
     SENTIMENT_DOWN = 2;
+    SENTIMENT_RETRACTED = 3;
+  }
+
+  enum Source {
+    SOURCE_UNSPECIFIED = 0;
+    SOURCE_IDE = 1;
+    SOURCE_GLASS = 2;
+  }
+
+  enum Variant {
+    VARIANT_UNSPECIFIED = 0;
+    VARIANT_PROMINENT = 1;
+    VARIANT_INLINE = 2;
   }
 
   string request_id = 1;
@@ -19590,6 +21110,8 @@ message ReportAgentFeedbackRequest {
   repeated string categories = 3;
   optional string comment = 4;
   optional string canonical_model_name = 5;
+  optional ReportAgentFeedbackRequest.Source source = 6;
+  optional ReportAgentFeedbackRequest.Variant variant = 7;
 }
 
 message ReportAgentFeedbackResponse {
@@ -19843,6 +21365,7 @@ message ReportProcessMetricsV2Request {
   string os = 6;
   string arch = 7;
   string client_version = 8;
+  string origin = 9;
 }
 
 message ReportProcessMetricsV2Response {
@@ -19861,6 +21384,9 @@ message ReportUsageRequest {
   string model = 10;
   ProviderErrorType provider_error_type = 11;
   string conversation_group_id = 12;
+  int64 cached_input_tokens = 13;
+  bool is_stream = 14;
+  string canonical_model = 15;
 }
 
 message ReportUsageResponse {
@@ -20016,6 +21542,20 @@ message RequestKillResponse {
   bool ok = 1;
 }
 
+message RequestLocalAgentRemoteControlRequest {
+  string bc_id = 1;
+  string machine_name = 2;
+  string worker_id = 3;
+  string idempotency_key = 4;
+}
+
+message RequestLocalAgentRemoteControlResponse {
+  RemoteControlRequestStatus status = 1;
+  RemoteControlRequestRejectionReason rejection_reason = 2;
+  string message = 3;
+  string migrated_bc_id = 4;
+}
+
 message RequestReceivedResponse {
   string req_uuid = 1;
 }
@@ -20028,6 +21568,16 @@ message RequestReplayHealthResponse {
 }
 
 message RequestReviewersAction {
+}
+
+message RequestRlEvalStepKillRequest {
+  string job_id = 1;
+  int32 step = 2;
+  optional string requested_by = 3;
+}
+
+message RequestRlEvalStepKillResponse {
+  bool ok = 1;
 }
 
 message RequestTrackingFileGitInfo {
@@ -20138,6 +21688,9 @@ message RescrapeDocsResponse {
   optional string new_doc_identifier = 2;
 }
 
+message ResetSandBoxRequest {
+}
+
 message ResetUserAdViewsRequest {
 }
 
@@ -20220,6 +21773,15 @@ message ResumeBackgroundComposerRequest {
 }
 
 message ResumeBackgroundComposerResponse {
+}
+
+message RetryAutomationRunRequest {
+  string run_uuid = 1;
+}
+
+message RetryAutomationRunResponse {
+  string background_composer_id = 1;
+  string run_uuid = 2;
 }
 
 message ReviewBug {
@@ -20738,6 +22300,13 @@ message RotateServiceAccountApiKeyResponse {
   ServiceAccountKeyInfo key_info = 2;
 }
 
+message RouteResult {
+  string deployment_id = 1;
+  DeploymentInfo deployment_info = 2;
+  string full_model_id = 3;
+  string provider = 4;
+}
+
 message Rule {
   string id = 1;
   string name = 2;
@@ -20760,6 +22329,44 @@ message RunBugBotPromptProps {
   string date = 3;
   repeated FileAndOutline context_files = 4;
   optional string file_content_source = 5;
+}
+
+message RunDiamondToBugbotMigrationRequest {
+  int32 team_id = 1;
+  int64 installation_id = 2;
+  optional string ghe_application = 3;
+  string graphite_workspace_id = 4;
+  DiamondToBugbotMigrationMode mode = 5;
+  optional string approved_preview_hash = 6;
+  google.protobuf.Struct extracted_settings = 7;
+}
+
+message RunDiamondToBugbotMigrationResponse {
+  string status = 1;
+  string preview_hash = 2;
+  string preview_json = 3;
+  string repository_rules_json = 4;
+  string apply_plan_json = 5;
+  string audit_json = 6;
+  repeated string warnings = 7;
+  repeated string blockers = 8;
+  repeated string applied_operation_ids = 9;
+  repeated string skipped_operation_ids = 10;
+  int32 resolved_team_id = 11;
+}
+
+message RunFullSelfDrivingCloudCommandRequest {
+  string pr_url = 1;
+  FullSelfDrivingMode mode = 2;
+  optional string user_instructions = 3;
+  optional string trigger_description = 4;
+  optional string model_id = 5;
+}
+
+message RunFullSelfDrivingCloudCommandResponse {
+  string bc_id = 1;
+  FullSelfDrivingCloudCommandAction action = 2;
+  FullSelfDrivingMode mode = 3;
 }
 
 message RunFullSelfDrivingWorkflowSuggestionRequest {
@@ -20883,6 +22490,41 @@ message RunTestResult {
   string result = 1;
 }
 
+message RunWebFetchError {
+  string error = 1;
+  bool is_timeout = 2;
+}
+
+message RunWebFetchRequest {
+  string url = 1;
+}
+
+message RunWebFetchResponse {
+  oneof result {
+    RunWebFetchSuccess success = 1;
+    RunWebFetchError error = 2;
+  }
+}
+
+message RunWebFetchSuccess {
+  string content = 1;
+}
+
+message RunWebSearchRequest {
+  string search_term = 1;
+  optional string explanation = 2;
+  string model_id = 3;
+}
+
+message RunWebSearchResponse {
+  optional string answer = 1;
+  repeated WebSearchDocument documents = 2;
+}
+
+message SandBoxDescriptor {
+  bool running = 2;
+}
+
 message SaveFileParams {
   string relative_workspace_path = 1;
 }
@@ -20962,6 +22604,26 @@ message ScimUpstreamGroup {
   string name = 2;
   string workos_group_id = 3;
   string idp_id = 4;
+}
+
+message SCMBatchGetPullRequestForBranchRequest {
+  repeated SCMBranchRef branches = 1;
+  optional bool skip_cache = 2;
+}
+
+message SCMBatchGetPullRequestForBranchResponse {
+  repeated SCMBranchPullRequests results = 1;
+}
+
+message SCMBranchPullRequests {
+  string repo_url = 1;
+  string branch_name = 2;
+  repeated string pr_urls = 3;
+}
+
+message SCMBranchRef {
+  string repo_url = 1;
+  string branch_name = 2;
 }
 
 message SCMClosePullRequestRequest {
@@ -21715,6 +23377,12 @@ message SetMicrosoftTeamsAuthResponse {
   string success_type = 1;
 }
 
+message SetOrganizationIdentityProviderAllowDomainJoinRequest {
+  string organization_id = 1;
+  string identity_provider_public_id = 2;
+  bool allow_domain_join = 3;
+}
+
 message SetOrganizationMemberRoleRequest {
   string organization_id = 1;
   int32 user_id = 2;
@@ -21736,6 +23404,18 @@ message SetOrganizationMemberTeamsResponse {
   bool changed = 1;
   repeated int32 added_team_ids = 2;
   repeated int32 removed_team_ids = 3;
+}
+
+message SetOrganizationNoZdrModelConsentRequest {
+  string organization_id = 1;
+  string model_id = 2;
+  bool enabled = 3;
+  bool acknowledged = 4;
+  string consent_version = 5;
+}
+
+message SetOrganizationNoZdrModelConsentResponse {
+  bool consented = 1;
 }
 
 message SetOrgTeamBudgetRequest {
@@ -21908,6 +23588,7 @@ message SetTeamMarketplacePluginPoliciesRequest {
 
   int64 marketplace_id = 1;
   repeated SetTeamMarketplacePluginPoliciesRequest.Policy policies = 2;
+  optional int32 team_id = 3;
 }
 
 message SetTeamMarketplacePluginPoliciesResponse {
@@ -21918,6 +23599,7 @@ message SetTeamMarketplacePluginPolicyVariablesRequest {
   int64 marketplace_id = 1;
   int64 plugin_id = 2;
   google.protobuf.Struct variables = 3;
+  optional int32 team_id = 4;
 }
 
 message SetTeamMarketplacePluginPolicyVariablesResponse {
@@ -21931,6 +23613,30 @@ message SetTeamMarketplaceRepositoryRequest {
 
 message SetTeamMarketplaceRepositoryResponse {
   Marketplace marketplace = 1;
+}
+
+message SetTeamMemberNoZdrModelConsentRequest {
+  int32 team_id = 1;
+  string model_id = 2;
+  bool enabled = 3;
+  bool acknowledged = 4;
+  string consent_version = 5;
+}
+
+message SetTeamMemberNoZdrModelConsentResponse {
+  bool consented = 1;
+}
+
+message SetTeamNoZdrModelConsentRequest {
+  int32 team_id = 1;
+  string model_id = 2;
+  bool enabled = 3;
+  bool acknowledged = 4;
+  string consent_version = 5;
+}
+
+message SetTeamNoZdrModelConsentResponse {
+  bool consented = 1;
 }
 
 message SetTeamRepoTypeRequest {
@@ -22005,6 +23711,17 @@ message SetUserMonthlyLimitRequest {
 }
 
 message SetUserMonthlyLimitResponse {
+}
+
+message SetUserNoZdrModelConsentRequest {
+  string model_id = 1;
+  bool enabled = 2;
+  bool acknowledged = 3;
+  string consent_version = 4;
+}
+
+message SetUserNoZdrModelConsentResponse {
+  bool consented = 1;
 }
 
 message SetUserPrivacyModeRequest {
@@ -22336,10 +24053,13 @@ message SlackRepoRoutingRule {
   string pattern = 2;
   string repo = 3;
   bool is_team_rule = 4;
+  SlackRoutingRuleTargetType target_type = 5;
+  optional string environment_public_id = 6;
 }
 
 message SlackSamplePayload {
   string message = 1;
+  bool is_thread_reply = 2;
 }
 
 message SlackSourceMetadata {
@@ -22358,6 +24078,7 @@ message SlackTrigger {
   bool block_unauthenticated_slack_users = 6;
   optional SlackCompletionReactionMode slack_completion_reaction_mode = 7;
   optional string slack_completion_reaction_custom_emoji = 8;
+  optional bool top_level_only = 9;
 }
 
 message SlackTriggerPayload {
@@ -22486,6 +24207,51 @@ message SpanContext {
   optional string trace_state = 4;
 }
 
+message SpanEnd {
+  string span_id = 1;
+  WaterfallSpanEndStatus end_status = 2;
+}
+
+message SpanLog {
+  string span_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  string message = 3;
+  WaterfallLogLevel level = 4;
+}
+
+message SpanStart {
+  oneof span_details {
+    GitReposSetupSpanDetails git_repos_setup = 3;
+    GitRepoSetupSpanDetails git_repo_setup = 4;
+  }
+  string span_id = 1;
+  optional string parent_span_id = 2;
+  WaterfallPhaseType phase_type = 5;
+  optional string fallback_phase_label = 6;
+}
+
+message SpanState {
+  oneof span_state {
+    GitReposSetupSpanState git_repos_setup = 1;
+    GitRepoSetupSpanState git_repo_setup = 2;
+  }
+}
+
+message SpanStatusUpdate {
+  string span_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  WaterfallSpanStatusType status_type = 3;
+  string message = 4;
+  optional CallToAction call_to_action = 5;
+}
+
+message SpanUpdate {
+  oneof span_update {
+    GenericLogSpanUpdate generic_log = 2;
+  }
+  string span_id = 1;
+}
+
 message SpecSubagentParams {
   string plan = 1;
 }
@@ -22599,6 +24365,10 @@ message StartBackgroundComposerFromSnapshotRequest {
   optional int32 team_id = 98;
   optional CloudSubagentParentReference cloud_subagent_parent = 99;
   optional PrivateWorkspaceIdentifier private_workspace_identifier = 100;
+  repeated string requested_additional_store_ids = 101;
+  optional string remote_control_workspace_key = 102;
+  optional string remote_control_machine_id = 103;
+  optional bool is_slack_v2 = 104;
 }
 
 message StartBackgroundComposerFromSnapshotResponse {
@@ -22615,6 +24385,22 @@ message StartBugbotBackfillLearningRequest {
 }
 
 message StartBugbotBackfillLearningResponse {
+}
+
+message StartCloudAgentLoadTestRequest {
+  string scenario_name = 1;
+  CloudAgentSyntheticsScenarioInput custom_scenario = 2;
+  string pool_id = 3;
+  uint32 count = 4;
+  uint32 per_identity_create_per_min = 5;
+  uint32 ramp_up_sec = 6;
+  string created_by = 7;
+}
+
+message StartCloudAgentLoadTestResponse {
+  string temporal_workflow_id = 1;
+  string temporal_run_id = 2;
+  string load_test_run_id = 3;
 }
 
 message StartGithubStreamingForFollowupRequest {
@@ -22641,6 +24427,20 @@ message StartLinearStreamingForFollowupRequest {
 }
 
 message StartLinearStreamingForFollowupResponse {
+}
+
+message StartLocalAgentCommand {
+  string request_id = 1;
+  string workspace_key = 2;
+  string mode = 5;
+  agent.v1.ConversationAction message = 6;
+  agent.v1.RequestedModel requested_model = 7;
+  string message_id = 8;
+  string bc_id = 9;
+}
+
+message StartLocalAgentResult {
+  string created_bc_id = 1;
 }
 
 message StartSlackStreamingForFollowupRequest {
@@ -23600,7 +25400,7 @@ message StreamEditRequest {
   CmdKDebugInfo cmd_k_debug_info = 13;
   string session_id = 14;
   bool fast_mode = 15;
-  PH_L7i original_request = 16;
+  StreamEditRequest original_request = 16;
   repeated ImageProto images = 17;
   repeated CmdKExternalLink links = 18;
   repeated CursorRule rules = 19;
@@ -23642,7 +25442,7 @@ message StreamGenerateRequest {
   CmdKDebugInfo cmd_k_debug_info = 13;
   string session_id = 14;
   bool fast_mode = 15;
-  PH_D7i original_request = 16;
+  StreamGenerateRequest original_request = 16;
 }
 
 message StreamGetRelevantChunksResponseContextWrapped {
@@ -24271,6 +26071,7 @@ message SubmitFeedbackRequest {
   optional string shell = 6;
   optional string model = 7;
   optional string update_channel = 8;
+  optional string agent_mode = 9;
 }
 
 message SubmitFeedbackResponse {
@@ -24640,6 +26441,18 @@ message SyncIndexRequest {
 }
 
 message SyncIndexResponse {
+}
+
+message SyncLiveActivityRequest {
+  string device_id = 1;
+  PushPlatform platform = 2;
+  string activity_push_token = 3;
+  LiveActivityContentState content_state = 4;
+  uint64 state_version = 5;
+  string bundle_id = 6;
+}
+
+message SyncLiveActivityResponse {
 }
 
 message SyncMerkleSubtreeRequest {
@@ -25026,6 +26839,7 @@ message Team {
   bool scim_require_user_directory = 29;
   bool self_serve_tiered_pricing_enabled = 30;
   bool new_member_usage_promo_eligible = 31;
+  optional int64 deleted_at_ms = 34;
 }
 
 message TeamAdminModelRef {
@@ -25112,23 +26926,6 @@ message TeamMemberDomain {
   bool is_enabled = 3;
 }
 
-message TeamMemberUsage {
-  int32 id = 1;
-  repeated TeamMemberUsageData usage_data = 2;
-}
-
-message TeamMemberUsageData {
-  string model_type = 1;
-  int32 num_requests = 2;
-  int32 num_tokens = 3;
-  int32 max_token_usage = 4;
-  int32 max_request_usage = 5;
-  string last_usage = 6;
-  optional int32 copilot_usage = 7;
-  optional int32 docs_count = 8;
-  optional int32 copilot_accepted_usage = 9;
-}
-
 message TeamPluginInstall {
   int32 team_id = 1;
   int64 plugin_id = 2;
@@ -25150,6 +26947,8 @@ message TeamPluginPrimitiveUsageRow {
   int64 plugin_id = 2;
   PluginPrimitiveType primitive_type = 3;
   uint64 usage_count = 4;
+  uint64 human_usage_count = 5;
+  uint64 agent_usage_count = 6;
 }
 
 message TeamRoleCount {
@@ -25604,6 +27403,18 @@ message Trigger {
   optional string agentic_filter_prompt = 14;
 }
 
+message TriggerCrewStandupRequest {
+  string crew_id = 1;
+  string member_id = 2;
+  string instructions = 3;
+}
+
+message TriggerCrewStandupResponse {
+  int32 triggered_count = 1;
+  repeated CrewStandupTriggerResult results = 2;
+  bool skipped = 3;
+}
+
 message TriggerMetadataEntry {
   PlatformTriggerType trigger_type = 1;
   map<string, string> metadata = 2;
@@ -25642,6 +27453,16 @@ message UndoEditResult {
   string relative_workspace_path = 4;
   int32 context_total_num_lines = 5;
   int32 file_total_lines = 6;
+}
+
+message UndoFullSelfDrivingOutputRequest {
+  string pr_url = 1;
+  string bc_id = 2;
+  string stable_key = 3;
+}
+
+message UndoFullSelfDrivingOutputResponse {
+  FullSelfDrivingFinding finding = 1;
 }
 
 message UnenrollFromGlassEarlyPreviewRequest {
@@ -25832,6 +27653,8 @@ message UpdateBackgroundComposerUserSettingsRequest {
   optional string bc_id = 13;
   optional string default_environment_public_id = 14;
   repeated BackgroundComposerDefaultEnvironmentSetting default_environment_settings = 15;
+  optional bool remote_control_enabled = 16;
+  optional PrReviewOpenSurfaceMode pr_review_open_surface = 17;
 }
 
 message UpdateBackgroundComposerUserSettingsResponse {
@@ -25868,11 +27691,27 @@ message UpdateBugbotManualRepositoryRuleResponse {
 message UpdateBugbotModeRequest {
   BugbotMode mode = 1;
   repeated BugbotModePrompt prompts = 2;
+  optional bool smart_frontier_enabled = 3;
 }
 
 message UpdateBugbotModeResponse {
   BugbotMode mode = 1;
   repeated BugbotModePrompt prompts = 2;
+  bool smart_frontier_enabled = 3;
+  bool frontier_available = 4;
+}
+
+message UpdateBugBotProUserModeRequest {
+  BugbotMode mode = 1;
+  repeated BugbotModePrompt prompts = 2;
+  optional bool smart_frontier_enabled = 3;
+}
+
+message UpdateBugBotProUserModeResponse {
+  BugbotMode mode = 1;
+  repeated BugbotModePrompt prompts = 2;
+  bool smart_frontier_enabled = 3;
+  bool frontier_available = 4;
 }
 
 message UpdateBugBotProUserSettingsRequest {
@@ -25888,6 +27727,7 @@ message UpdateBugbotTeamRuleRequest {
   optional string content = 3;
   optional bool is_active = 4;
   optional bool is_required = 5;
+  optional int32 team_id = 6;
 }
 
 message UpdateBugbotTeamRuleResponse {
@@ -25904,6 +27744,7 @@ message UpdateBugbotUserSettingsRequest {
   bool enable_vm_run = 7;
   bool fail_github_action_on_bugbot_findings = 8;
   repeated string bugbot_autofix_severity_filter = 9;
+  optional bool is_incremental_review_enabled = 10;
 }
 
 message UpdateBugbotUserSettingsResponse {
@@ -25920,12 +27761,47 @@ message UpdateConfig {
   optional int32 applied_at = 3;
 }
 
+message UpdateCrewRequest {
+  Crew crew = 1;
+}
+
+message UpdateCrewResponse {
+  Crew crew = 1;
+  optional CrewSlackChannelStatus slack_channel_status = 2;
+  bool annotations_refreshed = 3;
+  optional CrewScheduleStatus schedule_status = 4;
+}
+
+message UpdateDataOpsJobRequest {
+  string job_id = 1;
+  optional DataOpsJobDbStatus status = 2;
+  optional google.protobuf.Timestamp started_at = 3;
+  optional google.protobuf.Timestamp finished_at = 4;
+  optional string buildkite_build_id = 5;
+  optional int32 buildkite_build_number = 6;
+  optional string buildkite_build_url = 7;
+  optional string finalized_train_s3_uri = 8;
+  optional string finalized_eval_s3_uri = 9;
+  optional string manifest_s3_uri = 10;
+  optional string stats_s3_uri = 11;
+  optional string config_block_s3_uri = 12;
+  optional string error_message = 13;
+  optional string rollouts_s3_uri = 14;
+  optional string rewards_s3_uri = 15;
+  optional string datacheck_s3_uri = 16;
+}
+
+message UpdateDataOpsJobResponse {
+  bool ok = 1;
+}
+
 message UpdateDirectoryGroupSettingsRequest {
   int32 directory_group_id = 1;
   optional int32 hard_limit_per_user_dollars = 2;
   AutoRunControls auto_run_controls = 3;
   int32 per_user_monthly_limit_dollars = 4;
   int32 team_id = 5;
+  optional AllowedMCPConfiguration allowed_mcp_configuration = 6;
 }
 
 message UpdateDirectoryGroupSettingsResponse {
@@ -25987,11 +27863,23 @@ message UpdateFullSelfDrivingOutputResponse {
   FullSelfDrivingFinding finding = 1;
 }
 
+message UpdateFullSelfDrivingPrConfigRequest {
+  string pr_url = 1;
+  optional bool enabled = 2;
+  optional FullSelfDrivingMode mode = 3;
+  optional int32 team_id = 4;
+}
+
+message UpdateFullSelfDrivingPrConfigResponse {
+  FullSelfDrivingActiveAgent agent = 1;
+}
+
 message UpdateFullSelfDrivingTeamSettingsRequest {
   int32 team_id = 1;
   optional FullSelfDrivingMode default_mode = 2;
   optional bool only_cloud_agent_prs = 3;
   optional bool globally_disabled = 4;
+  optional bool auto_create_on_first_pr_push = 5;
 }
 
 message UpdateFullSelfDrivingTeamSettingsResponse {
@@ -26002,12 +27890,20 @@ message UpdateFullSelfDrivingUserSettingsRequest {
   optional FullSelfDrivingMode default_mode = 1;
   optional bool only_cloud_agent_prs = 2;
   optional bool globally_disabled = 3;
+  optional bool auto_create_on_first_pr_push = 4;
+  optional bool slack_notifications_enabled = 5;
+  optional string fsd_slack_channel_id = 6;
+  optional string default_model = 7;
 }
 
 message UpdateFullSelfDrivingUserSettingsResponse {
   FullSelfDrivingMode default_mode = 1;
   bool only_cloud_agent_prs = 2;
   bool globally_disabled = 3;
+  bool auto_create_on_first_pr_push = 4;
+  bool slack_notifications_enabled = 5;
+  optional string fsd_slack_channel_id = 6;
+  optional string default_model = 7;
 }
 
 message UpdateGithubInstallationSettingsRequest {
@@ -26110,6 +28006,8 @@ message UpdateMarketplaceRequest {
   optional string name = 2;
   optional string description = 3;
   optional bool auto_reindex = 4;
+  optional int32 team_id = 5;
+  optional string display_name = 6;
 }
 
 message UpdateMarketplaceResponse {
@@ -26156,6 +28054,25 @@ message UpdateOrganizationGroupRequest {
 
 message UpdateOrganizationGroupResponse {
   OrganizationGroup group = 1;
+}
+
+message UpdateOrganizationIdentityProviderResponse {
+  OrganizationIdentityProvider provider = 1;
+}
+
+message UpdateOrganizationIdentityProviderSsoSettingsRequest {
+  string organization_id = 1;
+  string identity_provider_public_id = 2;
+  bool allow_sso = 3;
+}
+
+message UpdateOrganizationRequest {
+  string organization_id = 1;
+  string name = 2;
+}
+
+message UpdateOrganizationResponse {
+  string name = 1;
 }
 
 message UpdateOrganizationTeamRequest {
@@ -26276,6 +28193,9 @@ message UpdateRunStatusResponse {
   bool ok = 1;
 }
 
+message UpdateSandBoxRequest {
+}
+
 message UpdateSelfGithubAllowlistRequest {
   enum Operation {
     OPERATION_UNSPECIFIED = 0;
@@ -26318,6 +28238,8 @@ message UpdateSlackRepoRoutingRuleRequest {
   string rule_id = 2;
   string pattern = 3;
   string repo = 4;
+  SlackRoutingRuleTargetType target_type = 5;
+  optional string environment_public_id = 6;
 }
 
 message UpdateSlackRepoRoutingRuleResponse {
@@ -26402,6 +28324,10 @@ message UpdateTeamAdminSettingsRequest {
   repeated string remote_permissions_file_paths = 46;
   optional bool permissions_file_overrides_auto_run = 47;
   optional ExtensionInstallCooldownSettings extension_install_cooldown_settings = 48;
+  AutoReviewInstructions auto_review = 49;
+  optional PublicProfileSettings public_profile_settings = 50;
+  optional BitbucketIntegrationSettings bitbucket_integration_settings = 51;
+  optional bool marketplace_leaderboard_disabled = 52;
 }
 
 message UpdateTeamAdminSettingsResponse {
@@ -26423,6 +28349,9 @@ message UpdateTeamBugbotSettingsRequest {
   optional AllowlistConfig allowlist_config = 5;
   optional bool bugbot_globally_disabled = 6;
   repeated string mcp_server_names = 7;
+  optional bool is_incremental_review_enabled = 8;
+  optional bool merged_pr_scan_opt_out = 9;
+  optional bool apply_onboarding_high_effort_learning_defaults = 10;
 }
 
 message UpdateTeamBugbotSettingsResponse {
@@ -26434,6 +28363,7 @@ message UpdateTeamCommandRequest {
   optional string content = 3;
   optional string description = 4;
   optional bool is_active = 5;
+  optional int32 team_id = 6;
 }
 
 message UpdateTeamCommandResponse {
@@ -26467,6 +28397,7 @@ message UpdateTeamHookRequest {
   optional string hook_type = 6;
   optional string prompt_content = 7;
   optional string prompt_model = 8;
+  optional int32 team_id = 9;
 }
 
 message UpdateTeamHookResponse {
@@ -26484,6 +28415,7 @@ message UpdateTeamInviteLinkTTLSettingResponse {
 message UpdateTeamMarketplaceConfigRequest {
   int64 marketplace_id = 1;
   repeated int64 directory_group_ids = 2;
+  optional int32 team_id = 3;
 }
 
 message UpdateTeamMarketplaceConfigResponse {
@@ -26526,6 +28458,14 @@ message UpdateTeamPrivacyModeMigrationOptOutRequest {
 message UpdateTeamPrivacyModeMigrationOptOutResponse {
 }
 
+message UpdateTeamPublicProfileSettingsRequest {
+  int32 team_id = 1;
+  PublicProfileSettings settings = 2;
+}
+
+message UpdateTeamPublicProfileSettingsResponse {
+}
+
 message UpdateTeamRuleRequest {
   string rule_id = 1;
   optional string name = 2;
@@ -26533,6 +28473,7 @@ message UpdateTeamRuleRequest {
   optional bool is_active = 4;
   optional bool is_required = 5;
   repeated string globs = 6;
+  optional int32 team_id = 7;
 }
 
 message UpdateTeamRuleResponse {
@@ -26601,6 +28542,14 @@ message UpdateUserPluginInstallRequest {
 
 message UpdateUserPluginInstallResponse {
   UserPluginInstall install = 1;
+}
+
+message UpdateUserProfilePictureRequest {
+  optional string profile_picture_url = 1;
+}
+
+message UpdateUserProfilePictureResponse {
+  optional string profile_picture_url = 1;
 }
 
 message UpdateUserProfileRequest {
@@ -26753,6 +28702,30 @@ message UploadResponse {
   string doc_uuid = 5;
 }
 
+message UploadUserProfilePictureRequest {
+  string content_type = 1;
+  bytes bytes = 2;
+}
+
+message UploadUserProfilePictureResponse {
+  string profile_picture_url = 1;
+}
+
+message UpsertDataOpsJobStepRequest {
+  string job_id = 1;
+  DataOpsPhase phase = 2;
+  optional DataOpsStepDbStatus status = 3;
+  optional string ray_job_name = 4;
+  optional string ray_job_namespace = 5;
+  optional google.protobuf.Timestamp started_at = 6;
+  optional google.protobuf.Timestamp finished_at = 7;
+}
+
+message UpsertDataOpsJobStepResponse {
+  bool ok = 1;
+  string step_id = 2;
+}
+
 message UpsertDocsRequest {
   optional UploadStatus upload_status = 1;
   optional string ignore_index_prefix = 2;
@@ -26832,6 +28805,7 @@ message UpsertRunRolloutStatusRequest {
   optional double env_prep_ms = 20;
   optional double agent_loop_ms = 21;
   optional double scoring_ms = 22;
+  optional int32 reasoning_tokens = 23;
 }
 
 message UpsertRunRolloutStatusResponse {
@@ -27046,6 +29020,7 @@ message UsageEventDisplay {
   optional string automation_id = 20;
   optional string automation_managed_type = 21;
   optional string client_type = 22;
+  optional string conversation_id = 23;
 }
 
 message UsageReport {
@@ -27057,6 +29032,9 @@ message UsageReport {
   int64 output_tokens = 6;
   bool success = 7;
   ProviderErrorType provider_error_type = 8;
+  int64 cached_input_tokens = 9;
+  bool is_stream = 10;
+  string canonical_model = 11;
 }
 
 message UsefulType {
@@ -27094,6 +29072,7 @@ message UserProfile {
   string updated_at = 5;
   optional string display_name = 6;
   optional string avatar_url = 7;
+  repeated string badges = 8;
 }
 
 message UserPullRequest {
@@ -27169,6 +29148,7 @@ message ValidateAutomationSpecResponse {
 
 message ValidateAutomationToolsRequest {
   string prompt = 1;
+  repeated string trigger_types = 2;
 }
 
 message ValidateAutomationToolsResponse {
@@ -27199,6 +29179,16 @@ message ValidateMcpOAuthTokensResponse {
   }
 
   repeated ValidateMcpOAuthTokensResponse.Result results = 1;
+}
+
+message VerifyAppleTransactionRequest {
+  string signed_transaction_jws = 1;
+  string product_id = 2;
+  string app_account_token = 3;
+}
+
+message VerifyAppleTransactionResponse {
+  string tier = 1;
 }
 
 message VerifyBackgroundComposerAccessRequest {
@@ -27263,6 +29253,8 @@ message ViewablePRProps {
 message VmProvisionedSkill {
   string skill_id = 1;
   string description = 2;
+  repeated string environments = 3;
+  repeated string disabled_environments = 4;
 }
 
 message VscodeCPUProperties {
@@ -27282,6 +29274,13 @@ message VscodeOSStatistics {
   double totalmem = 1;
   double freemem = 2;
   repeated double loadavg = 3;
+}
+
+message WakeBackgroundComposerRequest {
+  string bc_id = 1;
+}
+
+message WakeBackgroundComposerResponse {
 }
 
 message WarmApplyRequest {
@@ -27339,6 +29338,51 @@ message WatchBackgroundComposerSnapshotStateResponse {
   optional string error_message = 3;
 }
 
+message WaterfallSpan {
+  string span_id = 1;
+  optional string parent_span_id = 2;
+  google.protobuf.Timestamp start_time = 3;
+  repeated WaterfallSpanLog logs = 5;
+  optional WaterfallSpanStatus status = 6;
+  optional CallToAction call_to_action = 7;
+  SpanState span_state = 8;
+  optional WaterfallSpanEnd end = 9;
+  WaterfallPhaseType phase_type = 10;
+  optional string fallback_phase_label = 11;
+}
+
+message WaterfallSpanEnd {
+  google.protobuf.Timestamp timestamp = 1;
+  WaterfallSpanEndStatus end_status = 2;
+}
+
+message WaterfallSpanLog {
+  google.protobuf.Timestamp timestamp = 1;
+  string message = 2;
+  WaterfallLogLevel level = 3;
+}
+
+message WaterfallSpanStatus {
+  google.protobuf.Timestamp timestamp = 1;
+  WaterfallSpanStatusType status_type = 2;
+  string message = 3;
+}
+
+message WaterfallState {
+  repeated WaterfallSpan spans = 1;
+}
+
+message WaterfallUpdate {
+  oneof update {
+    SpanStart span_start = 2;
+    SpanEnd span_end = 3;
+    SpanLog span_log = 4;
+    SpanStatusUpdate span_status_update = 5;
+    SpanUpdate span_update = 6;
+  }
+  google.protobuf.Timestamp timestamp = 1;
+}
+
 message WebAcknowledgeGracePeriodDisclaimerRequest {
 }
 
@@ -27375,6 +29419,12 @@ message WebReference {
   string url = 1;
   string title = 2;
   string chunk = 3;
+}
+
+message WebSearchDocument {
+  string url = 1;
+  string title = 2;
+  string text = 3;
 }
 
 message WebSearchParams {
@@ -27466,6 +29516,7 @@ message WorkloadDemand {
   int64 requests = 3;
   int64 input_tokens = 4;
   int64 output_tokens = 5;
+  bool is_stream = 6;
 }
 
 message WorkloadGrant {
@@ -27480,6 +29531,9 @@ message WorkloadGrant {
   string model = 9;
   int64 replay_requests = 10;
   int64 max_replay_count_per_request = 11;
+  bool is_stream = 12;
+  RouteResult route_result = 13;
+  string canonical_model = 14;
 }
 
 message WorkspaceFolder {
@@ -27565,22 +29619,16 @@ message WriteTextFileResponse {
   repeated LinterError new_linter_errors = 1;
 }
 
-// ============================
-// Placeholder types (0 direct + 0 recursive-shell + 2 opaque)
-// ============================
-
-message PH_D7i {} // opaque placeholder for D7i
-
-message PH_L7i {} // opaque placeholder for L7i
-
 service AiService {
+  rpc ServerTime (ServerTimeRequest) returns (ServerTimeResponse);
   rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
   rpc PrivacyCheck (PrivacyCheckRequest) returns (PrivacyCheckResponse);
   rpc TimeLeftHealthCheck (HealthCheckRequest) returns (TimeLeftHealthCheckResponse);
   rpc ThrowErrorCheck (ThrowErrorCheckRequest) returns (ThrowErrorCheckResponse);
-  rpc AvailableModels (AvailableModelsRequest) returns (AvailableModelsResponse);
+  rpc StreamChatTryReallyHard (GetChatRequest) returns (stream StreamChatResponse);
   rpc RerankDocuments (RerankDocumentsRequest) returns (RerankDocumentsResponse);
   rpc StreamComposer (GetComposerChatRequest) returns (stream StreamChatResponse);
+  rpc StreamComposerContext (StreamChatContextRequest) returns (stream StreamChatContextResponse);
   rpc WarmComposerCache (GetComposerChatRequest) returns (WarmComposerCacheResponse);
   rpc KeepComposerCacheWarm (KeepComposerCacheWarmRequest) returns (KeepComposerCacheWarmResponse);
   rpc CountTokens (CountTokensRequest) returns (CountTokensResponse);
@@ -27593,8 +29641,11 @@ service AiService {
   rpc GetSimplePrompt (GetSimplePromptRequest) returns (GetSimplePromptResponse);
   rpc GetPassthroughPrompt (GetPassthroughPromptRequest) returns (GetPassthroughPromptResponse);
   rpc SuggestQuickActions (SuggestQuickActionsRequest) returns (SuggestQuickActionsResponse);
+  rpc CheckLongFilesFit (GetChatRequest) returns (CheckLongFilesFitResponse);
   rpc GetEvaluationPrompt (GetEvaluationPromptRequest) returns (GetEvaluationPromptResponse);
   rpc GetUserInfo (GetUserInfoRequest) returns (GetUserInfoResponse);
+  rpc StreamChat (GetChatRequest) returns (stream StreamChatResponse);
+  rpc StreamChatWeb (GetChatRequest) returns (stream StreamChatResponse);
   rpc WarmChatCache (WarmChatCacheRequest) returns (WarmChatCacheResponse);
   rpc StreamEdit (StreamEditRequest) returns (stream StreamChatResponse);
   rpc PreloadEdit (PreloadEditRequest) returns (PreloadEditResponse);
@@ -27612,10 +29663,12 @@ service AiService {
   rpc CheckUsageBasedPrice (CheckUsageBasedPriceRequest) returns (CheckUsageBasedPriceResponse);
   rpc DoThisForMeCheck (DoThisForMeCheckRequest) returns (DoThisForMeCheckResponse);
   rpc StreamDoThisForMe (DoThisForMeRequest) returns (stream DoThisForMeResponseWrapped);
+  rpc StreamChatToolformer (GetChatRequest) returns (stream StreamChatToolformerResponse);
   rpc StreamChatToolformerContinue (StreamChatToolformerContinueRequest) returns (stream StreamChatToolformerResponse);
   rpc PushAiThought (PushAiThoughtRequest) returns (PushAiThoughtResponse);
   rpc CheckDoableAsTask (CheckDoableAsTaskRequest) returns (CheckDoableAsTaskResponse);
   rpc ReportGroundTruthCandidate (ReportGroundTruthCandidateRequest) returns (ReportGroundTruthCandidateResponse);
+  rpc ReportCmdKFate (ReportCmdKFateRequest) returns (ReportCmdKFateResponse);
   rpc ShowWelcomeScreen (ShowWelcomeScreenRequest) returns (ShowWelcomeScreenResponse);
   rpc InterfaceAgentInit (InterfaceAgentInitRequest) returns (InterfaceAgentInitResponse);
   rpc StreamInterfaceAgentStatus (StreamInterfaceAgentStatusRequest) returns (stream StreamInterfaceAgentStatusResponse);
@@ -27623,7 +29676,6 @@ service AiService {
   rpc UpdateVscodeProfile (UpdateVscodeProfileRequest) returns (UpdateVscodeProfileResponse);
   rpc TaskInit (TaskInitRequest) returns (TaskInitResponse);
   rpc TaskPause (TaskPauseRequest) returns (TaskPauseResponse);
-  rpc TaskInfo (TaskInfoRequest) returns (TaskInfoResponse);
   rpc TaskStreamLog (TaskStreamLogRequest) returns (stream TaskStreamLogResponse);
   rpc TaskSendMessage (TaskSendMessageRequest) returns (TaskSendMessageResponse);
   rpc TaskProvideResult (TaskProvideResultRequest) returns (TaskProvideResultResponse);
@@ -27640,8 +29692,10 @@ service AiService {
   rpc SummarizeWithReferences (SummarizeWithReferencesRequest) returns (RequestReceivedResponse);
   rpc DocumentationQuery (DocumentationQueryRequest) returns (DocumentationQueryResponse);
   rpc AvailableDocs (AvailableDocsRequest) returns (AvailableDocsResponse);
+  rpc RunWebSearch (RunWebSearchRequest) returns (RunWebSearchResponse);
+  rpc RunWebFetch (RunWebFetchRequest) returns (RunWebFetchResponse);
   rpc ReportFeedback (ReportFeedbackRequest) returns (ReportFeedbackResponse);
-  rpc ReportBug (ReportBugRequest) returns (ReportBugResponse);
+  rpc StreamChatContext (StreamChatContextRequest) returns (stream StreamChatContextResponse);
   rpc GenerateTldr (GenerateTldrRequest) returns (GenerateTldrResponse);
   rpc TaskStreamChatContext (TaskStreamChatContextRequest) returns (stream TaskStreamChatContextResponseWrapped);
   rpc RerankResults (RerankerRequest) returns (RerankerResponse);
@@ -27649,7 +29703,7 @@ service AiService {
   rpc ModelQueryV2 (ModelQueryRequest) returns (stream ModelQueryResponseV2);
   rpc IntentPrediction (IntentPredictionRequest) returns (IntentPredictionResponse);
   rpc GetChatSuggestions (GetChatSuggestionsRequest) returns (GetChatSuggestionsResponse);
-  rpc GetUserInstructions (GetUserInstructionsRequest) returns (GetUserInstructionsResponse);
+  rpc StreamCursorTutor (StreamCursorTutorRequest) returns (stream StreamCursorTutorResponse);
   rpc CheckFeatureStatus (CheckFeatureStatusRequest) returns (CheckFeatureStatusResponse);
   rpc CheckFeaturesStatus (CheckFeaturesStatusRequest) returns (CheckFeaturesStatusResponse);
   rpc CheckFeatureStatusUnauthenticated (CheckFeatureStatusRequest) returns (CheckFeatureStatusResponse);
@@ -27662,13 +29716,11 @@ service AiService {
   rpc RefreshTabContext (RefreshTabContextRequest) returns (RefreshTabContextResponse);
   rpc CheckNumberConfig (CheckNumberConfigRequest) returns (CheckNumberConfigResponse);
   rpc CheckNumberConfigUnauthenticated (CheckNumberConfigRequest) returns (CheckNumberConfigResponse);
-  rpc CheckNumberConfigs (CheckNumberConfigsRequest) returns (CheckNumberConfigsResponse);
   rpc StreamTerminalAutocomplete (StreamTerminalAutocompleteRequest) returns (stream StreamTerminalAutocompleteResponse);
   rpc StreamPseudocodeGenerator (StreamPseudocodeGeneratorRequest) returns (stream StreamPseudocodeGeneratorResponse);
   rpc StreamPseudocodeMapper (StreamPseudocodeMapperRequest) returns (stream StreamPseudocodeMapperResponse);
   rpc AcknowledgeGracePeriodDisclaimer (AcknowledgeGracePeriodDisclaimerRequest) returns (AcknowledgeGracePeriodDisclaimerResponse);
   rpc StreamAiLintBug (StreamAiLintBugRequest) returns (stream StreamAiLintBugResponse);
-  rpc StreamAiCursorHelp (StreamAiCursorHelpRequest) returns (stream StreamAiCursorHelpResponse);
   rpc LogUserLintReply (LogUserLintReplyRequest) returns (LogUserLintReplyResponse);
   rpc LogLinterExplicitUserFeedback (LogLinterExplicitUserFeedbackRequest) returns (LogLinterExplicitUserFeedbackResponse);
   rpc StreamFixMarkers (FixMarkersRequest) returns (stream FixMarkersResponse);
@@ -27681,6 +29733,7 @@ service AiService {
   rpc ReportGenerationFeedback (ReportGenerationFeedbackRequest) returns (ReportGenerationFeedbackResponse);
   rpc ReportAgentFeedback (ReportAgentFeedbackRequest) returns (ReportAgentFeedbackResponse);
   rpc ReportAgentMessageFeedback (ReportAgentMessageFeedbackRequest) returns (ReportAgentMessageFeedbackResponse);
+  rpc GetThoughtAnnotation (GetThoughtAnnotationRequest) returns (GetThoughtAnnotationResponse);
   rpc StreamWebCmdKV1 (StreamWebCmdKV1Request) returns (stream StreamWebCmdKV1Response);
   rpc StreamNextCursorPrediction (StreamNextCursorPredictionRequest) returns (stream StreamNextCursorPredictionResponse);
   rpc IsCursorPredictionEnabled (IsCursorPredictionEnabledRequest) returns (IsCursorPredictionEnabledResponse);
@@ -27692,6 +29745,7 @@ service AiService {
   rpc BackgroundCmdK (BackgroundCmdKRequest) returns (stream BackgroundCmdKResponse);
   rpc CalculateAutoSelection (CalculateAutoSelectionRequest) returns (CalculateAutoSelectionResponse);
   rpc GetAtSymbolSuggestions (GetAtSymbolSuggestionsRequest) returns (GetAtSymbolSuggestionsResponse);
+  rpc GetCodebaseQuestions (GetChatRequest) returns (GetCodebaseQuestionsResponse);
   rpc CppEditHistoryAppend (EditHistoryAppendChangesRequest) returns (EditHistoryAppendChangesResponse);
   rpc DevOnlyGetPastRequestIds (DevOnlyGetPastRequestIdsRequest) returns (DevOnlyGetPastRequestIdsResponse);
   rpc GetFilesForComposer (GetFilesForComposerRequest) returns (GetFilesForComposerResponse);
@@ -27712,6 +29766,7 @@ service AiService {
   rpc StreamUiBestOfNJudgeSSE (BidiRequestId) returns (stream StreamUiBestOfNJudgeServerMessage);
   rpc StreamUiBestOfNJudgePoll (BidiPollRequest) returns (stream BidiPollResponse);
   rpc CheckBugBotPrice (CheckBugBotPriceRequest) returns (CheckBugBotPriceResponse);
+  rpc CheckBugBotTelemetryHealthy (CheckBugBotTelemetryHealthyRequest) returns (CheckBugBotTelemetryHealthyResponse);
   rpc RecordIdeBugReaction (RecordIdeBugReactionRequest) returns (RecordIdeBugReactionResponse);
   rpc GetSuggestedBugBotIterations (GetSuggestedBugBotIterationsRequest) returns (GetSuggestedBugBotIterationsResponse);
   rpc GetEditorBugbotAutoRunStatus (GetEditorBugbotAutoRunStatusRequest) returns (GetEditorBugbotAutoRunStatusResponse);
@@ -27720,11 +29775,11 @@ service AiService {
   rpc StreamDiffReviewByFile (GetDiffReviewRequest) returns (stream StreamDiffReviewByFileResponse);
   rpc GetModelLabels (GetModelLabelsRequest) returns (GetModelLabelsResponse);
   rpc GetLastDefaultModelNudge (GetLastDefaultModelNudgeRequest) returns (GetLastDefaultModelNudgeResponse);
-  rpc GetDefaultModelNudgeData (GetDefaultModelNudgeDataRequest) returns (GetDefaultModelNudgeDataResponse);
   rpc GetDefaultModel (GetDefaultModelRequest) returns (GetDefaultModelResponse);
   rpc ReportCommitAiAnalytics (ReportCommitAiAnalyticsRequest) returns (ReportCommitAiAnalyticsResponse);
   rpc TestBedrockCredentials (TestBedrockCredentialsRequest) returns (TestBedrockCredentialsResponse);
   rpc ReportAiCodeChangeMetrics (ReportAiCodeChangeMetricsRequest) returns (ReportAiCodeChangeMetricsResponse);
+  rpc ReportProcessMetrics (ReportProcessMetricsRequest) returns (ReportProcessMetricsResponse);
   rpc ReportProcessMetricsV2 (ReportProcessMetricsV2Request) returns (ReportProcessMetricsV2Response);
   rpc ReportClientNumericMetrics (ReportClientNumericMetricsRequest) returns (ReportClientNumericMetricsResponse);
   rpc PotentiallyGenerateMemory (PotentiallyGenerateMemoryRequest) returns (PotentiallyGenerateMemoryResponse);

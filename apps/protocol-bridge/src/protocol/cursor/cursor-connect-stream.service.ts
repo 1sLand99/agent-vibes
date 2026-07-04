@@ -36,6 +36,8 @@ import {
   ContextTelemetryService,
   type ContextToolResultReplacementState,
   type ContextUsageSnapshot,
+  type ContextMessageSource,
+  type ContextProjectionAttachment,
   detectPromptTooLong,
   extractText,
   formatSubAgentMemoryEntry,
@@ -520,6 +522,7 @@ type DeferredToolFamily =
   // 新增交互工具
   | "communicate_update"
   | "send_final_summary"
+  | "send_to_user"
   | "blame_by_file_path"
   | "report_bug"
   | "set_active_branch"
@@ -1808,6 +1811,7 @@ export class CursorConnectStreamService {
 
     const interruptedToolCalls: InterruptedToolCallInfo[] = []
     let interruptedSubAgent: SessionRestartRecovery["interruptedSubAgent"]
+    const execIdsToCancel = new Set<number>()
     // Sub-agent ids whose state machine we tear down at the end of this
     // sweep. Built up per-toolCallId so we only kill the sub-agents
     // whose pending work was actually interrupted, leaving any sibling
@@ -1829,6 +1833,9 @@ export class CursorConnectStreamService {
         reason: normalizedReason,
         detail: trimmedDetail,
       })
+      for (const execId of pendingToolCall.execIds) {
+        execIdsToCancel.add(execId)
+      }
 
       // Resolve the owning sub-agent. Try parent-tool-call first
       // (matches the `task` envelope), then subagent-owner (inner
@@ -1881,6 +1888,8 @@ export class CursorConnectStreamService {
     if (interruptedToolCalls.length === 0) {
       return 0
     }
+
+    this.cancelExecDispatchSlots(conversationId, execIdsToCancel)
 
     // Record an "interrupted" session-memory breadcrumb for each
     // sub-agent we are about to tear down, BEFORE clearing the
@@ -1989,14 +1998,22 @@ export class CursorConnectStreamService {
     const interruptedToolCalls: InterruptedToolCallInfo[] = []
     const trimmedDetail = reason.trim() || undefined
     for (const ctx of candidates) {
-      const ownedPendingIds = this.sessionManager
+      const ownedPendingToolCalls = this.sessionManager
         .listPendingToolCalls(session.conversationId)
         .filter(
           (pending) =>
             pending.subagentOwner === ctx.subagentId ||
             pending.toolCallId === ctx.parentToolCallId
         )
-        .map((pending) => pending.toolCallId)
+      const ownedPendingIds = ownedPendingToolCalls.map(
+        (pending) => pending.toolCallId
+      )
+      const ownedExecIds = new Set<number>()
+      for (const pending of ownedPendingToolCalls) {
+        for (const execId of pending.execIds) {
+          ownedExecIds.add(execId)
+        }
+      }
 
       // Reject every Exec waiter the sub-agent had outstanding so its
       // worker loop unwinds (rejectToolCall is keyed by toolCallId so
@@ -2026,6 +2043,7 @@ export class CursorConnectStreamService {
           `sub-agent cancelled: parent_cancelled${trimmedDetail ? ` (${trimmedDetail})` : ""}`
         )
       }
+      this.cancelExecDispatchSlots(conversationId, ownedExecIds)
       this.recordAbortedSubAgentMemory(
         conversationId,
         ctx,
@@ -7168,6 +7186,8 @@ export class CursorConnectStreamService {
      *  (boundary / summary / attachment / hook). Carried so the wire
      *  layer / transcript bridge can hide them. */
     isMeta?: boolean
+    source?: ContextMessageSource
+    attachmentKind?: ContextProjectionAttachment["kind"]
   }> {
     // Cache fast path.  See `truncateOutputCache` doc above for the
     // full safety argument.  Build the secondary keys first so a
@@ -7258,6 +7278,8 @@ export class CursorConnectStreamService {
       content: MessageContent
       messageId?: string
       isMeta?: boolean
+      source?: ContextMessageSource
+      attachmentKind?: ContextProjectionAttachment["kind"]
     }>
 
     // No protocol-level repair: the ToolCallLedger guarantees tool_use ↔
@@ -7270,6 +7292,8 @@ export class CursorConnectStreamService {
       content: MessageContent
       messageId?: string
       isMeta?: boolean
+      source?: ContextMessageSource
+      attachmentKind?: ContextProjectionAttachment["kind"]
     }> = (() => {
       const modelMessages =
         this.stripSubAgentUiPayloadsForBackend(truncatedMessages)
@@ -8045,12 +8069,16 @@ export class CursorConnectStreamService {
       content: MessageContent
       messageId?: string
       isMeta?: boolean
+      source?: ContextMessageSource
+      attachmentKind?: ContextProjectionAttachment["kind"]
     }>
   ): Array<{
     role: "user" | "assistant"
     content: MessageContent
     messageId?: string
     isMeta?: boolean
+    source?: ContextMessageSource
+    attachmentKind?: ContextProjectionAttachment["kind"]
   }> {
     let changed = false
     const nextMessages = messages.map((message) => {
@@ -8209,8 +8237,8 @@ export class CursorConnectStreamService {
     projectedMessages: Array<{
       role: "user" | "assistant"
       content: MessageContent
-      source?: string
-      attachmentKind?: string
+      source?: ContextMessageSource
+      attachmentKind?: ContextProjectionAttachment["kind"]
     }>,
     finalMessages: Array<{
       role: "user" | "assistant"
@@ -9254,6 +9282,10 @@ ${raw}
     let accumulatedText = ""
     let finalUsage: ContextUsageSnapshot | undefined
     let finalStopReason: string | null | undefined
+    let suppressVisibleThinkingTextForStream =
+      this.shouldSuppressVisibleThinkingTextForBackend(
+        this.modelRouter.resolveModel(session.model).backend
+      )
     let currentToolCall: ActiveToolCall | null = null
     let currentToolCallBlockIndex: number | undefined
     // Split-sibling persistence: each content_block_stop yields exactly one
@@ -9369,6 +9401,8 @@ ${raw}
         if (event.type === "message_start") {
           const route = this.modelRouter.resolveModel(session.model)
           const backend = route.backend
+          suppressVisibleThinkingTextForStream =
+            this.shouldSuppressVisibleThinkingTextForBackend(backend)
           const messageId =
             event.data.message && typeof event.data.message.id === "string"
               ? event.data.message.id
@@ -9461,32 +9495,35 @@ ${raw}
           const blockIndex =
             typeof event.data.index === "number" ? event.data.index : undefined
           if (delta?.type === "text_delta" && delta.text) {
-            logFirstSemanticEvent("content_block_delta", "text_delta")
-            logFirstActionableEvent("content_block_delta", "text_delta")
-            this.emit(
-              conversationId,
-              this.grpcService.createAgentTextResponse(delta.text)
-            )
-            accumulatedText += delta.text
-            // Per-index text accumulator. Joined at content_block_stop.
-            if (typeof blockIndex === "number") {
-              const buf =
-                textDeltasAtIndex.get(blockIndex) ??
-                (textDeltasAtIndex
-                  .set(blockIndex, [])
-                  .get(blockIndex) as string[])
-              buf.push(delta.text)
-            }
+            const text = delta.text
+            if (text.length > 0) {
+              logFirstSemanticEvent("content_block_delta", "text_delta")
+              logFirstActionableEvent("content_block_delta", "text_delta")
+              this.emit(
+                conversationId,
+                this.grpcService.createAgentTextResponse(text)
+              )
+              accumulatedText += text
+              // Per-index text accumulator. Joined at content_block_stop.
+              if (typeof blockIndex === "number") {
+                const buf =
+                  textDeltasAtIndex.get(blockIndex) ??
+                  (textDeltasAtIndex
+                    .set(blockIndex, [])
+                    .get(blockIndex) as string[])
+                buf.push(text)
+              }
 
-            if (emitTokenDeltas) {
-              const { estimateTokenCount } =
-                await import("./tools/agent-helpers")
-              const outputTokens = estimateTokenCount(delta.text)
-              if (outputTokens > 0) {
-                this.emit(
-                  conversationId,
-                  this.grpcService.createTokenDeltaResponse(0, outputTokens)
-                )
+              if (emitTokenDeltas) {
+                const { estimateTokenCount } =
+                  await import("./tools/agent-helpers")
+                const outputTokens = estimateTokenCount(text)
+                if (outputTokens > 0) {
+                  this.emit(
+                    conversationId,
+                    this.grpcService.createTokenDeltaResponse(0, outputTokens)
+                  )
+                }
               }
             }
           } else if (delta?.type === "input_json_delta" && currentToolCall) {
@@ -9550,20 +9587,26 @@ ${raw}
             }
           } else if (delta?.type === "thinking_delta") {
             logFirstSemanticEvent("content_block_delta", "thinking_delta")
+            const thinkingText =
+              typeof delta.thinking === "string" ? delta.thinking : ""
             // currentThinkingBlock is the same object reference held in
             // indexToThinkingBlock — direct mutation flows through to
             // content_block_stop's persist call.
-            if (currentThinkingBlock && delta.thinking) {
-              currentThinkingBlock.thinking += delta.thinking
+            if (
+              currentThinkingBlock &&
+              thinkingText &&
+              !suppressVisibleThinkingTextForStream
+            ) {
+              currentThinkingBlock.thinking += thinkingText
             }
             if (
-              typeof delta.thinking === "string" &&
-              delta.thinking.length > 0
+              thinkingText.length > 0 &&
+              !suppressVisibleThinkingTextForStream
             ) {
               this.emit(
                 conversationId,
                 this.grpcService.createThinkingDeltaResponse(
-                  delta.thinking,
+                  thinkingText,
                   session.model
                 )
               )
@@ -9653,7 +9696,13 @@ ${raw}
               )
             )
             const finishedThinking = indexToThinkingBlock.get(blockIndex)
-            if (finishedThinking) {
+            if (
+              finishedThinking &&
+              (!suppressVisibleThinkingTextForStream ||
+                finishedThinking.thinking.trim().length > 0 ||
+                (typeof finishedThinking.signature === "string" &&
+                  finishedThinking.signature.trim().length > 0))
+            ) {
               blockToPersist = { ...finishedThinking } as MessageContentItem
             }
             indexToThinkingBlock.delete(blockIndex)
@@ -10232,17 +10281,20 @@ ${raw}
     session: SessionRecord,
     text: string
   ): Promise<void> {
-    this.emit(
-      session.conversationId,
-      this.grpcService.createAgentTextResponse(text)
-    )
+    if (text.length > 0) {
+      this.emit(
+        session.conversationId,
+        this.grpcService.createAgentTextResponse(text)
+      )
+    }
 
     const activeSession =
       this.cleanSessionHistoryForTransientAssistantInfrastructureMessages(
         session,
         `emitAgentFinalTextResponse: ${session.conversationId}`
       )
-    const shouldPersist = !this.isTransientAssistantInfrastructureText(text)
+    const shouldPersist =
+      text.length > 0 && !this.isTransientAssistantInfrastructureText(text)
 
     if (shouldPersist) {
       const activeCtx = this.contextState.getContextRecord(
@@ -14134,6 +14186,8 @@ ${raw}
           return "generate_image"
         case "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS":
           return "report_bugfix_results"
+        case "CLIENT_SIDE_TOOL_V2_SEND_TO_USER":
+          return "send_to_user"
         case "CLIENT_SIDE_TOOL_V2_FILE_SEARCH":
           return "file_search"
         case "CLIENT_SIDE_TOOL_V2_GLOB_FILE_SEARCH":
@@ -14414,6 +14468,9 @@ ${raw}
       compact.includes("sendfinalsummary")
     ) {
       return "send_final_summary"
+    }
+    if (snake.includes("send_to_user") || compact.includes("sendtouser")) {
+      return "send_to_user"
     }
     if (
       snake.includes("blame_by_file_path") ||
@@ -14824,7 +14881,17 @@ ${raw}
           session.mcpToolDefs,
           finalName
         )
-        if (!registeredDef && session.mcpToolDefs?.length) {
+        if (registeredDef) {
+          if (registeredDef.name && registeredDef.name !== finalName) {
+            this.logger.debug(
+              `MCP name canonicalization: resolved "${finalName}" to ` +
+                `registered tool "${registeredDef.name}"`
+            )
+          }
+          finalName = registeredDef.name || finalName
+          finalToolName = registeredDef.toolName || finalToolName
+          finalProvider = registeredDef.providerIdentifier || finalProvider
+        } else if (session.mcpToolDefs?.length) {
           // composeMcpName produced a name the IDE doesn't recognize.
           // Try to find the correct def by matching providerIdentifier +
           // toolName against the registry.
@@ -14987,7 +15054,11 @@ ${raw}
     const requestedName = normalize(input.name)
     const requestedToolName = normalize(input.toolName || input.tool_name)
     const requestedProvider = normalize(
-      input.providerIdentifier || input.provider_identifier || input.serverName
+      input.providerIdentifier ||
+        input.provider_identifier ||
+        input.serverName ||
+        input.server ||
+        input.server_name
     )
 
     if (requestedName) {
@@ -17232,16 +17303,6 @@ ${raw}
    * cursor-grpc.service.ts::detectToolFamily but only for the families
    * the bridge actually allow-lists for sub-agent dispatch.
    *
-   * Returning undefined is fine — the hint is a hint, not a contract;
-   * handleToolResult derives the real family from `toolName` when the
-   * hint is missing.
-   */
-  /**
-   * Map an Exec-dispatchable user-facing tool name to the
-   * `toolFamilyHint` field on PendingToolCall. Mirrors the cases in
-   * cursor-grpc.service.ts::detectToolFamily but only for the families
-   * the bridge actually allow-lists for sub-agent dispatch.
-   *
    * Pass `session` when the resolution should also recognize MCP tools
    * by walking `session.mcpToolDefs`. Without that argument, MCP tool
    * names whose normalized form does not literally contain "mcp"
@@ -17287,6 +17348,10 @@ ${raw}
     toolName: string,
     execResult: SubagentExecResult
   ): string {
+    if (typeof execResult.inlineContent === "string") {
+      return execResult.inlineContent
+    }
+
     // Streamed shellStream path: synthesise a human-readable shell
     // result block from the buffered stdout/stderr/exitCode rather
     // than running the parsed-result formatter (which expects a real
@@ -17521,7 +17586,7 @@ ${raw}
     const types: string[] = []
     for (const agent of agents) types.push(agent.agentType)
     types.sort()
-    return types.join(" ")
+    return types.join("\u0000")
   }
 
   /**
@@ -21059,6 +21124,213 @@ ${raw}
     }
   }
 
+  private pickMcpServerName(input: Record<string, unknown>): string {
+    return (
+      this.pickFirstString(input, [
+        "serverName",
+        "server",
+        "server_name",
+        "providerIdentifier",
+        "provider_identifier",
+      ]) || ""
+    )
+  }
+
+  private listMountedMcpServerAliases(session: SessionRecord): string[] {
+    const aliases = new Set<string>()
+    for (const def of session.mcpToolDefs || []) {
+      const ideKey = (def?.ideRegistryKey || "").trim()
+      const provider = (def?.providerIdentifier || "").trim()
+      if (ideKey) aliases.add(ideKey)
+      if (provider) aliases.add(provider)
+    }
+    return Array.from(aliases).sort((left, right) => left.localeCompare(right))
+  }
+
+  private isMountedMcpServer(
+    session: SessionRecord,
+    requestedServer: string
+  ): boolean {
+    const requested = requestedServer.trim()
+    if (!requested) return false
+
+    const resolved = this.resolveMountedMcpServer(session, requested)
+    if (resolved && resolved !== requested) return true
+
+    const normalizedRequested = normalizeMcpToolIdentifier(requested)
+    const normalizedResolved = normalizeMcpToolIdentifier(resolved)
+    for (const alias of this.listMountedMcpServerAliases(session)) {
+      const normalizedAlias = normalizeMcpToolIdentifier(alias)
+      if (
+        alias === requested ||
+        alias === resolved ||
+        (normalizedRequested && normalizedAlias === normalizedRequested) ||
+        (normalizedResolved && normalizedAlias === normalizedResolved)
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private writeMcpServerNameToInput(
+    input: Record<string, unknown>,
+    serverName: string
+  ): void {
+    input.server = serverName
+    input.serverName = serverName
+    input.server_name = serverName
+    input.providerIdentifier = serverName
+    input.provider_identifier = serverName
+  }
+
+  private formatMountedMcpServersHint(session: SessionRecord): string {
+    const aliases = this.listMountedMcpServerAliases(session)
+    if (aliases.length === 0) {
+      return "No MCP servers are mounted in this session."
+    }
+    return `Available MCP servers: ${aliases.join(", ")}.`
+  }
+
+  private executeInlineSubAgentListMcpResources(
+    conversationId: string,
+    input: Record<string, unknown>
+  ): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+    extraData?: ToolCompletedExtraData
+  } {
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) {
+      return {
+        content: "[list_mcp_resources error] Session not found",
+        state: { status: "error", message: "session not found" },
+        extraData: {
+          toolResultState: {
+            status: "error",
+            message: "session not found",
+          },
+        },
+      }
+    }
+
+    const requestedServer = this.pickMcpServerName(input)
+    if (requestedServer && !this.isMountedMcpServer(session, requestedServer)) {
+      const message =
+        `Unknown MCP server "${requestedServer}". ` +
+        this.formatMountedMcpServersHint(session)
+      return {
+        content: `[list_mcp_resources error] ${message}`,
+        state: { status: "error", message },
+        extraData: {
+          toolResultState: {
+            status: "error",
+            message,
+          },
+        },
+      }
+    }
+
+    const resolvedServer = requestedServer
+      ? this.resolveMountedMcpServer(session, requestedServer)
+      : ""
+    if (resolvedServer) {
+      this.writeMcpServerNameToInput(input, resolvedServer)
+    }
+
+    const content = resolvedServer
+      ? `[list_mcp_resources success] no resources advertised for server "${resolvedServer}" in the current session`
+      : "[list_mcp_resources success] no MCP resources advertised by mounted servers in the current session"
+
+    return {
+      content,
+      state: { status: "success" },
+      extraData: {
+        listMcpResourcesSuccess: {
+          resources: [],
+        },
+        toolResultState: {
+          status: "success",
+        },
+      },
+    }
+  }
+
+  private executeInlineSubAgentReadMcpResource(
+    conversationId: string,
+    input: Record<string, unknown>
+  ): {
+    content: string
+    state: { status: ToolResultStatus; message?: string }
+    extraData?: ToolCompletedExtraData
+  } {
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) {
+      return {
+        content: "[read_mcp_resource error] Session not found",
+        state: { status: "error", message: "session not found" },
+        extraData: {
+          toolResultState: {
+            status: "error",
+            message: "session not found",
+          },
+        },
+      }
+    }
+
+    const requestedServer = this.pickMcpServerName(input)
+    const uri = this.pickFirstString(input, ["uri"]) || ""
+    if (!requestedServer || !uri) {
+      const missing = !requestedServer ? "server" : "uri"
+      const message = `Missing required ${missing}`
+      return {
+        content: `[read_mcp_resource error] ${message}`,
+        state: { status: "error", message },
+        extraData: {
+          toolResultState: {
+            status: "error",
+            message,
+          },
+        },
+      }
+    }
+
+    if (!this.isMountedMcpServer(session, requestedServer)) {
+      const message =
+        `Unknown MCP server "${requestedServer}". ` +
+        this.formatMountedMcpServersHint(session)
+      return {
+        content: `[read_mcp_resource error] ${message}`,
+        state: { status: "error", message },
+        extraData: {
+          toolResultState: {
+            status: "error",
+            message,
+          },
+        },
+      }
+    }
+
+    const resolvedServer = this.resolveMountedMcpServer(
+      session,
+      requestedServer
+    )
+    this.writeMcpServerNameToInput(input, resolvedServer)
+    input.uri = uri
+
+    const message = `resource "${uri}" is not advertised for server "${resolvedServer}" in the current session`
+    return {
+      content: `[read_mcp_resource not_found] ${message}; call list_mcp_resources first or use mcp_tool for server tools.`,
+      state: { status: "file_not_found", message },
+      extraData: {
+        toolResultState: {
+          status: "file_not_found",
+          message,
+        },
+      },
+    }
+  }
+
   private resolveWorkspaceRoot(conversationId: string): string {
     const allowedRoots =
       this.sessionManager.listAllowedWorkspaceRoots(conversationId)
@@ -21192,6 +21464,10 @@ ${raw}
           input,
           allowedRootsOverride
         )
+      case "list_mcp_resources":
+        return this.executeInlineSubAgentListMcpResources(conversationId, input)
+      case "read_mcp_resource":
+        return this.executeInlineSubAgentReadMcpResource(conversationId, input)
       case "run_terminal_command":
       case "run_terminal_command_v2":
         // Cursor IDE's ExecServerMessage shell path does not respond to
@@ -23776,6 +24052,21 @@ ${raw}
     if (family === "report_bugfix_results") {
       return this.executeInlineReportBugfixResults(input)
     }
+    if (family === "send_to_user") {
+      const message =
+        this.pickFirstString(input, ["message", "content", "text"]) || ""
+      if (!message) {
+        return Promise.resolve({
+          content: "[send_to_user error] Missing required message parameter",
+          state: { status: "error", message: "missing message" },
+        })
+      }
+      input.message = message
+      return Promise.resolve({
+        content: `[send_to_user success] ${message}`,
+        state: { status: "success" },
+      })
+    }
     if (family === "file_search" || family === "glob_search") {
       return this.executeInlineFileSearchFamily(conversationId, family, input)
     }
@@ -25310,6 +25601,16 @@ ${raw}
     }
   }
 
+  private shouldSuppressVisibleThinkingTextForBackend(
+    backend: string
+  ): boolean {
+    // Gemini-3 must keep includeThoughts enabled so tool thought signatures
+    // stay structured, but those thought parts can quote Cursor context
+    // attachments. Keep signatures in history; do not stream or persist the
+    // raw thought text into Cursor's visible transcript.
+    return backend === "google" || backend === "google-claude"
+  }
+
   private shouldSuppressInternalToolLifecycleStarted(
     toolName: string,
     deferredToolFamily?: DeferredToolFamily
@@ -25400,6 +25701,7 @@ ${raw}
         "create_plan",
         "task",
         "generate_image",
+        "send_to_user",
       ])
     if (family && UI_CARD_TOOL_FAMILIES.has(family)) {
       return undefined
@@ -25440,6 +25742,7 @@ ${raw}
       normalized === "mcp_state_exec" ||
       normalized === "request_context" ||
       normalized === "subagent_await" ||
+      normalized === SNIP_MESSAGES_TOOL_NAME ||
       normalized === "truncated" ||
       normalized === "truncated_tool_call" ||
       normalized === "update_project" ||
@@ -25465,6 +25768,7 @@ ${raw}
       compact === "mcpstateexec" ||
       compact === "requestcontext" ||
       compact === "subagentawait" ||
+      compact === "snipmessages" ||
       compact === "truncated" ||
       compact === "truncatedtoolcall" ||
       compact === "updateproject" ||
@@ -25828,11 +26132,11 @@ ${raw}
    * This single helper is invoked at every buildMessages exit so the wire
    * payload always conforms to the active backend's constraints.
    *
-   * The runtime objects passed in MAY carry an optional `messageId` field
-   * (Anthropic split-sibling key) carried through the projection layer
-   * since commits 90fa446 / 1f9... — `CreateMessageDto["messages"]` is
-   * the API DTO type without that field, but the cast is sound because
-   * normalizeFlatMessagesForAPI only reads `messageId` if present.
+   * The runtime objects passed in may carry bridge metadata (`messageId`,
+   * `isMeta`, `source`, `attachmentKind`) from the projection layer.
+   * normalizeFlatMessagesForAPI preserves those fields for provider adapters
+   * that need to keep internal context separate from visible conversation
+   * history.
    */
   private applySendTimeSanitize(
     messages: CreateMessageDto["messages"],
@@ -25886,6 +26190,8 @@ ${raw}
         content: LooseMessageContent
         messageId?: string
         isMeta?: boolean
+        source?: ContextMessageSource
+        attachmentKind?: ContextProjectionAttachment["kind"]
       }>,
       {
         backend: sanitizeBackend,
@@ -28155,7 +28461,7 @@ ${raw}
         toolCallId,
         projectedToolName,
         projectedToolInput,
-        undefined,
+        pendingToolCall.toolFamilyHint,
         pendingToolCall.modelCallId
       )
       this.emit(conversationId, startedFallback)
@@ -28171,7 +28477,7 @@ ${raw}
       projectedToolName,
       projectedToolInput,
       toolResultContent,
-      undefined,
+      pendingToolCall.toolFamilyHint,
       pendingToolCall.modelCallId,
       extraData
     )
@@ -29799,6 +30105,15 @@ ${raw}
       conversationId,
       execIdNumber,
       (queuedFrame) => this.emit(conversationId, queuedFrame)
+    )
+  }
+
+  private cancelExecDispatchSlots(
+    conversationId: string,
+    execIds: Iterable<number>
+  ): void {
+    this.execDispatchSerializer.cancel(conversationId, execIds, (queuedFrame) =>
+      this.emit(conversationId, queuedFrame)
     )
   }
 
@@ -31932,7 +32247,23 @@ ${raw}
       this.releaseExecDispatchSlot(conversationId, execNumericId)
     }
 
+    const retiredExecMapping = execNumericId
+      ? this.sessionManager.getRetiredToolExecMapping(
+          conversationId,
+          execNumericId
+        )
+      : undefined
+
     if (!toolCallId) {
+      if (retiredExecMapping) {
+        this.logger.warn(
+          `Ignoring late tool result for retired execId=${execNumericId} ` +
+            `toolCallId=${retiredExecMapping.toolCallId} ` +
+            `tool=${retiredExecMapping.toolName} ` +
+            `result=${toolResult.resultCase}`
+        )
+        return
+      }
       const reason = `tool result missing toolCallId (execId=${execNumericId || "(none)"})`
       await this.failPendingToolCallsWithProtocolError(conversationId, reason)
       return
@@ -31945,6 +32276,15 @@ ${raw}
         toolCallId
       )
     ) {
+      if (retiredExecMapping?.toolCallId === toolCallId) {
+        this.logger.warn(
+          `Ignoring late tool result for retired toolCallId=${toolCallId} ` +
+            `execId=${execNumericId || "(none)"} ` +
+            `tool=${retiredExecMapping.toolName} ` +
+            `result=${toolResult.resultCase}`
+        )
+        return
+      }
       const reason =
         `tool result referenced non-pending toolCallId=${toolCallId} ` +
         `(execId=${execNumericId || "(none)"})`
@@ -31984,7 +32324,7 @@ ${raw}
       // BOTH cases — the sub-agent owns the tool call, even when the
       // chunk is intermediate.
       let delivered: boolean
-      if (toolResult.resultCase === "shellStream") {
+      if (toolResult.resultCase === "shell_stream") {
         delivered = this.subagentExecBridge.deliverShellStreamChunk(
           toolCallId,
           toolResult.resultData
@@ -31993,6 +32333,7 @@ ${raw}
         delivered = this.subagentExecBridge.deliverResult(toolCallId, {
           resultData: toolResult.resultData,
           resultCase: toolResult.resultCase,
+          inlineContent: toolResult.inlineContent,
         })
       }
       if (delivered) {
@@ -34861,7 +35202,12 @@ ${raw}
   private buildGoogleContextMessages(
     context: PromptContext,
     conversationId: string
-  ): Array<{ role: "user" | "assistant"; content: MessageContent }> {
+  ): Array<{
+    role: "user" | "assistant"
+    content: MessageContent
+    isMeta: true
+    source: ContextMessageSource
+  }> {
     const contextMessages: Array<{
       role: "user" | "assistant"
       content: MessageContent
@@ -35031,7 +35377,11 @@ ${raw}
       contextMessages.push({ role: "user", content: ephLines.join("\n") })
     }
 
-    return contextMessages
+    return contextMessages.map((message) => ({
+      ...message,
+      isMeta: true as const,
+      source: "protected_context" as const,
+    }))
   }
 
   private truncateText(text: string, maxChars: number): string {

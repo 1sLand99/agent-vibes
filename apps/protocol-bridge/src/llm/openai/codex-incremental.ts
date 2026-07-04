@@ -26,6 +26,40 @@ export interface CodexInputMismatch {
   requestType?: string
 }
 
+export interface CodexContinuationState {
+  lastResponse?: CodexLastResponseSnapshot
+  lastRequest?: Record<string, unknown>
+}
+
+export type CodexContinuationDecision =
+  | {
+      mode: "full"
+      reason: "no_baseline"
+      request: Record<string, unknown>
+      nextState: CodexContinuationState
+    }
+  | {
+      mode: "incremental"
+      request: Record<string, unknown>
+      previousResponseId: string
+      incrementalItemCount: number
+      nextState: CodexContinuationState
+    }
+  | {
+      mode: "full_reset"
+      reason: "static_fields_changed"
+      changedStaticKeys: string[]
+      request: Record<string, unknown>
+      nextState: CodexContinuationState
+    }
+  | {
+      mode: "full_reset"
+      reason: "input_not_extension"
+      inputMismatch: CodexInputMismatch
+      request: Record<string, unknown>
+      nextState: CodexContinuationState
+    }
+
 const TRANSPORT_ONLY_REQUEST_FIELDS = new Set([
   "input",
   "previous_response_id",
@@ -114,6 +148,73 @@ export function getCodexIncrementalInput(
   }
 
   return { ok: true, input: requestInput.slice(baseline.length) }
+}
+
+export function prepareCodexContinuationRequest(
+  request: Record<string, unknown>,
+  state: CodexContinuationState,
+  allowEmptyDelta: boolean
+): CodexContinuationDecision {
+  const lastResponse = state.lastResponse
+  const lastRequest = state.lastRequest
+  if (!lastResponse?.responseId || !lastRequest) {
+    return {
+      mode: "full",
+      reason: "no_baseline",
+      request,
+      nextState: {
+        lastRequest: request,
+        lastResponse: undefined,
+      },
+    }
+  }
+
+  const result = getCodexIncrementalInput(
+    request,
+    lastRequest,
+    lastResponse,
+    allowEmptyDelta
+  )
+  if (!result.ok) {
+    if (result.reason === "static_fields_changed") {
+      return {
+        mode: "full_reset",
+        reason: "static_fields_changed",
+        changedStaticKeys: result.changedStaticKeys,
+        request,
+        nextState: {
+          lastRequest: request,
+          lastResponse: undefined,
+        },
+      }
+    }
+
+    return {
+      mode: "full_reset",
+      reason: "input_not_extension",
+      inputMismatch: result.inputMismatch,
+      request,
+      nextState: {
+        lastRequest: request,
+        lastResponse: undefined,
+      },
+    }
+  }
+
+  return {
+    mode: "incremental",
+    request: {
+      ...request,
+      input: result.input,
+      previous_response_id: lastResponse.responseId,
+    },
+    previousResponseId: lastResponse.responseId,
+    incrementalItemCount: result.input.length,
+    nextState: {
+      lastRequest: request,
+      lastResponse,
+    },
+  }
 }
 
 function diffCodexStaticRequestKeys(

@@ -710,6 +710,12 @@ export interface ContextStateRecord {
   todos: SessionTodoItem[]
 }
 
+export interface RetiredToolExecMapping {
+  toolCallId: string
+  toolName: string
+  retiredAt: number
+}
+
 /**
  * Stream-domain fields owned by SessionStreamService.
  *
@@ -720,6 +726,8 @@ export interface SessionStreamRecord {
   backgroundCommands: Map<string, SessionBackgroundCommand>
   /** ExecServerMessage.id → toolCallId mapping for control messages. */
   pendingToolCallByExecId: Map<number, string>
+  /** Recently detached exec ids. Used to ignore late Cursor result frames. */
+  retiredToolCallByExecId: Map<number, RetiredToolExecMapping>
   /** Current BiDi stream id (rotated on supersede). */
   currentStreamId: string
 
@@ -1300,7 +1308,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
    * timeout error tool_result. Picked at 90s — enough for `ls` over a
    * slow network mount, conservative enough to surface a stalled IDE
    * within a reasonable model-loop iteration. Long-running channels
-   * (shell streams, sub-agent execs) opt out via
+   * (shell streams, task/await tools, background work) opt out via
    * `EXEC_DISPATCH_DEADLINE_EXEMPT_TOOLS`.
    */
   private readonly EXEC_DISPATCH_DEADLINE_MS = 90 * 1000
@@ -1330,6 +1338,8 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       "force_background_shell",
       "force_background_subagent",
     ])
+  private readonly RETIRED_EXEC_ID_TTL_MS = 10 * 60 * 1000
+  private readonly MAX_RETIRED_EXEC_ID_MAPPINGS = 512
   private readonly MAX_READ_SNAPSHOTS_PER_SESSION = 24
   private readonly MAX_READ_SNAPSHOTS_PER_FILE = 6
   private readonly MAX_READ_SNAPSHOT_CHARS = 80_000
@@ -4430,6 +4440,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
           : []
       ),
       pendingToolCallByExecId: new Map(),
+      retiredToolCallByExecId: new Map(),
       currentStreamId: crypto.randomUUID(),
       editPathHolderByPath: new Map(),
       editPathQueueByPath: new Map(),
@@ -4551,6 +4562,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     const streamRecord: SessionStreamRecord = {
       backgroundCommands: new Map(),
       pendingToolCallByExecId: new Map(),
+      retiredToolCallByExecId: new Map(),
       currentStreamId: crypto.randomUUID(),
       editPathHolderByPath: new Map(),
       editPathQueueByPath: new Map(),
@@ -4678,8 +4690,13 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
           []
         )
       }
-      if (initialRequest) {
-        // Same reference-stability guard as above.
+      if (initialRequest?.mcpToolDefs !== undefined) {
+        // AgentService continuation / control requests can omit MCP
+        // definitions even though the conversation already learned them from
+        // an earlier full request. Absence means "not present on this frame",
+        // not "clear the registry"; keep the last known definitions so
+        // history replay and follow-up dispatch can still resolve concrete
+        // MCP names such as cursor-ide-browser-browser_snapshot.
         session.mcpToolDefs = freezeCacheKeyArray(initialRequest.mcpToolDefs)
       }
       this.logMcpAdvisoryIfMissing(session, "session_reuse")
@@ -4906,7 +4923,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     toolCallId: string,
     toolName: string,
     toolInput: Record<string, unknown>,
-    toolFamilyHint?: "mcp" | "web_fetch",
+    toolFamilyHint?: "mcp" | "edit" | "web_fetch",
     modelCallId: string = "",
     historyToolName?: string,
     historyToolInput?: Record<string, unknown>,
@@ -5026,10 +5043,12 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     }
 
     for (const execId of toolCall.execIds) {
+      this.markRetiredToolExecId(stream, execId, toolCall)
       stream.pendingToolCallByExecId.delete(execId)
     }
     for (const [execId, mappedToolCallId] of stream.pendingToolCallByExecId) {
       if (mappedToolCallId === toolCallId) {
+        this.markRetiredToolExecId(stream, execId, toolCall)
         stream.pendingToolCallByExecId.delete(execId)
       }
     }
@@ -5044,6 +5063,40 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     this.clearEditPathSlot(session, toolCall)
 
     return toolCall
+  }
+
+  private markRetiredToolExecId(
+    stream: SessionStreamRecord,
+    execId: number,
+    toolCall: PendingToolCall
+  ): void {
+    if (!Number.isFinite(execId) || execId <= 0) return
+    const now = Date.now()
+    stream.retiredToolCallByExecId.set(Math.floor(execId), {
+      toolCallId: toolCall.toolCallId,
+      toolName: toolCall.toolName,
+      retiredAt: now,
+    })
+    this.pruneRetiredToolExecIds(stream, now)
+  }
+
+  private pruneRetiredToolExecIds(
+    stream: SessionStreamRecord,
+    now = Date.now()
+  ): void {
+    const cutoff = now - this.RETIRED_EXEC_ID_TTL_MS
+    for (const [execId, retired] of stream.retiredToolCallByExecId) {
+      if (retired.retiredAt < cutoff) {
+        stream.retiredToolCallByExecId.delete(execId)
+      }
+    }
+    while (
+      stream.retiredToolCallByExecId.size > this.MAX_RETIRED_EXEC_ID_MAPPINGS
+    ) {
+      const oldestExecId = stream.retiredToolCallByExecId.keys().next().value
+      if (oldestExecId === undefined) break
+      stream.retiredToolCallByExecId.delete(oldestExecId)
+    }
   }
 
   /**
@@ -5284,18 +5337,10 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   /**
    * Decide whether `registerPendingToolExecId` should auto-arm the
    * sweeper deadline. The default is true; tools that legitimately
-   * run for minutes / hours (shell streams, sub-agent execs) opt out
-   * via `EXEC_DISPATCH_DEADLINE_EXEMPT_TOOLS`. Family hint takes
-   * priority for paths where the tool name was canonicalised away.
+   * run for minutes / hours (shell streams, task/await tools,
+   * background work) opt out via `EXEC_DISPATCH_DEADLINE_EXEMPT_TOOLS`.
    */
   private shouldArmExecDispatchDeadline(pending: PendingToolCall): boolean {
-    if (pending.subagentOwner) {
-      // Sub-agent dispatch frames stay open for the lifetime of the
-      // child run — the parent's `task` tool result is what eventually
-      // closes them. Skip the deadline so the parent's own deadline
-      // remains the single source of truth.
-      return false
-    }
     const normalized = (pending.toolName || "").trim().toLowerCase()
     if (this.EXEC_DISPATCH_DEADLINE_EXEMPT_TOOLS.has(normalized)) {
       return false
@@ -5359,6 +5404,18 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     return stream.pendingToolCallByExecId.get(Math.floor(execIdNumber))
   }
 
+  getRetiredToolExecMapping(
+    conversationId: string,
+    execIdNumber: number
+  ): RetiredToolExecMapping | undefined {
+    const stream = this.sessionStream.getStreamRecord(conversationId)
+    const session = this.getSession(conversationId)
+    if (!stream || !session) return undefined
+    if (!Number.isFinite(execIdNumber) || execIdNumber <= 0) return undefined
+    this.pruneRetiredToolExecIds(stream)
+    return stream.retiredToolCallByExecId.get(Math.floor(execIdNumber))
+  }
+
   consumePendingToolCallByExecId(
     conversationId: string,
     execIdNumber: number
@@ -5385,6 +5442,13 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
 
     const count = this.pendingToolCallCount(session.conversationId)
     const clearedIds = this.listPendingToolCallIds(session.conversationId)
+    for (const [, pendingToolCall] of this.listPendingToolCallEntries(
+      session.conversationId
+    )) {
+      for (const execId of pendingToolCall.execIds) {
+        this.markRetiredToolExecId(stream, execId, pendingToolCall)
+      }
+    }
 
     this.clearAllPendingToolCalls(session.conversationId)
     stream.pendingToolCallByExecId.clear()
