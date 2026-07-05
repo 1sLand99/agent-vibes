@@ -127,6 +127,7 @@ import { BidiStreamController } from "./bidi/bidi-stream-controller"
 import {
   assembleCursorCodexExecutionRequest,
   buildCursorCodexClientMetadata,
+  resolveCursorCodexTurnId,
   resolveCursorCodexServiceTier,
   shouldRequestCursorCodexThinkingSummary,
   shouldSuppressCursorCodexThinkingSummary,
@@ -1369,6 +1370,27 @@ export class CursorConnectStreamService {
    */
   private readonly parentTurnStackByConversation: Map<string, TurnHandle[]> =
     new Map()
+
+  /**
+   * Codex upstream uses `window_id = <thread_id>:<auto_compact_window_number>`.
+   * Cursor has no native Codex window counter, so the bridge maps this to its
+   * own compaction epoch: stable during a normal turn/tool loop, advanced only
+   * when a compaction commit moves the conversation into a new context window.
+   */
+  private resolveCodexWindowId(
+    session: SessionRecord | undefined,
+    conversationId: string
+  ): string {
+    const record = session
+      ? this.contextState.getContextRecord(session.conversationId)
+      : undefined
+    const rawEpoch = record?.contextState.compactionEpoch
+    const windowNumber =
+      typeof rawEpoch === "number" && Number.isFinite(rawEpoch) && rawEpoch >= 0
+        ? Math.floor(rawEpoch)
+        : 0
+    return `${conversationId}:${windowNumber}`
+  }
 
   private readonly activeBackendStreamCountsByConversation = new Map<
     string,
@@ -4535,9 +4557,29 @@ export class CursorConnectStreamService {
             .length || 0
         : 0) + 1
     )
+    const activeTurnId = resolveCursorCodexTurnId({
+      conversationId: normalizedConversationId,
+      requestOrdinal,
+      cursorTurnId: this.contextState.getCursorTurnState(
+        normalizedConversationId
+      )?.id,
+      parentTurnId: this.getCurrentParentTurnId(normalizedConversationId),
+      openTurnId: this.sessionManager.openTurnIdForConversation(
+        normalizedConversationId
+      ),
+    }) as TurnId | undefined
+    const windowId = this.resolveCodexWindowId(
+      session,
+      normalizedConversationId
+    )
+    this.logger.debug(
+      `[Codex][Metadata] conversation=${normalizedConversationId} turn=${activeTurnId || "(none)"} window=${windowId}`
+    )
     return buildCursorCodexClientMetadata({
       conversationId: normalizedConversationId,
       requestOrdinal,
+      turnId: activeTurnId,
+      windowId,
       installationId: this.codexInstallationId,
       workspaceRootPath: session?.projectContext?.rootPath,
     })

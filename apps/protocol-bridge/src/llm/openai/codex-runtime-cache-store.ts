@@ -148,6 +148,23 @@ export class CodexRuntimeCacheStore {
     return deleted
   }
 
+  takeWsEntriesByConversationHash(
+    conversationIdHash: string
+  ): CodexCachedWsEntry[] {
+    const normalizedHash = conversationIdHash.trim()
+    if (!normalizedHash) return []
+    const suffix = `:conversation:${normalizedHash}`
+    const entries: CodexCachedWsEntry[] = []
+    for (const [key, entry] of this.cachedWsSessions) {
+      if (!key.endsWith(suffix)) {
+        continue
+      }
+      this.cachedWsSessions.delete(key)
+      entries.push(entry)
+    }
+    return entries
+  }
+
   setWarmupPayload(
     conversationId: string,
     payload: Record<string, unknown>

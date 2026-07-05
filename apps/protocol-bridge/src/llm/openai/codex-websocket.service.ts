@@ -6,7 +6,7 @@
  * - WebSocket connection management with session reuse
  * - Automatic reconnection on connection loss
  * - Fallback to HTTP when WebSocket upgrade is rejected
- * - Prompt cache via WebSocket headers
+ * - Prompt cache via request body prompt_cache_key
  * - Streaming and non-streaming modes
  *
  * Ported from CLIProxyAPI:
@@ -95,13 +95,14 @@ export class CodexWebSocketService implements OnModuleDestroy {
   /** Active sessions keyed by session ID */
   private readonly sessions = new Map<string, WebSocketSession>()
   private readonly connToSession = new WeakMap<WebSocket, WebSocketSession>()
+  private readonly connCloseOrigins = new WeakMap<WebSocket, string>()
 
   constructor(private readonly identity: CodexClientIdentityService) {}
 
   onModuleDestroy(): void {
     // Close all active sessions
     for (const [id] of this.sessions) {
-      this.closeSession(id)
+      this.closeSession(id, "module_destroy")
     }
     this.sessions.clear()
   }
@@ -140,7 +141,6 @@ export class CodexWebSocketService implements OnModuleDestroy {
     conversationId?: string,
     accountId?: string,
     workspaceId?: string,
-    cacheHeaders?: Record<string, string>,
     forwardHeaders?: CodexForwardHeaders,
     omitAccountId: boolean = false,
     useResponsesLite: boolean = false,
@@ -158,7 +158,6 @@ export class CodexWebSocketService implements OnModuleDestroy {
       clientMetadata,
       accountId,
       workspaceId,
-      cacheHeaders,
       forwardHeaders,
       omitAccountId,
       useResponsesLite,
@@ -664,7 +663,15 @@ export class CodexWebSocketService implements OnModuleDestroy {
       return current
     }
 
-    this.invalidateSessionConnection(sessionId, current)
+    this.invalidateSessionConnection(
+      sessionId,
+      current,
+      current
+        ? current.readyState === WebSocket.OPEN
+          ? "replace_ws_url_changed"
+          : `replace_${this.describeReadyState(current.readyState)}_connection`
+        : "open_initial_connection"
+    )
 
     const ws = await this.connect(wsUrl, headers, proxyUrl)
     session.conn = ws
@@ -699,7 +706,8 @@ export class CodexWebSocketService implements OnModuleDestroy {
 
   invalidateSessionConnection(
     sessionId: string,
-    conn?: WebSocket | null
+    conn?: WebSocket | null,
+    reason: string = "invalidate_session_connection"
   ): void {
     const session = this.sessions.get(sessionId)
     if (!session) {
@@ -716,6 +724,10 @@ export class CodexWebSocketService implements OnModuleDestroy {
       return
     }
 
+    this.connCloseOrigins.set(current, reason)
+    this.logger.debug(
+      `[Codex][WS] invalidating session=${sessionId} reason=${reason} readyState=${this.describeReadyState(current.readyState)}`
+    )
     this.failActiveStream(
       session,
       current,
@@ -768,8 +780,11 @@ export class CodexWebSocketService implements OnModuleDestroy {
     conn.on("close", (code: number, reason: Buffer) => {
       const reasonText = reason.toString("utf8")
       const activeStream = session.activeStream
+      const closeOrigin =
+        this.connCloseOrigins.get(conn) || "remote_or_transport"
+      this.connCloseOrigins.delete(conn)
       this.logger.debug(
-        `WebSocket session ${session.sessionId} closed: code=${code} reason=${JSON.stringify(reasonText)} active=${activeStream?.conn === conn}`
+        `WebSocket session ${session.sessionId} closed: code=${code} reason=${JSON.stringify(reasonText)} active=${activeStream?.conn === conn} origin=${closeOrigin} readyState=${this.describeReadyState(conn.readyState)}`
       )
       this.failActiveStream(
         session,
@@ -956,19 +971,24 @@ export class CodexWebSocketService implements OnModuleDestroy {
           continue
         }
 
-        yield parsed
         if (parsed.type === "response.completed") {
           responseCompleted = true
           activeStream.done = true
+          yield parsed
           return
         }
+        yield parsed
       }
     } finally {
       if (session.activeStream === activeStream) {
         session.activeStream = null
       }
       if (!responseCompleted && !preserveOnError) {
-        this.invalidateSessionConnection(session.sessionId, ws)
+        this.invalidateSessionConnection(
+          session.sessionId,
+          ws,
+          "stream_ended_before_response_completed"
+        )
       } else if (preserveOnError) {
         this.logger.debug(
           `[Codex][WS] session ${session.sessionId} preserved after protocol-level error (ws.readyState=${ws.readyState})`
@@ -1059,11 +1079,12 @@ export class CodexWebSocketService implements OnModuleDestroy {
           continue
         }
 
-        yield parsed
         if (parsed.type === "response.completed") {
           done = true
+          yield parsed
           return
         }
+        yield parsed
       }
     } finally {
       ws.off("message", onMessage)
@@ -1075,13 +1096,13 @@ export class CodexWebSocketService implements OnModuleDestroy {
   /**
    * Close a session and its WebSocket connection.
    */
-  closeSession(sessionId: string): void {
+  closeSession(sessionId: string, reason: string = "close_session"): void {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
-    this.invalidateSessionConnection(sessionId, session.conn)
+    this.invalidateSessionConnection(sessionId, session.conn, reason)
     this.sessions.delete(sessionId)
-    this.logger.log(`WebSocket session closed: ${sessionId}`)
+    this.logger.log(`WebSocket session closed: ${sessionId} reason=${reason}`)
   }
 
   /**
@@ -1089,7 +1110,7 @@ export class CodexWebSocketService implements OnModuleDestroy {
    */
   closeAllSessions(): void {
     for (const [id] of this.sessions) {
-      this.closeSession(id)
+      this.closeSession(id, "close_all_sessions")
     }
   }
 
@@ -1099,6 +1120,21 @@ export class CodexWebSocketService implements OnModuleDestroy {
    */
   isWebSocketAvailable(): boolean {
     return typeof WebSocket !== "undefined"
+  }
+
+  private describeReadyState(readyState: number): string {
+    switch (readyState) {
+      case WebSocket.CONNECTING:
+        return "connecting"
+      case WebSocket.OPEN:
+        return "open"
+      case WebSocket.CLOSING:
+        return "closing"
+      case WebSocket.CLOSED:
+        return "closed"
+      default:
+        return String(readyState)
+    }
   }
 }
 

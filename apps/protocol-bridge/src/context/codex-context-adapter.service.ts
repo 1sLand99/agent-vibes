@@ -724,8 +724,9 @@ export class CodexContextAdapterService {
 
   private findCurrentTurnInsertionIndex(messages: UnifiedMessage[]): number {
     for (let index = messages.length - 1; index >= 0; index--) {
-      if (messages[index]?.role === "user") {
-        return index
+      const message = messages[index]
+      if (message?.role === "user") {
+        return this.messageContainsToolResult(message) ? index + 1 : index
       }
     }
     return messages.length

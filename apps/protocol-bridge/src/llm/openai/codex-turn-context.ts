@@ -54,6 +54,9 @@ export function reuseCodexActiveTurnContext(
   if (context.turnKey !== turnKey) {
     context.turnKey = turnKey
     context.turnState = undefined
+    context.lastRequest = undefined
+    context.lastResponse = undefined
+    context.connectionReused = false
   }
   return context
 }
@@ -68,20 +71,35 @@ export function createCodexTurnContext(
       wsSessionId: cached.wsSessionId,
       turnKey: options.turnKey,
       turnState: turnKeyMatches ? cached.turnState : undefined,
-      lastResponse: cached.lastResponse,
-      lastRequest: cached.lastRequest,
-      connectionReused: true,
+      lastResponse: turnKeyMatches ? cached.lastResponse : undefined,
+      lastRequest: turnKeyMatches ? cached.lastRequest : undefined,
+      connectionReused: turnKeyMatches,
     }
   }
 
   return {
-    wsSessionId: options.conversationId,
+    wsSessionId: buildCodexTurnWsSessionId(
+      options.conversationId,
+      options.turnKey
+    ),
     turnKey: options.turnKey,
     turnState: undefined,
     lastResponse: undefined,
     lastRequest: undefined,
     connectionReused: false,
   }
+}
+
+export function buildCodexTurnWsSessionId(
+  conversationId: string,
+  turnKey?: string
+): string {
+  const normalizedConversationId = conversationId.trim()
+  const normalizedTurnKey = turnKey?.trim()
+  if (!normalizedTurnKey) {
+    return `${normalizedConversationId}:turn:unkeyed`
+  }
+  return `${normalizedConversationId}:turn:${hashCodexIdentityPart(normalizedTurnKey)}`
 }
 
 export function codexTurnContextToCachedWsEntry(

@@ -95,6 +95,8 @@ export class MessagesController {
         "x-responsesapi-include-timing-metrics",
         "session_id",
         "session-id",
+        "thread_id",
+        "thread-id",
       ],
       headers
     )

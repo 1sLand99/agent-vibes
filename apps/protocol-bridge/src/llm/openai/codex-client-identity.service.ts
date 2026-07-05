@@ -25,10 +25,9 @@
  * is a much better failure mode than crashing the bridge at boot on a host
  * without the CLI installed.
  *
- * Originator is hardcoded to `codex_cli_rs` to match upstream's
- * `codex-rs/login/src/auth/default_client.rs:DEFAULT_ORIGINATOR`. The server
- * uses this value for first-party-client detection and treats `codex-tui`
- * (an older alias) as grandfathered but no longer canonical.
+ * Originator identity is hardcoded to `codex_cli_rs` to match upstream's
+ * `codex-rs/login/src/auth/default_client.rs:DEFAULT_ORIGINATOR`. Upstream
+ * sends this value through its default headers, including WebSocket upgrades.
  */
 
 import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
@@ -97,7 +96,7 @@ export class CodexClientIdentityService implements OnModuleInit {
     return this.resolvedUserAgent
   }
 
-  /** Originator header (`codex_cli_rs`). Constant by design. */
+  /** Codex originator identity (`codex_cli_rs`). Constant by design. */
   originator(): string {
     return ORIGINATOR
   }

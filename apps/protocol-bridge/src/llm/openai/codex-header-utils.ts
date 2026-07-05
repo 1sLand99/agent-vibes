@@ -1,5 +1,3 @@
-import * as crypto from "crypto"
-
 export type CodexForwardHeaders = Record<string, string>
 
 /**
@@ -14,10 +12,11 @@ export interface CodexClientIdentity {
   version: string
   /** Full User-Agent string. */
   userAgent: string
-  /** Sent in the `Originator` header for OAuth (non-API-key) requests. */
+  /** Codex originator identity sent in the `originator` header. */
   originator: string
 }
 
+export const CODEX_DEFAULT_ORIGINATOR = "codex_cli_rs"
 export const CODEX_WS_BETA_HEADER = "responses_websockets=2026-02-06"
 export const CODEX_RESPONSES_LITE_HEADER =
   "x-openai-internal-codex-responses-lite"
@@ -29,8 +28,6 @@ export const CODEX_WS_STREAM_REQUEST_START_MS_METADATA_KEY =
   "x-codex-ws-stream-request-start-ms"
 export const CODEX_TURN_STATE_HEADER = "x-codex-turn-state"
 
-const MAX_CODEX_SESSION_ID_LENGTH = 64
-
 interface BuildCodexHttpHeadersParams {
   token: string
   isApiKey: boolean
@@ -40,7 +37,6 @@ interface BuildCodexHttpHeadersParams {
   clientMetadata?: CodexForwardHeaders
   accountId?: string
   workspaceId?: string
-  cacheHeaders?: Record<string, string>
   forwardHeaders?: CodexForwardHeaders
   omitAccountId?: boolean
   useResponsesLite?: boolean
@@ -55,7 +51,6 @@ interface BuildCodexWebSocketHeadersParams {
   clientMetadata?: CodexForwardHeaders
   accountId?: string
   workspaceId?: string
-  cacheHeaders?: Record<string, string>
   forwardHeaders?: CodexForwardHeaders
   omitAccountId?: boolean
   useResponsesLite?: boolean
@@ -162,44 +157,76 @@ function sanitizeHeaders(
   )
 }
 
-function normalizeCodexSessionId(conversationId: string): string {
-  const trimmed = conversationId.trim()
-  if (!trimmed) return ""
-  if (trimmed.length <= MAX_CODEX_SESSION_ID_LENGTH) {
-    return trimmed
-  }
+function resolveCodexIdentityHeaders(
+  forwardHeaders: CodexForwardHeaders | undefined,
+  clientMetadata: CodexForwardHeaders | undefined,
+  defaultConversationId: string
+): { sessionId: string; threadId: string } {
+  const sessionId =
+    getForwardHeader(forwardHeaders, "session-id", "session_id") ||
+    getForwardHeader(clientMetadata, "session_id", "session-id") ||
+    defaultConversationId.trim()
+  const threadId =
+    getForwardHeader(forwardHeaders, "thread-id", "thread_id") ||
+    getForwardHeader(clientMetadata, "thread_id", "thread-id") ||
+    sessionId
 
-  return crypto
-    .createHash("sha256")
-    .update(`agent-vibes:codex-session-id:${trimmed}`)
-    .digest("hex")
+  return {
+    sessionId,
+    threadId,
+  }
 }
 
-function ensureSessionIdHeader(
+function ensureCodexSessionHeaders(
   target: Record<string, string>,
-  source: CodexForwardHeaders | undefined,
-  defaultConversationId: string
+  identity: { sessionId: string; threadId: string }
 ): void {
-  if (getExistingHeader(target, "session_id", "session-id")) {
+  if (!getExistingHeader(target, "session-id")) {
+    const sessionId = identity.sessionId.trim()
+    if (sessionId) {
+      target["session-id"] = sessionId
+    }
+  }
+  if (!getExistingHeader(target, "thread-id")) {
+    const threadId = identity.threadId.trim()
+    if (threadId) {
+      target["thread-id"] = threadId
+    }
+  }
+}
+
+function ensureCodexOriginatorHeader(
+  target: Record<string, string>,
+  forwardHeaders: CodexForwardHeaders | undefined,
+  identityOriginator: string
+): void {
+  if (getExistingHeader(target, "Originator", "originator")) {
     return
   }
 
-  const sourceSessionId = getForwardHeader(source, "session_id", "session-id")
-  target.session_id =
-    normalizeCodexSessionId(sourceSessionId || defaultConversationId) ||
-    crypto.randomUUID()
+  const originator =
+    getForwardHeader(forwardHeaders, "Originator", "originator") ||
+    identityOriginator
+  const normalizedOriginator = originator.trim()
+  if (normalizedOriginator) {
+    target.originator = normalizedOriginator
+  }
 }
 
 export function buildCodexHttpHeaders(
   params: BuildCodexHttpHeadersParams
 ): Record<string, string> {
   const normalizedConversationId = params.conversationId?.trim() || ""
+  const codexIdentity = resolveCodexIdentityHeaders(
+    params.forwardHeaders,
+    params.clientMetadata,
+    normalizedConversationId
+  )
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${params.token}`,
     Accept: params.stream ? "text/event-stream" : "application/json",
     Connection: "Keep-Alive",
-    ...(params.cacheHeaders || {}),
   }
 
   const betaFeatures = getForwardHeader(
@@ -257,7 +284,7 @@ export function buildCodexHttpHeaders(
     headers,
     params.forwardHeaders,
     "X-Client-Request-Id",
-    normalizedConversationId,
+    codexIdentity.threadId || normalizedConversationId,
     ["x-client-request-id"]
   )
   ensureHeader(
@@ -267,19 +294,13 @@ export function buildCodexHttpHeaders(
     params.identity.userAgent,
     ["user-agent"]
   )
-  ensureSessionIdHeader(
-    headers,
-    params.forwardHeaders,
-    normalizedConversationId
-  )
+  ensureCodexSessionHeaders(headers, codexIdentity)
 
   if (!params.isApiKey) {
-    ensureHeader(
+    ensureCodexOriginatorHeader(
       headers,
       params.forwardHeaders,
-      "Originator",
-      params.identity.originator,
-      ["originator"]
+      params.identity.originator
     )
     const accountId = params.omitAccountId ? "" : params.accountId?.trim() || ""
     if (accountId) {
@@ -298,9 +319,13 @@ export function buildCodexWebSocketHeaders(
   params: BuildCodexWebSocketHeadersParams
 ): Record<string, string> {
   const normalizedConversationId = params.conversationId?.trim() || ""
+  const codexIdentity = resolveCodexIdentityHeaders(
+    params.forwardHeaders,
+    params.clientMetadata,
+    normalizedConversationId
+  )
   const headers: Record<string, string> = {
     Authorization: `Bearer ${params.token}`,
-    ...(params.cacheHeaders || {}),
   }
 
   const betaFeatures = getForwardHeader(
@@ -310,10 +335,6 @@ export function buildCodexWebSocketHeaders(
   if (betaFeatures) {
     headers["x-codex-beta-features"] = betaFeatures
   }
-  if (params.useResponsesLite) {
-    headers[CODEX_RESPONSES_LITE_HEADER] = "true"
-  }
-
   ensureHeader(headers, params.forwardHeaders, "x-codex-turn-state", "", [
     "x-codex-turn-state",
   ])
@@ -345,7 +366,7 @@ export function buildCodexWebSocketHeaders(
     headers,
     params.forwardHeaders,
     "x-client-request-id",
-    normalizedConversationId,
+    codexIdentity.threadId || normalizedConversationId,
     ["x-client-request-id"]
   )
   ensureHeader(
@@ -362,10 +383,6 @@ export function buildCodexWebSocketHeaders(
     params.identity.version,
     ["Version"]
   )
-  // The WebSocket upgrade request strips User-Agent before send (see the
-  // explicit `delete headers["User-Agent"]` below), but we still register it
-  // here so any forwardHeaders override would be honored if WebSocket
-  // semantics change. Keep User-Agent identity in sync with HTTP.
   ensureHeader(
     headers,
     params.forwardHeaders,
@@ -380,20 +397,13 @@ export function buildCodexWebSocketHeaders(
       ? openAiBeta
       : CODEX_WS_BETA_HEADER
 
-  ensureSessionIdHeader(
-    headers,
-    params.forwardHeaders,
-    normalizedConversationId
-  )
-  delete headers["User-Agent"]
+  ensureCodexSessionHeaders(headers, codexIdentity)
 
   if (!params.isApiKey) {
-    ensureHeader(
+    ensureCodexOriginatorHeader(
       headers,
       params.forwardHeaders,
-      "Originator",
-      params.identity.originator,
-      ["originator"]
+      params.identity.originator
     )
     const accountId = params.omitAccountId ? "" : params.accountId?.trim() || ""
     if (accountId) {

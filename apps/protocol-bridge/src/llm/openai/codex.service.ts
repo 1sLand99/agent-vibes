@@ -10,7 +10,7 @@
  * - Proxy support (HTTP/HTTPS/SOCKS5)
  * - Request header emulation matching CLIProxyAPI Codex behavior
  * - OAuth token management with auto-refresh
- * - Prompt caching via Conversation_id/Session_id headers
+ * - Prompt caching via prompt_cache_key
  * - Retry-after handling for rate limits
  *
  * Ported from CLIProxyAPI:
@@ -166,6 +166,7 @@ import { isCodexRefreshTokenInvalidationMessage } from "./codex-token-refresh-po
 import {
   resolveCodexWebSocketFailure,
   shouldReplayCodexRequestWithoutPreviousResponseId,
+  shouldRetryCodexWebSocketBeforeHttpFallback,
   shouldRetryCodexSessionWebSocketError,
 } from "./codex-transport-error-policy"
 import {
@@ -213,6 +214,19 @@ const CODEX_ACCOUNTS_DEFAULT_PATH = resolveDefaultAccountConfigPath(
 )
 const CODEX_MODEL_TIER_ORDER: CodexModelTier[] = ["free", "plus", "team", "pro"]
 const DEFAULT_CODEX_RATE_LIMIT_MODEL = "gpt-5.5"
+const DEFAULT_CODEX_WEBSOCKET_STREAM_MAX_RETRIES = 2
+
+function parseNonNegativeInteger(
+  value: string | undefined,
+  fallback: number
+): number {
+  const parsed = Number.parseInt(value?.trim() || "", 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
+}
+
+function codexWebSocketRetryDelayMs(retryCount: number): number {
+  return Math.min(250 * 2 ** Math.max(0, retryCount - 1), 1_000)
+}
 
 // ── Service ────────────────────────────────────────────────────────────
 
@@ -269,6 +283,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   private readonly sessionWarmupPromises = new Map<string, Promise<void>>()
 
   private readonly runtimeCache = new CodexRuntimeCacheStore()
+  private readonly websocketStreamMaxRetries: number
 
   /**
    * Logical Codex turn lifecycle. Physical WebSocket transport still belongs
@@ -297,6 +312,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       runtimeCache: this.runtimeCache,
       closeWsSession: (sessionId) => this.wsService.closeSession(sessionId),
     })
+    this.websocketStreamMaxRetries = parseNonNegativeInteger(
+      this.configService.get<string>("CODEX_WEBSOCKET_STREAM_MAX_RETRIES", ""),
+      DEFAULT_CODEX_WEBSOCKET_STREAM_MAX_RETRIES
+    )
     this.accountStateStore = new BackendAccountStateStore(
       persistence,
       this.logger
@@ -917,9 +936,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
    * Automatically inject previous_response_id before sending a request.
    * Mirrors official prepare_websocket_request() + get_incremental_items().
    *
-   * The response-chain baseline belongs to the upstream WebSocket session. It is
-   * valid only while that physical connection remains alive and the transcript
-   * stays append-only.
+   * The response-chain baseline is scoped to the live upstream WebSocket.
+   * When that socket is rebuilt, the server rejects the old response id, so the
+   * new connection must start with a full request and rely on prompt caching.
    */
   private prepareRequestWithTurnContext(
     codexRequest: Record<string, unknown>,
@@ -1017,11 +1036,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
 
     const discarded = result.discardedPreviousResponseId
-      ? ` discarded previous_response_id=${result.discardedPreviousResponseId}`
+      ? ` discarded_previous_response_id=${result.discardedPreviousResponseId}`
       : ""
     this.logger.debug(
       `[Codex][TurnContext] ${reason} for ${normalizedConversationId}; ` +
-        `reset response chain after WebSocket reconnect${discarded}`
+        `cleared response chain for rebuilt WebSocket${discarded}`
     )
   }
 
@@ -1846,13 +1865,12 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   }
 
   /**
-   * Build request headers matching CLIProxyAPI Codex behavior.
+   * Build request headers matching the upstream Codex Responses client.
    */
   private buildHeaders(
     slot: CodexAccountSlot,
     token: string,
     stream: boolean,
-    cacheHeaders?: Record<string, string>,
     options?: {
       conversationId?: string
       omitAccountId?: boolean
@@ -1870,7 +1888,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       accountId: this.getSlotAccountId(slot),
       workspaceId: slot.workspaceId,
       stream,
-      cacheHeaders,
       forwardHeaders: options?.forwardHeaders,
       omitAccountId: options?.omitAccountId,
       useResponsesLite: options?.useResponsesLite,
@@ -2235,7 +2252,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const preparedCodexRequest = prepareCodexRequestForSend(codexRequest)
     const payload = buildCodexCompactRequestPayload(preparedCodexRequest)
     const url = this.buildUrl(requestSlot, "responses/compact")
-    const headers = this.buildHeaders(requestSlot, token, false, undefined, {
+    const headers = this.buildHeaders(requestSlot, token, false, {
       conversationId,
       forwardHeaders,
       clientMetadata: this.getCodexRequestClientMetadata(codexRequest),
@@ -2405,7 +2422,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     ) as Record<string, unknown>
 
     const url = this.buildUrl(slot, "responses")
-    const headers = this.buildHeaders(slot, token, true, undefined, {
+    const headers = this.buildHeaders(slot, token, true, {
       conversationId,
       clientMetadata: this.getCodexRequestClientMetadata(codexRequest),
       useResponsesLite: this.usesResponsesLite(modelName),
@@ -2637,7 +2654,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     ) as Record<string, unknown>
 
     const url = this.buildUrl(slot, "responses")
-    const headers = this.buildHeaders(slot, token, true, undefined, {
+    const headers = this.buildHeaders(slot, token, true, {
       conversationId,
       clientMetadata: this.getCodexRequestClientMetadata(codexRequest),
       useResponsesLite: this.usesResponsesLite(modelName),
@@ -2993,8 +3010,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const preparedCodexRequest = prepareCodexRequestForSend(codexRequest)
     const requestBody = JSON.stringify(preparedCodexRequest)
     const url = this.buildUrl(slot, "responses")
-    const cacheHeaders = this.cacheService.buildHttpCacheHeaders(cacheId)
-    const headers = this.buildHeaders(slot, token, true, cacheHeaders, {
+    const headers = this.buildHeaders(slot, token, true, {
       conversationId,
       omitAccountId,
       forwardHeaders,
@@ -3179,14 +3195,12 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       (conversationId
         ? this.getOrCreateTurnContext(conversationId, slot, modelName, turnKey)
         : undefined)
-    const cacheHeaders = this.cacheService.buildWebSocketCacheHeaders(cacheId)
     const wsHeaders = this.wsService.buildWebSocketHeaders(
       token,
       this.isApiKeyMode(slot),
       conversationId,
       this.getSlotAccountId(slot),
       slot.workspaceId,
-      cacheHeaders,
       forwardHeaders,
       false,
       this.usesResponsesLite(modelName),
@@ -3384,7 +3398,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           this.logger.warn(
             `[Codex] Reconnecting stale WebSocket session ${sessionId} before non-stream retry`
           )
-          this.wsService.invalidateSessionConnection(sessionId, ws)
+          this.wsService.invalidateSessionConnection(
+            sessionId,
+            ws,
+            "previous_response_rejected_non_stream_retry"
+          )
           this.applyCodexTurnStateHeader(wsHeaders, turnContext)
           ws = await this.wsService.ensureSessionConnection(
             sessionId,
@@ -3470,6 +3488,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     options?: {
       forwardHeaders?: CodexForwardHeaders
       reason?: string
+      turnKey?: string
       /**
        * 完整的 CodexRequest 请求体（由 buildCodexRequest 构建）。
        * 当提供时，连接建立后会发送 generate:false 的 warmup payload，
@@ -3479,6 +3498,15 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
   ): Promise<void> {
     if (!this.useWebSocket || !this.wsService.isWebSocketAvailable()) {
+      return
+    }
+
+    const warmupReason = options?.reason?.trim() || "request"
+    const turnKey = options?.turnKey?.trim()
+    if (!turnKey) {
+      this.logger.debug(
+        `[Codex][Warmup] reason=${warmupReason} model=${request.model} skipped: Codex WebSocket warmup requires a turn-scoped context`
+      )
       return
     }
 
@@ -3501,6 +3529,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         slotKey: this.getSlotStickyKey(slot),
         modelName: request.model,
         conversationId: conversationId || undefined,
+        turnKey,
       }).sessionId
     } catch (error) {
       this.logger.debug(
@@ -3514,7 +3543,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       return existingWarmup
     }
 
-    const warmupReason = options?.reason?.trim() || "request"
     const warmupPromise = this.runSessionWarmup(
       request,
       slot,
@@ -3570,14 +3598,12 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     this.bindConversationToSlot(conversationId, slot)
 
     const cacheId = this.getCacheId(request, slot)
-    const cacheHeaders = this.cacheService.buildWebSocketCacheHeaders(cacheId)
     const wsHeaders = this.wsService.buildWebSocketHeaders(
       token,
       this.isApiKeyMode(slot),
-      conversationId,
+      conversationId || sessionId,
       this.getSlotAccountId(slot),
       slot.workspaceId,
-      cacheHeaders,
       forwardHeaders,
       false,
       this.usesResponsesLite(modelName),
@@ -3798,6 +3824,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       : undefined
 
     let emittedEvents = false
+    let websocketRetryCount = 0
 
     try {
       // Try WebSocket transport first when enabled for this Codex session.
@@ -3806,99 +3833,130 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         this.wsService.isWebSocketAvailable() &&
         !this.isHttpFallbackTransport(conversationId, slot, modelName)
       ) {
-        try {
-          for await (const event of this.streamViaWebSocket(
-            slot,
-            token,
-            codexRequest,
-            modelName,
-            reverseToolMap,
-            cacheId,
-            request,
-            forwardHeaders,
-            abortSignal
-          )) {
-            emittedEvents = true
-            yield event
-          }
-          markAccountSuccess(slot, modelName)
-          return
-        } catch (e) {
-          const abortedError = toUpstreamRequestAbortedError(
-            e,
-            abortSignal,
-            "Codex WebSocket stream aborted"
-          )
-          if (abortedError) {
-            throw abortedError
-          }
+        while (true) {
+          try {
+            for await (const event of this.streamViaWebSocket(
+              slot,
+              token,
+              codexRequest,
+              modelName,
+              reverseToolMap,
+              cacheId,
+              request,
+              forwardHeaders,
+              abortSignal
+            )) {
+              emittedEvents = true
+              yield event
+            }
+            markAccountSuccess(slot, modelName)
+            return
+          } catch (e) {
+            const abortedError = toUpstreamRequestAbortedError(
+              e,
+              abortSignal,
+              "Codex WebSocket stream aborted"
+            )
+            if (abortedError) {
+              throw abortedError
+            }
 
-          const failureAction = resolveCodexWebSocketFailure(e, {
-            isApiKeyMode: this.isApiKeyMode(slot),
-          })
-
-          switch (failureAction.kind) {
-            case "retry_http_without_account":
+            if (
+              shouldRetryCodexWebSocketBeforeHttpFallback(e, {
+                emittedEvents,
+                retryCount: websocketRetryCount,
+                maxRetries: this.websocketStreamMaxRetries,
+              })
+            ) {
+              websocketRetryCount++
+              this.recordTurnContextTransportReconnect(
+                conversationId,
+                slot,
+                modelName,
+                `WebSocket stream retry ${websocketRetryCount}/${this.websocketStreamMaxRetries}`
+              )
               this.logger.warn(
-                `[Codex] WebSocket returned deactivated_workspace for ${this.getAccountLabel(slot)}, retrying stream over HTTP without Chatgpt-Account-Id`
+                `[Codex] WebSocket streaming unavailable before first event, retrying ` +
+                  `(${websocketRetryCount}/${this.websocketStreamMaxRetries}): ` +
+                  `${e instanceof Error ? e.message : String(e)}`
               )
-              this.beginHttpTransportTurn(
-                conversationId,
-                slot,
-                modelName,
-                "WebSocket deactivated_workspace forced HTTP stream retry",
-                true
+              await new Promise((resolve) =>
+                setTimeout(
+                  resolve,
+                  codexWebSocketRetryDelayMs(websocketRetryCount)
+                )
               )
-              for await (const event of this.streamViaHttp(
-                slot,
-                token,
-                codexRequest,
-                modelName,
-                reverseToolMap,
-                cacheId,
-                this.getConversationId(request),
-                true,
-                forwardHeaders,
-                abortSignal,
-                turnContext
-              )) {
-                emittedEvents = true
-                yield event
-              }
-              markAccountSuccess(slot, modelName)
-              return
-            case "fallback_http":
-              if (
-                failureAction.reason === "transport_unavailable" &&
-                emittedEvents
-              ) {
-                throw e
-              }
+              continue
+            }
 
-              if (failureAction.reason === "upgrade_rejected") {
+            const failureAction = resolveCodexWebSocketFailure(e, {
+              isApiKeyMode: this.isApiKeyMode(slot),
+            })
+
+            switch (failureAction.kind) {
+              case "retry_http_without_account":
                 this.logger.warn(
-                  "WebSocket upgrade rejected, falling back to HTTP for streaming"
+                  `[Codex] WebSocket returned deactivated_workspace for ${this.getAccountLabel(slot)}, retrying stream over HTTP without Chatgpt-Account-Id`
                 )
-              } else {
-                this.logger.warn(
-                  `[Codex] WebSocket streaming unavailable, falling back to HTTP: ${e instanceof Error ? e.message : String(e)}`
+                this.beginHttpTransportTurn(
+                  conversationId,
+                  slot,
+                  modelName,
+                  "WebSocket deactivated_workspace forced HTTP stream retry",
+                  true
                 )
-              }
-              this.beginHttpTransportTurn(
-                conversationId,
-                slot,
-                modelName,
-                "WebSocket streaming transport fallback",
-                true
-              )
-              break
-            case "throw_codex_api_error":
-              throw createCodexApiErrorFromBody(
-                failureAction.statusCode,
-                failureAction.body
-              )
-            case "throw_original":
-              throw e
+                for await (const event of this.streamViaHttp(
+                  slot,
+                  token,
+                  codexRequest,
+                  modelName,
+                  reverseToolMap,
+                  cacheId,
+                  this.getConversationId(request),
+                  true,
+                  forwardHeaders,
+                  abortSignal,
+                  turnContext
+                )) {
+                  emittedEvents = true
+                  yield event
+                }
+                markAccountSuccess(slot, modelName)
+                return
+              case "fallback_http":
+                if (
+                  failureAction.reason === "transport_unavailable" &&
+                  emittedEvents
+                ) {
+                  throw e
+                }
+
+                if (failureAction.reason === "upgrade_rejected") {
+                  this.logger.warn(
+                    "WebSocket upgrade rejected, falling back to HTTP for streaming"
+                  )
+                } else {
+                  this.logger.warn(
+                    `[Codex] WebSocket streaming unavailable, falling back to HTTP: ${e instanceof Error ? e.message : String(e)}`
+                  )
+                }
+                this.beginHttpTransportTurn(
+                  conversationId,
+                  slot,
+                  modelName,
+                  "WebSocket streaming transport fallback",
+                  true
+                )
+                break
+              case "throw_codex_api_error":
+                throw createCodexApiErrorFromBody(
+                  failureAction.statusCode,
+                  failureAction.body
+                )
+              case "throw_original":
+                throw e
+            }
+            break
           }
         }
       }
@@ -4134,8 +4192,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const preparedCodexRequest = prepareCodexRequestForSend(codexRequest)
     const requestBody = JSON.stringify(preparedCodexRequest)
     const url = this.buildUrl(slot, "responses")
-    const cacheHeaders = this.cacheService.buildHttpCacheHeaders(cacheId)
-    const headers = this.buildHeaders(slot, token, true, cacheHeaders, {
+    const headers = this.buildHeaders(slot, token, true, {
       conversationId,
       omitAccountId,
       forwardHeaders,
@@ -4417,7 +4474,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const httpUrl = this.buildUrl(slot, "responses")
     const wsUrl = this.wsService.buildWebSocketUrl(httpUrl)
     const conversationId = this.getConversationId(request)
-    const cacheHeaders = this.cacheService.buildWebSocketCacheHeaders(cacheId)
     const turnKey = this.getCodexTurnKey(codexRequest)
     // Use CodexTurnContext to obtain session ID (eliminates warm pool promotion)
     const turnContext = conversationId
@@ -4429,7 +4485,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       conversationId,
       this.getSlotAccountId(slot),
       slot.workspaceId,
-      cacheHeaders,
       forwardHeaders,
       false,
       this.usesResponsesLite(modelName),
@@ -4487,9 +4542,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         )
       }
 
-      // NOW inject previous_response_id — only after a usable socket exists.
-      // Fresh transports clear continuation first, matching official Codex's
-      // websocket_connection() reset of last_request/last_response.
       const originalCodexRequest = codexRequest
       if (turnContext && conversationId) {
         codexRequest = this.prepareRequestWithTurnContext(
@@ -4573,7 +4625,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
               `[Codex][TurnContext] Reusing live WebSocket session=${sessionId} after prev_resp rejection`
             )
           } else {
-            this.wsService.invalidateSessionConnection(sessionId, ws)
+            this.wsService.invalidateSessionConnection(
+              sessionId,
+              ws,
+              "previous_response_rejected_stream_retry"
+            )
             this.applyCodexTurnStateHeader(wsHeaders, turnContext)
             ws = await this.wsService.ensureSessionConnection(
               sessionId,
@@ -4607,7 +4663,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         this.logger.warn(
           `[Codex] Reconnecting stale WebSocket session ${sessionId} before streamed retry`
         )
-        this.wsService.invalidateSessionConnection(sessionId, ws)
+        this.wsService.invalidateSessionConnection(
+          sessionId,
+          ws,
+          "stream_retry_reconnect"
+        )
         this.applyCodexTurnStateHeader(wsHeaders, turnContext)
         ws = await this.wsService.ensureSessionConnection(
           sessionId,
@@ -4652,7 +4712,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             codexRequest = originalCodexRequest
             const wsStillUsable = ws.readyState === WebSocket.OPEN
             if (!wsStillUsable) {
-              this.wsService.invalidateSessionConnection(sessionId, ws)
+              this.wsService.invalidateSessionConnection(
+                sessionId,
+                ws,
+                "previous_response_rejected_after_retry"
+              )
               this.applyCodexTurnStateHeader(wsHeaders, turnContext)
               ws = await this.wsService.ensureSessionConnection(
                 sessionId,
@@ -4706,9 +4770,21 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     let firstContentMs: number | undefined
     let firstContentType: string | undefined
     let responseCompleted = false
+    let abortListenerAttached = false
     const onAbort = () => {
+      if (responseCompleted) {
+        this.logger.debug(
+          `[Codex][WS] Ignored abort after response.completed for session=${sessionId || "standalone"} conversation=${conversationId || "none"}`
+        )
+        return
+      }
+
       if (sessionId) {
-        this.wsService.invalidateSessionConnection(sessionId, ws)
+        this.wsService.invalidateSessionConnection(
+          sessionId,
+          ws,
+          "abort_signal"
+        )
       } else {
         ws.close()
       }
@@ -4723,7 +4799,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         )
       }
 
-      abortSignal?.addEventListener("abort", onAbort, { once: true })
+      if (abortSignal) {
+        abortSignal.addEventListener("abort", onAbort, { once: true })
+        abortListenerAttached = true
+      }
       const wsBody = this.wsService.buildWebSocketRequestBody(
         prepareCodexRequestForSend(codexRequest),
         {
@@ -4751,6 +4830,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
         if (msg.type === "response.completed") {
           responseCompleted = true
+          if (abortSignal && abortListenerAttached) {
+            abortSignal.removeEventListener("abort", onAbort)
+            abortListenerAttached = false
+          }
           // Mirrors map_response_stream() ResponseEvent::Completed → LastResponse.
           if (conversationId && sessionId) {
             const capturedId = getCodexCompletedResponseId(
@@ -4812,10 +4895,17 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         )
       }
     } finally {
-      abortSignal?.removeEventListener("abort", onAbort)
+      if (abortSignal && abortListenerAttached) {
+        abortSignal.removeEventListener("abort", onAbort)
+        abortListenerAttached = false
+      }
       if (sessionId) {
         if (!responseCompleted) {
-          this.wsService.invalidateSessionConnection(sessionId, ws)
+          this.wsService.invalidateSessionConnection(
+            sessionId,
+            ws,
+            "stream_finally_incomplete"
+          )
         }
       } else {
         ws.close()

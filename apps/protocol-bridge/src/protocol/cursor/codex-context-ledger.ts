@@ -178,11 +178,24 @@ function findCurrentTurnContextInsertionIndex(
   visibleMessages: CodexExecutionRequest["messages"]
 ): number {
   for (let index = visibleMessages.length - 1; index >= 0; index--) {
-    if (visibleMessages[index]?.role === "user") {
-      return index
+    const message = visibleMessages[index]
+    if (message?.role === "user") {
+      return messageContainsToolResult(message) ? index + 1 : index
     }
   }
   return visibleMessages.length
+}
+
+function messageContainsToolResult(
+  message: CodexConversationMessage | undefined
+): boolean {
+  if (!message || !Array.isArray(message.content)) {
+    return false
+  }
+  return message.content.some(
+    (block) =>
+      !!block && typeof block === "object" && block.type === "tool_result"
+  )
 }
 
 function normalizeEntries(entries: CodexContextEntry[]): CodexContextEntry[] {

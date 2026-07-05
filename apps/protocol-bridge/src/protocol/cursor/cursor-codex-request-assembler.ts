@@ -28,9 +28,46 @@ export interface CursorCodexRequestAssemblyInput {
 
 export interface CursorCodexClientMetadataInput {
   conversationId?: string
-  requestOrdinal: number
+  requestOrdinal?: number
+  turnId?: string
+  windowId?: string
   installationId: string
   workspaceRootPath?: string
+}
+
+export interface CursorCodexTurnIdInput {
+  conversationId?: string
+  requestOrdinal?: number
+  cursorTurnId?: string
+  parentTurnId?: string
+  openTurnId?: string
+}
+
+export function resolveCursorCodexTurnId(
+  input: CursorCodexTurnIdInput
+): string | undefined {
+  const cursorTurnId = input.cursorTurnId?.trim()
+  if (cursorTurnId) {
+    return cursorTurnId
+  }
+
+  const parentTurnId = input.parentTurnId?.trim()
+  if (parentTurnId) {
+    return parentTurnId
+  }
+
+  const openTurnId = input.openTurnId?.trim()
+  if (openTurnId) {
+    return openTurnId
+  }
+
+  const conversationId = input.conversationId?.trim()
+  if (!conversationId) {
+    return undefined
+  }
+
+  const requestOrdinal = Math.max(1, Math.floor(input.requestOrdinal || 1))
+  return `${conversationId}:${requestOrdinal}`
 }
 
 export function resolveCursorCodexServiceTier(
@@ -175,11 +212,18 @@ export function buildCursorCodexClientMetadata(
     return undefined
   }
 
-  const requestOrdinal = Math.max(1, Math.floor(input.requestOrdinal))
+  const requestOrdinal = Math.max(1, Math.floor(input.requestOrdinal || 1))
+  const turnId = input.turnId?.trim() || `${conversationId}:${requestOrdinal}`
+  const windowId = input.windowId?.trim() || `${conversationId}:0`
+  const installationId = input.installationId.trim()
   const turnMetadata: Record<string, unknown> = {
+    installation_id: installationId,
     session_id: conversationId,
+    thread_id: conversationId,
+    turn_id: turnId,
+    window_id: windowId,
+    request_kind: "turn",
     thread_source: "user",
-    turn_id: `${conversationId}:${requestOrdinal}`,
     sandbox: "none",
   }
 
@@ -193,9 +237,9 @@ export function buildCursorCodexClientMetadata(
   return {
     session_id: conversationId,
     thread_id: conversationId,
-    turn_id: `${conversationId}:${requestOrdinal}`,
-    "x-codex-window-id": `${conversationId}:${requestOrdinal}`,
+    turn_id: turnId,
+    "x-codex-window-id": windowId,
     "x-codex-turn-metadata": JSON.stringify(turnMetadata),
-    "x-codex-installation-id": input.installationId,
+    "x-codex-installation-id": installationId,
   }
 }

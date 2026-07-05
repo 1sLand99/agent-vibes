@@ -13,7 +13,8 @@ export function shouldRetryCodexSessionWebSocketError(error: unknown): boolean {
   return (
     message.includes("websocket is not open") ||
     message.includes("readystate") ||
-    message.includes("socket has been closed")
+    message.includes("socket has been closed") ||
+    message.includes("websocket closed before response.completed")
   )
 }
 
@@ -75,6 +76,32 @@ export function shouldFallbackToHttpAfterCodexWebSocketError(
     message.includes("proxy") ||
     message.includes("tls") ||
     message.includes("certificate")
+  )
+}
+
+export interface ShouldRetryCodexWebSocketBeforeHttpFallbackOptions {
+  emittedEvents: boolean
+  retryCount: number
+  maxRetries: number
+}
+
+export function shouldRetryCodexWebSocketBeforeHttpFallback(
+  error: unknown,
+  options: ShouldRetryCodexWebSocketBeforeHttpFallbackOptions
+): boolean {
+  if (options.emittedEvents) {
+    return false
+  }
+  if (options.retryCount >= Math.max(0, options.maxRetries)) {
+    return false
+  }
+  if (error instanceof CodexWebSocketUpgradeError) {
+    return false
+  }
+
+  return (
+    shouldRetryCodexSessionWebSocketError(error) ||
+    shouldFallbackToHttpAfterCodexWebSocketError(error)
   )
 }
 

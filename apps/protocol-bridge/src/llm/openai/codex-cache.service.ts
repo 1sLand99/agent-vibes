@@ -2,8 +2,9 @@
  * Codex Prompt Cache Service
  *
  * Manages prompt cache keys for Codex upstream to enable prompt caching.
- * The Codex API supports prompt caching via Conversation_id and Session_id
- * headers, which allow the upstream to reuse cached prompt prefixes.
+ * Current Codex Responses requests carry the cache identity in the
+ * `prompt_cache_key` body field; WebSocket/HTTP headers are reserved for
+ * session and thread identity.
  *
  * Ported from CLIProxyAPI:
  *   - internal/runtime/executor/cache_helpers.go
@@ -122,28 +123,6 @@ export class CodexCacheService {
    */
   private generateCacheId(): string {
     return crypto.randomUUID()
-  }
-
-  /**
-   * Build prompt cache headers for Codex requests.
-   * Returns headers to be added to the HTTP request.
-   */
-  buildHttpCacheHeaders(cacheId: string): Record<string, string> {
-    const promptCacheKey = this.normalizePromptCacheKey(cacheId)
-    if (!promptCacheKey) return {}
-
-    return {
-      Session_id: promptCacheKey,
-    }
-  }
-
-  buildWebSocketCacheHeaders(cacheId: string): Record<string, string> {
-    const promptCacheKey = this.normalizePromptCacheKey(cacheId)
-    if (!promptCacheKey) return {}
-
-    return {
-      Conversation_id: promptCacheKey,
-    }
   }
 
   /**

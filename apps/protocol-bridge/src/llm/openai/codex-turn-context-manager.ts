@@ -3,9 +3,9 @@ import type { CodexRuntimeCacheStore } from "./codex-runtime-cache-store"
 import type { CodexInputItem } from "./codex-native-types"
 import {
   buildCodexScopedWsCacheKey,
+  buildCodexTurnWsSessionId,
   codexTurnContextToCachedWsEntry,
   createCodexTurnContext,
-  reuseCodexActiveTurnContext,
   type CodexTurnContext,
 } from "./codex-turn-context"
 import {
@@ -197,21 +197,31 @@ export class CodexTurnContextManager {
   }
 
   prepareWarmupContext(
-    input: CodexTurnContextCacheScope
+    input: CodexTurnContextCacheScope & { turnKey?: string }
   ): CodexPreparedWarmupContext {
     const conversationId = this.normalizeConversationId(input.conversationId)
+    const turnKey = input.turnKey?.trim() || undefined
     const cacheKey = this.buildWsCacheKey({
       slotKey: input.slotKey,
       modelName: input.modelName,
       conversationId: conversationId || undefined,
     })
-    const cached = this.runtimeCache.getWs(cacheKey)
-    const sessionId = cached?.wsSessionId || conversationId || cacheKey
+    let cached = this.runtimeCache.getWs(cacheKey)
+    if (cached && cached.turnKey !== turnKey) {
+      this.runtimeCache.deleteWs(cacheKey)
+      this.closeWsSession(cached.wsSessionId)
+      cached = undefined
+    }
+    const sessionId =
+      cached?.wsSessionId ||
+      (conversationId
+        ? buildCodexTurnWsSessionId(conversationId, turnKey)
+        : cacheKey)
 
     if (!cached) {
       this.runtimeCache.setWs(cacheKey, {
         wsSessionId: sessionId,
-        turnKey: undefined,
+        turnKey,
         turnState: undefined,
         lastResponse: undefined,
         lastRequest: undefined,
@@ -281,7 +291,12 @@ export class CodexTurnContextManager {
 
     const existing = this.sessions.getActive(conversationId)
     if (existing) {
-      return reuseCodexActiveTurnContext(existing, input.turnKey)
+      if (existing.turnKey === input.turnKey) {
+        return existing
+      }
+
+      this.closeWsSession(existing.wsSessionId)
+      this.sessions.clearActive(conversationId)
     }
 
     const cacheKey = this.buildWsCacheKey({
@@ -293,14 +308,19 @@ export class CodexTurnContextManager {
       slotKey: input.slotKey,
       modelName: input.modelName,
     })
-    // Startup/model-picker warmups have no conversation id yet, but the
-    // upstream WebSocket is still reusable for the first real turn. The cache
-    // store only adopts pristine global entries so response-chain state cannot
-    // leak across conversations.
-    const takenCache = this.runtimeCache.takeConversationWsWithGlobalFallback(
+    let takenCache = this.runtimeCache.takeConversationWsWithGlobalFallback(
       cacheKey,
       globalCacheKey
     )
+    if (takenCache && takenCache.entry.turnKey !== input.turnKey) {
+      // A WebSocket session id is immutable inside CodexWebSocketService. A
+      // connection opened by startup/model-picker warmup has no Codex turn key,
+      // so promoting it into a keyed ModelClientSession would replay sticky
+      // routing on the wrong logical turn. Match Codex CLI by starting a fresh
+      // turn-scoped session whenever the turn key changes.
+      this.closeWsSession(takenCache.entry.wsSessionId)
+      takenCache = undefined
+    }
     const context = createCodexTurnContext({
       conversationId,
       turnKey: input.turnKey,
@@ -438,7 +458,6 @@ export class CodexTurnContextManager {
 
     const hadContinuationBaseline =
       !!cached.lastRequest || !!cached.lastResponse
-    const discardedPreviousResponseId = cached.lastResponse?.responseId
     if (!hadContinuationBaseline) {
       return {
         conversationId,
@@ -447,10 +466,12 @@ export class CodexTurnContextManager {
       }
     }
 
+    const discardedPreviousResponseId = cached.lastResponse?.responseId
     this.runtimeCache.setWs(cacheKey, {
       ...cached,
       lastRequest: undefined,
       lastResponse: undefined,
+      updatedAt: this.now(),
     })
 
     return {
@@ -566,9 +587,17 @@ export class CodexTurnContextManager {
       this.normalizeConversationId(conversationId)
     if (!normalizedConversationId) return
 
+    const activeContext = this.sessions.getActive(normalizedConversationId)
+    if (activeContext) {
+      this.closeWsSession(activeContext.wsSessionId)
+    }
     this.sessions.delete(normalizedConversationId)
     this.runtimeCache.deleteWarmupPayload(normalizedConversationId)
-    this.runtimeCache.deleteWsEntriesBySessionId(normalizedConversationId)
+    for (const entry of this.runtimeCache.takeWsEntriesByConversationHash(
+      hashCodexIdentityPart(normalizedConversationId)
+    )) {
+      this.closeWsSession(entry.wsSessionId)
+    }
     this.deleteHttpFallbackTransports(normalizedConversationId)
   }
 
