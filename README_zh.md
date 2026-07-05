@@ -156,40 +156,40 @@ Cursor 客户端侧使用 free 账号即可，不需要开通 Cursor 付费订�
 
 ```bash
 # Download
-curl -L -o agent-vibes-darwin-arm64-0.1.51.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.51/agent-vibes-darwin-arm64-0.1.51.vsix
+curl -L -o agent-vibes-darwin-arm64-0.1.52.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.52/agent-vibes-darwin-arm64-0.1.52.vsix
 
 # Install
-cursor --install-extension agent-vibes-darwin-arm64-0.1.51.vsix --force
+cursor --install-extension agent-vibes-darwin-arm64-0.1.52.vsix --force
 ```
 
 #### macOS Intel
 
 ```bash
 # Download
-curl -L -o agent-vibes-darwin-x64-0.1.51.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.51/agent-vibes-darwin-x64-0.1.51.vsix
+curl -L -o agent-vibes-darwin-x64-0.1.52.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.52/agent-vibes-darwin-x64-0.1.52.vsix
 
 # Install
-cursor --install-extension agent-vibes-darwin-x64-0.1.51.vsix --force
+cursor --install-extension agent-vibes-darwin-x64-0.1.52.vsix --force
 ```
 
 #### Linux x64
 
 ```bash
 # Download
-curl -L -o agent-vibes-linux-x64-0.1.51.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.51/agent-vibes-linux-x64-0.1.51.vsix
+curl -L -o agent-vibes-linux-x64-0.1.52.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.52/agent-vibes-linux-x64-0.1.52.vsix
 
 # Install
-cursor --install-extension agent-vibes-linux-x64-0.1.51.vsix --force
+cursor --install-extension agent-vibes-linux-x64-0.1.52.vsix --force
 ```
 
 #### Windows x64
 
 ```powershell
 # Download
-Invoke-WebRequest -Uri "https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.51/agent-vibes-win32-x64-0.1.51.vsix" -OutFile "agent-vibes-win32-x64-0.1.51.vsix"
+Invoke-WebRequest -Uri "https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.52/agent-vibes-win32-x64-0.1.52.vsix" -OutFile "agent-vibes-win32-x64-0.1.52.vsix"
 
 # Install
-cursor --install-extension agent-vibes-win32-x64-0.1.51.vsix --force
+cursor --install-extension agent-vibes-win32-x64-0.1.52.vsix --force
 ```
 
 安装后重启 Cursor，扩展会自动启动代理服务器（仅启动 bridge，不会自动开启 Cursor 转发），
