@@ -828,7 +828,7 @@ export interface PendingToolCall extends PendingToolExecutionState {
   toolInput: Record<string, unknown>
   historyToolName?: string
   historyToolInput?: Record<string, unknown>
-  codexToolCallType?: "function" | "custom"
+  codexToolCallType?: "function" | "custom" | "tool_search"
   toolFamilyHint?: "mcp" | "edit" | "web_fetch"
   modelCallId: string
   startedEmitted: boolean
@@ -1036,7 +1036,7 @@ interface PersistedPendingToolCall extends PendingToolExecutionState {
   toolInput: Record<string, unknown>
   historyToolName?: string
   historyToolInput?: Record<string, unknown>
-  codexToolCallType?: "function" | "custom"
+  codexToolCallType?: "function" | "custom" | "tool_search"
   toolFamilyHint?: "mcp" | "edit" | "web_fetch"
   modelCallId: string
   startedEmitted: boolean
@@ -2879,6 +2879,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       ...(message.type === "assistant" && message.message.id
         ? { messageId: message.message.id }
         : {}),
+      ...(message.type === "user" && message.isMeta ? { isMeta: true } : {}),
     }
   }
 
@@ -3327,6 +3328,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     return records.filter(isMessageRecord).map((record) =>
       makeSessionMessage(record.role, record.content, {
         messageId: record.messageId,
+        isMeta: record.isMeta,
       })
     )
   }
@@ -3706,6 +3708,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       msg: SessionMessage
     ): boolean =>
       record.role === msg.message.role &&
+      Boolean(record.isMeta) === Boolean(msg.type === "user" && msg.isMeta) &&
       this.messageContentEqual(record.content, msg.message.content)
 
     let prefix = 0
@@ -4927,7 +4930,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     modelCallId: string = "",
     historyToolName?: string,
     historyToolInput?: Record<string, unknown>,
-    codexToolCallType?: "function" | "custom",
+    codexToolCallType?: "function" | "custom" | "tool_search",
     subagentOwner?: string,
     // Optional caller-supplied turnId. When omitted the resolver
     // installed by CursorConnectStreamService is queried.

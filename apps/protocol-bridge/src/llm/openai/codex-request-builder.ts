@@ -1,668 +1,108 @@
+import { projectCodexNativeRequest } from "./codex-native-projector"
+import type {
+  CodexExecutionRequest,
+  CodexInputItem,
+  CodexRequest,
+  CodexTool,
+} from "./codex-native-types"
 import {
-  CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
-  type LooseMessageContent,
-} from "../../context"
-import { sanitizeResponsesToolCallIntegrity } from "../shared/openai-tool-call-integrity"
-import { appendLanguageDirectiveToText } from "../shared/language-directive"
-import type { ThinkingIntent } from "../shared/thinking-types"
-import { resolveCodexReasoningEffort } from "./codex-thinking"
-import { buildShortNameMap, shortenNameIfNeeded } from "./tool-name-shortener"
+  resolveCodexRequestCapabilities,
+  type CodexRequestCapabilities,
+} from "../shared/model-registry"
 
-export interface CodexConversationMessage {
-  role: "user" | "assistant"
-  content: LooseMessageContent
+const CODEX_UNKNOWN_MODEL_CAPABILITIES: CodexRequestCapabilities = {
+  supportsVerbosity: false,
+  supportsParallelToolCalls: false,
+  useResponsesLite: false,
+  supportsReasoningSummaries: false,
+  supportsOriginalImageDetail: false,
+  supportedServiceTiers: [],
 }
 
-export interface CodexConversationTool {
-  type?:
-    | "function"
-    | "custom"
-    | "web_search"
-    | "web_search_20250305"
-    | "image_generation"
-  name: string
-  description: string
-  input_schema?: Record<string, unknown>
-  format?: Record<string, unknown>
-  external_web_access?: boolean
-  search_context_size?: "low" | "medium" | "high"
-  search_content_types?: string[]
-  output_format?: string
-}
-
-export interface CodexSystemTextBlock {
-  type?: string
-  text?: string
-}
-
-export interface CodexExecutionRequest {
-  model: string
-  system?: string | CodexSystemTextBlock[]
-  messages: CodexConversationMessage[]
-  tools?: CodexConversationTool[]
-  conversationId?: string
-  pendingToolUseIds?: string[]
-  thinkingIntent?: ThinkingIntent | null
-  includeThinkingSummary?: boolean
-  serviceTier?: string
-  parallelToolCalls?: boolean
-  cacheUserId?: string
-  /**
-   * True when the request originates from the Claude Code frontend (set from
-   * `dto._clientIsClaudeCode` by the Claude→Codex translator). Suppresses the
-   * forced language directive in the built instructions — CC manages its own
-   * response/thinking language.
-   */
-  clientIsClaudeCode?: boolean
-  /**
-   * @deprecated previous_response_id 现在由 CodexService.streamViaWebSocket() 在 transport 层自动注入，
-   * 由 strict incremental delta 校验保护。不再从外部传入。该字段不参与请求构建。
-   * 保留字段声明以避免现有调用方的编译错误。
-   */
-  previousResponseId?: string
-  clientMetadata?: Record<string, string>
-  textVerbosity?: string
-}
-
-export interface CodexInputMessage {
-  type: "message"
-  role: string
-  content: Array<Record<string, unknown>>
-}
-
-export interface CodexFunctionCall {
-  type: "function_call"
-  call_id: string
-  name: string
-  arguments: string
-}
-
-export interface CodexCustomToolCall {
-  type: "custom_tool_call"
-  call_id: string
-  name: string
-  input: string
-}
-
-export interface CodexFunctionCallOutput {
-  type: "function_call_output"
-  call_id: string
-  output: string | Array<Record<string, unknown>>
-}
-
-export interface CodexCustomToolCallOutput {
-  type: "custom_tool_call_output"
-  call_id: string
-  output: string
-}
-
-export interface CodexCompactionInputItem {
-  type: "compaction"
-  encrypted_content: string
-}
-
-export type CodexInputItem =
-  | CodexInputMessage
-  | CodexFunctionCall
-  | CodexCustomToolCall
-  | CodexFunctionCallOutput
-  | CodexCustomToolCallOutput
-  | CodexCompactionInputItem
-
-export interface CodexTool {
-  type: "function" | "custom" | "web_search" | "image_generation"
-  name?: string
-  description?: string
-  parameters?: Record<string, unknown>
-  strict?: boolean
-  format?: Record<string, unknown>
-  external_web_access?: boolean
-  search_context_size?: "low" | "medium" | "high"
-  search_content_types?: string[]
-  output_format?: string
-}
-
-export interface CodexRequest {
-  model: string
-  instructions: string
-  input: CodexInputItem[]
-  tools?: CodexTool[]
-  tool_choice?: string | Record<string, unknown>
-  stream: boolean
-  store?: boolean
-  parallel_tool_calls?: boolean
-  reasoning?: { effort: string; summary?: string }
-  include?: string[]
-  previous_response_id?: string
-  client_metadata?: Record<string, string>
-  text?: { verbosity: string }
-  generate?: boolean
-  [key: string]: unknown
-}
-
-// 对齐官方 Codex CLI（client.rs:865-868）：
-// Fast → "priority"，其他非空值直接透传
-function normalizeCodexServiceTier(serviceTier?: string): string | undefined {
-  const normalized = serviceTier?.trim().toLowerCase()
-  if (!normalized) {
-    return undefined
-  }
-  if (normalized === "fast") {
-    return "priority"
-  }
-  return normalized
-}
-
-const TOOL_SCHEMA_DOC_KEYS = new Set([
-  "description",
-  "title",
-  "examples",
-  "example",
-  "default",
-])
-
-function compactToolSchemaForCodex(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => compactToolSchemaForCodex(item))
-  }
-
-  if (!value || typeof value !== "object") {
-    return value
-  }
-
-  const compacted: Record<string, unknown> = {}
-  for (const [key, nestedValue] of Object.entries(
-    value as Record<string, unknown>
-  )) {
-    if (TOOL_SCHEMA_DOC_KEYS.has(key)) {
-      continue
-    }
-    compacted[key] = compactToolSchemaForCodex(nestedValue)
-  }
-  return compacted
-}
-
-function normalizeToolParameters(
-  schema: Record<string, unknown> | undefined
-): Record<string, unknown> {
-  if (!schema || typeof schema !== "object") {
-    return { type: "object", properties: {} }
-  }
-  const result = { ...schema }
-  if (!result.type) {
-    result.type = "object"
-  }
-  if (result.type === "object" && !result.properties) {
-    result.properties = {}
-  }
-  delete result.$schema
-  return compactToolSchemaForCodex(result) as Record<string, unknown>
-}
-
-function buildToolNameShortener(
-  tools: CodexConversationTool[] | undefined
-): (name: string) => string {
-  const toolNames: string[] = []
-  if (tools) {
-    for (const tool of tools) {
-      if (tool.name) {
-        toolNames.push(tool.name)
-      }
-    }
-  }
-
-  const shortMap =
-    toolNames.length > 0
-      ? buildShortNameMap(toolNames)
-      : new Map<string, string>()
-
-  return (name: string): string => {
-    const short = shortMap.get(name)
-    if (short) return short
-    return shortenNameIfNeeded(name)
-  }
-}
-
-function serializeCodexInstructions(
-  system?: string | CodexSystemTextBlock[]
-): string {
-  if (typeof system === "string") {
-    return system.trim()
-  }
-
-  if (!Array.isArray(system)) {
-    return ""
-  }
-
-  return system
-    .flatMap((block) => {
-      if (block.type !== "text" || typeof block.text !== "string") {
-        return []
-      }
-      if (block.text.startsWith("x-anthropic-billing-header: ")) {
-        return []
-      }
-      const text = block.text.trim()
-      return text ? [text] : []
-    })
-    .join("\n\n")
-}
-
-function buildToolTypeLookup(
-  tools: CodexConversationTool[] | undefined
-): Map<string, CodexConversationTool["type"]> {
-  const lookup = new Map<string, CodexConversationTool["type"]>()
-  if (!tools) {
-    return lookup
-  }
-
-  for (const tool of tools) {
-    if (!tool?.name) continue
-    lookup.set(tool.name, tool.type)
-  }
-
-  return lookup
-}
-
-function serializeCustomToolInput(input: unknown): string {
-  if (typeof input === "string") {
-    return input
-  }
-
-  if (input && typeof input === "object") {
-    const record = input as Record<string, unknown>
-    for (const key of ["patch", "input", "content", "text"]) {
-      const value = record[key]
-      if (typeof value === "string") {
-        return value
-      }
-    }
-  }
-
-  return JSON.stringify(input ?? {})
-}
-
-function serializeCustomToolOutput(
-  output: string | Array<Record<string, unknown>>
-): string {
-  if (typeof output === "string") {
-    return output
-  }
-
-  const parts: string[] = []
-  for (const part of output) {
-    if (part.type === "input_text" && typeof part.text === "string") {
-      parts.push(part.text)
-    }
-  }
-
-  if (parts.length > 0) {
-    return parts.join("\n")
-  }
-
-  return JSON.stringify(output)
-}
-
-function normalizeToolCallTypeHint(
-  value: unknown
-): "function" | "custom" | undefined {
-  if (typeof value !== "string") {
-    return undefined
-  }
-
-  const normalized = value.trim().toLowerCase()
-  if (normalized === "custom") {
-    return "custom"
-  }
-  if (normalized === "function") {
-    return "function"
-  }
-  return undefined
-}
-
-function stableToolSortKey(tool: CodexTool): string {
-  return [tool.type || "", tool.name || "", stableJsonStringify(tool)].join(
-    "\u0000"
-  )
-}
-
-function stableJsonStringify(value: unknown): string {
-  return JSON.stringify(sortJsonValue(value))
-}
-
-function isCodexCompactionInputItem(
-  value: unknown
-): value is CodexCompactionInputItem {
-  if (!value || typeof value !== "object") return false
-  const record = value as Record<string, unknown>
-  return (
-    record.type === "compaction" && typeof record.encrypted_content === "string"
-  )
-}
-
-function sortJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => sortJsonValue(item))
-  }
-  if (!value || typeof value !== "object") {
-    return value
-  }
-  const sorted: Record<string, unknown> = {}
-  for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-    sorted[key] = sortJsonValue((value as Record<string, unknown>)[key])
-  }
-  return sorted
-}
-
-function sortCodexToolsForStableRequests(tools: CodexTool[]): CodexTool[] {
-  return [...tools].sort((a, b) =>
-    stableToolSortKey(a).localeCompare(stableToolSortKey(b))
-  )
-}
+export type {
+  CodexCompactionInputItem,
+  CodexContextCompactionInputItem,
+  CodexConversationMessage,
+  CodexConversationTool,
+  CodexAdditionalTools,
+  CodexAgentMessageInputItem,
+  CodexCustomToolCall,
+  CodexCustomToolCallOutput,
+  CodexExecutionRequest,
+  CodexFunctionCall,
+  CodexFunctionCallOutput,
+  CodexImageGenerationCallInputItem,
+  CodexInputItem,
+  CodexInputMessage,
+  CodexLocalShellCallInputItem,
+  CodexRequest,
+  CodexReasoningInputItem,
+  CodexSystemTextBlock,
+  CodexToolSearchCallInputItem,
+  CodexToolSearchOutputInputItem,
+  CodexTool,
+  CodexWebSearchCallInputItem,
+} from "./codex-native-types"
 
 export function buildCodexRequest(
   request: CodexExecutionRequest,
-  modelName: string = request.model
-): CodexRequest {
-  const shortenName = buildToolNameShortener(request.tools)
-  const toolTypeByName = buildToolTypeLookup(request.tools)
-  const toolCallTypeById = new Map<string, "function" | "custom">()
-  let input: CodexInputItem[] = []
-  const instructions = appendLanguageDirectiveToText(
-    serializeCodexInstructions(request.system),
-    request.messages,
-    { skip: request.clientIsClaudeCode === true }
+  modelName: string = request.model,
+  capabilities: CodexRequestCapabilities | null = resolveCodexRequestCapabilities(
+    modelName
   )
+): CodexRequest {
+  const effectiveCapabilities = capabilities ?? CODEX_UNKNOWN_MODEL_CAPABILITIES
+  const projection = projectCodexNativeRequest(request, modelName, {
+    supportsOriginalImageDetail:
+      effectiveCapabilities.supportsOriginalImageDetail === true,
+  })
 
-  // No protocol-level repair: the ToolCallLedger guarantees tool_use ↔
-  // tool_result alignment at write time, so the messages reaching here
-  // are already protocol-correct.
-  for (const msg of request.messages as Array<{
-    role: "user" | "assistant"
-    content: unknown
-  }>) {
-    const role = msg.role
-    const messageContent: Array<Record<string, unknown>> = []
-    let hasContent = false
-
-    const flushMessage = () => {
-      if (!hasContent) {
-        return
-      }
-      input.push({
-        type: "message",
-        role,
-        content: [...messageContent],
-      })
-      messageContent.length = 0
-      hasContent = false
-    }
-
-    const appendTextContent = (text: string) => {
-      const partType = role === "assistant" ? "output_text" : "input_text"
-      messageContent.push({ type: partType, text })
-      hasContent = true
-    }
-
-    const appendImageContent = (dataURL: string) => {
-      messageContent.push({ type: "input_image", image_url: dataURL })
-      hasContent = true
-    }
-
-    if (typeof msg.content === "string") {
-      if (msg.content) {
-        appendTextContent(msg.content)
-      }
-      flushMessage()
-      continue
-    }
-
-    if (!Array.isArray(msg.content)) {
-      continue
-    }
-
-    const blocks = msg.content as Array<{
-      type?: string
-      text?: string
-      id?: string
-      name?: string
-      input?: unknown
-      tool_use_id?: string
-      item?: unknown
-      content?:
-        | string
-        | Array<{
-            type: string
-            text?: string
-            source?: Record<string, unknown>
-          }>
-      source?: {
-        data?: string
-        base64?: string
-        media_type?: string
-        mime_type?: string
-      }
-    }>
-
-    for (const block of blocks) {
-      switch (block.type) {
-        case "text":
-          if (block.text) {
-            appendTextContent(block.text)
-          }
-          break
-
-        case "image": {
-          const source = block.source
-          if (!source) {
-            break
-          }
-          const data = source.data || source.base64
-          if (!data) {
-            break
-          }
-          const mediaType =
-            source.media_type || source.mime_type || "application/octet-stream"
-          appendImageContent(`data:${mediaType};base64,${data}`)
-          break
-        }
-
-        case "tool_use":
-          flushMessage()
-          {
-            const originalName = block.name || ""
-            const shortName = shortenName(originalName)
-            const toolType =
-              toolTypeByName.get(originalName) ||
-              normalizeToolCallTypeHint(
-                (block as Record<string, unknown>).tool_call_type
-              )
-            const callId = block.id || ""
-
-            if (toolType === "custom") {
-              input.push({
-                type: "custom_tool_call",
-                call_id: callId,
-                name: shortName,
-                input: serializeCustomToolInput(block.input),
-              })
-              toolCallTypeById.set(callId, "custom")
-            } else {
-              input.push({
-                type: "function_call",
-                call_id: callId,
-                name: shortName,
-                arguments:
-                  typeof block.input === "string"
-                    ? block.input
-                    : JSON.stringify(block.input || {}),
-              })
-              toolCallTypeById.set(callId, "function")
-            }
-          }
-          break
-
-        case "tool_result": {
-          flushMessage()
-
-          let output: string | Array<Record<string, unknown>> = ""
-          if (typeof block.content === "string") {
-            output = block.content
-          } else if (Array.isArray(block.content)) {
-            const parts: Array<Record<string, unknown>> = []
-            for (const part of block.content) {
-              if (part.type === "text" && part.text) {
-                parts.push({ type: "input_text", text: part.text })
-                continue
-              }
-              if (part.type === "image" && part.source) {
-                const src = part.source as {
-                  data?: string
-                  base64?: string
-                  media_type?: string
-                  mime_type?: string
-                }
-                const imgData = src.data || src.base64
-                if (!imgData) {
-                  continue
-                }
-                const mediaType =
-                  src.media_type || src.mime_type || "application/octet-stream"
-                const detail =
-                  typeof (part as { detail?: unknown }).detail === "string"
-                    ? ((part as { detail?: string }).detail as string)
-                    : undefined
-                parts.push({
-                  type: "input_image",
-                  image_url: `data:${mediaType};base64,${imgData}`,
-                  ...(detail ? { detail } : {}),
-                })
-              }
-            }
-            output = parts.length > 0 ? parts : ""
-          }
-
-          const callId = block.tool_use_id || ""
-          const callType =
-            toolCallTypeById.get(callId) ||
-            normalizeToolCallTypeHint(
-              (block as Record<string, unknown>).tool_call_type
-            )
-          if (callType === "custom") {
-            input.push({
-              type: "custom_tool_call_output",
-              call_id: callId,
-              output: serializeCustomToolOutput(output),
-            })
-          } else {
-            input.push({
-              type: "function_call_output",
-              call_id: callId,
-              output,
-            })
-          }
-          break
-        }
-
-        case CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE:
-          flushMessage()
-          if (isCodexCompactionInputItem(block.item)) {
-            input.push({ ...block.item })
-          }
-          break
-
-        default:
-          if (block.text) {
-            appendTextContent(block.text)
-          }
-          break
-      }
-    }
-
-    flushMessage()
-  }
-
-  input = sanitizeResponsesToolCallIntegrity(
-    input,
-    request.pendingToolUseIds
-  ).items
-
-  let codexTools: CodexTool[] | undefined
-  if (request.tools && request.tools.length > 0) {
-    codexTools = []
-    for (const tool of request.tools) {
-      if (tool.type === "web_search_20250305" || tool.type === "web_search") {
-        codexTools.push({
-          type: "web_search",
-          external_web_access:
-            typeof tool.external_web_access === "boolean"
-              ? tool.external_web_access
-              : true,
-          ...(tool.search_context_size
-            ? { search_context_size: tool.search_context_size }
-            : {}),
-          ...(Array.isArray(tool.search_content_types)
-            ? { search_content_types: tool.search_content_types }
-            : {}),
-        })
-        continue
-      }
-
-      if (tool.type === "custom") {
-        codexTools.push({
-          type: "custom",
-          name: shortenName(tool.name || ""),
-          description: tool.description,
-          format: tool.format,
-        })
-        continue
-      }
-
-      if (tool.type === "image_generation") {
-        codexTools.push({
-          type: "image_generation",
-          output_format: tool.output_format || "png",
-        })
-        continue
-      }
-
-      codexTools.push({
-        type: "function",
-        name: shortenName(tool.name || ""),
-        description: tool.description,
-        parameters: normalizeToolParameters(tool.input_schema),
-        strict: false,
-      })
-    }
-  }
-
-  const serviceTier = normalizeCodexServiceTier(request.serviceTier)
-  const reasoning: CodexRequest["reasoning"] = {
-    effort: resolveCodexReasoningEffort(request.thinkingIntent, modelName),
-  }
-  if (request.includeThinkingSummary) {
-    reasoning.summary = "auto"
-  }
-
+  const reasoning = resolveReasoningForRequest(
+    projection.reasoning,
+    effectiveCapabilities
+  )
+  const responsesPayload = buildResponsesPayloadForRequest(
+    projection.instructions,
+    projection.input,
+    projection.tools,
+    effectiveCapabilities
+  )
   const codexRequest: CodexRequest = {
     model: modelName,
-    instructions,
-    input,
+    instructions: responsesPayload.instructions,
+    input: responsesPayload.input,
     stream: true,
     store: false,
-    parallel_tool_calls: request.parallelToolCalls !== false,
-    reasoning,
-    include: ["reasoning.encrypted_content"],
-    text: { verbosity: request.textVerbosity?.trim() || "low" },
+    parallel_tool_calls: resolveParallelToolCallsForRequest(
+      request.parallelToolCalls,
+      effectiveCapabilities
+    ),
+    tool_choice: "auto",
+    include: reasoning ? ["reasoning.encrypted_content"] : [],
   }
 
+  if (reasoning) {
+    codexRequest.reasoning = reasoning
+  }
+
+  const text = resolveTextParamForRequest(
+    request.textVerbosity,
+    effectiveCapabilities
+  )
+  if (text) {
+    codexRequest.text = text
+  }
+
+  const serviceTier = resolveServiceTierForRequest(
+    projection.serviceTier,
+    effectiveCapabilities
+  )
   if (serviceTier) {
     codexRequest.service_tier = serviceTier
   }
 
-  if (codexTools && codexTools.length > 0) {
-    codexRequest.tools = sortCodexToolsForStableRequests(codexTools)
-    codexRequest.tool_choice = "auto"
+  if (responsesPayload.tools && responsesPayload.tools.length > 0) {
+    codexRequest.tools = responsesPayload.tools
   }
 
   const clientMetadata = request.clientMetadata
@@ -677,13 +117,141 @@ export function buildCodexRequest(
   return codexRequest
 }
 
+function buildResponsesPayloadForRequest(
+  instructions: string,
+  input: CodexInputItem[],
+  tools: CodexTool[] | undefined,
+  capabilities: CodexRequestCapabilities | null
+): { instructions: string; input: CodexInputItem[]; tools?: CodexTool[] } {
+  if (capabilities?.useResponsesLite !== true) {
+    return { instructions, input, tools }
+  }
+
+  const prefix: CodexInputItem[] = [
+    {
+      type: "additional_tools",
+      role: "developer",
+      tools: tools || [],
+    },
+  ]
+
+  if (instructions.length > 0) {
+    prefix.push({
+      type: "message",
+      role: "developer",
+      content: [{ type: "input_text", text: instructions }],
+    })
+  }
+
+  return {
+    instructions: "",
+    input: [...prefix, ...stripImageDetailsForResponsesLite(input)],
+  }
+}
+
+function stripImageDetailsForResponsesLite(
+  input: CodexInputItem[]
+): CodexInputItem[] {
+  return input.map((item) => {
+    if (item.type === "message") {
+      return {
+        ...item,
+        content: stripImageDetailsFromContent(item.content),
+      }
+    }
+
+    if (
+      item.type === "function_call_output" ||
+      item.type === "custom_tool_call_output"
+    ) {
+      return Array.isArray(item.output)
+        ? {
+            ...item,
+            output: stripImageDetailsFromContent(item.output),
+          }
+        : { ...item }
+    }
+
+    return { ...item }
+  })
+}
+
+function stripImageDetailsFromContent(
+  content: Array<Record<string, unknown>>
+): Array<Record<string, unknown>> {
+  return content.map((part) => {
+    if (part.type !== "input_image") {
+      return { ...part }
+    }
+
+    const { detail: _detail, ...rest } = part
+    return rest
+  })
+}
+
+function resolveParallelToolCallsForRequest(
+  requested: boolean | undefined,
+  capabilities: CodexRequestCapabilities | null
+): boolean {
+  return (
+    requested !== false &&
+    capabilities?.supportsParallelToolCalls !== false &&
+    capabilities?.useResponsesLite !== true
+  )
+}
+
+function resolveTextParamForRequest(
+  textVerbosity: string | undefined,
+  capabilities: CodexRequestCapabilities | null
+): CodexRequest["text"] | undefined {
+  if (capabilities?.supportsVerbosity === false) {
+    return undefined
+  }
+
+  const verbosity =
+    textVerbosity?.trim() || capabilities?.defaultVerbosity?.trim() || "low"
+  return verbosity ? { verbosity } : undefined
+}
+
+function resolveReasoningForRequest(
+  reasoning: CodexRequest["reasoning"],
+  capabilities: CodexRequestCapabilities | null
+): CodexRequest["reasoning"] {
+  if (capabilities?.supportsReasoningSummaries === false) {
+    return undefined
+  }
+  if (!reasoning) {
+    return undefined
+  }
+  if (capabilities?.useResponsesLite === true) {
+    return { ...reasoning, context: "all_turns" }
+  }
+  return reasoning
+}
+
+function resolveServiceTierForRequest(
+  serviceTier: string | undefined,
+  capabilities: CodexRequestCapabilities | null
+): string | undefined {
+  if (!serviceTier || serviceTier === "default") {
+    return undefined
+  }
+
+  const supportedServiceTiers = capabilities?.supportedServiceTiers
+  if (supportedServiceTiers) {
+    return supportedServiceTiers.includes(serviceTier) ? serviceTier : undefined
+  }
+
+  return serviceTier
+}
+
 /**
  * 从完整的 CodexRequest 中提取 warmup-only payload。
- * 只保留 model + instructions + tools + reasoning + include + text 等静态配置，
- * 去掉 input messages 和 previous_response_id，用于 generate:false 的 prompt cache 预热。
+ * 普通 Responses 请求保留顶层静态配置并清空 input；Responses Lite 请求的
+ * tools/instructions 已经位于 input 前缀，因此只保留该静态前缀。
  *
- * 对齐官方 Codex CLI（session_startup_prewarm.rs:216-223）：
- *   build_prompt(Vec::new(), ...) — 使用空的 input items 构建 warmup prompt。
+ * 对齐官方 Codex CLI（session_startup_prewarm.rs）：
+ *   build_prompt(Vec::new(), ...) 后仍通过同一套 Responses request builder。
  */
 export function extractWarmupPayload(
   codexRequest: CodexRequest
@@ -691,12 +259,13 @@ export function extractWarmupPayload(
   const payload: Record<string, unknown> = {
     model: codexRequest.model,
     instructions: codexRequest.instructions,
-    input: [],
+    input: extractWarmupInputItems(codexRequest.input),
     stream: true,
     store: codexRequest.store,
     parallel_tool_calls: codexRequest.parallel_tool_calls,
     reasoning: codexRequest.reasoning,
     include: codexRequest.include,
+    tool_choice: codexRequest.tool_choice,
   }
 
   if (codexRequest.text) {
@@ -704,7 +273,6 @@ export function extractWarmupPayload(
   }
   if (codexRequest.tools && codexRequest.tools.length > 0) {
     payload.tools = codexRequest.tools
-    payload.tool_choice = codexRequest.tool_choice
   }
   if (codexRequest.service_tier) {
     payload.service_tier = codexRequest.service_tier
@@ -714,4 +282,30 @@ export function extractWarmupPayload(
   }
 
   return payload
+}
+
+function extractWarmupInputItems(input: CodexInputItem[]): CodexInputItem[] {
+  if (input[0]?.type !== "additional_tools") {
+    return []
+  }
+
+  const additionalTools = input[0]
+  const prefix: CodexInputItem[] = [
+    {
+      ...additionalTools,
+      tools: additionalTools.tools.map((tool) => ({ ...tool })),
+    },
+  ]
+  const developerMessage = input[1]
+  if (
+    developerMessage?.type === "message" &&
+    developerMessage.role === "developer"
+  ) {
+    prefix.push({
+      ...developerMessage,
+      content: developerMessage.content.map((part) => ({ ...part })),
+    })
+  }
+
+  return prefix
 }

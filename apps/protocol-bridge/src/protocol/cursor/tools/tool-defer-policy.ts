@@ -37,6 +37,21 @@ import type { BackendType } from "../../../llm/shared/model-router.service"
  * avoid a circular dependency between policy and handler.
  */
 export const DISCOVER_TOOL_NAME = "discover_tool"
+export const CODEX_TOOL_SEARCH_NAME = "tool_search"
+
+export function isBridgeInternalToolName(toolName: string): boolean {
+  const normalized = toolName.trim().toLowerCase()
+  if (!normalized) return false
+  const compact = normalized.replace(/[^a-z0-9]/g, "")
+  const discoverCompact = DISCOVER_TOOL_NAME.replace(/[^a-z0-9]/g, "")
+  const toolSearchCompact = CODEX_TOOL_SEARCH_NAME.replace(/[^a-z0-9]/g, "")
+  return (
+    normalized === DISCOVER_TOOL_NAME ||
+    compact === discoverCompact ||
+    normalized === CODEX_TOOL_SEARCH_NAME ||
+    compact === toolSearchCompact
+  )
+}
 
 /**
  * Curated set of always-loaded tools.  Mirrors claude-code's `CORE_TOOLS`
@@ -98,6 +113,8 @@ export const CORE_TOOL_NAMES: ReadonlySet<string> = new Set([
   "web_fetch",
   // ── Bridge-internal tool (always present when defer is on)
   DISCOVER_TOOL_NAME,
+  // ── Codex-native dynamic tool discovery
+  CODEX_TOOL_SEARCH_NAME,
 ])
 
 /**

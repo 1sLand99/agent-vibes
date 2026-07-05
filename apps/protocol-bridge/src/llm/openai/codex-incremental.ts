@@ -1,4 +1,5 @@
-import type { CodexInputItem } from "./codex-request-builder"
+import type { CodexInputItem } from "./codex-native-types"
+import { isCodexApiVisibleInputItem } from "./codex-response-items"
 
 export interface CodexLastResponseSnapshot {
   responseId: string
@@ -67,8 +68,6 @@ const TRANSPORT_ONLY_REQUEST_FIELDS = new Set([
   // Official Codex sends WebSocket client metadata separately from the
   // semantic ResponsesApiRequest compared by get_incremental_items().
   "client_metadata",
-  // Cache identity affects transport/cache selection, not prompt semantics.
-  "prompt_cache_key",
 ])
 
 export function stripCodexRequestForIncrementalCompare(
@@ -111,13 +110,30 @@ export function getCodexIncrementalInput(
     }
   }
 
-  const previousInput = getCodexInputItems(previousRequest)
-  const requestInput = getCodexInputItems(request)
-  const baseline = [...previousInput, ...lastResponse.itemsAdded]
+  const previousInput = canonicalizeCodexInputItemsForContinuation(
+    getCodexInputItems(previousRequest)
+  )
+  const requestInput = canonicalizeCodexInputItemsForContinuation(
+    getCodexInputItems(request)
+  )
+  const responseInput = canonicalizeCodexInputItemsForContinuation(
+    lastResponse.itemsAdded
+  )
+  const baseline = [...previousInput, ...responseInput]
   if (
     requestInput.length < baseline.length ||
     (!allowEmptyDelta && requestInput.length === baseline.length)
   ) {
+    const omittedResponseResult =
+      getCodexIncrementalInputWithOmittedResponseItems(
+        requestInput,
+        previousInput,
+        responseInput,
+        allowEmptyDelta
+      )
+    if (omittedResponseResult) {
+      return omittedResponseResult
+    }
     return {
       ok: false,
       reason: "input_not_extension",
@@ -133,6 +149,16 @@ export function getCodexIncrementalInput(
       stableCodexJsonStringify(requestInput[index]) !==
       stableCodexJsonStringify(baseline[index])
     ) {
+      const omittedResponseResult =
+        getCodexIncrementalInputWithOmittedResponseItems(
+          requestInput,
+          previousInput,
+          responseInput,
+          allowEmptyDelta
+        )
+      if (omittedResponseResult) {
+        return omittedResponseResult
+      }
       return {
         ok: false,
         reason: "input_not_extension",
@@ -148,6 +174,114 @@ export function getCodexIncrementalInput(
   }
 
   return { ok: true, input: requestInput.slice(baseline.length) }
+}
+
+function getCodexIncrementalInputWithOmittedResponseItems(
+  requestInput: CodexInputItem[],
+  previousInput: CodexInputItem[],
+  responseInput: CodexInputItem[],
+  allowEmptyDelta: boolean
+): { ok: true; input: CodexInputItem[] } | undefined {
+  if (requestInput.length < previousInput.length) {
+    return undefined
+  }
+
+  for (let index = 0; index < previousInput.length; index++) {
+    if (
+      stableCodexJsonStringify(requestInput[index]) !==
+      stableCodexJsonStringify(previousInput[index])
+    ) {
+      return undefined
+    }
+  }
+
+  let requestIndex = previousInput.length
+  let responseIndex = 0
+  while (requestIndex < requestInput.length) {
+    const requestItem = requestInput[requestIndex]
+    const matchedResponseIndex = findMatchingResponseReplayItemIndex(
+      responseInput,
+      responseIndex,
+      requestItem
+    )
+    if (matchedResponseIndex >= 0) {
+      responseIndex = matchedResponseIndex + 1
+      requestIndex++
+      continue
+    }
+
+    if (isCodexResponseReplayItem(requestItem)) {
+      requestIndex++
+      continue
+    }
+
+    break
+  }
+
+  const incrementalInput = requestInput.slice(requestIndex)
+  if (!allowEmptyDelta && incrementalInput.length === 0) {
+    return undefined
+  }
+  return { ok: true, input: incrementalInput }
+}
+
+function findMatchingResponseReplayItemIndex(
+  responseInput: CodexInputItem[],
+  startIndex: number,
+  requestItem: CodexInputItem | undefined
+): number {
+  if (!requestItem) {
+    return -1
+  }
+  const requestKey = stableCodexJsonStringify(requestItem)
+  for (let index = startIndex; index < responseInput.length; index++) {
+    const responseItem = responseInput[index]
+    if (!isCodexResponseReplayItem(responseItem)) {
+      continue
+    }
+    if (stableCodexJsonStringify(responseItem) === requestKey) {
+      return index
+    }
+  }
+  return -1
+}
+
+function isCodexResponseReplayItem(item: CodexInputItem | undefined): boolean {
+  const type = getCodexInputItemType(item)
+  if (type === "message") {
+    return getCodexMessageRole(item) === "assistant"
+  }
+  return CODEX_RESPONSE_REPLAY_ITEM_TYPES.has(type)
+}
+
+const CODEX_RESPONSE_REPLAY_ITEM_TYPES = new Set([
+  "agent_message",
+  "reasoning",
+  "local_shell_call",
+  "function_call",
+  "custom_tool_call",
+  "tool_search_call",
+  "web_search_call",
+  "image_generation_call",
+])
+
+/**
+ * Codex continuation state is compared against the semantic Responses API
+ * input stream, not the raw websocket event stream. The request builder never
+ * emits empty text messages, so empty upstream `message` output items must not
+ * become part of the continuation baseline.
+ */
+export function canonicalizeCodexInputItemsForContinuation(
+  items: CodexInputItem[]
+): CodexInputItem[] {
+  const result: CodexInputItem[] = []
+  for (const item of items) {
+    const canonical = canonicalizeCodexInputItemForContinuation(item)
+    if (canonical) {
+      result.push(canonical)
+    }
+  }
+  return result
 }
 
 export function prepareCodexContinuationRequest(
@@ -244,10 +378,151 @@ function getCodexInputItemType(item: CodexInputItem | undefined): string {
   return type || "unknown"
 }
 
+function getCodexMessageRole(item: CodexInputItem | undefined): string {
+  if (!item || getCodexInputItemType(item) !== "message") {
+    return ""
+  }
+  const role = (item as { role?: unknown }).role
+  return typeof role === "string" ? role.trim() : ""
+}
+
 function getCodexInputItems(
   request: Record<string, unknown>
 ): CodexInputItem[] {
   return Array.isArray(request.input) ? (request.input as CodexInputItem[]) : []
+}
+
+function canonicalizeCodexInputItemForContinuation(
+  item: CodexInputItem | undefined
+): CodexInputItem | undefined {
+  if (!item) return undefined
+  const type = (item as { type?: unknown }).type
+
+  if (type === "message") {
+    const message = item as Extract<CodexInputItem, { type: "message" }>
+    const role = typeof message.role === "string" ? message.role : "assistant"
+    if (role === "system") {
+      return undefined
+    }
+    const content = canonicalizeCodexContentArray(message.content)
+    if (content.length === 0) {
+      return undefined
+    }
+    return stripCodexContinuationMetadata({
+      ...message,
+      role,
+      content,
+    })
+  }
+
+  if (type === "function_call") {
+    const call = item as Extract<CodexInputItem, { type: "function_call" }>
+    return stripCodexContinuationMetadata({
+      ...call,
+      call_id: typeof call.call_id === "string" ? call.call_id : "",
+      name: typeof call.name === "string" ? call.name : "",
+      arguments:
+        typeof call.arguments === "string"
+          ? call.arguments
+          : JSON.stringify(
+              (call as unknown as Record<string, unknown>).arguments ?? {}
+            ),
+    })
+  }
+
+  if (type === "custom_tool_call") {
+    const call = item as Extract<CodexInputItem, { type: "custom_tool_call" }>
+    return stripCodexContinuationMetadata({
+      ...call,
+      call_id: typeof call.call_id === "string" ? call.call_id : "",
+      name: typeof call.name === "string" ? call.name : "",
+      input:
+        typeof call.input === "string"
+          ? call.input
+          : JSON.stringify(
+              (call as unknown as Record<string, unknown>).input ?? ""
+            ),
+    })
+  }
+
+  if (type === "function_call_output") {
+    const output = item as Extract<
+      CodexInputItem,
+      { type: "function_call_output" }
+    >
+    const outputParts = Array.isArray(output.output)
+      ? canonicalizeCodexContentArray(output.output)
+      : undefined
+    return stripCodexContinuationMetadata({
+      ...output,
+      call_id: typeof output.call_id === "string" ? output.call_id : "",
+      output: outputParts
+        ? outputParts.length > 0
+          ? outputParts
+          : ""
+        : typeof output.output === "string"
+          ? output.output
+          : JSON.stringify(
+              (output as unknown as Record<string, unknown>).output ?? ""
+            ),
+    })
+  }
+
+  if (type === "custom_tool_call_output") {
+    const output = item as Extract<
+      CodexInputItem,
+      { type: "custom_tool_call_output" }
+    >
+    return stripCodexContinuationMetadata({
+      ...output,
+      call_id: typeof output.call_id === "string" ? output.call_id : "",
+      output:
+        typeof output.output === "string"
+          ? output.output
+          : JSON.stringify(
+              (output as unknown as Record<string, unknown>).output ?? ""
+            ),
+    })
+  }
+
+  if (isCodexApiVisibleInputItem(item)) {
+    return stripCodexContinuationMetadata({
+      ...(item as Record<string, unknown>),
+    }) as CodexInputItem
+  }
+
+  return undefined
+}
+
+function stripCodexContinuationMetadata<T extends object>(item: T): T {
+  const copy = { ...(item as Record<string, unknown>) }
+  delete copy.id
+  delete copy.internal_chat_message_metadata_passthrough
+  return copy as T
+}
+
+function canonicalizeCodexContentArray(
+  content: Array<Record<string, unknown>> | undefined
+): Array<Record<string, unknown>> {
+  if (!Array.isArray(content)) return []
+  const result: Array<Record<string, unknown>> = []
+  for (const part of content) {
+    if (!part || typeof part !== "object") {
+      continue
+    }
+    const type = typeof part.type === "string" ? part.type : ""
+    if (type === "input_text" || type === "output_text" || type === "text") {
+      const text = typeof part.text === "string" ? part.text : ""
+      if (text.length === 0) {
+        continue
+      }
+      result.push({ ...part, text })
+      continue
+    }
+
+    result.push({ ...part })
+  }
+  return result
 }
 
 function sortJsonValue(value: unknown): unknown {

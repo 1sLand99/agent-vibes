@@ -6,7 +6,7 @@
 
 import { DISCOVER_TOOL_DEFINITION } from "./discover-tool-handler"
 import { SNIP_MESSAGES_TOOL_DEFINITION } from "./snip-tool-handler"
-import { shouldDeferTool } from "./tool-defer-policy"
+import { CODEX_TOOL_SEARCH_NAME, shouldDeferTool } from "./tool-defer-policy"
 
 // Tool definition in Anthropic format
 export interface AnthropicTool {
@@ -2145,14 +2145,42 @@ export interface CursorBuiltInToolCapabilityOptions {
 }
 
 export interface ToolDefinition {
-  type: "function" | "custom" | "web_search"
+  type: "function" | "custom" | "tool_search" | "web_search"
   name: string
   description: string
   input_schema?: Record<string, unknown>
+  execution?: "client"
   strict?: boolean
   format?: Record<string, unknown>
   external_web_access?: boolean
   search_content_types?: string[]
+}
+
+const CODEX_TOOL_SEARCH_DEFINITION: ToolDefinition = {
+  type: "tool_search",
+  name: CODEX_TOOL_SEARCH_NAME,
+  execution: "client",
+  description:
+    "# Tool discovery\n\n" +
+    "Searches over deferred tool metadata and exposes matching tools for " +
+    "the next model call.\n\n" +
+    "Some of the tools may not have been provided upfront. Use this tool " +
+    "to search for the required tools instead of inventing tool names.",
+  input_schema: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description: "Search query for deferred tools.",
+      },
+      limit: {
+        type: "number",
+        description: "Maximum number of tools to return. Defaults to 8.",
+      },
+    },
+    required: ["query"],
+    additionalProperties: false,
+  },
 }
 
 function normalizeToolInputSchema(
@@ -3253,7 +3281,7 @@ export function buildToolsForApiWithDefer(
   if (!options?.defer || options.defer.strategy === "off") {
     return { tools: allTools, deferred: [] }
   }
-  return applyDeferPolicy(allTools, provenance, options.defer)
+  return applyDeferPolicy(allTools, provenance, options.defer, options.backend)
 }
 
 /**
@@ -3263,7 +3291,8 @@ export function buildToolsForApiWithDefer(
 function applyDeferPolicy(
   tools: ToolDefinition[],
   isBuiltInByName: ReadonlyMap<string, boolean>,
-  defer: BuildToolsDeferOptions
+  defer: BuildToolsDeferOptions,
+  backend?: string
 ): BuildToolsForApiResult {
   const discovered = defer.discoveredTools ?? new Set<string>()
   const core: ToolDefinition[] = []
@@ -3289,12 +3318,17 @@ function applyDeferPolicy(
 
   const sortedCore = sortToolDefinitionsForPromptCache(core)
 
-  // Inject the bridge-internal `discover_tool` so the model can pull
-  // any deferred entry into core mid-session.  Only inject when there
-  // is at least one deferred tool — empty catalogs would just waste
-  // tokens on a useless tool.
+  // Inject the backend-appropriate discovery entrypoint only when there
+  // is at least one deferred tool. Codex must use native tool_search:
+  // promoting discovered tools into the static tools array breaks
+  // previous_response_id continuation because top-level tool fields must
+  // remain stable across a response chain.
   if (deferred.length > 0) {
-    sortedCore.push(DISCOVER_TOOL_DEFINITION)
+    sortedCore.push(
+      backend === "codex"
+        ? cloneToolDefinition(CODEX_TOOL_SEARCH_DEFINITION)
+        : DISCOVER_TOOL_DEFINITION
+    )
   }
 
   // Always inject the bridge-internal `snip_messages` tool so the model

@@ -19,7 +19,7 @@
  *   - internal/translator/codex/claude/
  */
 
-import { HttpException, Injectable, Logger, OnModuleInit } from "@nestjs/common"
+import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import * as crypto from "crypto"
 import * as fs from "fs"
@@ -47,55 +47,149 @@ import {
   type CooldownableAccount,
   clearAccountDisablement,
   disableAccount,
-  isAccountAvailableForModel,
   isAccountDisabled,
   markAccountCooldown,
   markAccountSuccess,
 } from "../shared/account-cooldown"
-import {
-  BackendAccountStateStore,
-  type PersistedBackendAccountState,
-} from "../shared/backend-account-state-store"
+import { BackendAccountStateStore } from "../shared/backend-account-state-store"
 import { PersistenceService } from "../../persistence"
 import type { CodexReplacementHistoryItem } from "../../context"
 import {
-  BackendPoolEntryState,
   BackendPoolStatus,
   type CodexRateLimitAccountSummary,
   type CodexRateLimitModelSummary,
   type CodexRateLimitSnapshot,
   type CodexRateLimitSource,
-  type CodexRateLimitWindow,
 } from "../shared/backend-pool-status"
+import { buildBackendPoolStatus } from "../shared/backend-pool-status-summary"
 import {
   CodexModelTier,
   getCodexModelIdsForTier,
   getPublicModelMetadata,
   isChatGptCodexModelSupported,
   normalizeCodexModelTier,
+  resolveCodexRequestCapabilities,
   supportsCodexModelForTier,
 } from "../shared/model-registry"
 import { CodexAuthService, type CodexTokenData } from "./codex-auth.service"
 import { CodexCacheService } from "./codex-cache.service"
 import { CodexClientIdentityService } from "./codex-client-identity.service"
+import { buildCodexDispatchLogLine } from "./codex-dispatch-log-summary"
+import { resolveCodexPromptCacheIdentity } from "./codex-cache-identity-policy"
 import {
   buildCodexHttpHeaders,
   type CodexForwardHeaders,
 } from "./codex-header-utils"
 import {
+  createCodexApiErrorFromBody,
+  resolveCodexHttpErrorResponse,
+} from "./codex-api-error-response"
+import {
+  formatCodexRateLimitWindow,
+  parseCodexRateLimitHeaders,
+} from "./codex-rate-limit-headers"
+import {
+  getAllCodexAccountsRateLimitedRetrySeconds,
+  getCodexQuotaCooldownUntil,
+  getCodexQuotaRemainingPercent,
+  isCodexRateLimitSnapshotExhausted,
+} from "./codex-rate-limit-policy"
+import {
+  getActiveCodexModelCooldowns,
+  resolveCodexPoolEntryState,
+} from "./codex-pool-status-policy"
+import {
+  getCodexSlotRecoveryTimeForModel,
+  isCodexSlotAvailableForModel,
+} from "./codex-slot-availability-policy"
+import {
+  getCodexRateLimitAccountSummary,
+  getCodexRateLimitModelSummary,
+  hasCodexRateLimitData,
+  normalizeCodexRateLimitModelName,
+  setCodexRateLimitSnapshot,
+} from "./codex-rate-limit-summary"
+import {
+  extractCodexCompletedUsage,
+  parseCodexSsePayload,
+} from "./codex-sse-parsing"
+import {
+  buildCodexHttpRequestLogLine,
+  summarizeCodexRequestForLogs,
+} from "./codex-request-log-summary"
+import { prepareCodexRequestForSend } from "./codex-request-sanitizer"
+import { CodexApiError } from "./codex-api-error"
+import { CodexRuntimeCacheStore } from "./codex-runtime-cache-store"
+import {
+  buildCodexCompactRequestPayload,
+  parseCodexCompactOutputHistory,
+} from "./codex-compact-payload"
+import type { CodexTurnContext } from "./codex-turn-context"
+import { CodexTurnContextManager } from "./codex-turn-context-manager"
+import {
   buildCodexRequest,
   extractWarmupPayload,
-  type CodexCustomToolCall,
-  type CodexExecutionRequest,
-  type CodexFunctionCall,
-  type CodexInputItem,
-  type CodexInputMessage,
-  type CodexRequest,
 } from "./codex-request-builder"
+import { CodexSlotRouter } from "./codex-slot-router"
 import {
-  prepareCodexContinuationRequest,
-  type CodexContinuationDecision,
-} from "./codex-incremental"
+  createCodexPersistedAccountStates,
+  getCodexCredentialFingerprint,
+  restoreCodexPersistedAccountStates,
+  shouldClearCodexDisablementForCredentialChange,
+} from "./codex-account-state-policy"
+import {
+  buildCodexSlotStateKey,
+  buildCodexSlotStickyKey,
+} from "./codex-slot-identity"
+import {
+  extractCodexServiceTierFromToml,
+  normalizeCodexServiceTier,
+} from "./codex-service-tier"
+import type {
+  CodexExecutionRequest,
+  CodexInputItem,
+  CodexRequest,
+} from "./codex-native-types"
+import {
+  appendCodexResponseOutputItemToLedger,
+  getCodexCompletedResponseId,
+} from "./codex-turn-ledger"
+import { buildCodexContinuationDecisionLogLine } from "./codex-turn-state"
+import {
+  captureCodexTurnState,
+  extractCodexTurnStateFromMetadataEvent,
+  extractCodexTurnKey,
+  applyCodexTurnStateHeader as writeCodexTurnStateHeader,
+  readCodexTurnStateFromHeaders,
+} from "./codex-turn-metadata"
+import { isCodexRefreshTokenInvalidationMessage } from "./codex-token-refresh-policy"
+import {
+  resolveCodexWebSocketFailure,
+  shouldReplayCodexRequestWithoutPreviousResponseId,
+  shouldRetryCodexSessionWebSocketError,
+} from "./codex-transport-error-policy"
+import {
+  isCodexAuthRetryStatus,
+  isCodexGatewayTransientStatus,
+  isCodexRateLimitRetryStatus,
+  shouldFailOverCodexAccountForStatus,
+  shouldRefreshCodexTokenForStatus,
+  shouldRetryCodexGatewayTransientOnSameSlot,
+} from "./codex-status-retry-policy"
+import { resolveCodexSlotSelection } from "./codex-slot-selection-policy"
+import { shouldSendCodexWarmupPayload } from "./codex-warmup-policy"
+import {
+  applyCodexFileSlotRecordMetadata,
+  buildCodexFileSlotRecordFields,
+  buildCodexLoadedAccountTokenSeed,
+  buildCodexFileSlotReloadKey,
+  buildCodexLoadedRecordReloadKey,
+  hydrateCodexTokenData,
+  type LoadedCodexAccountRecord,
+  mergeCodexLoadedAccountRecords,
+  type PersistedCodexAccountRecord,
+  upsertCodexPersistedAccountRecord,
+} from "./codex-account-records"
 import { createCodexExecutionRequestFromClaude } from "./codex-request-translator"
 import {
   createStreamState,
@@ -120,50 +214,7 @@ const CODEX_ACCOUNTS_DEFAULT_PATH = resolveDefaultAccountConfigPath(
 const CODEX_MODEL_TIER_ORDER: CodexModelTier[] = ["free", "plus", "team", "pro"]
 const DEFAULT_CODEX_RATE_LIMIT_MODEL = "gpt-5.5"
 
-export class CodexApiError extends HttpException {
-  constructor(
-    statusCode: number,
-    message: string,
-    public readonly retryAfterSeconds?: number
-  ) {
-    super(
-      {
-        type: "error",
-        error: {
-          type: "api_error",
-          message,
-        },
-        message,
-        ...(retryAfterSeconds != null
-          ? { retry_after: retryAfterSeconds }
-          : {}),
-      },
-      statusCode
-    )
-    this.name = "CodexApiError"
-  }
-}
-
 // ── Service ────────────────────────────────────────────────────────────
-
-interface PersistedCodexAccountRecord {
-  label?: string
-  apiKey?: string
-  accessToken?: string
-  refreshToken?: string
-  idToken?: string
-  accountId?: string
-  workspaceId?: string
-  email?: string
-  planType?: string
-  expire?: string
-  baseUrl?: string
-  proxyUrl?: string
-}
-
-interface LoadedCodexAccountRecord extends PersistedCodexAccountRecord {
-  configPath: string
-}
 
 interface CodexAccountSlot extends CooldownableAccount {
   label?: string
@@ -197,109 +248,18 @@ interface CodexAccountSlot extends CooldownableAccount {
   >
 }
 
-interface ConversationSlotBinding {
-  slotKey: string
-  expire: number
-}
-
-/**
- * Mirrors the official Codex CLI ModelClientSession.
- *
- * Turn-scoped management of WebSocket transport plus response-chain state.
- * Each turn (executeStreamWithCooldownRetry call) creates a fresh context and disposes
- * it in the finally block, returning the WS connection to cachedWsSessions.
- *
- * This matches the official design:
- *   - "Create a fresh ModelClientSession for each Codex turn. Reusing it across
- *     turns would replay the previous turn's sticky-routing token into the next
- *     turn, which violates the client/server contract" (client.rs:209-211)
- *
- * Cross-turn state preservation:
- *   - lastResponseId is carried across turns for incremental append
- *   - request baseline is carried with it so the next request can send only the delta
- *
- * Lifecycle:
- *   - Turn start: getOrCreateTurnContext() takes connection from cachedWsSessions
- *   - Turn stream: operates on the context
- *   - Turn end (finally): disposeTurnContext() returns connection to cachedWsSessions
- */
-interface CodexTurnContext {
-  /** Current WebSocket session ID (key in wsService.sessions) */
-  wsSessionId: string
-  /** Stable Codex turn metadata key used to scope sticky routing state */
-  turnKey: string | undefined
-  /** x-codex-turn-state captured from the WebSocket upgrade response */
-  turnState: string | undefined
-  /** Last completed response metadata used for incremental append */
-  lastResponse: CodexLastResponse | undefined
-  /** Last full request sent on this WebSocket session */
-  lastRequest: Record<string, unknown> | undefined
-  /** Whether the connection was reused from cache */
-  connectionReused: boolean
-}
-
-interface CodexLastResponse {
-  responseId: string
-  itemsAdded: CodexInputItem[]
-}
-
-/** Cross-turn cached WebSocket connection entry, keyed by slotStickyKey + model */
-interface CachedWsEntry {
-  /** Session ID in wsService */
-  wsSessionId: string
-  /** Turn metadata key that produced turnState */
-  turnKey: string | undefined
-  /** x-codex-turn-state captured for this turn only */
-  turnState: string | undefined
-  /** Last completed response metadata, carried across turns */
-  lastResponse: CodexLastResponse | undefined
-  /** Last full request sent on this WebSocket session */
-  lastRequest: Record<string, unknown> | undefined
-  /** Last time this cache entry was used or refreshed */
-  updatedAt: number
-}
-
-interface WarmupPayloadCacheEntry {
-  payload: Record<string, unknown>
-  updatedAt: number
-}
-
-/**
- * 单一会话状态机条目。
- *
- * 一个 conversationId 对应一个 ConversationCodexSession，承载该会话所有 turn 间共享状态：
- *   - active: 当前 turn 持有的 CodexTurnContext（turn 边界内非空）
- *   - streamTail: turn 串行锁的尾 promise（保证一个 conv 同时只有 1 个 turn 在跑）
- *   - createdAt/updatedAt: 用于 LRU + TTL 清理
- *
- * 不接管的：
- *   - cachedWsSessions: cache key 含 slot+model 维度，跨 conversation 共用；保留独立
- *   - wsService.sessions: 物理 WebSocket 连接层；通过 turnContext.wsSessionId 间接引用
- */
-interface ConversationCodexSession {
-  conversationId: string
-  active: CodexTurnContext | null
-  streamTail: Promise<void> | null
-  createdAt: number
-  updatedAt: number
-}
-
 @Injectable()
 export class CodexService implements OnModuleInit, ProviderAdapter {
   private readonly logger = new Logger(CodexService.name)
 
   /** All loaded accounts (round-robin pool) */
   private accounts: CodexAccountSlot[] = []
-  /** Round-robin counter */
-  private accountIndex = 0
   /** Backing file used for multi-account OAuth persistence */
   private accountsFilePath: string = CODEX_ACCOUNTS_DEFAULT_PATH
 
-  /** Sticky conversation -> account binding to keep cache locality intact. */
-  private readonly conversationSlotBindings = new Map<
-    string,
-    ConversationSlotBinding
-  >()
+  private readonly slotRouter = new CodexSlotRouter({
+    affinityTtlMs: 60 * 60 * 1000,
+  })
 
   private configuredModelTier: CodexModelTier | null = null
   private configuredDefaultServiceTier: string | undefined
@@ -308,46 +268,15 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   private useWebSocket: boolean = false
   private readonly sessionWarmupPromises = new Map<string, Promise<void>>()
 
-  /**
-   * Cross-turn cached WebSocket connections, keyed by
-   * getCachedWsKey(slot, model, conversationId).
-   * Mirrors the official Codex CLI ModelClient.cached_websocket_session.
-   * Connections are returned here when a turn ends; the next turn reuses the same connection.
-   */
-  private readonly cachedWsSessions = new Map<string, CachedWsEntry>()
+  private readonly runtimeCache = new CodexRuntimeCacheStore()
 
   /**
-   * 单一会话状态机：每个 conversationId 对应一个 ConversationCodexSession。
-   *
-   * 合并了原先三套并行 Map：
-   *   - activeTurnContexts (Map<conversationId, CodexTurnContext>)
-   *   - conversationStreamLocks (Map<conversationId, Promise<void>>)
-   *   - 部分 conversation-scoped 的 cache 句柄
-   *
-   * 物理 WS 连接仍由 wsService.sessions 管理——它是 transport 层，
-   * 这里 conversationSessions 是逻辑会话层；二者通过 wsSessionId 字符串关联，
-   * 物理连接的关闭 / 失效不会反向破坏逻辑会话状态，反之亦然。
+   * Logical Codex turn lifecycle. Physical WebSocket transport still belongs
+   * to wsService; this manager owns the conversation-scoped ModelClientSession
+   * state that mirrors the upstream Codex CLI runtime.
    */
-  private readonly conversationSessions = new Map<
-    string,
-    ConversationCodexSession
-  >()
+  private readonly turnContexts: CodexTurnContextManager
 
-  /**
-   * Warmup payload cache, keyed by conversationId.
-   * Previously stored in SessionLifecycleService (protocol layer);
-   * now owned by the provider adapter where it belongs.
-   */
-  private readonly warmupPayloadCache = new Map<
-    string,
-    WarmupPayloadCacheEntry
-  >()
-
-  private readonly CONVERSATION_SLOT_TTL_MS = 60 * 60 * 1000
-  private readonly WS_SESSION_CACHE_TTL_MS = 10 * 60 * 1000
-  private readonly WARMUP_PAYLOAD_CACHE_TTL_MS = 30 * 60 * 1000
-  private readonly MAX_CACHED_WS_SESSIONS = 128
-  private readonly MAX_WARMUP_PAYLOAD_CACHE_ENTRIES = 256
   private rateLimitProbePromise: Promise<number> | null = null
   private activeLiveRequests = 0
   private activeRateLimitProbeAbortController: AbortController | null = null
@@ -364,6 +293,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     private readonly usageStats: UsageStatsService,
     persistence: PersistenceService
   ) {
+    this.turnContexts = new CodexTurnContextManager({
+      runtimeCache: this.runtimeCache,
+      closeWsSession: (sessionId) => this.wsService.closeSession(sessionId),
+    })
     this.accountStateStore = new BackendAccountStateStore(
       persistence,
       this.logger
@@ -465,54 +398,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
     // 4. Add file accounts
     for (const fa of fileAccounts) {
-      const slot: CodexAccountSlot = {
-        label: fa.label || fa.email || undefined,
-        apiKey: fa.apiKey || undefined,
-        accessToken: fa.accessToken || undefined,
-        refreshToken: fa.refreshToken || undefined,
-        accountId: fa.accountId || undefined,
-        workspaceId: fa.workspaceId || undefined,
-        email: fa.email || undefined,
-        planType: normalizeCodexModelTier(fa.planType) || undefined,
-        baseUrl: fa.baseUrl || envBaseUrl,
-        proxyUrl: fa.proxyUrl || envProxyUrl || undefined,
-        configPath: fa.configPath,
-        source: "file",
-        stateKey: this.buildCodexSlotStateKey({
-          apiKey: fa.apiKey,
-          email: fa.email,
-          accountId: fa.accountId,
-          baseUrl: fa.baseUrl || envBaseUrl,
-        }),
-        tokenData: null,
-        cooldownUntil: 0,
-        modelStates: new Map(),
-        rateLimitSnapshots: new Map(),
-        persistedMatch: {
-          apiKey: fa.apiKey || undefined,
-          email: fa.email || undefined,
-          accountId: fa.accountId || undefined,
-          accessToken: fa.accessToken || undefined,
-          refreshToken: fa.refreshToken || undefined,
-        },
-      }
-
-      if (fa.accessToken || fa.refreshToken || fa.idToken) {
-        this.applyTokenDataToSlot(
-          slot,
-          this.hydrateTokenData({
-            idToken: fa.idToken || "",
-            accessToken: fa.accessToken || "",
-            refreshToken: fa.refreshToken || "",
-            accountId: fa.accountId || "",
-            workspaceId: fa.workspaceId || "",
-            email: fa.email || "",
-            expire: fa.expire || "",
-          })
-        )
-      }
-
-      this.accounts.push(slot)
+      this.accounts.push(
+        this.createFileSlotFromLoadedRecord(fa, envBaseUrl, envProxyUrl)
+      )
     }
 
     this.configuredModelTier = this.resolveConfiguredModelTier()
@@ -570,7 +458,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       if (slot.source !== "file") {
         continue
       }
-      existingFileSlots.set(this.getFileSlotReloadKey(slot), slot)
+      existingFileSlots.set(
+        buildCodexFileSlotReloadKey(slot, DEFAULT_BASE_URL),
+        slot
+      )
     }
 
     const nextAccounts = this.accounts.filter((slot) => slot.source !== "file")
@@ -578,7 +469,12 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     let added = 0
 
     freshRecords.forEach((record, index) => {
-      const reloadKey = this.getLoadedRecordReloadKey(record, envBaseUrl, index)
+      const reloadKey = buildCodexLoadedRecordReloadKey(
+        record,
+        envBaseUrl,
+        DEFAULT_BASE_URL,
+        index
+      )
       if (seenReloadKeys.has(reloadKey)) {
         return
       }
@@ -618,8 +514,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
 
     this.accounts = nextAccounts
-    this.accountIndex =
-      this.accounts.length > 0 ? this.accountIndex % this.accounts.length : 0
+    this.slotRouter.normalizeAccountIndex(this.accounts.length)
     this.configuredModelTier = this.resolveConfiguredModelTier()
 
     if (added > 0 || removedSlots.length > 0) {
@@ -634,8 +529,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   getPoolStatus(): BackendPoolStatus {
     const now = Date.now()
     const entries = this.accounts.map((account) => {
-      const modelCooldowns = this.getActiveModelCooldowns(account, now)
-      const state = this.getPoolEntryState(account, modelCooldowns, now)
+      const modelCooldowns = getActiveCodexModelCooldowns(account, now)
+      const state = resolveCodexPoolEntryState(account, modelCooldowns, now)
       return {
         id: [
           account.email || "",
@@ -661,27 +556,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
     })
 
-    return {
+    return buildBackendPoolStatus({
       backend: "codex",
       kind: "account-pool",
       configured: this.accounts.length > 0,
-      total: entries.length,
-      available: entries.filter(
-        (entry) =>
-          entry.state === "ready" ||
-          entry.state === "degraded" ||
-          entry.state === "model_cooldown"
-      ).length,
-      ready: entries.filter((entry) => entry.state === "ready").length,
-      degraded: entries.filter((entry) => entry.state === "degraded").length,
-      modelCooldown: entries.filter((entry) => entry.state === "model_cooldown")
-        .length,
-      cooling: entries.filter((entry) => entry.state === "cooldown").length,
-      disabled: entries.filter((entry) => entry.state === "disabled").length,
-      unavailable: 0,
       configPath: this.accountsFilePath,
       entries,
-    }
+    })
   }
 
   getModelTier(): CodexModelTier | null {
@@ -713,7 +594,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   }
 
   private resolveConfiguredDefaultServiceTier(): string | undefined {
-    const envTier = this.normalizeConfiguredServiceTier(
+    const envTier = normalizeCodexServiceTier(
       this.configService.get<string>("CODEX_SERVICE_TIER", "")
     )
     if (envTier) {
@@ -721,27 +602,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
 
     return this.readServiceTierFromLocalConfig()
-  }
-
-  private normalizeConfiguredServiceTier(
-    rawValue?: string
-  ): string | undefined {
-    const normalized = rawValue?.trim().toLowerCase()
-    if (!normalized) {
-      return undefined
-    }
-
-    switch (normalized) {
-      case "priority":
-      case "fast":
-      case "true":
-      case "on":
-      case "enabled":
-      case "1":
-        return "priority"
-      default:
-        return undefined
-    }
   }
 
   private readServiceTierFromLocalConfig(): string | undefined {
@@ -755,8 +615,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
 
       const raw = fs.readFileSync(configFile, "utf8")
-      const match = raw.match(/^\s*service_tier\s*=\s*"([^"]+)"/m)
-      return this.normalizeConfiguredServiceTier(match?.[1])
+      return extractCodexServiceTierFromToml(raw)
     } catch (error) {
       this.logger.warn(
         `Failed to infer Codex service tier from ${configFile}: ${error instanceof Error ? error.message : String(error)}`
@@ -828,7 +687,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       return []
     }
 
-    const mergedRecords = this.mergeLoadedAccountRecords(loadedRecords)
+    const mergedRecords = mergeCodexLoadedAccountRecords(loadedRecords)
     const preferredConfigPath =
       mergedRecords[mergedRecords.length - 1]?.configPath ||
       loadedPaths[loadedPaths.length - 1] ||
@@ -848,90 +707,18 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     return mergedRecords
   }
 
-  private mergeLoadedAccountRecords(
-    records: LoadedCodexAccountRecord[]
-  ): LoadedCodexAccountRecord[] {
-    const merged = new Map<string, LoadedCodexAccountRecord>()
-
-    records.forEach((record, index) => {
-      const key = this.getLoadedAccountOverrideKey(record, index)
-      if (merged.has(key)) {
-        merged.delete(key)
-      }
-      merged.set(key, record)
-    })
-
-    return Array.from(merged.values())
-  }
-
-  private getLoadedAccountOverrideKey(
-    account: LoadedCodexAccountRecord,
-    index: number
-  ): string {
-    const email = account.email?.trim().toLowerCase()
-    const accountId = account.accountId?.trim()
-    if (email && accountId) {
-      return `email:${email}:${accountId}`
-    }
-    if (email) {
-      return `email:${email}`
-    }
-
-    const apiKey = account.apiKey?.trim()
-    if (apiKey) {
-      return `api_key:${apiKey}`
-    }
-
-    const refreshToken = account.refreshToken?.trim()
-    if (refreshToken) {
-      return `refresh_token:${refreshToken}`
-    }
-
-    const accessToken = account.accessToken?.trim()
-    if (accessToken) {
-      return `access_token:${accessToken}`
-    }
-
-    if (accountId) {
-      return `account_id:${accountId}`
-    }
-
-    return `path:${account.configPath}:${index}`
-  }
-
   /**
    * Derive per-slot token metadata from persisted or env-backed credentials.
    */
   private hydrateTokenData(tokenData: Partial<CodexTokenData>): CodexTokenData {
-    const idToken = tokenData.idToken?.trim() || ""
-    const accessToken = tokenData.accessToken?.trim() || ""
-
-    return {
-      idToken,
-      accessToken,
-      refreshToken: tokenData.refreshToken?.trim() || "",
-      accountId:
-        tokenData.accountId?.trim() ||
+    return hydrateCodexTokenData(tokenData, {
+      getAccountIdFromIdToken: (idToken) =>
         this.authService.getAccountIdFromIdToken(idToken),
-      workspaceId:
-        tokenData.workspaceId?.trim() ||
+      getWorkspaceIdFromIdToken: (idToken) =>
         this.authService.getWorkspaceIdFromIdToken(idToken),
-      email: tokenData.email?.trim() || "",
-      expire:
-        tokenData.expire?.trim() || this.inferTokenExpiry(accessToken, idToken),
-    }
-  }
-
-  private inferTokenExpiry(...tokens: Array<string | undefined>): string {
-    for (const token of tokens) {
-      if (!token) continue
-      const expire = this.authService.getTokenExpiryFromJwt(token)
-      if (expire) {
-        return expire
-      }
-    }
-
-    return new Date(Date.now() + 3600 * 1000).toISOString()
+      getTokenExpiryFromJwt: (token) =>
+        this.authService.getTokenExpiryFromJwt(token),
+    })
   }
 
   private applyTokenDataToSlot(
@@ -1001,54 +788,67 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   }
 
   private getCodexTurnKey(codexRequest: Record<string, unknown>): string {
-    const metadata = codexRequest.client_metadata
-    if (!metadata || typeof metadata !== "object") {
-      return ""
-    }
+    return extractCodexTurnKey(codexRequest)
+  }
 
-    const record = metadata as Record<string, unknown>
-    const rawTurnMetadata = record["x-codex-turn-metadata"]
-    if (typeof rawTurnMetadata === "string" && rawTurnMetadata.trim()) {
-      try {
-        const parsed = JSON.parse(rawTurnMetadata) as Record<string, unknown>
-        const turnId = parsed?.turn_id
-        if (typeof turnId === "string" && turnId.trim()) {
-          return turnId.trim()
-        }
-      } catch {
-        return rawTurnMetadata.trim()
-      }
-      return rawTurnMetadata.trim()
-    }
-
-    const windowId = record["x-codex-window-id"]
-    return typeof windowId === "string" ? windowId.trim() : ""
+  private usesResponsesLite(modelName: string): boolean {
+    return resolveCodexRequestCapabilities(modelName)?.useResponsesLite === true
   }
 
   private applyCodexTurnStateHeader(
     headers: Record<string, string>,
     context: CodexTurnContext | undefined
   ): void {
-    const turnState = context?.turnState?.trim()
-    if (!turnState) {
-      return
-    }
-    headers["x-codex-turn-state"] = turnState
+    writeCodexTurnStateHeader(headers, context?.turnState)
   }
 
   private captureCodexTurnStateFromConnection(
     context: CodexTurnContext | undefined,
     ws: WebSocket
   ): void {
+    if (!context) {
+      return
+    }
     const turnState = this.wsService
       .getConnectionMetadata(ws)
       ?.turnState?.trim()
-    if (!context || !turnState || context.turnState === turnState) {
+    if (!captureCodexTurnState(context, turnState)) {
       return
     }
-    context.turnState = turnState
     this.logger.debug(
       `[Codex][TurnContext] Captured x-codex-turn-state for session=${context.wsSessionId} turn=${context.turnKey || "unknown"}`
+    )
+  }
+
+  private captureCodexTurnStateFromHttpHeaders(
+    context: CodexTurnContext | undefined,
+    headers: Pick<Headers, "get">
+  ): void {
+    if (!context) {
+      return
+    }
+    const turnState = readCodexTurnStateFromHeaders(headers)
+    if (!captureCodexTurnState(context, turnState)) {
+      return
+    }
+    this.logger.debug(
+      `[Codex][TurnContext] Captured x-codex-turn-state from HTTP for session=${context.wsSessionId} turn=${context.turnKey || "unknown"}`
+    )
+  }
+
+  private captureCodexTurnStateFromSsePayload(
+    context: CodexTurnContext | undefined,
+    payload: Record<string, unknown> | null
+  ): void {
+    if (!context) {
+      return
+    }
+    const turnState = extractCodexTurnStateFromMetadataEvent(payload)
+    if (!captureCodexTurnState(context, turnState)) {
+      return
+    }
+    this.logger.debug(
+      `[Codex][TurnContext] Captured x-codex-turn-state from response.metadata for session=${context.wsSessionId} turn=${context.turnKey || "unknown"}`
     )
   }
 
@@ -1058,55 +858,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   // All requests for a conversation (prewarm + stream) share a single CodexTurnContext.
   // When a turn ends the connection is returned to cachedWsSessions.
   // Eliminates the warm pool promotion mechanism entirely.
-
-  // ── ConversationCodexSession store ─────────────────────────────────────
-  //
-  // 唯一入口管理逻辑会话状态。所有读 / 写 active turn context 与 stream lock 都
-  // 走这里，不再直接操作裸 Map，避免 turn / lock / dispose 三处状态错位。
-
-  private getConversationSession(
-    conversationId: string
-  ): ConversationCodexSession | undefined {
-    const normalized = conversationId.trim()
-    if (!normalized) return undefined
-    return this.conversationSessions.get(normalized)
-  }
-
-  private getOrCreateConversationSession(
-    conversationId: string
-  ): ConversationCodexSession {
-    const normalized = conversationId.trim()
-    if (!normalized) {
-      throw new Error(
-        "[CodexService] empty conversationId passed to getOrCreateConversationSession"
-      )
-    }
-    const existing = this.conversationSessions.get(normalized)
-    if (existing) {
-      existing.updatedAt = Date.now()
-      return existing
-    }
-    const created: ConversationCodexSession = {
-      conversationId: normalized,
-      active: null,
-      streamTail: null,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    }
-    this.conversationSessions.set(normalized, created)
-    return created
-  }
-
-  /** 仅用于"无 active turn 也无 lock 残留时"清理空 session，避免 Map 长期膨胀。 */
-  private maybePurgeConversationSession(conversationId: string): void {
-    const normalized = conversationId.trim()
-    if (!normalized) return
-    const session = this.conversationSessions.get(normalized)
-    if (!session) return
-    if (session.active === null && session.streamTail === null) {
-      this.conversationSessions.delete(normalized)
-    }
-  }
 
   /**
    * Generate the cross-turn connection cache key.
@@ -1118,13 +869,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     modelName: string,
     conversationId?: string
   ): string {
-    const slotKeyHash = this.hashIdentityPart(this.getSlotStickyKey(slot))
-    const normalizedModel = modelName.toLowerCase().trim() || "unknown"
-    const normalizedConversationId = conversationId?.trim()
-    const scope = normalizedConversationId
-      ? `conversation:${this.hashIdentityPart(normalizedConversationId)}`
-      : "global"
-    return `ws:${normalizedModel}:${slotKeyHash}:${scope}`
+    return this.turnContexts.buildWsCacheKey({
+      slotKey: this.getSlotStickyKey(slot),
+      modelName,
+      conversationId,
+    })
   }
 
   /**
@@ -1140,83 +889,12 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     modelName: string,
     turnKey?: string
   ): CodexTurnContext {
-    const session = this.getOrCreateConversationSession(conversationId)
-    const existing = session.active
-    if (existing) {
-      if (existing.turnKey !== turnKey) {
-        existing.turnKey = turnKey
-        existing.turnState = undefined
-      }
-      return existing
-    }
-
-    this.pruneCodexRuntimeCaches()
-    const cacheKey = this.getCachedWsKey(slot, modelName, conversationId)
-    let cached = this.cachedWsSessions.get(cacheKey)
-    let adoptedCacheKey = cacheKey
-
-    // Fallback: adopt a pristine startup-warmup connection.
-    //
-    // Startup / model-picker warmups (scheduleCodexWarmupForCursorModel) run
-    // before any conversationId exists, so prewarmSessionConnection() caches
-    // the connection under the `:global` scope. The first real request for a
-    // conversation looks up the `:conversation:<hash>` scope and misses,
-    // leaving that warm OPEN socket orphaned and forcing a fresh handshake on
-    // the very first turn of every session.
-    //
-    // When the conversation-scoped lookup misses, reclaim the global warm
-    // entry for the SAME (slot, model). This restores the official Codex CLI
-    // `prewarm_websocket()` semantics: conversationId rides per-request in the
-    // upgrade headers (see buildWebSocketHeaders), it does not bind the
-    // socket, so the first turn can reuse the prewarmed connection.
-    //
-    // Guard: only adopt a *pristine* entry (no lastResponse / lastRequest), so
-    // we never inherit a foreign previous_response_id chain — adopting a used
-    // connection would trip the strict incremental-extension check and corrupt
-    // turn state. Matching (slot, model) also guarantees the same wsUrl, so
-    // ensureSessionConnection() reuses the socket instead of reconnecting.
-    if (!cached) {
-      const globalCacheKey = this.getCachedWsKey(slot, modelName)
-      if (globalCacheKey !== cacheKey) {
-        const globalCached = this.cachedWsSessions.get(globalCacheKey)
-        if (
-          globalCached &&
-          !globalCached.lastResponse &&
-          !globalCached.lastRequest
-        ) {
-          cached = globalCached
-          adoptedCacheKey = globalCacheKey
-        }
-      }
-    }
-
-    let context: CodexTurnContext
-    if (cached) {
-      // Reuse connection from cache (mirrors take_cached_websocket_session)
-      this.cachedWsSessions.delete(adoptedCacheKey)
-      context = {
-        wsSessionId: cached.wsSessionId,
-        turnKey,
-        turnState: cached.turnKey === turnKey ? cached.turnState : undefined,
-        lastResponse: cached.lastResponse,
-        lastRequest: cached.lastRequest,
-        connectionReused: true,
-      }
-    } else {
-      // No cached connection; use conversationId as session key (lazy connect)
-      context = {
-        wsSessionId: conversationId,
-        turnKey,
-        turnState: undefined,
-        lastResponse: undefined,
-        lastRequest: undefined,
-        connectionReused: false,
-      }
-    }
-
-    session.active = context
-    session.updatedAt = Date.now()
-    return context
+    return this.turnContexts.getOrCreateContext({
+      conversationId,
+      slotKey: this.getSlotStickyKey(slot),
+      modelName,
+      turnKey,
+    })
   }
 
   /**
@@ -1228,87 +906,34 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     slot: CodexAccountSlot,
     modelName: string
   ): void {
-    const session = this.getConversationSession(conversationId)
-    if (!session) return
-    const context = session.active
-    if (!context) return
-
-    const cacheKey = this.getCachedWsKey(slot, modelName, conversationId)
-    // Return connection to cache (mirrors store_cached_websocket_session)
-    this.setCachedWsSession(cacheKey, {
-      wsSessionId: context.wsSessionId,
-      turnKey: context.turnKey,
-      turnState: context.turnState,
-      lastResponse: context.lastResponse,
-      lastRequest: context.lastRequest,
-      updatedAt: Date.now(),
+    this.turnContexts.disposeContext({
+      conversationId,
+      slotKey: this.getSlotStickyKey(slot),
+      modelName,
     })
-
-    session.active = null
-    session.updatedAt = Date.now()
-    this.maybePurgeConversationSession(conversationId)
   }
 
   /**
    * Automatically inject previous_response_id before sending a request.
    * Mirrors official prepare_websocket_request() + get_incremental_items().
    *
-   * The semantic response chain is independent from the physical WebSocket
-   * connection. A server-side close after response.completed only means the next
-   * turn needs a fresh socket; it does not invalidate previous_response_id.
+   * The response-chain baseline belongs to the upstream WebSocket session. It is
+   * valid only while that physical connection remains alive and the transcript
+   * stays append-only.
    */
   private prepareRequestWithTurnContext(
     codexRequest: Record<string, unknown>,
     context: CodexTurnContext,
     conversationId: string
   ): Record<string, unknown> {
-    const decision = prepareCodexContinuationRequest(
+    const { request, decision } = this.turnContexts.prepareRequest(
       codexRequest,
-      {
-        lastRequest: context.lastRequest,
-        lastResponse: context.lastResponse,
-      },
-      true
+      context
     )
-
-    context.lastRequest = decision.nextState.lastRequest
-    context.lastResponse = decision.nextState.lastResponse
-    this.logCodexContinuationDecision(conversationId, decision)
-    return decision.request
-  }
-
-  private logCodexContinuationDecision(
-    conversationId: string,
-    decision: CodexContinuationDecision
-  ): void {
-    if (decision.mode === "full") {
-      this.logger.debug(
-        `[Codex][TurnContext] Starting full response chain for ${conversationId}: ${decision.reason}`
-      )
-      return
-    }
-
-    if (decision.mode === "full_reset") {
-      const detail =
-        decision.reason === "static_fields_changed"
-          ? ` keys=${decision.changedStaticKeys.join(",") || "unknown"}`
-          : ` baseline=${decision.inputMismatch.baselineLength} request=${decision.inputMismatch.requestLength}` +
-            (typeof decision.inputMismatch.mismatchIndex === "number"
-              ? ` mismatch_index=${decision.inputMismatch.mismatchIndex}` +
-                ` baseline_type=${decision.inputMismatch.baselineType || "unknown"}` +
-                ` request_type=${decision.inputMismatch.requestType || "unknown"}`
-              : "")
-      this.logger.debug(
-        `[Codex][TurnContext] Incremental request unavailable: ${decision.reason}${detail}; ` +
-          `resetting response chain for ${conversationId}`
-      )
-      return
-    }
-
     this.logger.debug(
-      `[Codex][TurnContext] Injected previous_response_id=${decision.previousResponseId} ` +
-        `for conversation=${conversationId}; incremental_items=${decision.incrementalItemCount}`
+      buildCodexContinuationDecisionLogLine(conversationId, decision)
     )
+    return request
   }
 
   private beginFullCodexResponseChain(
@@ -1321,62 +946,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       return
     }
 
-    const previousResponseId = context.lastResponse?.responseId
-    context.lastRequest = codexRequest
-    context.lastResponse = undefined
+    const previousResponseId = this.turnContexts.beginFullResponseChain(
+      context,
+      codexRequest
+    )
     if (conversationId && previousResponseId) {
       this.logger.debug(
         `[Codex][TurnContext] Reset response chain for ${conversationId}: ${reason}; ` +
           `discarded previous_response_id=${previousResponseId}`
       )
     }
-  }
-
-  private convertResponseOutputItemToInputItem(
-    item: Record<string, unknown> | undefined
-  ): CodexInputItem | undefined {
-    if (!item) return undefined
-
-    if (item.type === "function_call") {
-      return {
-        type: "function_call",
-        call_id: typeof item.call_id === "string" ? item.call_id : "",
-        name: typeof item.name === "string" ? item.name : "",
-        arguments:
-          typeof item.arguments === "string"
-            ? item.arguments
-            : JSON.stringify(item.arguments ?? {}),
-      } satisfies CodexFunctionCall
-    }
-
-    if (item.type === "custom_tool_call") {
-      return {
-        type: "custom_tool_call",
-        call_id: typeof item.call_id === "string" ? item.call_id : "",
-        name: typeof item.name === "string" ? item.name : "",
-        input:
-          typeof item.input === "string"
-            ? item.input
-            : JSON.stringify(item.input ?? ""),
-      } satisfies CodexCustomToolCall
-    }
-
-    if (item.type === "message") {
-      const rawContent = item.content
-      const content = Array.isArray(rawContent)
-        ? (rawContent as Array<Record<string, unknown>>)
-        : typeof rawContent === "string"
-          ? [{ type: "output_text", text: rawContent }]
-          : []
-
-      return {
-        type: "message",
-        role: typeof item.role === "string" ? item.role : "assistant",
-        content,
-      } satisfies CodexInputMessage
-    }
-
-    return undefined
   }
 
   /**
@@ -1388,12 +967,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     responseId: string,
     itemsAdded: CodexInputItem[]
   ): void {
-    if (!conversationId || !responseId) return
-    const session = this.getConversationSession(conversationId)
-    const context = session?.active
-    if (!context) return
-    context.lastResponse = { responseId, itemsAdded }
-    if (session) session.updatedAt = Date.now()
+    if (
+      !this.turnContexts.captureResponse(conversationId, responseId, itemsAdded)
+    ) {
+      return
+    }
     this.logger.debug(
       `[Codex][TurnContext] Captured response_id=${responseId} ` +
         `for conversation=${conversationId}; items_added=${itemsAdded.length}`
@@ -1408,19 +986,100 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     conversationId: string,
     reason?: string
   ): void {
-    const session = this.getConversationSession(conversationId)
-    const context = session?.active
-    if (context) {
-      if (context.lastResponse?.responseId && reason) {
-        this.logger.debug(
-          `[Codex][TurnContext] ${reason} for ${conversationId}, ` +
-            `discarding stale previous_response_id=${context.lastResponse.responseId}`
-        )
-      }
-      context.lastResponse = undefined
-      context.lastRequest = undefined
-      if (session) session.updatedAt = Date.now()
+    const previousResponseId =
+      this.turnContexts.resetResponseState(conversationId)
+    if (previousResponseId && reason) {
+      this.logger.debug(
+        `[Codex][TurnContext] ${reason} for ${conversationId}, ` +
+          `discarding stale previous_response_id=${previousResponseId}`
+      )
     }
+  }
+
+  private recordTurnContextTransportReconnect(
+    conversationId: string | undefined,
+    slot: CodexAccountSlot,
+    modelName: string,
+    reason: string
+  ): void {
+    const normalizedConversationId = conversationId?.trim()
+    if (!normalizedConversationId) {
+      return
+    }
+
+    const result = this.turnContexts.recordTransportReconnect({
+      conversationId: normalizedConversationId,
+      slotKey: this.getSlotStickyKey(slot),
+      modelName,
+    })
+    if (!result.hadContinuationBaseline) {
+      return
+    }
+
+    const discarded = result.discardedPreviousResponseId
+      ? ` discarded previous_response_id=${result.discardedPreviousResponseId}`
+      : ""
+    this.logger.debug(
+      `[Codex][TurnContext] ${reason} for ${normalizedConversationId}; ` +
+        `reset response chain after WebSocket reconnect${discarded}`
+    )
+  }
+
+  private isHttpFallbackTransport(
+    conversationId: string | undefined,
+    slot: CodexAccountSlot,
+    modelName: string
+  ): boolean {
+    const normalizedConversationId = conversationId?.trim()
+    if (!normalizedConversationId) {
+      return false
+    }
+
+    return this.turnContexts.isHttpFallbackTransport({
+      conversationId: normalizedConversationId,
+      slotKey: this.getSlotStickyKey(slot),
+      modelName,
+    })
+  }
+
+  private beginHttpTransportTurn(
+    conversationId: string | undefined,
+    slot: CodexAccountSlot,
+    modelName: string,
+    reason: string,
+    persistHttpFallback: boolean = false
+  ): void {
+    const normalizedConversationId = conversationId?.trim()
+    if (!normalizedConversationId) {
+      return
+    }
+
+    const result = this.turnContexts.beginHttpTransportTurn({
+      conversationId: normalizedConversationId,
+      slotKey: this.getSlotStickyKey(slot),
+      modelName,
+      persistHttpFallback,
+    })
+
+    if (
+      !result.httpFallbackActivated &&
+      !result.clearedActiveContext &&
+      !result.deletedCachedContext
+    ) {
+      return
+    }
+
+    const discarded = result.discardedPreviousResponseId
+      ? ` discarded previous_response_id=${result.discardedPreviousResponseId}`
+      : ""
+    const closed =
+      result.closedSessionIds.length > 0
+        ? ` closed_sessions=${result.closedSessionIds.join(",")}`
+        : ""
+    this.logger.debug(
+      `[Codex][TurnContext] ${reason} for ${normalizedConversationId}; ` +
+        `using HTTP transport${persistHttpFallback ? " for session" : ""}${discarded}${closed}`
+    )
   }
 
   /**
@@ -1441,51 +1100,26 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       return
     }
 
-    let resetCount = 0
-    const activeSession = this.getConversationSession(normalizedConversationId)
-    const activeContext = activeSession?.active
-    if (activeContext) {
-      this.resetTurnContextResponseState(normalizedConversationId, reason)
-      this.wsService.closeSession(activeContext.wsSessionId)
-      activeContext.connectionReused = false
-      resetCount++
+    const result = this.turnContexts.resetContinuationState({
+      conversationId: normalizedConversationId,
+      modelName,
+      slotKeys: this.accounts.map((slot) => this.getSlotStickyKey(slot)),
+    })
+
+    if (result.discardedActivePreviousResponseId && reason) {
+      this.logger.debug(
+        `[Codex][TurnContext] ${reason} for ${normalizedConversationId}, ` +
+          `discarding stale previous_response_id=${result.discardedActivePreviousResponseId}`
+      )
     }
 
-    const normalizedModel = modelName?.trim()
-    if (normalizedModel) {
-      for (const slot of this.accounts) {
-        const cacheKey = this.getCachedWsKey(
-          slot,
-          normalizedModel,
-          normalizedConversationId
-        )
-        const cached = this.cachedWsSessions.get(cacheKey)
-        if (!cached) {
-          continue
-        }
-        this.wsService.closeSession(cached.wsSessionId)
-        this.cachedWsSessions.delete(cacheKey)
-        resetCount++
-      }
-    }
-
-    this.warmupPayloadCache.delete(normalizedConversationId)
-
-    if (resetCount > 0 || reason) {
+    if (result.resetCount > 0 || reason) {
       this.logger.debug(
         `[Codex][TurnContext] Reset continuation state for ${normalizedConversationId}` +
-          `${normalizedModel ? ` model=${normalizedModel}` : ""}` +
+          `${result.modelName ? ` model=${result.modelName}` : ""}` +
           `${reason ? `: ${reason}` : ""}`
       )
     }
-  }
-
-  /**
-   * Check whether the given conversation has an active turn context with a captured response.
-   * Used by cache identity and slot selection to distinguish initial vs continuation requests.
-   */
-  private hasActiveTurnContext(conversationId: string): boolean {
-    return this.hasConversationContinuationState(conversationId)
   }
 
   private hasConversationContinuationState(
@@ -1493,68 +1127,21 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     slot?: CodexAccountSlot,
     modelName?: string
   ): boolean {
-    const normalizedConversationId = conversationId.trim()
-    if (!normalizedConversationId) {
-      return false
-    }
-
-    const activeContext = this.getConversationSession(
-      normalizedConversationId
-    )?.active
-    if (activeContext?.lastResponse?.responseId) {
-      return true
-    }
-
-    if (!slot || !modelName) {
-      return false
-    }
-
-    this.pruneCodexRuntimeCaches()
-    const cached = this.cachedWsSessions.get(
-      this.getCachedWsKey(slot, modelName, normalizedConversationId)
+    return this.turnContexts.hasContinuationState(
+      conversationId,
+      slot && modelName
+        ? {
+            slotKey: this.getSlotStickyKey(slot),
+            modelName,
+          }
+        : undefined
     )
-    return !!cached?.lastResponse?.responseId
   }
 
   private async acquireConversationStreamLock(
     conversationId: string
   ): Promise<() => void> {
-    const normalizedConversationId = conversationId.trim()
-    if (!normalizedConversationId) {
-      return () => {}
-    }
-
-    const session = this.getOrCreateConversationSession(
-      normalizedConversationId
-    )
-    const previousTail = session.streamTail
-    let release!: () => void
-    const currentTail = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    session.streamTail = currentTail
-    session.updatedAt = Date.now()
-
-    if (previousTail) {
-      try {
-        await previousTail
-      } catch {
-        // 锁尾 promise 理论上只 resolve；这里防御异常，避免永久阻塞后续 turn。
-      }
-    }
-
-    let released = false
-    return () => {
-      if (released) return
-      released = true
-      const current = this.getConversationSession(normalizedConversationId)
-      if (current && current.streamTail === currentTail) {
-        current.streamTail = null
-        current.updatedAt = Date.now()
-        this.maybePurgeConversationSession(normalizedConversationId)
-      }
-      release()
-    }
+    return this.turnContexts.acquireStreamLock(conversationId)
   }
 
   private onLiveRequestStart(): void {
@@ -1568,183 +1155,37 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     this.activeLiveRequests = Math.max(0, this.activeLiveRequests - 1)
   }
 
-  private pruneCodexRuntimeCaches(now: number = Date.now()): void {
-    for (const [key, entry] of this.cachedWsSessions) {
-      if (entry.updatedAt + this.WS_SESSION_CACHE_TTL_MS <= now) {
-        this.cachedWsSessions.delete(key)
-      }
-    }
-    this.pruneMapToMaxSize(this.cachedWsSessions, this.MAX_CACHED_WS_SESSIONS)
-
-    for (const [conversationId, entry] of this.warmupPayloadCache) {
-      if (entry.updatedAt + this.WARMUP_PAYLOAD_CACHE_TTL_MS <= now) {
-        this.warmupPayloadCache.delete(conversationId)
-      }
-    }
-    this.pruneMapToMaxSize(
-      this.warmupPayloadCache,
-      this.MAX_WARMUP_PAYLOAD_CACHE_ENTRIES
-    )
-  }
-
-  private pruneMapToMaxSize<K, V>(map: Map<K, V>, maxSize: number): void {
-    while (map.size > maxSize) {
-      const oldestKey = map.keys().next().value
-      if (oldestKey === undefined) return
-      map.delete(oldestKey)
-    }
-  }
-
-  private setCachedWsSession(cacheKey: string, entry: CachedWsEntry): void {
-    if (!cacheKey) return
-    this.pruneCodexRuntimeCaches()
-    this.cachedWsSessions.set(cacheKey, {
-      ...entry,
-      updatedAt: Date.now(),
-    })
-    this.pruneMapToMaxSize(this.cachedWsSessions, this.MAX_CACHED_WS_SESSIONS)
-  }
-
   private setWarmupPayloadCache(
     conversationId: string,
     payload: Record<string, unknown>
   ): void {
-    const normalizedConversationId = conversationId.trim()
-    if (!normalizedConversationId) return
-    this.pruneCodexRuntimeCaches()
-    this.warmupPayloadCache.set(normalizedConversationId, {
-      payload,
-      updatedAt: Date.now(),
-    })
-    this.pruneMapToMaxSize(
-      this.warmupPayloadCache,
-      this.MAX_WARMUP_PAYLOAD_CACHE_ENTRIES
-    )
+    this.turnContexts.setWarmupPayload(conversationId, payload)
   }
 
   private getWarmupPayloadCache(
     conversationId: string | undefined
   ): Record<string, unknown> | undefined {
-    const normalizedConversationId = conversationId?.trim()
-    if (!normalizedConversationId) return undefined
-    this.pruneCodexRuntimeCaches()
-    const entry = this.warmupPayloadCache.get(normalizedConversationId)
-    if (!entry) return undefined
-
-    entry.updatedAt = Date.now()
-    this.warmupPayloadCache.delete(normalizedConversationId)
-    this.warmupPayloadCache.set(normalizedConversationId, entry)
-    return entry.payload
-  }
-
-  private shouldRetrySessionWebSocketError(error: unknown): boolean {
-    if (error instanceof CodexWebSocketUpgradeError) {
-      return false
-    }
-
-    const message =
-      error instanceof Error ? error.message.toLowerCase() : String(error)
-
-    return (
-      message.includes("websocket is not open") ||
-      message.includes("readystate") ||
-      message.includes("socket has been closed")
-    )
-  }
-
-  /**
-   * Detect "Previous response with id ... not found" errors from the Codex API.
-   * This happens when the server evicts the response from its cache (e.g. due to
-   * parallel tool calls taking too long). The fix is to retry without
-   * previous_response_id, sending the full input instead.
-   */
-  private isStaleResponseIdError(error: unknown): boolean {
-    if (error instanceof CodexWebSocketUpgradeError) {
-      return (
-        error.statusCode === 400 &&
-        /previous.response.*not found/i.test(error.body)
-      )
-    }
-    if (error instanceof CodexApiError) {
-      return (
-        error.getStatus() === 400 &&
-        /previous.response.*not found/i.test(error.message)
-      )
-    }
-    return false
-  }
-
-  private shouldFallbackToHttpAfterWebSocketError(error: unknown): boolean {
-    if (error instanceof CodexWebSocketUpgradeError) {
-      return error.shouldFallbackToHttp()
-    }
-
-    const message =
-      error instanceof Error ? error.message.toLowerCase() : String(error)
-
-    return (
-      message.includes("handshake timeout") ||
-      message.includes("unexpected server response") ||
-      message.includes("socket hang up") ||
-      message.includes("econnreset") ||
-      message.includes("econnrefused") ||
-      message.includes("etimedout") ||
-      message.includes("ehostunreach") ||
-      message.includes("enotfound") ||
-      message.includes("proxy") ||
-      message.includes("tls") ||
-      message.includes("certificate")
-    )
-  }
-
-  private hashIdentityPart(value: string): string {
-    return crypto.createHash("sha256").update(value).digest("hex").slice(0, 16)
+    return this.turnContexts.getWarmupPayload(conversationId)
   }
 
   private getSlotStickyKey(slot: CodexAccountSlot): string {
-    const apiKey = slot.apiKey?.trim()
-    if (apiKey) {
-      return `api_key:${apiKey}\0base:${slot.baseUrl}`
-    }
-
-    const accountId = this.getSlotAccountId(slot).trim()
-    if (accountId) {
-      return `account_id:${accountId}\0base:${slot.baseUrl}`
-    }
-
-    const email = slot.email?.trim().toLowerCase()
-    if (email) {
-      return `email:${email}\0base:${slot.baseUrl}`
-    }
-
-    const refreshToken =
-      slot.tokenData?.refreshToken?.trim() || slot.refreshToken?.trim()
-    if (refreshToken) {
-      return `refresh:${this.hashIdentityPart(refreshToken)}\0base:${slot.baseUrl}`
-    }
-
-    const accessToken =
-      slot.tokenData?.accessToken?.trim() || slot.accessToken?.trim()
-    if (accessToken) {
-      return `access:${this.hashIdentityPart(accessToken)}\0base:${slot.baseUrl}`
-    }
-
-    return `label:${slot.label || ""}\0base:${slot.baseUrl}`
+    return buildCodexSlotStickyKey({
+      apiKey: slot.apiKey,
+      accountId: this.getSlotAccountId(slot),
+      email: slot.email,
+      refreshToken: slot.tokenData?.refreshToken || slot.refreshToken,
+      accessToken: slot.tokenData?.accessToken || slot.accessToken,
+      label: slot.label,
+      baseUrl: slot.baseUrl,
+    })
   }
 
   private purgeExpiredConversationBindings(now: number = Date.now()): void {
-    for (const [conversationId, binding] of this.conversationSlotBindings) {
-      if (binding.expire <= now) {
-        this.conversationSlotBindings.delete(conversationId)
-        // 同步清理 conversationSession 的 active turn 字段（仅文本元数据，无连接句柄）。
-        // 物理 WS 连接由 wsService 自己的 STALE_TIMEOUT_MS 兜底。
-        const session = this.conversationSessions.get(conversationId)
-        if (session) {
-          session.active = null
-          this.maybePurgeConversationSession(conversationId)
-        }
-      }
-    }
+    this.slotRouter.pruneExpiredBindings(now, (conversationId) => {
+      // 同步清理 conversationSession 的 active turn 字段（仅文本元数据，无连接句柄）。
+      // 物理 WS 连接由 wsService 自己的 STALE_TIMEOUT_MS 兜底。
+      this.turnContexts.clearActiveContext(conversationId)
+    })
   }
 
   private bindConversationToSlot(
@@ -1755,10 +1196,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     if (!normalizedConversationId) return
 
     this.purgeExpiredConversationBindings()
-    this.conversationSlotBindings.set(normalizedConversationId, {
-      slotKey: this.getSlotStickyKey(slot),
-      expire: Date.now() + this.CONVERSATION_SLOT_TTL_MS,
-    })
+    this.slotRouter.bindConversation(
+      normalizedConversationId,
+      this.getSlotStickyKey(slot)
+    )
   }
 
   private getStickyConversationSlot(
@@ -1770,49 +1211,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       return null
     }
 
+    const normalizedModelName = modelName.toLowerCase().trim()
     const now = Date.now()
     this.purgeExpiredConversationBindings(now)
-
-    const binding = this.conversationSlotBindings.get(normalizedConversationId)
-    if (!binding) {
-      return null
-    }
-
-    const normalizedModelName = modelName.toLowerCase().trim()
-    const slot =
-      this.accounts.find(
-        (candidate) => this.getSlotStickyKey(candidate) === binding.slotKey
-      ) || null
-
-    if (
-      !slot ||
-      !this.isModelSupportedBySlot(slot, normalizedModelName) ||
-      !this.isSlotAvailableForModel(slot, normalizedModelName, now)
-    ) {
-      this.conversationSlotBindings.delete(normalizedConversationId)
-      return null
-    }
-
-    binding.expire = now + this.CONVERSATION_SLOT_TTL_MS
-    this.conversationSlotBindings.set(normalizedConversationId, binding)
-    return slot
-  }
-
-  private getOAuthCacheIdentity(
-    request: Pick<CodexExecutionRequest, "conversationId" | "model">,
-    slot: CodexAccountSlot,
-    options?: {
-      includeConversationId?: boolean
-    }
-  ): string {
-    const slotKey = this.getSlotStickyKey(slot)
-    const conversationId = this.getConversationId(request)
-
-    if ((options?.includeConversationId ?? true) && conversationId) {
-      return `oauth:${slotKey}:conversation:${conversationId}:model:${request.model}`
-    }
-
-    return `oauth:${slotKey}:model:${request.model}`
+    return this.slotRouter.getStickySlot(normalizedConversationId, {
+      candidates: this.accounts,
+      getSlotKey: (candidate) => this.getSlotStickyKey(candidate),
+      isSlotUsable: (candidate) =>
+        this.isModelSupportedBySlot(candidate, normalizedModelName) &&
+        this.isSlotAvailableForModel(candidate, normalizedModelName, now),
+    })
   }
 
   private isModelSupportedBySlot(
@@ -1856,52 +1264,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     accountId?: string
     baseUrl?: string
   }): string {
-    const email = identity.email?.trim().toLowerCase() || ""
-    const accountId = identity.accountId?.trim() || ""
-    const apiKey = identity.apiKey?.trim() || ""
-    const baseUrl = identity.baseUrl?.trim() || DEFAULT_BASE_URL
-
-    if (email && accountId) {
-      return crypto
-        .createHash("sha256")
-        .update(`codex:${email}:${accountId}`)
-        .digest("hex")
-        .slice(0, 16)
-    }
-    if (email) {
-      return crypto
-        .createHash("sha256")
-        .update(`codex:${email}`)
-        .digest("hex")
-        .slice(0, 16)
-    }
-    if (apiKey) {
-      return crypto
-        .createHash("sha256")
-        .update(`codex:apikey:${apiKey}`)
-        .digest("hex")
-        .slice(0, 16)
-    }
-    return crypto
-      .createHash("sha256")
-      .update(`codex:base:${baseUrl}`)
-      .digest("hex")
-      .slice(0, 16)
-  }
-
-  /**
-   * 生成账号当前凭据的指纹。
-   * OAuth 账号取 refreshToken，api-key 账号取 apiKey。
-   * 用于判断"被 disable 时的凭据"与"当前文件里的凭据"是否一致。
-   */
-  private computeCredentialFingerprint(slot: CodexAccountSlot): string {
-    const material = slot.refreshToken?.trim() || slot.apiKey?.trim() || ""
-    if (!material) return ""
-    return crypto
-      .createHash("sha256")
-      .update(material)
-      .digest("hex")
-      .slice(0, 16)
+    return buildCodexSlotStateKey(identity, DEFAULT_BASE_URL)
   }
 
   /**
@@ -1917,40 +1280,25 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const persistedStates = this.accountStateStore.loadStates("codex")
     if (persistedStates.size === 0) return
 
-    let staleCleared = false
+    const result = restoreCodexPersistedAccountStates(
+      this.accounts,
+      persistedStates
+    )
 
-    for (const slot of this.accounts) {
-      const state = persistedStates.get(slot.stateKey)
-      if (!state) continue
+    for (const { slot, state } of result.stale) {
+      this.logger.log(
+        `[Codex] 检测到凭据已更新，清除过期 disabled 状态: ${this.getAccountLabel(slot)} (reason=${state.disabledReason})`
+      )
+    }
 
-      if (typeof state.disabledAt === "number" && state.disabledAt > 0) {
-        const currentFingerprint = this.computeCredentialFingerprint(slot)
-        if (
-          state.credentialFingerprint &&
-          currentFingerprint &&
-          state.credentialFingerprint !== currentFingerprint
-        ) {
-          staleCleared = true
-          this.logger.log(
-            `[Codex] 检测到凭据已更新，清除过期 disabled 状态: ${this.getAccountLabel(slot)} (reason=${state.disabledReason})`
-          )
-          continue
-        }
-
-        slot.disabledAt = state.disabledAt
-        slot.disabledReason = state.disabledReason
-        slot.disabledStatusCode = state.disabledStatusCode
-        slot.disabledMessage = state.disabledMessage
-        slot.cooldownUntil = 0
-        slot.modelStates.clear()
-        this.logger.warn(
-          `[Codex] 恢复已 disabled 账号: ${this.getAccountLabel(slot)} (reason=${state.disabledReason})`
-        )
-      }
+    for (const { slot, state } of result.restored) {
+      this.logger.warn(
+        `[Codex] 恢复已 disabled 账号: ${this.getAccountLabel(slot)} (reason=${state.disabledReason})`
+      )
     }
 
     // 有过期记录被清除时，把内存状态重新写回 DB，保证持久化层与内存对齐。
-    if (staleCleared) {
+    if (result.stale.length > 0) {
       this.persistCodexAccountStates()
     }
   }
@@ -1960,20 +1308,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
    * 仅在 disableAccount 后调用，保证下次重启时跳过失效账号。
    */
   private persistCodexAccountStates(): void {
-    const states: PersistedBackendAccountState[] = []
-    for (const slot of this.accounts) {
-      if (!isAccountDisabled(slot)) continue
-      states.push({
-        stateKey: slot.stateKey,
-        label: slot.label || slot.email,
-        disabledAt: slot.disabledAt,
-        disabledReason: slot.disabledReason,
-        disabledStatusCode: slot.disabledStatusCode,
-        disabledMessage: slot.disabledMessage,
-        credentialFingerprint: this.computeCredentialFingerprint(slot),
-        updatedAt: Date.now(),
-      })
-    }
+    const states = createCodexPersistedAccountStates(this.accounts, Date.now())
     this.accountStateStore.replaceStates("codex", states)
   }
 
@@ -1996,133 +1331,34 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     return `${base} (${details.join(", ")})`
   }
 
-  private getLoadedRecordReloadKey(
-    account: LoadedCodexAccountRecord,
-    fallbackBaseUrl: string,
-    index: number
-  ): string {
-    const baseUrl =
-      (account.baseUrl || fallbackBaseUrl).trim() || DEFAULT_BASE_URL
-    return this.getNormalizedReloadKey({
-      apiKey: account.apiKey,
-      email: account.email,
-      accountId: account.accountId,
-      refreshToken: account.refreshToken,
-      accessToken: account.accessToken,
-      baseUrl,
-      configPath: account.configPath,
-      index,
-    })
-  }
-
-  private getFileSlotReloadKey(slot: CodexAccountSlot): string {
-    return this.getNormalizedReloadKey({
-      apiKey: slot.apiKey,
-      email: slot.email,
-      accountId: slot.accountId,
-      refreshToken: slot.refreshToken || slot.tokenData?.refreshToken,
-      accessToken: slot.accessToken || slot.tokenData?.accessToken,
-      baseUrl: slot.baseUrl,
-      configPath: slot.configPath,
-      index: 0,
-    })
-  }
-
-  private getNormalizedReloadKey(identity: {
-    apiKey?: string
-    email?: string
-    accountId?: string
-    refreshToken?: string
-    accessToken?: string
-    baseUrl?: string
-    configPath?: string
-    index: number
-  }): string {
-    const baseUrl = identity.baseUrl?.trim() || DEFAULT_BASE_URL
-    const email = identity.email?.trim().toLowerCase() || ""
-    const accountId = identity.accountId?.trim() || ""
-    const apiKey = identity.apiKey?.trim() || ""
-    const refreshToken = identity.refreshToken?.trim() || ""
-    const accessToken = identity.accessToken?.trim() || ""
-
-    if (email && accountId) {
-      return `email:${email}:${accountId}\0base:${baseUrl}`
-    }
-    if (email && refreshToken) {
-      return `email_refresh:${email}:${this.hashIdentityPart(refreshToken)}\0base:${baseUrl}`
-    }
-    if (email && accessToken) {
-      return `email_access:${email}:${this.hashIdentityPart(accessToken)}\0base:${baseUrl}`
-    }
-    if (email) {
-      return `email:${email}\0base:${baseUrl}`
-    }
-    if (apiKey) {
-      return `api_key:${apiKey}\0base:${baseUrl}`
-    }
-    if (refreshToken) {
-      return `refresh:${this.hashIdentityPart(refreshToken)}\0base:${baseUrl}`
-    }
-    if (accessToken) {
-      return `access:${this.hashIdentityPart(accessToken)}\0base:${baseUrl}`
-    }
-    if (accountId) {
-      return `account_id:${accountId}\0base:${baseUrl}`
-    }
-
-    return `path:${identity.configPath || ""}:${identity.index}\0base:${baseUrl}`
-  }
-
   private createFileSlotFromLoadedRecord(
     record: LoadedCodexAccountRecord,
     fallbackBaseUrl: string,
     fallbackProxyUrl: string
   ): CodexAccountSlot {
+    const fields = buildCodexFileSlotRecordFields(
+      record,
+      fallbackBaseUrl,
+      fallbackProxyUrl
+    )
     const slot: CodexAccountSlot = {
-      label: record.label || record.email || undefined,
-      apiKey: record.apiKey || undefined,
-      accessToken: record.accessToken || undefined,
-      refreshToken: record.refreshToken || undefined,
-      accountId: record.accountId || undefined,
-      workspaceId: record.workspaceId || undefined,
-      email: record.email || undefined,
-      planType: normalizeCodexModelTier(record.planType) || undefined,
-      baseUrl: record.baseUrl || fallbackBaseUrl,
-      proxyUrl: record.proxyUrl || fallbackProxyUrl || undefined,
-      configPath: record.configPath,
+      ...fields,
       source: "file",
       stateKey: this.buildCodexSlotStateKey({
         apiKey: record.apiKey,
         email: record.email,
         accountId: record.accountId,
-        baseUrl: record.baseUrl || fallbackBaseUrl,
+        baseUrl: fields.baseUrl,
       }),
       tokenData: null,
       cooldownUntil: 0,
       modelStates: new Map(),
       rateLimitSnapshots: new Map(),
-      persistedMatch: {
-        apiKey: record.apiKey || undefined,
-        email: record.email || undefined,
-        accountId: record.accountId || undefined,
-        accessToken: record.accessToken || undefined,
-        refreshToken: record.refreshToken || undefined,
-      },
     }
 
-    if (record.accessToken || record.refreshToken || record.idToken) {
-      this.applyTokenDataToSlot(
-        slot,
-        this.hydrateTokenData({
-          idToken: record.idToken || "",
-          accessToken: record.accessToken || "",
-          refreshToken: record.refreshToken || "",
-          accountId: record.accountId || "",
-          workspaceId: record.workspaceId || "",
-          email: record.email || "",
-          expire: record.expire || "",
-        })
-      )
+    const tokenSeed = buildCodexLoadedAccountTokenSeed(record)
+    if (tokenSeed) {
+      this.applyTokenDataToSlot(slot, this.hydrateTokenData(tokenSeed))
     }
 
     return slot
@@ -2137,39 +1373,19 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     // 捕获更新前的凭据指纹，用于热重载（如 Sync Codex CLI）时判断凭据是否已变更。
     const wasDisabled = isAccountDisabled(slot)
     const previousFingerprint = wasDisabled
-      ? this.computeCredentialFingerprint(slot)
+      ? getCodexCredentialFingerprint(slot)
       : ""
 
-    slot.label = record.label || record.email || undefined
-    slot.apiKey = record.apiKey || undefined
-    slot.accountId = record.accountId || undefined
-    slot.workspaceId = record.workspaceId || undefined
-    slot.email = record.email || undefined
-    slot.planType = normalizeCodexModelTier(record.planType) || undefined
-    slot.baseUrl = record.baseUrl || fallbackBaseUrl
-    slot.proxyUrl = record.proxyUrl || fallbackProxyUrl || undefined
-    slot.configPath = record.configPath
-    slot.persistedMatch = {
-      apiKey: record.apiKey || undefined,
-      email: record.email || undefined,
-      accountId: record.accountId || undefined,
-      accessToken: record.accessToken || undefined,
-      refreshToken: record.refreshToken || undefined,
-    }
+    const fields = buildCodexFileSlotRecordFields(
+      record,
+      fallbackBaseUrl,
+      fallbackProxyUrl
+    )
+    applyCodexFileSlotRecordMetadata(slot, fields)
 
-    if (record.accessToken || record.refreshToken || record.idToken) {
-      this.applyTokenDataToSlot(
-        slot,
-        this.hydrateTokenData({
-          idToken: record.idToken || "",
-          accessToken: record.accessToken || "",
-          refreshToken: record.refreshToken || "",
-          accountId: record.accountId || "",
-          workspaceId: record.workspaceId || "",
-          email: record.email || "",
-          expire: record.expire || "",
-        })
-      )
+    const tokenSeed = buildCodexLoadedAccountTokenSeed(record)
+    if (tokenSeed) {
+      this.applyTokenDataToSlot(slot, this.hydrateTokenData(tokenSeed))
       this.clearDisablementIfCredentialChanged(
         slot,
         wasDisabled,
@@ -2199,9 +1415,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     wasDisabled: boolean,
     previousFingerprint: string
   ): void {
-    if (!wasDisabled) return
-    const currentFingerprint = this.computeCredentialFingerprint(slot)
-    if (!currentFingerprint || currentFingerprint === previousFingerprint) {
+    if (
+      !shouldClearCodexDisablementForCredentialChange(
+        slot,
+        wasDisabled,
+        previousFingerprint
+      )
+    ) {
       return
     }
     clearAccountDisablement(slot)
@@ -2212,20 +1432,17 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   }
 
   private pruneConversationBindingsForSlots(slots: CodexAccountSlot[]): void {
-    if (slots.length === 0 || this.conversationSlotBindings.size === 0) {
+    if (slots.length === 0 || this.slotRouter.bindingCount === 0) {
       return
     }
 
-    const staleKeys = new Set(slots.map((slot) => this.getSlotStickyKey(slot)))
-    for (const [conversationId, binding] of this.conversationSlotBindings) {
-      if (staleKeys.has(binding.slotKey)) {
-        this.conversationSlotBindings.delete(conversationId)
-      }
-    }
+    this.slotRouter.pruneBindingsForSlotKeys(
+      slots.map((slot) => this.getSlotStickyKey(slot))
+    )
   }
 
   private normalizeCodexModelName(modelName: string): string {
-    return modelName.toLowerCase().trim()
+    return normalizeCodexRateLimitModelName(modelName)
   }
 
   private getCodexDisplayModel(modelName: string): string {
@@ -2234,97 +1451,39 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   }
 
   private hasRateLimitData(account: CodexAccountSlot): boolean {
-    for (const snapshots of account.rateLimitSnapshots.values()) {
-      if (snapshots.request || snapshots.probe) {
-        return true
-      }
-    }
-    return false
-  }
-
-  private getEffectiveRateLimitSnapshot(
-    snapshots?: Partial<Record<CodexRateLimitSource, CodexRateLimitSnapshot>>
-  ): CodexRateLimitSnapshot | null {
-    if (!snapshots) {
-      return null
-    }
-
-    if (snapshots.request) {
-      return snapshots.request
-    }
-
-    return snapshots.probe || null
+    return hasCodexRateLimitData(account.rateLimitSnapshots)
   }
 
   private getRateLimitModelSummary(
     account: CodexAccountSlot,
     modelName: string
   ): CodexRateLimitModelSummary | null {
-    const normalized = this.normalizeCodexModelName(modelName)
-    const snapshots = account.rateLimitSnapshots.get(normalized)
-    const effective = this.getEffectiveRateLimitSnapshot(snapshots)
-
-    if (!snapshots && !effective) {
-      return null
-    }
-
-    const request = snapshots?.request
-    const probe = snapshots?.probe
-    const updatedAt = Math.max(
-      request?.updatedAt || 0,
-      probe?.updatedAt || 0,
-      effective?.updatedAt || 0
+    return getCodexRateLimitModelSummary(
+      account.rateLimitSnapshots,
+      modelName,
+      (normalizedModel) => this.getCodexDisplayModel(normalizedModel)
     )
-
-    return {
-      model: normalized,
-      displayModel: this.getCodexDisplayModel(normalized),
-      effective,
-      request,
-      probe,
-      updatedAt,
-    }
   }
 
   private getRateLimitAccountSummary(
     account: CodexAccountSlot
   ): CodexRateLimitAccountSummary | undefined {
-    const models = Array.from(account.rateLimitSnapshots.keys())
-      .map((modelName) => this.getRateLimitModelSummary(account, modelName))
-      .filter(
-        (summary): summary is CodexRateLimitModelSummary => summary != null
-      )
-      .sort((left, right) => right.updatedAt - left.updatedAt)
-
-    if (models.length === 0) {
-      return undefined
-    }
-
-    const preferred =
-      models.find(
-        (summary) => summary.model === DEFAULT_CODEX_RATE_LIMIT_MODEL
-      ) || null
-    const effective = preferred?.effective || models[0]?.effective || null
-    const updatedAt = preferred?.updatedAt || models[0]?.updatedAt || null
-    return {
-      effective,
-      models,
-      updatedAt,
-    }
+    return getCodexRateLimitAccountSummary(
+      account.rateLimitSnapshots,
+      DEFAULT_CODEX_RATE_LIMIT_MODEL,
+      (normalizedModel) => this.getCodexDisplayModel(normalizedModel)
+    )
   }
 
   private setRateLimitSnapshot(
     slot: CodexAccountSlot,
     snapshot: CodexRateLimitSnapshot
   ): void {
-    const normalized = this.normalizeCodexModelName(snapshot.model)
-    const existing = slot.rateLimitSnapshots.get(normalized) || {}
-    existing[snapshot.source] = {
-      ...snapshot,
-      model: normalized,
-      displayModel: this.getCodexDisplayModel(normalized),
-    }
-    slot.rateLimitSnapshots.set(normalized, existing)
+    setCodexRateLimitSnapshot(
+      slot.rateLimitSnapshots,
+      snapshot,
+      (normalizedModel) => this.getCodexDisplayModel(normalizedModel)
+    )
   }
 
   private getQuotaRemainingPercent(
@@ -2336,12 +1495,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       account,
       modelName
     )?.effective
-    const usedPercent = effective?.[tier]?.usedPercent
-    if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent)) {
-      return null
-    }
-
-    return Math.max(0, 100 - usedPercent)
+    return getCodexQuotaRemainingPercent(effective || null, tier)
   }
 
   private getQuotaCooldownUntil(
@@ -2353,91 +1507,15 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       account,
       modelName
     )?.effective
-    const remainingPercent = this.getQuotaRemainingPercent(
-      account,
-      tier,
-      modelName
-    )
-    const resetsAt = effective?.[tier]?.resetsAt
-
-    if (
-      remainingPercent === null ||
-      remainingPercent >= 1 ||
-      typeof resetsAt !== "number" ||
-      !Number.isFinite(resetsAt)
-    ) {
-      return 0
-    }
-
-    return resetsAt * 1000
-  }
-
-  private getWeeklyQuotaCooldownUntil(
-    account: CodexAccountSlot,
-    modelName: string
-  ): number {
-    return this.getQuotaCooldownUntil(account, "secondary", modelName)
-  }
-
-  private getPrimaryQuotaCooldownUntil(
-    account: CodexAccountSlot,
-    modelName: string
-  ): number {
-    return this.getQuotaCooldownUntil(account, "primary", modelName)
-  }
-
-  private getRateLimitQuotaCooldownUntil(
-    snapshot: CodexRateLimitSnapshot | null,
-    now: number
-  ): number {
-    if (!snapshot) {
-      return 0
-    }
-
-    const windows = [snapshot.primary, snapshot.secondary]
-    const activeResets = windows
-      .map((window) => {
-        if (!window) {
-          return 0
-        }
-        const remainingPercent = Math.max(0, 100 - window.usedPercent)
-        if (
-          remainingPercent >= 1 ||
-          typeof window.resetsAt !== "number" ||
-          !Number.isFinite(window.resetsAt)
-        ) {
-          return 0
-        }
-        return window.resetsAt * 1000
-      })
-      .filter((cooldownUntil) => cooldownUntil > now)
-
-    return activeResets.length > 0 ? Math.max(...activeResets) : 0
+    return getCodexQuotaCooldownUntil(effective || null, tier)
   }
 
   private isRateLimitExhaustedForModel(
     slot: CodexAccountSlot,
     model: string
   ): boolean {
-    const primaryRemaining = this.getQuotaRemainingPercent(
-      slot,
-      "primary",
-      model
-    )
-    if (primaryRemaining != null && primaryRemaining < 1) {
-      return true
-    }
-
-    const secondaryRemaining = this.getQuotaRemainingPercent(
-      slot,
-      "secondary",
-      model
-    )
-    if (secondaryRemaining != null && secondaryRemaining < 1) {
-      return true
-    }
-
-    return false
+    const effective = this.getRateLimitModelSummary(slot, model)?.effective
+    return isCodexRateLimitSnapshotExhausted(effective || null)
   }
 
   private isSlotAvailableForModel(
@@ -2445,27 +1523,15 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     model: string,
     now: number
   ): boolean {
-    if (this.isRateLimitExhaustedForModel(slot, model)) {
-      return false
-    }
-
-    const weeklyQuotaCooldownUntil = this.getWeeklyQuotaCooldownUntil(
+    return isCodexSlotAvailableForModel({
       slot,
-      model
-    )
-    if (weeklyQuotaCooldownUntil > now) {
-      return false
-    }
-
-    const primaryQuotaCooldownUntil = this.getPrimaryQuotaCooldownUntil(
-      slot,
-      model
-    )
-    if (primaryQuotaCooldownUntil > now) {
-      return false
-    }
-
-    return isAccountAvailableForModel(slot, model, now)
+      model,
+      now,
+      isRateLimitExhausted: (candidate, candidateModel) =>
+        this.isRateLimitExhaustedForModel(candidate, candidateModel),
+      getQuotaCooldownUntil: (candidate, tier, candidateModel) =>
+        this.getQuotaCooldownUntil(candidate, tier, candidateModel),
+    })
   }
 
   private getSlotRecoveryTimeForModel(
@@ -2473,91 +1539,15 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     model: string,
     now: number
   ): number | null {
-    if (isAccountDisabled(slot) || !this.isModelSupportedBySlot(slot, model)) {
-      return null
-    }
-
-    const recoveryCandidates: number[] = []
-
-    if (slot.cooldownUntil > now) {
-      recoveryCandidates.push(slot.cooldownUntil)
-    }
-
-    const modelState = slot.modelStates.get(model)
-    if (modelState?.cooldownUntil && modelState.cooldownUntil > now) {
-      recoveryCandidates.push(modelState.cooldownUntil)
-    }
-
-    const primaryQuotaCooldownUntil = this.getPrimaryQuotaCooldownUntil(
+    return getCodexSlotRecoveryTimeForModel({
       slot,
-      model
-    )
-    if (primaryQuotaCooldownUntil > now) {
-      recoveryCandidates.push(primaryQuotaCooldownUntil)
-    }
-
-    const weeklyQuotaCooldownUntil = this.getWeeklyQuotaCooldownUntil(
-      slot,
-      model
-    )
-    if (weeklyQuotaCooldownUntil > now) {
-      recoveryCandidates.push(weeklyQuotaCooldownUntil)
-    }
-
-    if (recoveryCandidates.length === 0) {
-      return null
-    }
-
-    return Math.max(...recoveryCandidates)
-  }
-
-  private getActiveModelCooldowns(
-    account: CodexAccountSlot,
-    now: number
-  ): BackendPoolStatus["entries"][number]["modelCooldowns"] {
-    return Array.from(account.modelStates.entries())
-      .filter(([, state]) => state.cooldownUntil > now)
-      .map(([model, state]) => ({
-        model,
-        cooldownUntil: state.cooldownUntil,
-        quotaExhausted: state.quotaExhausted,
-        backoffLevel: state.backoffLevel,
-      }))
-      .sort((left, right) => left.cooldownUntil - right.cooldownUntil)
-  }
-
-  private getPoolEntryState(
-    account: CodexAccountSlot,
-    modelCooldowns: BackendPoolStatus["entries"][number]["modelCooldowns"],
-    now: number
-  ): BackendPoolEntryState {
-    if (isAccountDisabled(account)) {
-      return "disabled"
-    }
-
-    const activeQuotaCooldowns = Array.from(account.rateLimitSnapshots.values())
-      .map((snapshots) =>
-        this.getRateLimitQuotaCooldownUntil(
-          this.getEffectiveRateLimitSnapshot(snapshots),
-          now
-        )
-      )
-      .filter((cooldownUntil) => cooldownUntil > now)
-
-    if (activeQuotaCooldowns.length > 0) {
-      account.cooldownUntil = Math.max(
-        account.cooldownUntil,
-        ...activeQuotaCooldowns
-      )
-    }
-
-    if (account.cooldownUntil > now) {
-      return "cooldown"
-    }
-    if (modelCooldowns.length > 0) {
-      return "model_cooldown"
-    }
-    return "ready"
+      model,
+      now,
+      isModelSupported: (candidate, candidateModel) =>
+        this.isModelSupportedBySlot(candidate, candidateModel),
+      getQuotaCooldownUntil: (candidate, tier, candidateModel) =>
+        this.getQuotaCooldownUntil(candidate, tier, candidateModel),
+    })
   }
 
   /**
@@ -2567,11 +1557,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
    * @returns The slot, or null if all accounts are in cooldown
    */
   private pickNextAvailableAccount(model: string): CodexAccountSlot | null {
+    const now = Date.now()
     const normalized = model.toLowerCase().trim()
-    const candidate = this.findNextAvailableAccount(normalized)
-    if (candidate) {
-      this.accountIndex = (candidate.index + 1) % this.accounts.length
-      return candidate.slot
+    const slot = this.slotRouter.pickFromCurrentIndex({
+      candidates: this.accounts,
+      isSlotUsable: (candidate) =>
+        this.isModelSupportedBySlot(candidate, normalized) &&
+        this.isSlotAvailableForModel(candidate, normalized, now),
+    })
+    if (slot) {
+      return slot
     }
 
     this.logger.warn(
@@ -2598,7 +1593,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
    * Persist a refreshed file-backed OAuth slot back into codex-accounts.json.
    */
   private persistFileBackedAccount(slot: CodexAccountSlot): void {
-    if (!slot.tokenData) return
+    const tokenData = slot.tokenData
+    if (!tokenData) return
 
     try {
       const filePath =
@@ -2614,64 +1610,14 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         payload.accounts = Array.isArray(parsed.accounts) ? parsed.accounts : []
       }
 
-      const existingIndex = payload.accounts.findIndex((account) => {
-        if (
-          slot.persistedMatch?.apiKey &&
-          account.apiKey === slot.persistedMatch.apiKey
-        ) {
-          return true
-        }
-        if (
-          slot.persistedMatch?.refreshToken &&
-          account.refreshToken === slot.persistedMatch.refreshToken
-        ) {
-          return true
-        }
-        if (
-          slot.persistedMatch?.accessToken &&
-          account.accessToken === slot.persistedMatch.accessToken
-        ) {
-          return true
-        }
-
-        const matchEmail = slot.persistedMatch?.email || slot.email || ""
-        const matchAccountId =
-          slot.persistedMatch?.accountId || slot.accountId || ""
-        return (
-          (account.email || "") === matchEmail &&
-          (account.accountId || "") === matchAccountId
-        )
-      })
-
-      const currentRecord: PersistedCodexAccountRecord = {
-        ...(existingIndex >= 0 ? payload.accounts[existingIndex] : {}),
-        ...(slot.label ? { label: slot.label } : {}),
-        ...(slot.apiKey ? { apiKey: slot.apiKey } : {}),
-        ...(slot.email ? { email: slot.email } : {}),
-        ...(slot.baseUrl ? { baseUrl: slot.baseUrl } : {}),
-        ...(slot.proxyUrl ? { proxyUrl: slot.proxyUrl } : {}),
-        accessToken: slot.tokenData.accessToken,
-        refreshToken: slot.tokenData.refreshToken,
-        idToken: slot.tokenData.idToken,
+      payload.accounts = upsertCodexPersistedAccountRecord({
+        accounts: payload.accounts,
+        account: slot,
+        tokenData,
         accountId: this.getSlotAccountId(slot) || undefined,
-        workspaceId:
-          slot.workspaceId || slot.tokenData.workspaceId || undefined,
+        workspaceId: slot.workspaceId || tokenData.workspaceId || undefined,
         planType: this.getSlotPlanType(slot) || undefined,
-        expire: slot.tokenData.expire || undefined,
-      }
-
-      Object.keys(currentRecord).forEach((key) => {
-        const typedKey = key as keyof PersistedCodexAccountRecord
-        if (!currentRecord[typedKey]) {
-          delete currentRecord[typedKey]
-        }
       })
-
-      if (existingIndex >= 0) {
-        payload.accounts[existingIndex] = currentRecord
-      } else {
-        payload.accounts.push(currentRecord)
-      }
 
       fs.mkdirSync(path.dirname(filePath), { recursive: true })
       fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf8")
@@ -2795,13 +1741,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         // Refresh token rotation violation or revoked → permanently disable
         // this account to stop the pool from repeatedly selecting a slot
         // whose credentials are permanently invalid.
-        const lowerMsg = errorMsg.toLowerCase()
-        if (
-          lowerMsg.includes("already been used") ||
-          lowerMsg.includes("refresh_token_reused") ||
-          lowerMsg.includes("token_invalidated") ||
-          lowerMsg.includes("token has been invalidated")
-        ) {
+        if (isCodexRefreshTokenInvalidationMessage(errorMsg)) {
           disableAccount(slot, "token_invalidated", {
             statusCode: 401,
             message: errorMsg,
@@ -2917,18 +1857,24 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       conversationId?: string
       omitAccountId?: boolean
       forwardHeaders?: CodexForwardHeaders
+      clientMetadata?: CodexForwardHeaders
+      useResponsesLite?: boolean
+      includeInstallationIdHeader?: boolean
     }
   ): Record<string, string> {
     return buildCodexHttpHeaders({
       token,
       isApiKey: this.isApiKeyMode(slot),
       conversationId: options?.conversationId,
+      clientMetadata: options?.clientMetadata,
       accountId: this.getSlotAccountId(slot),
       workspaceId: slot.workspaceId,
       stream,
       cacheHeaders,
       forwardHeaders: options?.forwardHeaders,
       omitAccountId: options?.omitAccountId,
+      useResponsesLite: options?.useResponsesLite,
+      includeInstallationIdHeader: options?.includeInstallationIdHeader,
       identity: {
         version: this.identity.version(),
         userAgent: this.identity.userAgent(),
@@ -2937,146 +1883,22 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     })
   }
 
-  /**
-   * Parse retry-after from Codex rate limit errors.
-   * Ported from: codex_executor.go parseCodexRetryAfter()
-   */
-  private parseRetryAfter(
-    statusCode: number,
-    errorBody: string
-  ): number | null {
-    if (statusCode !== 429) return null
-
-    try {
-      const parsed = JSON.parse(errorBody) as Record<string, unknown>
-      const error = parsed.error as Record<string, unknown> | undefined
-      if (!error) return null
-
-      if (error.type !== "usage_limit_reached") return null
-
-      // Check resets_at (Unix timestamp)
-      const resetsAt = error.resets_at as number | undefined
-      if (resetsAt && resetsAt > 0) {
-        const now = Math.floor(Date.now() / 1000)
-        if (resetsAt > now) {
-          return resetsAt - now
-        }
-      }
-
-      // Check resets_in_seconds
-      const resetsInSeconds = error.resets_in_seconds as number | undefined
-      if (resetsInSeconds && resetsInSeconds > 0) {
-        return resetsInSeconds
-      }
-    } catch {
-      // Ignore parse errors
+  private getCodexRequestClientMetadata(
+    request: Record<string, unknown> | undefined
+  ): CodexForwardHeaders | undefined {
+    const metadata = request?.client_metadata
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+      return undefined
     }
 
-    return null
-  }
+    const entries = Object.entries(metadata as Record<string, unknown>).flatMap(
+      ([key, value]): Array<[string, string]> =>
+        typeof value === "string" && value.trim().length > 0
+          ? [[key, value]]
+          : []
+    )
 
-  private summarizeErrorBody(errorBody: string): string {
-    const trimmed = errorBody.trim()
-    if (!trimmed) {
-      return ""
-    }
-
-    try {
-      const parsed = JSON.parse(trimmed) as Record<string, unknown>
-      const error =
-        parsed.error && typeof parsed.error === "object"
-          ? (parsed.error as Record<string, unknown>)
-          : undefined
-      const message =
-        (typeof error?.message === "string" && error.message.trim()) ||
-        (typeof parsed.message === "string" && parsed.message.trim()) ||
-        trimmed
-
-      return message.slice(0, 200)
-    } catch {
-      return trimmed.slice(0, 200)
-    }
-  }
-
-  private extractErrorCode(errorBody: string): string | null {
-    const trimmed = errorBody.trim()
-    if (!trimmed) {
-      return null
-    }
-
-    try {
-      const parsed = JSON.parse(trimmed) as Record<string, unknown>
-      const detail =
-        parsed.detail && typeof parsed.detail === "object"
-          ? (parsed.detail as Record<string, unknown>)
-          : undefined
-      const error =
-        parsed.error && typeof parsed.error === "object"
-          ? (parsed.error as Record<string, unknown>)
-          : undefined
-
-      const code = detail?.code ?? error?.code
-      return typeof code === "string" && code.trim() ? code.trim() : null
-    } catch {
-      return null
-    }
-  }
-
-  private isDeactivatedWorkspaceError(errorBody: string): boolean {
-    return this.extractErrorCode(errorBody) === "deactivated_workspace"
-  }
-
-  private createCodexApiError(
-    statusCode: number,
-    errorBody: string
-  ): CodexApiError {
-    const retryAfter = this.parseRetryAfter(statusCode, errorBody)
-    const details = this.summarizeErrorBody(errorBody)
-
-    if (retryAfter != null) {
-      const suffix = details ? ` ${details}` : ""
-      return new CodexApiError(
-        statusCode,
-        `Codex rate limited. Retry after ${retryAfter} seconds.${suffix}`,
-        retryAfter
-      )
-    }
-
-    const message = details
-      ? `Codex API error ${statusCode}: ${details}`
-      : `Codex API error ${statusCode}`
-
-    return new CodexApiError(statusCode, message)
-  }
-
-  private toNumber(value: unknown): number {
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return value
-    }
-    if (typeof value === "string" && value.trim()) {
-      const parsed = Number(value)
-      return Number.isFinite(parsed) ? parsed : 0
-    }
-    return 0
-  }
-
-  private parseCodexSsePayload(line: string): Record<string, unknown> | null {
-    const trimmed = line.trim()
-    if (!trimmed.startsWith("data:")) {
-      return null
-    }
-
-    const jsonStr = trimmed.slice(5).trim()
-    if (!jsonStr || jsonStr === "[DONE]") {
-      return null
-    }
-
-    try {
-      const parsed = JSON.parse(jsonStr) as Record<string, unknown>
-      return parsed && typeof parsed === "object" ? parsed : null
-    } catch {
-      return null
-    }
+    return entries.length > 0 ? Object.fromEntries(entries) : undefined
   }
 
   private logCodexUsage(
@@ -3087,44 +1909,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     event: Record<string, unknown> | null,
     requestStartedAt?: number
   ): void {
-    if (!event || event.type !== "response.completed") {
-      return
-    }
+    const usage = extractCodexCompletedUsage(event)
+    if (!usage) return
 
-    const response =
-      event.response && typeof event.response === "object"
-        ? (event.response as Record<string, unknown>)
-        : null
-    const usage =
-      response?.usage && typeof response.usage === "object"
-        ? (response.usage as Record<string, unknown>)
-        : null
-
-    const totalInputTokens = this.toNumber(usage?.input_tokens)
-    const outputTokens = this.toNumber(usage?.output_tokens)
-    const cachedTokens =
-      usage?.input_tokens_details &&
-      typeof usage.input_tokens_details === "object"
-        ? this.toNumber(
-            (usage.input_tokens_details as Record<string, unknown>)
-              .cached_tokens
-          )
-        : 0
-    const cacheCreationTokens =
-      typeof usage?.cache_creation_input_tokens === "number"
-        ? this.toNumber(usage.cache_creation_input_tokens)
-        : 0
-    const webSearchRequests =
-      usage?.server_tool_use &&
-      typeof usage.server_tool_use === "object" &&
-      typeof (usage.server_tool_use as Record<string, unknown>)
-        .web_search_requests === "number"
-        ? this.toNumber(
-            (usage.server_tool_use as Record<string, unknown>)
-              .web_search_requests
-          )
-        : 0
-    const inputTokens = Math.max(0, totalInputTokens - cachedTokens)
     const durationMs =
       typeof requestStartedAt === "number"
         ? Math.max(0, Date.now() - requestStartedAt)
@@ -3132,75 +1919,29 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
     const message =
       `[Codex][Cache] transport=${transport} model=${modelName} ` +
-      `cache=${cacheId || "(none)"} input=${inputTokens} ` +
-      `cached=${cachedTokens} cacheWrite=${cacheCreationTokens} ` +
-      `output=${outputTokens} duration=${durationMs}ms`
+      `cache=${cacheId || "(none)"} input=${usage.inputTokens} ` +
+      `cached=${usage.cachedInputTokens} cacheWrite=${usage.cacheCreationInputTokens} ` +
+      `output=${usage.outputTokens} duration=${durationMs}ms`
 
     this.usageStats.recordCodexUsage({
       transport,
       modelName,
       accountKey: this.getSlotStickyKey(slot),
       accountLabel: this.getAccountLabel(slot),
-      inputTokens,
-      cachedInputTokens: cachedTokens,
-      cacheCreationInputTokens: cacheCreationTokens,
-      outputTokens,
-      webSearchRequests,
+      inputTokens: usage.inputTokens,
+      cachedInputTokens: usage.cachedInputTokens,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens,
+      outputTokens: usage.outputTokens,
+      webSearchRequests: usage.webSearchRequests,
       durationMs,
     })
 
-    if (cachedTokens > 0) {
+    if (usage.cachedInputTokens > 0) {
       this.logger.log(message)
       return
     }
 
     this.logger.debug(message)
-  }
-
-  private summarizeCodexRequestForLogs(
-    codexRequest: Record<string, unknown>
-  ): string {
-    const inputItems = Array.isArray(codexRequest.input)
-      ? (codexRequest.input as Array<Record<string, unknown>>)
-      : []
-    const inputTypeCounts = new Map<string, number>()
-    const callIds: string[] = []
-
-    for (const item of inputItems) {
-      const type =
-        typeof item?.type === "string" && item.type.trim().length > 0
-          ? item.type
-          : "unknown"
-      inputTypeCounts.set(type, (inputTypeCounts.get(type) || 0) + 1)
-
-      const callId =
-        typeof item?.call_id === "string" ? item.call_id.trim() : ""
-      if (callId) {
-        callIds.push(callId)
-      }
-    }
-
-    const inputSummary =
-      Array.from(inputTypeCounts.entries())
-        .map(([type, count]) => `${type}:${count}`)
-        .join(", ") || "none"
-    const toolsCount = Array.isArray(codexRequest.tools)
-      ? codexRequest.tools.length
-      : 0
-    const previousResponseId =
-      typeof codexRequest.previous_response_id === "string" &&
-      codexRequest.previous_response_id.trim().length > 0
-        ? codexRequest.previous_response_id.trim()
-        : ""
-    const sampleCallIds =
-      callIds.length > 0 ? callIds.slice(0, 4).join(",") : "-"
-
-    return (
-      `previous_response_id=${previousResponseId || "none"} ` +
-      `input_items=${inputItems.length} [${inputSummary}] ` +
-      `tools=${toolsCount} ` +
-      `call_ids=${sampleCallIds}`
-    )
   }
 
   /**
@@ -3225,58 +1966,40 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     >,
     slot: CodexAccountSlot
   ): string {
-    this.pruneCodexRuntimeCaches()
-    const conversationIdRaw = this.getConversationId(request)
-    const useStableInitialCacheIdentity =
-      !this.hasConversationContinuationState(
-        conversationIdRaw,
-        slot,
-        request.model
-      )
-    const conversationId = useStableInitialCacheIdentity
-      ? ""
-      : this.getConversationId(request)
-    if (conversationId) {
-      return conversationId
+    this.turnContexts.pruneRuntimeState()
+    const conversationId = this.getConversationId(request)
+    const decision = resolveCodexPromptCacheIdentity({
+      model: request.model,
+      conversationId,
+      cacheUserId: request.cacheUserId,
+      apiKey: slot.apiKey,
+      slotKey: this.getSlotStickyKey(slot),
+    })
+
+    switch (decision.kind) {
+      case "conversation":
+        return decision.cacheId
+      case "user":
+        return this.cacheService.getOrCreateCacheId(
+          decision.model,
+          decision.userId
+        )
+      case "api_key":
+        return this.cacheService.getCacheIdFromApiKey(decision.apiKey)
+      case "oauth":
+        return this.cacheService.getCacheIdFromIdentity(decision.identity)
     }
-
-    const userId = request.cacheUserId?.trim()
-
-    if (userId) {
-      return this.cacheService.getOrCreateCacheId(request.model, userId)
-    }
-
-    if (slot.apiKey) {
-      return this.cacheService.getCacheIdFromApiKey(slot.apiKey)
-    }
-
-    return this.cacheService.getCacheIdFromIdentity(
-      this.getOAuthCacheIdentity(request, slot, {
-        includeConversationId: !useStableInitialCacheIdentity,
-      })
-    )
   }
 
   private createAllAccountsRateLimitedError(modelName: string): CodexApiError {
     const now = Date.now()
     const normalizedModelName = modelName.toLowerCase().trim()
-    let earliestRecovery = Infinity
-
-    for (const slot of this.accounts) {
-      const slotRecovery = this.getSlotRecoveryTimeForModel(
-        slot,
-        normalizedModelName,
-        now
-      )
-      if (slotRecovery != null) {
-        earliestRecovery = Math.min(earliestRecovery, slotRecovery)
-      }
-    }
-
-    const retryAfterMs = Number.isFinite(earliestRecovery)
-      ? Math.max(0, earliestRecovery - now)
-      : 0
-    const retrySeconds = retryAfterMs > 0 ? Math.ceil(retryAfterMs / 1000) : 60
+    const retrySeconds = getAllCodexAccountsRateLimitedRetrySeconds(
+      this.accounts.map((slot) =>
+        this.getSlotRecoveryTimeForModel(slot, normalizedModelName, now)
+      ),
+      now
+    )
     return new CodexApiError(
       429,
       `All Codex accounts are rate-limited for model ${modelName}. ` +
@@ -3290,21 +2013,41 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   ): { slot: CodexAccountSlot; index: number } | null {
     const now = Date.now()
     const normalized = model.toLowerCase().trim()
+    const selection = this.slotRouter.findFromCurrentIndex({
+      candidates: this.accounts,
+      isSlotUsable: (slot) =>
+        this.isModelSupportedBySlot(slot, normalized) &&
+        this.isSlotAvailableForModel(slot, normalized, now),
+    })
 
-    for (let offset = 0; offset < this.accounts.length; offset++) {
-      const index = (this.accountIndex + offset) % this.accounts.length
-      const slot = this.accounts[index]!
+    return selection
+      ? { slot: selection.account, index: selection.index }
+      : null
+  }
 
-      if (!this.isModelSupportedBySlot(slot, normalized)) {
-        continue
-      }
-
-      if (this.isSlotAvailableForModel(slot, normalized, now)) {
-        return { slot, index }
-      }
+  private isWarmPoolSlotUsable(
+    slot: CodexAccountSlot,
+    normalizedModel: string,
+    now: number
+  ): boolean {
+    if (!this.isModelSupportedBySlot(slot, normalizedModel)) {
+      return false
     }
 
-    return null
+    if (!this.isSlotAvailableForModel(slot, normalizedModel, now)) {
+      return false
+    }
+
+    const wsUrl = this.wsService.buildWebSocketUrl(
+      this.buildUrl(slot, "responses")
+    )
+    return this.turnContexts.getWarmPoolAvailability({
+      slotKey: this.getSlotStickyKey(slot),
+      modelName: normalizedModel,
+      wsUrl,
+      hasOpenSessionConnection: (sessionId, targetWsUrl) =>
+        this.wsService.hasOpenSessionConnection(sessionId, targetWsUrl),
+    }).available
   }
 
   private findWarmPoolAccount(
@@ -3316,48 +2059,27 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
     const now = Date.now()
     const normalized = model.toLowerCase().trim()
+    const selection = this.slotRouter.findFromCurrentIndex({
+      candidates: this.accounts,
+      isSlotUsable: (slot) => this.isWarmPoolSlotUsable(slot, normalized, now),
+    })
 
-    for (let offset = 0; offset < this.accounts.length; offset++) {
-      const index = (this.accountIndex + offset) % this.accounts.length
-      const slot = this.accounts[index]!
-
-      if (!this.isModelSupportedBySlot(slot, normalized)) {
-        continue
-      }
-
-      if (!this.isSlotAvailableForModel(slot, normalized, now)) {
-        continue
-      }
-
-      const wsUrl = this.wsService.buildWebSocketUrl(
-        this.buildUrl(slot, "responses")
-      )
-      // Check cachedWsSessions or wsService for an available connection
-      const cacheKey = this.getCachedWsKey(slot, normalized)
-      const cached = this.cachedWsSessions.get(cacheKey)
-      if (
-        cached &&
-        this.wsService.hasOpenSessionConnection(cached.wsSessionId, wsUrl)
-      ) {
-        return { slot, index }
-      }
-      // Also check connections keyed by cacheKey itself (created by startup warmup)
-      if (this.wsService.hasOpenSessionConnection(cacheKey, wsUrl)) {
-        return { slot, index }
-      }
-    }
-
-    return null
+    return selection
+      ? { slot: selection.account, index: selection.index }
+      : null
   }
 
   private pickWarmPoolAccount(model: string): CodexAccountSlot | null {
-    const candidate = this.findWarmPoolAccount(model)
-    if (!candidate) {
+    if (!this.useWebSocket || !this.wsService.isWebSocketAvailable()) {
       return null
     }
 
-    this.accountIndex = (candidate.index + 1) % this.accounts.length
-    return candidate.slot
+    const now = Date.now()
+    const normalized = model.toLowerCase().trim()
+    return this.slotRouter.pickFromCurrentIndex({
+      candidates: this.accounts,
+      isSlotUsable: (slot) => this.isWarmPoolSlotUsable(slot, normalized, now),
+    })
   }
 
   private selectWarmupSlot(
@@ -3376,27 +2098,21 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       )
     }
 
-    if (conversationId) {
-      const stickySlot = this.getStickyConversationSlot(
-        conversationId,
-        modelName
-      )
-      if (stickySlot) {
-        return stickySlot
-      }
-    }
-
-    const warmedSlot = this.findWarmPoolAccount(modelName)
-    if (warmedSlot) {
-      return warmedSlot.slot
-    }
-
-    const candidate = this.findNextAvailableAccount(modelName)
-    if (!candidate) {
+    const selection = resolveCodexSlotSelection({
+      getStickySlot: () =>
+        conversationId
+          ? this.getStickyConversationSlot(conversationId, modelName)
+          : null,
+      getWarmPoolSlot: () => this.findWarmPoolAccount(modelName)?.slot ?? null,
+      getNextAvailableSlot: () =>
+        this.findNextAvailableAccount(modelName)?.slot ?? null,
+      preferWarmPool: true,
+    })
+    if (selection.kind === "none") {
       throw this.createAllAccountsRateLimitedError(modelName)
     }
 
-    return candidate.slot
+    return selection.slot
   }
 
   private selectRequestSlot(
@@ -3418,28 +2134,19 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       )
     }
 
-    if (conversationId) {
-      const stickySlot = this.getStickyConversationSlot(
-        conversationId,
-        modelName
-      )
-      if (stickySlot) {
-        return stickySlot
-      }
-    }
-
-    if (options?.preferWarmPool) {
-      const warmPoolSlot = this.pickWarmPoolAccount(modelName)
-      if (warmPoolSlot) {
-        return warmPoolSlot
-      }
-    }
-
-    const slot = this.pickNextAvailableAccount(modelName)
-    if (!slot) {
+    const selection = resolveCodexSlotSelection({
+      getStickySlot: () =>
+        conversationId
+          ? this.getStickyConversationSlot(conversationId, modelName)
+          : null,
+      getWarmPoolSlot: () => this.pickWarmPoolAccount(modelName),
+      getNextAvailableSlot: () => this.pickNextAvailableAccount(modelName),
+      preferWarmPool: options?.preferWarmPool,
+    })
+    if (selection.kind === "none") {
       throw this.createAllAccountsRateLimitedError(modelName)
     }
-    return slot
+    return selection.slot
   }
 
   // ── Non-streaming ────────────────────────────────────────────────────
@@ -3512,24 +2219,30 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
     this.bindConversationToSlot(conversationId, requestSlot)
 
-    const codexRequest = buildCodexRequest(
+    let codexRequest = buildCodexRequest(
       { ...request, conversationId },
       modelName
     )
-    const payload: Record<string, unknown> = {
-      model: codexRequest.model,
-      input: codexRequest.input,
-      instructions: codexRequest.instructions,
-      tools: codexRequest.tools || [],
-      parallel_tool_calls: codexRequest.parallel_tool_calls !== false,
-      reasoning: codexRequest.reasoning,
-      text: codexRequest.text,
+    const cacheId = this.getCacheId({ ...request, conversationId }, requestSlot)
+    if (cacheId) {
+      codexRequest = this.cacheService.injectCacheKey(
+        codexRequest as Record<string, unknown>,
+        cacheId
+      ) as CodexRequest
     }
+    const compactTurnContext =
+      this.turnContexts.getActiveContext(conversationId)
+    const preparedCodexRequest = prepareCodexRequestForSend(codexRequest)
+    const payload = buildCodexCompactRequestPayload(preparedCodexRequest)
     const url = this.buildUrl(requestSlot, "responses/compact")
     const headers = this.buildHeaders(requestSlot, token, false, undefined, {
       conversationId,
       forwardHeaders,
+      clientMetadata: this.getCodexRequestClientMetadata(codexRequest),
+      useResponsesLite: this.usesResponsesLite(modelName),
+      includeInstallationIdHeader: true,
     })
+    this.applyCodexTurnStateHeader(headers, compactTurnContext)
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
       method: "POST",
       headers,
@@ -3541,11 +2254,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       fetchOptions.dispatcher = dispatcher
     }
 
-    const response = await fetch(url, fetchOptions)
     try {
+      const response = await fetch(url, fetchOptions)
       if (!response.ok) {
         const errorBody = await response.text()
-        throw this.createCodexApiError(response.status, errorBody)
+        throw createCodexApiErrorFromBody(response.status, errorBody)
       }
       this.captureCodexRateLimitHeaders(
         response.headers,
@@ -3553,27 +2266,22 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         modelName,
         "request"
       )
+      this.captureCodexTurnStateFromHttpHeaders(
+        compactTurnContext,
+        response.headers
+      )
       markAccountSuccess(requestSlot, modelName)
 
-      const parsed = (await response.json()) as { output?: unknown }
-      if (!Array.isArray(parsed.output)) {
-        throw new CodexApiError(
-          502,
-          "Codex compact response did not include output history."
-        )
-      }
-      return parsed.output.flatMap((item) =>
-        item && typeof item === "object"
-          ? [{ ...(item as Record<string, unknown>) }]
-          : []
-      )
+      return parseCodexCompactOutputHistory(await response.json())
     } catch (error) {
       if (error instanceof CodexApiError) {
         const statusCode = error.getStatus()
         if (
-          (statusCode === 401 || statusCode === 403) &&
-          attempt === 1 &&
-          !this.isApiKeyMode(requestSlot)
+          shouldRefreshCodexTokenForStatus({
+            statusCode,
+            attempt,
+            isApiKeyMode: this.isApiKeyMode(requestSlot),
+          })
         ) {
           const newToken = await this.tryRefreshSlotToken(
             requestSlot,
@@ -3599,8 +2307,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         )
 
         if (
-          (statusCode === 401 || statusCode === 403 || statusCode === 429) &&
-          attempt < this.accounts.length
+          shouldFailOverCodexAccountForStatus({
+            statusCode,
+            attempt,
+            accountCount: this.accounts.length,
+          })
         ) {
           const nextSlot = this.pickNextAvailableAccount(modelName)
           if (nextSlot && nextSlot !== requestSlot) {
@@ -3696,11 +2407,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const url = this.buildUrl(slot, "responses")
     const headers = this.buildHeaders(slot, token, true, undefined, {
       conversationId,
+      clientMetadata: this.getCodexRequestClientMetadata(codexRequest),
+      useResponsesLite: this.usesResponsesLite(modelName),
     })
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
       method: "POST",
       headers,
-      body: JSON.stringify(codexRequest),
+      body: JSON.stringify(prepareCodexRequestForSend(codexRequest)),
       signal: input.signal
         ? AbortSignal.any([input.signal, AbortSignal.timeout(300_000)])
         : AbortSignal.timeout(300_000),
@@ -3713,7 +2426,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const response = await fetch(url, fetchOptions)
     if (!response.ok) {
       const errorBody = await response.text()
-      throw this.createCodexApiError(response.status, errorBody)
+      throw createCodexApiErrorFromBody(response.status, errorBody)
     }
     this.captureCodexRateLimitHeaders(
       response.headers,
@@ -3842,7 +2555,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         buffer = lines.pop() || ""
 
         for (const line of lines) {
-          const payload = this.parseCodexSsePayload(line.trim())
+          const payload = parseCodexSsePayload(line.trim())
           if (payload && processPayload(payload)) {
             completed = true
             break
@@ -3852,7 +2565,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
       const tail = buffer.trim()
       if (!completed && tail) {
-        const payload = this.parseCodexSsePayload(tail)
+        const payload = parseCodexSsePayload(tail)
         if (payload) {
           processPayload(payload)
         }
@@ -3926,11 +2639,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const url = this.buildUrl(slot, "responses")
     const headers = this.buildHeaders(slot, token, true, undefined, {
       conversationId,
+      clientMetadata: this.getCodexRequestClientMetadata(codexRequest),
+      useResponsesLite: this.usesResponsesLite(modelName),
     })
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
       method: "POST",
       headers,
-      body: JSON.stringify(codexRequest),
+      body: JSON.stringify(prepareCodexRequestForSend(codexRequest)),
       signal: AbortSignal.timeout(600_000),
     }
     const dispatcher = this.buildProxyDispatcher(slot)
@@ -3941,7 +2656,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const response = await fetch(url, fetchOptions)
     if (!response.ok) {
       const errorBody = await response.text()
-      throw this.createCodexApiError(response.status, errorBody)
+      throw createCodexApiErrorFromBody(response.status, errorBody)
     }
 
     this.captureCodexRateLimitHeaders(
@@ -3956,7 +2671,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     let status: string | undefined
 
     for (const line of fullBody.split("\n")) {
-      const payload = this.parseCodexSsePayload(line.trim())
+      const payload = parseCodexSsePayload(line.trim())
       const item =
         payload?.type === "response.output_item.done" &&
         payload.item &&
@@ -4049,12 +2764,22 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     if (cacheId) {
       codexRequest = this.cacheService.injectCacheKey(codexRequest, cacheId)
     }
+    const conversationId = this.getConversationId(request)
+    const turnKey = this.getCodexTurnKey(codexRequest)
+    const shouldTryWebSocket =
+      this.useWebSocket &&
+      this.wsService.isWebSocketAvailable() &&
+      !this.isHttpFallbackTransport(conversationId, slot, modelName)
+    const turnContext =
+      conversationId && shouldTryWebSocket
+        ? this.getOrCreateTurnContext(conversationId, slot, modelName, turnKey)
+        : undefined
 
     try {
       let result: AnthropicResponse
 
-      // Try WebSocket transport first when enabled.
-      if (this.useWebSocket && this.wsService.isWebSocketAvailable()) {
+      // Try WebSocket transport first when enabled for this Codex session.
+      if (shouldTryWebSocket) {
         try {
           result = await this.sendViaWebSocket(
             slot,
@@ -4064,17 +2789,26 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             reverseToolMap,
             cacheId,
             request,
-            forwardHeaders
+            forwardHeaders,
+            turnContext
           )
         } catch (e) {
-          if (e instanceof CodexWebSocketUpgradeError) {
-            if (
-              !this.isApiKeyMode(slot) &&
-              this.isDeactivatedWorkspaceError(e.body)
-            ) {
+          const failureAction = resolveCodexWebSocketFailure(e, {
+            isApiKeyMode: this.isApiKeyMode(slot),
+          })
+
+          switch (failureAction.kind) {
+            case "retry_http_without_account":
               this.logger.warn(
                 `[Codex] WebSocket returned deactivated_workspace for ${this.getAccountLabel(slot)}, retrying over HTTP without Chatgpt-Account-Id`
               )
+              this.beginHttpTransportTurn(
+                conversationId,
+                slot,
+                modelName,
+                "WebSocket deactivated_workspace forced HTTP retry",
+                true
+              )
               result = await this.sendViaHttp(
                 slot,
                 token,
@@ -4082,13 +2816,28 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
                 modelName,
                 reverseToolMap,
                 cacheId,
-                this.getConversationId(request),
+                conversationId,
                 true,
-                forwardHeaders
+                forwardHeaders,
+                turnContext
               )
-            } else if (e.shouldFallbackToHttp()) {
-              this.logger.warn(
-                "WebSocket upgrade rejected, falling back to HTTP"
+              break
+            case "fallback_http":
+              if (failureAction.reason === "upgrade_rejected") {
+                this.logger.warn(
+                  "WebSocket upgrade rejected, falling back to HTTP"
+                )
+              } else {
+                this.logger.warn(
+                  `[Codex] WebSocket transport unavailable, falling back to HTTP: ${e instanceof Error ? e.message : String(e)}`
+                )
+              }
+              this.beginHttpTransportTurn(
+                conversationId,
+                slot,
+                modelName,
+                "WebSocket transport fallback",
+                true
               )
               result = await this.sendViaHttp(
                 slot,
@@ -4097,36 +2846,30 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
                 modelName,
                 reverseToolMap,
                 cacheId,
-                this.getConversationId(request),
+                conversationId,
                 false,
-                forwardHeaders
+                forwardHeaders,
+                turnContext
               )
-            } else {
-              throw this.createCodexApiError(
-                e.statusCode || 502,
-                e.body || e.message
+              break
+            case "throw_codex_api_error":
+              throw createCodexApiErrorFromBody(
+                failureAction.statusCode,
+                failureAction.body
               )
-            }
-          } else if (this.shouldFallbackToHttpAfterWebSocketError(e)) {
-            this.logger.warn(
-              `[Codex] WebSocket transport unavailable, falling back to HTTP: ${e instanceof Error ? e.message : String(e)}`
-            )
-            result = await this.sendViaHttp(
-              slot,
-              token,
-              codexRequest,
-              modelName,
-              reverseToolMap,
-              cacheId,
-              this.getConversationId(request),
-              false,
-              forwardHeaders
-            )
-          } else {
-            throw e
+            case "throw_original":
+              throw e
           }
         }
       } else {
+        this.beginHttpTransportTurn(
+          conversationId,
+          slot,
+          modelName,
+          this.isHttpFallbackTransport(conversationId, slot, modelName)
+            ? "Codex session pinned to HTTP transport"
+            : "WebSocket transport disabled or unavailable"
+        )
         result = await this.sendViaHttp(
           slot,
           token,
@@ -4134,9 +2877,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           modelName,
           reverseToolMap,
           cacheId,
-          this.getConversationId(request),
+          conversationId,
           false,
-          forwardHeaders
+          forwardHeaders,
+          turnContext
         )
       }
 
@@ -4149,9 +2893,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
         // 401/403: 尝试 refresh token 后用同一 slot 重试一次，避免直接 cooldown
         if (
-          (statusCode === 401 || statusCode === 403) &&
-          attempt === 1 &&
-          !this.isApiKeyMode(slot)
+          shouldRefreshCodexTokenForStatus({
+            statusCode,
+            attempt,
+            isApiKeyMode: this.isApiKeyMode(slot),
+          })
         ) {
           const newToken = await this.tryRefreshSlotToken(
             slot,
@@ -4178,8 +2924,12 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
         // 401/403: refresh 失败后，尝试用下一个可用账号重试（跨 slot 故障转移）
         if (
-          (statusCode === 401 || statusCode === 403) &&
-          attempt < this.accounts.length
+          isCodexAuthRetryStatus(statusCode) &&
+          shouldFailOverCodexAccountForStatus({
+            statusCode,
+            attempt,
+            accountCount: this.accounts.length,
+          })
         ) {
           const nextSlot = this.pickNextAvailableAccount(modelName)
           if (nextSlot && nextSlot !== slot) {
@@ -4198,7 +2948,14 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         }
 
         // Auto-retry on 429 if another account is available
-        if (statusCode === 429 && attempt < this.accounts.length) {
+        if (
+          isCodexRateLimitRetryStatus(statusCode) &&
+          shouldFailOverCodexAccountForStatus({
+            statusCode,
+            attempt,
+            accountCount: this.accounts.length,
+          })
+        ) {
           const nextSlot = this.pickNextAvailableAccount(modelName)
           if (nextSlot && nextSlot !== slot) {
             this.logger.log(
@@ -4229,23 +2986,41 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     cacheId: string,
     conversationId?: string,
     omitAccountId: boolean = false,
-    forwardHeaders?: CodexForwardHeaders
+    forwardHeaders?: CodexForwardHeaders,
+    turnContext?: CodexTurnContext
   ): Promise<AnthropicResponse> {
     const requestStartedAt = Date.now()
-    const requestBody = JSON.stringify(codexRequest)
+    const preparedCodexRequest = prepareCodexRequestForSend(codexRequest)
+    const requestBody = JSON.stringify(preparedCodexRequest)
     const url = this.buildUrl(slot, "responses")
     const cacheHeaders = this.cacheService.buildHttpCacheHeaders(cacheId)
     const headers = this.buildHeaders(slot, token, true, cacheHeaders, {
       conversationId,
       omitAccountId,
       forwardHeaders,
+      clientMetadata: this.getCodexRequestClientMetadata(codexRequest),
+      useResponsesLite: this.usesResponsesLite(modelName),
     })
+    this.applyCodexTurnStateHeader(headers, turnContext)
 
     this.logger.log(
-      `[Codex][Dispatch] slot=${this.getAccountLabel(slot)} model=${modelName} transport=http omitAccountId=${omitAccountId} accountId=${JSON.stringify(this.getSlotAccountId(slot) || null)} workspaceId=${JSON.stringify(slot.workspaceId || null)} orgHeader=${JSON.stringify(headers["OpenAI-Organization"] || null)} accountHeader=${JSON.stringify(headers["Chatgpt-Account-Id"] || null)}`
+      buildCodexDispatchLogLine({
+        slotLabel: this.getAccountLabel(slot),
+        modelName,
+        transport: "http",
+        omitAccountId,
+        accountId: this.getSlotAccountId(slot),
+        workspaceId: slot.workspaceId,
+        headers,
+      })
     )
     this.logger.log(
-      `[Codex] Non-stream request: model=${modelName}, url=${url}, reasoning=${JSON.stringify((codexRequest as { reasoning?: unknown }).reasoning ?? null)}, service_tier=${JSON.stringify((codexRequest as { service_tier?: unknown }).service_tier ?? null)}`
+      buildCodexHttpRequestLogLine({
+        kind: "non_stream",
+        modelName,
+        url,
+        codexRequest: preparedCodexRequest,
+      })
     )
 
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
@@ -4268,28 +3043,38 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         `[Codex] Request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
       )
 
-      if (
-        !omitAccountId &&
-        !this.isApiKeyMode(slot) &&
-        this.isDeactivatedWorkspaceError(errorBody)
-      ) {
-        this.logger.warn(
-          `[Codex] deactivated_workspace for ${this.getAccountLabel(slot)}, retrying without Chatgpt-Account-Id`
-        )
-        return this.sendViaHttp(
-          slot,
-          token,
-          codexRequest,
-          modelName,
-          reverseToolMap,
-          cacheId,
-          conversationId,
-          true,
-          forwardHeaders
-        )
-      }
+      const failureAction = resolveCodexHttpErrorResponse(
+        response.status,
+        errorBody,
+        {
+          omitAccountId,
+          isApiKeyMode: this.isApiKeyMode(slot),
+        }
+      )
 
-      throw this.createCodexApiError(response.status, errorBody)
+      switch (failureAction.kind) {
+        case "retry_http_without_account":
+          this.logger.warn(
+            `[Codex] deactivated_workspace for ${this.getAccountLabel(slot)}, retrying without Chatgpt-Account-Id`
+          )
+          return this.sendViaHttp(
+            slot,
+            token,
+            codexRequest,
+            modelName,
+            reverseToolMap,
+            cacheId,
+            conversationId,
+            true,
+            forwardHeaders,
+            turnContext
+          )
+        case "throw_codex_api_error":
+          throw createCodexApiErrorFromBody(
+            failureAction.statusCode,
+            failureAction.body
+          )
+      }
     }
 
     // Read the full SSE stream and find response.completed
@@ -4299,6 +3084,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       modelName,
       "request"
     )
+    this.captureCodexTurnStateFromHttpHeaders(turnContext, response.headers)
     const fullBody = await response.text()
     const lines = fullBody.split("\n")
 
@@ -4318,6 +3104,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
       try {
         const event = JSON.parse(jsonStr) as Record<string, unknown>
+        this.captureCodexTurnStateFromSsePayload(turnContext, event)
         if (event.type === "response.output_item.done") {
           const item = event.item as Record<string, unknown> | undefined
           if (item && typeof item === "object") {
@@ -4379,46 +3166,111 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       CodexExecutionRequest,
       "conversationId" | "model" | "pendingToolUseIds"
     >,
-    forwardHeaders?: CodexForwardHeaders
+    forwardHeaders?: CodexForwardHeaders,
+    turnContextOverride?: CodexTurnContext
   ): Promise<AnthropicResponse> {
     const requestStartedAt = Date.now()
     const httpUrl = this.buildUrl(slot, "responses")
     const wsUrl = this.wsService.buildWebSocketUrl(httpUrl)
+    const conversationId = this.getConversationId(request)
+    const turnKey = this.getCodexTurnKey(codexRequest)
+    const turnContext =
+      turnContextOverride ||
+      (conversationId
+        ? this.getOrCreateTurnContext(conversationId, slot, modelName, turnKey)
+        : undefined)
     const cacheHeaders = this.cacheService.buildWebSocketCacheHeaders(cacheId)
     const wsHeaders = this.wsService.buildWebSocketHeaders(
       token,
       this.isApiKeyMode(slot),
-      this.getConversationId(request),
+      conversationId,
       this.getSlotAccountId(slot),
       slot.workspaceId,
       cacheHeaders,
-      forwardHeaders
+      forwardHeaders,
+      false,
+      this.usesResponsesLite(modelName),
+      this.getCodexRequestClientMetadata(codexRequest)
     )
-    const wsBody = this.wsService.buildWebSocketRequestBody(codexRequest)
-    const conversationIdForSession = this.getConversationId(request)
+    this.applyCodexTurnStateHeader(wsHeaders, turnContext)
     const sessionId =
-      conversationIdForSession || this.getCachedWsKey(slot, request.model)
-    const conversationId = this.getConversationId(request)
+      turnContext?.wsSessionId || this.getCachedWsKey(slot, request.model)
 
-    this.logger.log(
-      `[Codex][Dispatch] slot=${this.getAccountLabel(slot)} model=${modelName} transport=websocket omitAccountId=false accountId=${JSON.stringify(this.getSlotAccountId(slot) || null)} workspaceId=${JSON.stringify(slot.workspaceId || null)} orgHeader=${JSON.stringify(wsHeaders["OpenAI-Organization"] || null)} accountHeader=${JSON.stringify(wsHeaders["Chatgpt-Account-Id"] || null)}`
-    )
-    this.logger.log(
-      `[Codex] WebSocket non-stream request: model=${modelName}, url=${wsUrl}`
-    )
-    this.logger.debug(
-      `[Codex][WS Request] ${this.summarizeCodexRequestForLogs(wsBody)}`
-    )
-    if (sessionId && conversationId && sessionId !== conversationId) {
+    const buildWsBody = (requestForSend: Record<string, unknown>) =>
+      this.wsService.buildWebSocketRequestBody(
+        prepareCodexRequestForSend(requestForSend),
+        {
+          useResponsesLite: this.usesResponsesLite(modelName),
+          forwardHeaders,
+          streamRequestStartMs: Date.now(),
+          turnState: turnContext?.turnState,
+        }
+      )
+
+    const logWsRequest = (wsBody: Record<string, unknown>) => {
+      this.logger.log(
+        buildCodexDispatchLogLine({
+          slotLabel: this.getAccountLabel(slot),
+          modelName,
+          transport: "websocket",
+          omitAccountId: false,
+          accountId: this.getSlotAccountId(slot),
+          workspaceId: slot.workspaceId,
+          headers: wsHeaders,
+        })
+      )
+      this.logger.log(
+        `[Codex] WebSocket non-stream request: model=${modelName}, url=${wsUrl}`
+      )
       this.logger.debug(
-        `[Codex] Reusing warm WebSocket pool session ${sessionId} for initial request conversation=${conversationId}`
+        `[Codex][WS Request] ${summarizeCodexRequestForLogs(wsBody)}`
       )
     }
 
+    const captureNonStreamResponse = (
+      completedEvent: Record<string, unknown>
+    ) => {
+      if (!conversationId || !turnContext) {
+        return
+      }
+
+      const response = completedEvent.response as
+        | Record<string, unknown>
+        | undefined
+      const output = response?.output
+      const itemsAdded: CodexInputItem[] = []
+      if (Array.isArray(output)) {
+        for (const item of output) {
+          appendCodexResponseOutputItemToLedger(
+            itemsAdded,
+            item as Record<string, unknown> | undefined
+          )
+        }
+      }
+
+      const capturedId = getCodexCompletedResponseId(completedEvent)
+      if (capturedId) {
+        this.captureResponseInTurnContext(
+          conversationId,
+          capturedId,
+          itemsAdded
+        )
+      }
+    }
+
     const executeRequest = async (
-      ws: WebSocket
+      ws: WebSocket,
+      requestForSend: Record<string, unknown>
     ): Promise<AnthropicResponse> => {
-      const completedEvent = await this.wsService.sendViaWebSocket(ws, wsBody)
+      const wsBody = buildWsBody(requestForSend)
+      logWsRequest(wsBody)
+      const completedEvent = await this.wsService.sendViaWebSocket(ws, wsBody, {
+        onMessage: (msg) =>
+          this.captureCodexTurnStateFromSsePayload(
+            turnContext,
+            msg as Record<string, unknown>
+          ),
+      })
       this.logCodexUsage(
         "websocket",
         modelName,
@@ -4427,6 +3279,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         completedEvent as Record<string, unknown>,
         requestStartedAt
       )
+      captureNonStreamResponse(completedEvent as Record<string, unknown>)
 
       const result = translateCodexToClaudeNonStream(
         completedEvent as Record<string, unknown>,
@@ -4442,60 +3295,120 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       return result
     }
 
-    if (!sessionId) {
-      this.logger.log(
-        `[Codex][Dispatch] slot=${this.getAccountLabel(slot)} model=${modelName} transport=websocket-stream omitAccountId=false accountId=${JSON.stringify(this.getSlotAccountId(slot) || null)} workspaceId=${JSON.stringify(slot.workspaceId || null)} orgHeader=${JSON.stringify(wsHeaders["OpenAI-Organization"] || null)} accountHeader=${JSON.stringify(wsHeaders["Chatgpt-Account-Id"] || null)}`
-      )
-      this.logger.log(
-        `[Codex] WebSocket stream request: model=${modelName}, url=${wsUrl}`
-      )
+    if (sessionId && conversationId && sessionId !== conversationId) {
       this.logger.debug(
-        `[Codex][WS Request] ${this.summarizeCodexRequestForLogs(
-          this.wsService.buildWebSocketRequestBody(codexRequest)
-        )}`
+        `[Codex] Reusing warm WebSocket pool session ${sessionId} for initial request conversation=${conversationId}`
       )
-      const ws = await this.wsService.connect(
-        wsUrl,
-        wsHeaders,
-        slot.proxyUrl || undefined
-      )
-      try {
-        return await executeRequest(ws)
-      } finally {
-        ws.close()
-      }
     }
 
-    const { release } = await this.wsService.acquireSession(sessionId)
+    const prepareWebSocketRequest = (
+      requestForSend: Record<string, unknown>
+    ): Record<string, unknown> =>
+      turnContext && conversationId
+        ? this.prepareRequestWithTurnContext(
+            requestForSend,
+            turnContext,
+            conversationId
+          )
+        : requestForSend
+
     try {
-      let ws = await this.wsService.ensureSessionConnection(
-        sessionId,
-        wsUrl,
-        wsHeaders,
-        slot.proxyUrl || undefined
-      )
-
-      try {
-        return await executeRequest(ws)
-      } catch (error) {
-        if (!this.shouldRetrySessionWebSocketError(error)) {
-          throw error
-        }
-
-        this.logger.warn(
-          `[Codex] Reconnecting stale WebSocket session ${sessionId} before retry`
+      if (!sessionId) {
+        const ws = await this.wsService.connect(
+          wsUrl,
+          wsHeaders,
+          slot.proxyUrl || undefined
         )
-        this.wsService.invalidateSessionConnection(sessionId, ws)
-        ws = await this.wsService.ensureSessionConnection(
+        this.captureCodexTurnStateFromConnection(turnContext, ws)
+        try {
+          return await executeRequest(ws, prepareWebSocketRequest(codexRequest))
+        } finally {
+          ws.close()
+        }
+      }
+
+      const { release } = await this.wsService.acquireSession(sessionId)
+      try {
+        const sessionState = this.wsService.getOrCreateSession(sessionId)
+        const hadOpenConnection =
+          !!sessionState.conn &&
+          sessionState.wsUrl === wsUrl &&
+          sessionState.conn.readyState === 1
+
+        let ws = await this.wsService.ensureSessionConnection(
           sessionId,
           wsUrl,
           wsHeaders,
           slot.proxyUrl || undefined
         )
-        return executeRequest(ws)
+        this.captureCodexTurnStateFromConnection(turnContext, ws)
+
+        if (!hadOpenConnection) {
+          this.recordTurnContextTransportReconnect(
+            conversationId,
+            slot,
+            modelName,
+            "WebSocket non-stream connection rebuilt before request"
+          )
+        }
+
+        const originalCodexRequest = codexRequest
+        let requestForSend = prepareWebSocketRequest(codexRequest)
+
+        try {
+          return await executeRequest(ws, requestForSend)
+        } catch (error) {
+          if (
+            shouldReplayCodexRequestWithoutPreviousResponseId(error, {
+              conversationId,
+              currentRequest: requestForSend,
+              originalRequest: originalCodexRequest,
+            })
+          ) {
+            this.logger.warn(
+              `[Codex] Previous response_id rejected by server for ${conversationId}, retrying non-stream without previous_response_id`
+            )
+            this.beginFullCodexResponseChain(
+              turnContext,
+              conversationId,
+              originalCodexRequest,
+              "Server rejected stale previous_response_id on non-stream request"
+            )
+            return executeRequest(ws, originalCodexRequest)
+          }
+
+          if (!shouldRetryCodexSessionWebSocketError(error)) {
+            throw error
+          }
+
+          this.logger.warn(
+            `[Codex] Reconnecting stale WebSocket session ${sessionId} before non-stream retry`
+          )
+          this.wsService.invalidateSessionConnection(sessionId, ws)
+          this.applyCodexTurnStateHeader(wsHeaders, turnContext)
+          ws = await this.wsService.ensureSessionConnection(
+            sessionId,
+            wsUrl,
+            wsHeaders,
+            slot.proxyUrl || undefined
+          )
+          this.captureCodexTurnStateFromConnection(turnContext, ws)
+          this.recordTurnContextTransportReconnect(
+            conversationId,
+            slot,
+            modelName,
+            "WebSocket non-stream connection rebuilt before retry"
+          )
+          requestForSend = prepareWebSocketRequest(originalCodexRequest)
+          return executeRequest(ws, requestForSend)
+        }
+      } finally {
+        release()
       }
     } finally {
-      release()
+      if (conversationId) {
+        this.disposeTurnContext(conversationId, slot, modelName)
+      }
     }
   }
 
@@ -4576,28 +3489,19 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       const modelName = request.model
       const conversationId = this.getConversationId(request)
       slot = this.selectWarmupSlot(modelName, conversationId)
+      if (this.isHttpFallbackTransport(conversationId, slot, modelName)) {
+        this.logger.debug(
+          `[Codex][Warmup] reason=${options?.reason?.trim() || "request"} model=${modelName} skipped: Codex session is pinned to HTTP transport`
+        )
+        return
+      }
       const httpUrl = this.buildUrl(slot, "responses")
       wsUrl = this.wsService.buildWebSocketUrl(httpUrl)
-      const cacheKey = this.getCachedWsKey(
-        slot,
-        request.model,
-        conversationId || undefined
-      )
-      const cached = this.cachedWsSessions.get(cacheKey)
-      sessionId = cached?.wsSessionId || conversationId || cacheKey
-
-      // Warmup 只准备可复用的 connection cache，不创建 active turn context。
-      // ConversationCodexSession.active 只属于真实 stream turn，避免 warmup 占用或污染 turn lifecycle。
-      if (!cached) {
-        this.setCachedWsSession(cacheKey, {
-          wsSessionId: sessionId,
-          turnKey: undefined,
-          turnState: undefined,
-          lastResponse: undefined,
-          lastRequest: undefined,
-          updatedAt: Date.now(),
-        })
-      }
+      sessionId = this.turnContexts.prepareWarmupContext({
+        slotKey: this.getSlotStickyKey(slot),
+        modelName: request.model,
+        conversationId: conversationId || undefined,
+      }).sessionId
     } catch (error) {
       this.logger.debug(
         `[Codex][Warmup] reason=${options?.reason?.trim() || "request"} model=${request.model} skipped before dispatch: ${error instanceof Error ? error.message : String(error)}`
@@ -4674,7 +3578,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       this.getSlotAccountId(slot),
       slot.workspaceId,
       cacheHeaders,
-      forwardHeaders
+      forwardHeaders,
+      false,
+      this.usesResponsesLite(modelName),
+      this.getCodexRequestClientMetadata(warmupPayload)
     )
 
     const { release } = await this.wsService.acquireSession(sessionId)
@@ -4685,6 +3592,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         !!session.conn &&
         session.wsUrl === wsUrl &&
         session.conn.readyState === 1
+      const conversationHadContinuation =
+        !!conversationId &&
+        this.hasConversationContinuationState(conversationId, slot, modelName)
 
       const ws = await this.wsService.ensureSessionConnection(
         sessionId,
@@ -4693,10 +3603,14 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         slot.proxyUrl || undefined
       )
 
-      // A connection-only warmup may rebuild the transport before the real
-      // continuation request reaches streamViaWebSocket(). Do not clear the
-      // response chain here; the next real request will validate the strict
-      // delta and the stale-response retry path will handle server rejection.
+      if (!reusedConnection) {
+        this.recordTurnContextTransportReconnect(
+          conversationId,
+          slot,
+          modelName,
+          "Warmup rebuilt WebSocket connection"
+        )
+      }
 
       // Send generate:false warmup payload to prime the server-side prompt cache (mirrors Codex CLI).
       //
@@ -4708,28 +3622,23 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       // won't recognize the response_id from the actual request because it belongs to
       // a different chain than the warmup response.
       //
-      // Skip conditions:
-      // 1. Connection was reused (no new connection to warm up)
-      // 2. Conversation already has a cached response_id (would invalidate it)
-      // 3. This is a continuation warmup (not initial-chat) — mirrors official CLI behavior
-      const isContinuationWarmup =
-        warmupReason.includes("continuation") ||
-        warmupReason.includes("shell") ||
-        warmupReason.includes("tool")
-      const cachedEntry = this.cachedWsSessions.get(
-        this.getCachedWsKey(slot, modelName, conversationId || undefined)
-      )
-      const skipWarmupPayload =
-        isContinuationWarmup ||
-        (!!conversationId &&
-          (this.hasActiveTurnContext(conversationId) ||
-            !!cachedEntry?.lastResponse?.responseId))
-      if (warmupPayload && !reusedConnection && !skipWarmupPayload) {
+      const warmupPayloadDecision = shouldSendCodexWarmupPayload({
+        warmupPayloadAvailable: !!warmupPayload,
+        reusedConnection,
+        warmupReason,
+        conversationHasContinuation: conversationHadContinuation,
+      })
+      if (warmupPayloadDecision.sendPayload && warmupPayload) {
         let warmupBody = { ...warmupPayload }
         if (cacheId) {
           warmupBody = this.cacheService.injectCacheKey(warmupBody, cacheId)
         }
-        const wsBody = this.wsService.buildWarmupRequestBody(warmupBody)
+        warmupBody = prepareCodexRequestForSend(warmupBody)
+        const wsBody = this.wsService.buildWarmupRequestBody(warmupBody, {
+          useResponsesLite: this.usesResponsesLite(modelName),
+          forwardHeaders,
+          streamRequestStartMs: Date.now(),
+        })
 
         this.logger.debug(
           `[Codex][Warmup] reason=${warmupReason} session=${sessionId} model=${modelName} sending generate:false payload`
@@ -4803,16 +3712,33 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   dispose(conversationId: string): void {
     const normalized = conversationId.trim()
     if (!normalized) return
-    // 一次性清空 ConversationCodexSession（含 active turn + streamTail）。
-    // 不需要 disposeTurnContext，因为 conversation 即将销毁，cache 已无意义。
-    this.conversationSessions.delete(normalized)
-    this.warmupPayloadCache.delete(normalized)
-    // 同步清理这个 conversation 维度的 cachedWsSessions 条目。
-    for (const [key, entry] of this.cachedWsSessions) {
-      if (entry.wsSessionId === normalized) {
-        this.cachedWsSessions.delete(key)
-      }
+    this.turnContexts.deleteConversation(normalized)
+  }
+
+  private async *retryStreamWithFreshTurnContext(
+    request: CodexExecutionRequest,
+    forwardHeaders: CodexForwardHeaders | undefined,
+    abortSignal: AbortSignal | undefined,
+    attempt: number,
+    currentSlot: CodexAccountSlot,
+    retrySlot: CodexAccountSlot,
+    modelName: string,
+    conversationId: string,
+    delayMs: number = 0
+  ): AsyncGenerator<string, void, unknown> {
+    if (conversationId) {
+      this.disposeTurnContext(conversationId, currentSlot, modelName)
     }
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs))
+    }
+    yield* this.executeStreamWithCooldownRetry(
+      request,
+      forwardHeaders,
+      abortSignal,
+      attempt + 1,
+      retrySlot
+    )
   }
 
   private async *executeStreamWithCooldownRetry(
@@ -4867,15 +3793,19 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     // This matches the official Codex CLI ModelClientSession lifecycle:
     //   client.new_session() → turn → Drop → store_cached_websocket_session
     const turnKey = this.getCodexTurnKey(codexRequest)
-    if (conversationId) {
-      this.getOrCreateTurnContext(conversationId, slot, modelName, turnKey)
-    }
+    const turnContext = conversationId
+      ? this.getOrCreateTurnContext(conversationId, slot, modelName, turnKey)
+      : undefined
 
     let emittedEvents = false
 
     try {
-      // Try WebSocket transport first when enabled.
-      if (this.useWebSocket && this.wsService.isWebSocketAvailable()) {
+      // Try WebSocket transport first when enabled for this Codex session.
+      if (
+        this.useWebSocket &&
+        this.wsService.isWebSocketAvailable() &&
+        !this.isHttpFallbackTransport(conversationId, slot, modelName)
+      ) {
         try {
           for await (const event of this.streamViaWebSocket(
             slot,
@@ -4903,13 +3833,21 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             throw abortedError
           }
 
-          if (e instanceof CodexWebSocketUpgradeError) {
-            if (
-              !this.isApiKeyMode(slot) &&
-              this.isDeactivatedWorkspaceError(e.body)
-            ) {
+          const failureAction = resolveCodexWebSocketFailure(e, {
+            isApiKeyMode: this.isApiKeyMode(slot),
+          })
+
+          switch (failureAction.kind) {
+            case "retry_http_without_account":
               this.logger.warn(
                 `[Codex] WebSocket returned deactivated_workspace for ${this.getAccountLabel(slot)}, retrying stream over HTTP without Chatgpt-Account-Id`
+              )
+              this.beginHttpTransportTurn(
+                conversationId,
+                slot,
+                modelName,
+                "WebSocket deactivated_workspace forced HTTP stream retry",
+                true
               )
               for await (const event of this.streamViaHttp(
                 slot,
@@ -4921,38 +3859,58 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
                 this.getConversationId(request),
                 true,
                 forwardHeaders,
-                abortSignal
+                abortSignal,
+                turnContext
               )) {
                 emittedEvents = true
                 yield event
               }
               markAccountSuccess(slot, modelName)
               return
-            }
+            case "fallback_http":
+              if (
+                failureAction.reason === "transport_unavailable" &&
+                emittedEvents
+              ) {
+                throw e
+              }
 
-            if (e.shouldFallbackToHttp()) {
-              this.logger.warn(
-                "WebSocket upgrade rejected, falling back to HTTP for streaming"
+              if (failureAction.reason === "upgrade_rejected") {
+                this.logger.warn(
+                  "WebSocket upgrade rejected, falling back to HTTP for streaming"
+                )
+              } else {
+                this.logger.warn(
+                  `[Codex] WebSocket streaming unavailable, falling back to HTTP: ${e instanceof Error ? e.message : String(e)}`
+                )
+              }
+              this.beginHttpTransportTurn(
+                conversationId,
+                slot,
+                modelName,
+                "WebSocket streaming transport fallback",
+                true
               )
-            } else {
-              throw this.createCodexApiError(
-                e.statusCode || 502,
-                e.body || e.message
+              break
+            case "throw_codex_api_error":
+              throw createCodexApiErrorFromBody(
+                failureAction.statusCode,
+                failureAction.body
               )
-            }
-          } else if (
-            !emittedEvents &&
-            this.shouldFallbackToHttpAfterWebSocketError(e)
-          ) {
-            this.logger.warn(
-              `[Codex] WebSocket streaming unavailable, falling back to HTTP: ${e instanceof Error ? e.message : String(e)}`
-            )
-          } else {
-            throw e
+            case "throw_original":
+              throw e
           }
         }
       }
 
+      this.beginHttpTransportTurn(
+        conversationId,
+        slot,
+        modelName,
+        this.isHttpFallbackTransport(conversationId, slot, modelName)
+          ? "Codex session pinned to HTTP transport"
+          : "WebSocket transport disabled or unavailable"
+      )
       for await (const event of this.streamViaHttp(
         slot,
         token,
@@ -4963,7 +3921,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         this.getConversationId(request),
         false,
         forwardHeaders,
-        abortSignal
+        abortSignal,
+        turnContext
       )) {
         emittedEvents = true
         yield event
@@ -4984,26 +3943,27 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
         // 401/403: 尚未输出任何 event 时，尝试 refresh token 后用同一 slot 重试
         if (
-          (statusCode === 401 || statusCode === 403) &&
-          attempt === 1 &&
-          !emittedEvents &&
-          !this.isApiKeyMode(slot)
+          shouldRefreshCodexTokenForStatus({
+            statusCode,
+            attempt,
+            emittedEvents,
+            isApiKeyMode: this.isApiKeyMode(slot),
+          })
         ) {
           const newToken = await this.tryRefreshSlotToken(
             slot,
             `${statusCode} stream retry`
           )
           if (newToken) {
-            // Dispose current turn context before retry so the inner call gets a fresh one
-            if (conversationId) {
-              this.disposeTurnContext(conversationId, slot, modelName)
-            }
-            yield* this.executeStreamWithCooldownRetry(
+            yield* this.retryStreamWithFreshTurnContext(
               request,
               forwardHeaders,
               abortSignal,
-              attempt + 1,
-              slot
+              attempt,
+              slot,
+              slot,
+              modelName,
+              conversationId
             )
             return
           }
@@ -5016,23 +3976,28 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         // delete_file -> PostToolContinuation 的 503 中断）。
         // 策略：第一次失败时先在同一 slot 上短暂 backoff 后重试一次；
         // 仍然失败再走原有的 cooldown + 跨账号故障转移路径。
-        const isGatewayTransient =
-          statusCode === 502 || statusCode === 503 || statusCode === 504
-        if (isGatewayTransient && !emittedEvents && attempt === 1) {
+        const isGatewayTransient = isCodexGatewayTransientStatus(statusCode)
+        if (
+          shouldRetryCodexGatewayTransientOnSameSlot({
+            statusCode,
+            attempt,
+            emittedEvents,
+          })
+        ) {
           this.logger.warn(
             `[Codex] ${statusCode} transient gateway error on ${this.getAccountLabel(slot)} ` +
               `(${e.message}); retrying same slot once before cooldown`
           )
-          if (conversationId) {
-            this.disposeTurnContext(conversationId, slot, modelName)
-          }
-          await new Promise((resolve) => setTimeout(resolve, 500))
-          yield* this.executeStreamWithCooldownRetry(
+          yield* this.retryStreamWithFreshTurnContext(
             request,
             forwardHeaders,
             abortSignal,
-            attempt + 1,
-            slot
+            attempt,
+            slot,
+            slot,
+            modelName,
+            conversationId,
+            500
           )
           return
         }
@@ -5049,8 +4014,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         // 故障转移；只剩一个账号时就直接落到下面的 throw 让上层处理
         if (
           isGatewayTransient &&
-          !emittedEvents &&
-          attempt < this.accounts.length
+          shouldFailOverCodexAccountForStatus({
+            statusCode,
+            attempt,
+            emittedEvents,
+            accountCount: this.accounts.length,
+            includeGatewayTransient: true,
+          })
         ) {
           const nextSlot = this.pickNextAvailableAccount(modelName)
           if (nextSlot && nextSlot !== slot) {
@@ -5059,15 +4029,15 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
                 `failing over to ${this.getAccountLabel(nextSlot)} ` +
                 `(attempt ${attempt + 1}/${this.accounts.length})`
             )
-            if (conversationId) {
-              this.disposeTurnContext(conversationId, slot, modelName)
-            }
-            yield* this.executeStreamWithCooldownRetry(
+            yield* this.retryStreamWithFreshTurnContext(
               request,
               forwardHeaders,
               abortSignal,
-              attempt + 1,
-              nextSlot
+              attempt,
+              slot,
+              nextSlot,
+              modelName,
+              conversationId
             )
             return
           }
@@ -5075,9 +4045,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
         // 401/403: refresh 失败后，尝试用下一个可用账号重试（跨 slot 故障转移）
         if (
-          (statusCode === 401 || statusCode === 403) &&
-          !emittedEvents &&
-          attempt < this.accounts.length
+          isCodexAuthRetryStatus(statusCode) &&
+          shouldFailOverCodexAccountForStatus({
+            statusCode,
+            attempt,
+            emittedEvents,
+            accountCount: this.accounts.length,
+          })
         ) {
           const nextSlot = this.pickNextAvailableAccount(modelName)
           if (nextSlot && nextSlot !== slot) {
@@ -5086,16 +4060,15 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
                 `falling over to ${this.getAccountLabel(nextSlot)} ` +
                 `(attempt ${attempt + 1}/${this.accounts.length})`
             )
-            // Dispose current turn context before failover to different slot
-            if (conversationId) {
-              this.disposeTurnContext(conversationId, slot, modelName)
-            }
-            yield* this.executeStreamWithCooldownRetry(
+            yield* this.retryStreamWithFreshTurnContext(
               request,
               forwardHeaders,
               abortSignal,
-              attempt + 1,
-              nextSlot
+              attempt,
+              slot,
+              nextSlot,
+              modelName,
+              conversationId
             )
             return
           }
@@ -5103,25 +4076,28 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
         // Auto-retry on 429 if another account is available
         if (
-          statusCode === 429 &&
-          attempt < this.accounts.length &&
-          !emittedEvents
+          isCodexRateLimitRetryStatus(statusCode) &&
+          shouldFailOverCodexAccountForStatus({
+            statusCode,
+            attempt,
+            emittedEvents,
+            accountCount: this.accounts.length,
+          })
         ) {
           const nextSlot = this.pickNextAvailableAccount(modelName)
           if (nextSlot && nextSlot !== slot) {
             this.logger.log(
               `[Codex] 429 on ${this.getAccountLabel(slot)}, retrying streamed request with ${this.getAccountLabel(nextSlot)} (attempt ${attempt + 1}/${this.accounts.length})`
             )
-            // Dispose current turn context before failover to different slot
-            if (conversationId) {
-              this.disposeTurnContext(conversationId, slot, modelName)
-            }
-            yield* this.executeStreamWithCooldownRetry(
+            yield* this.retryStreamWithFreshTurnContext(
               request,
               forwardHeaders,
               abortSignal,
-              attempt + 1,
-              nextSlot
+              attempt,
+              slot,
+              nextSlot,
+              modelName,
+              conversationId
             )
             return
           }
@@ -5151,23 +4127,41 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     conversationId?: string,
     omitAccountId: boolean = false,
     forwardHeaders?: CodexForwardHeaders,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    turnContext?: CodexTurnContext
   ): AsyncGenerator<string, void, unknown> {
     const requestStartedAt = Date.now()
-    const requestBody = JSON.stringify(codexRequest)
+    const preparedCodexRequest = prepareCodexRequestForSend(codexRequest)
+    const requestBody = JSON.stringify(preparedCodexRequest)
     const url = this.buildUrl(slot, "responses")
     const cacheHeaders = this.cacheService.buildHttpCacheHeaders(cacheId)
     const headers = this.buildHeaders(slot, token, true, cacheHeaders, {
       conversationId,
       omitAccountId,
       forwardHeaders,
+      clientMetadata: this.getCodexRequestClientMetadata(codexRequest),
+      useResponsesLite: this.usesResponsesLite(modelName),
     })
+    this.applyCodexTurnStateHeader(headers, turnContext)
 
     this.logger.log(
-      `[Codex][Dispatch] slot=${this.getAccountLabel(slot)} model=${modelName} transport=http-stream omitAccountId=${omitAccountId} accountId=${JSON.stringify(this.getSlotAccountId(slot) || null)} workspaceId=${JSON.stringify(slot.workspaceId || null)} orgHeader=${JSON.stringify(headers["OpenAI-Organization"] || null)} accountHeader=${JSON.stringify(headers["Chatgpt-Account-Id"] || null)}`
+      buildCodexDispatchLogLine({
+        slotLabel: this.getAccountLabel(slot),
+        modelName,
+        transport: "http-stream",
+        omitAccountId,
+        accountId: this.getSlotAccountId(slot),
+        workspaceId: slot.workspaceId,
+        headers,
+      })
     )
     this.logger.log(
-      `[Codex] Stream request: model=${modelName}, url=${url}, reasoning=${JSON.stringify((codexRequest as { reasoning?: unknown }).reasoning ?? null)}, service_tier=${JSON.stringify((codexRequest as { service_tier?: unknown }).service_tier ?? null)}`
+      buildCodexHttpRequestLogLine({
+        kind: "stream",
+        modelName,
+        url,
+        codexRequest: preparedCodexRequest,
+      })
     )
 
     const requestSignal = createAbortSignalWithTimeout(600_000, abortSignal)
@@ -5197,30 +4191,40 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           `[Codex] Stream request failed: status=${response.status}, body=${errorBody.slice(0, 500)}`
         )
 
-        if (
-          !omitAccountId &&
-          !this.isApiKeyMode(slot) &&
-          this.isDeactivatedWorkspaceError(errorBody)
-        ) {
-          this.logger.warn(
-            `[Codex] deactivated_workspace for ${this.getAccountLabel(slot)}, retrying stream without Chatgpt-Account-Id`
-          )
-          yield* this.streamViaHttp(
-            slot,
-            token,
-            codexRequest,
-            modelName,
-            reverseToolMap,
-            cacheId,
-            conversationId,
-            true,
-            forwardHeaders,
-            abortSignal
-          )
-          return
-        }
+        const failureAction = resolveCodexHttpErrorResponse(
+          response.status,
+          errorBody,
+          {
+            omitAccountId,
+            isApiKeyMode: this.isApiKeyMode(slot),
+          }
+        )
 
-        throw this.createCodexApiError(response.status, errorBody)
+        switch (failureAction.kind) {
+          case "retry_http_without_account":
+            this.logger.warn(
+              `[Codex] deactivated_workspace for ${this.getAccountLabel(slot)}, retrying stream without Chatgpt-Account-Id`
+            )
+            yield* this.streamViaHttp(
+              slot,
+              token,
+              codexRequest,
+              modelName,
+              reverseToolMap,
+              cacheId,
+              conversationId,
+              true,
+              forwardHeaders,
+              abortSignal,
+              turnContext
+            )
+            return
+          case "throw_codex_api_error":
+            throw createCodexApiErrorFromBody(
+              failureAction.statusCode,
+              failureAction.body
+            )
+        }
       }
 
       if (!response.body) {
@@ -5234,6 +4238,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         modelName,
         "request"
       )
+      this.captureCodexTurnStateFromHttpHeaders(turnContext, response.headers)
 
       // Stream SSE events
       const reader = response.body.getReader()
@@ -5261,7 +4266,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             for (const line of lines) {
               const trimmed = line.trim()
               if (!trimmed) continue
-              const payload = this.parseCodexSsePayload(trimmed)
+              const payload = parseCodexSsePayload(trimmed)
+              this.captureCodexTurnStateFromSsePayload(turnContext, payload)
 
               if (
                 firstUpstreamMs === undefined &&
@@ -5310,7 +4316,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
         // Process remaining buffer
         if (buffer.trim()) {
-          const payload = this.parseCodexSsePayload(buffer.trim())
+          const payload = parseCodexSsePayload(buffer.trim())
+          this.captureCodexTurnStateFromSsePayload(turnContext, payload)
           if (
             firstUpstreamMs === undefined &&
             typeof payload?.type === "string"
@@ -5423,20 +4430,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       this.getSlotAccountId(slot),
       slot.workspaceId,
       cacheHeaders,
-      forwardHeaders
+      forwardHeaders,
+      false,
+      this.usesResponsesLite(modelName),
+      this.getCodexRequestClientMetadata(codexRequest)
     )
     this.applyCodexTurnStateHeader(wsHeaders, turnContext)
     const sessionId = turnContext?.wsSessionId || ""
-    // P0.3 prewarm 配置：每个 turn 完成后用它在 turn 间隙异步起新连接，下个
-    // turn 进入 ensureSessionConnection 时直接命中 OPEN 连接、零握手。
-    // streamViaWebSocketConnection 内部用 (responseCompleted && sessionId)
-    // 守卫，无 sessionId 路径自然不会触发 prewarm。
-    const prewarmConfig = {
-      wsUrl,
-      wsHeaders,
-      proxyUrl: slot.proxyUrl || undefined,
-    }
-
     if (!sessionId) {
       const ws = await this.wsService.connect(
         wsUrl,
@@ -5455,7 +4455,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         "",
         abortSignal,
         conversationId,
-        prewarmConfig
+        forwardHeaders,
+        turnContext
       )
       return
     }
@@ -5477,16 +4478,18 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       )
       this.captureCodexTurnStateFromConnection(turnContext, ws)
 
-      if (!hadOpenConnection && turnContext?.lastResponse?.responseId) {
-        this.logger.debug(
-          `[Codex][TurnContext] WebSocket connection rebuilt before request for ${conversationId}; ` +
-            `preserving response chain previous_response_id=${turnContext.lastResponse.responseId}`
+      if (!hadOpenConnection) {
+        this.recordTurnContextTransportReconnect(
+          conversationId,
+          slot,
+          modelName,
+          "WebSocket connection rebuilt before request"
         )
       }
 
       // NOW inject previous_response_id — only after a usable socket exists.
-      // The response chain survives transport reconnects; only transcript
-      // rewrites/static request changes/server stale-id rejections reset it.
+      // Fresh transports clear continuation first, matching official Codex's
+      // websocket_connection() reset of last_request/last_response.
       const originalCodexRequest = codexRequest
       if (turnContext && conversationId) {
         codexRequest = this.prepareRequestWithTurnContext(
@@ -5498,14 +4501,29 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
       try {
         this.logger.log(
-          `[Codex][Dispatch] slot=${this.getAccountLabel(slot)} model=${modelName} transport=websocket-stream omitAccountId=false accountId=${JSON.stringify(this.getSlotAccountId(slot) || null)} workspaceId=${JSON.stringify(slot.workspaceId || null)} orgHeader=${JSON.stringify(wsHeaders["OpenAI-Organization"] || null)} accountHeader=${JSON.stringify(wsHeaders["Chatgpt-Account-Id"] || null)}`
+          buildCodexDispatchLogLine({
+            slotLabel: this.getAccountLabel(slot),
+            modelName,
+            transport: "websocket-stream",
+            omitAccountId: false,
+            accountId: this.getSlotAccountId(slot),
+            workspaceId: slot.workspaceId,
+            headers: wsHeaders,
+          })
         )
         this.logger.log(
           `[Codex] WebSocket stream request: model=${modelName}, url=${wsUrl}`
         )
         this.logger.debug(
-          `[Codex][WS Request] ${this.summarizeCodexRequestForLogs(
-            this.wsService.buildWebSocketRequestBody(codexRequest)
+          `[Codex][WS Request] ${summarizeCodexRequestForLogs(
+            this.wsService.buildWebSocketRequestBody(
+              prepareCodexRequestForSend(codexRequest),
+              {
+                useResponsesLite: this.usesResponsesLite(modelName),
+                forwardHeaders,
+                turnState: turnContext?.turnState,
+              }
+            )
           )}`
         )
 
@@ -5520,7 +4538,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           sessionId,
           abortSignal,
           conversationId,
-          prewarmConfig
+          forwardHeaders,
+          turnContext
         )
         return
       } catch (error) {
@@ -5529,9 +4548,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         // input (no previous_response_id). This commonly happens when parallel
         // tool calls take long enough for the server-side session to expire.
         if (
-          conversationId &&
-          this.isStaleResponseIdError(error) &&
-          codexRequest !== originalCodexRequest
+          shouldReplayCodexRequestWithoutPreviousResponseId(error, {
+            conversationId,
+            currentRequest: codexRequest,
+            originalRequest: originalCodexRequest,
+          })
         ) {
           this.logger.warn(
             `[Codex] Previous response_id rejected by server for ${conversationId}, ` +
@@ -5573,12 +4594,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             sessionId,
             abortSignal,
             conversationId,
-            prewarmConfig
+            forwardHeaders,
+            turnContext
           )
           return
         }
 
-        if (!this.shouldRetrySessionWebSocketError(error)) {
+        if (!shouldRetryCodexSessionWebSocketError(error)) {
           throw error
         }
 
@@ -5606,13 +4628,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             sessionId,
             abortSignal,
             conversationId,
-            prewarmConfig
+            forwardHeaders,
+            turnContext
           )
         } catch (retryError) {
           if (
-            conversationId &&
-            this.isStaleResponseIdError(retryError) &&
-            codexRequest !== originalCodexRequest
+            shouldReplayCodexRequestWithoutPreviousResponseId(retryError, {
+              conversationId,
+              currentRequest: codexRequest,
+              originalRequest: originalCodexRequest,
+            })
           ) {
             this.logger.warn(
               `[Codex] Previous response_id rejected by server for ${conversationId} after WebSocket retry, ` +
@@ -5648,7 +4673,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
               sessionId,
               abortSignal,
               conversationId,
-              prewarmConfig
+              forwardHeaders,
+              turnContext
             )
             return
           }
@@ -5671,11 +4697,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     sessionId: string,
     abortSignal?: AbortSignal,
     conversationId?: string,
-    prewarm?: {
-      wsUrl: string
-      wsHeaders: Record<string, string>
-      proxyUrl?: string
-    }
+    forwardHeaders?: CodexForwardHeaders,
+    turnContext?: CodexTurnContext
   ): AsyncGenerator<string, void, unknown> {
     const state = createStreamState()
     const itemsAdded: CodexInputItem[] = []
@@ -5701,29 +4724,38 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
 
       abortSignal?.addEventListener("abort", onAbort, { once: true })
-      const wsBody = this.wsService.buildWebSocketRequestBody(codexRequest)
+      const wsBody = this.wsService.buildWebSocketRequestBody(
+        prepareCodexRequestForSend(codexRequest),
+        {
+          useResponsesLite: this.usesResponsesLite(modelName),
+          forwardHeaders,
+          streamRequestStartMs: Date.now(),
+          turnState: turnContext?.turnState,
+        }
+      )
 
       for await (const msg of this.wsService.streamViaWebSocket(ws, wsBody)) {
+        this.captureCodexTurnStateFromSsePayload(
+          turnContext,
+          msg as Record<string, unknown>
+        )
+
         if (msg.type === "response.output_item.done") {
-          const item = this.convertResponseOutputItemToInputItem(
+          appendCodexResponseOutputItemToLedger(
+            itemsAdded,
             (msg as Record<string, unknown>).item as
               | Record<string, unknown>
               | undefined
           )
-          if (item) {
-            itemsAdded.push(item)
-          }
         }
 
         if (msg.type === "response.completed") {
           responseCompleted = true
           // Mirrors map_response_stream() ResponseEvent::Completed → LastResponse.
           if (conversationId && sessionId) {
-            const response = (msg as Record<string, unknown>).response as
-              | Record<string, unknown>
-              | undefined
-            const capturedId =
-              typeof response?.id === "string" ? response.id : ""
+            const capturedId = getCodexCompletedResponseId(
+              msg as Record<string, unknown>
+            )
             if (capturedId) {
               this.captureResponseInTurnContext(
                 conversationId,
@@ -5790,20 +4822,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
     }
 
-    // P0.3 prewarm：response.completed 之后服务端通常以 code=1005 关连接，下个
-    // turn 必须重新握手（约 1s）。在 turn 结束的"间隙"异步起一条新 WS 挂回 session，
-    // 下个 turn 进入 ensureSessionConnection 时直接命中 OPEN 连接、零握手。
-    // 仅在 responseCompleted 且仍持有 sessionId / prewarm 配置时触发。
-    if (responseCompleted && sessionId && prewarm) {
-      void this.wsService.schedulePrewarmConnection(
-        sessionId,
-        prewarm.wsUrl,
-        prewarm.wsHeaders,
-        prewarm.proxyUrl,
-        ws
-      )
-    }
-
     const totalMs = Date.now() - requestStartedAt
     // 结构化 turn timing：grep '[Codex][TurnTiming]' 即可拉出每个 turn 的耗时分布
     this.logger.log(
@@ -5834,8 +4852,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     source: CodexRateLimitSource
   ): void {
     try {
-      const primary = this.parseRateLimitWindow(headers, "primary")
-      const secondary = this.parseRateLimitWindow(headers, "secondary")
+      const { primary, secondary } = parseCodexRateLimitHeaders(headers)
 
       if (!primary && !secondary) {
         return
@@ -5860,10 +4877,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       const label = this.getAccountLabel(slot)
       const parts: string[] = []
       if (primary) {
-        parts.push(this.formatRateLimitWindow("primary", primary))
+        parts.push(formatCodexRateLimitWindow("primary", primary))
       }
       if (secondary) {
-        parts.push(this.formatRateLimitWindow("secondary", secondary))
+        parts.push(formatCodexRateLimitWindow("secondary", secondary))
       }
       const sourceLabel = source === "request" ? "live" : "healthcheck"
       const message = `[Codex][RateLimit] ${label}: model=${normalizedModel}, source=${sourceLabel}, ${parts.join(", ")}`
@@ -5878,53 +4895,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
     } catch {
       // Non-critical: silently ignore parse failures
-    }
-  }
-
-  private formatRateLimitWindow(
-    tier: "primary" | "secondary",
-    window: CodexRateLimitWindow
-  ): string {
-    const left = Math.max(0, 100 - window.usedPercent).toFixed(0)
-    const windowMinutes =
-      typeof window.windowMinutes === "number" &&
-      Number.isFinite(window.windowMinutes)
-        ? `${window.windowMinutes}m`
-        : "unknown"
-    const resetAt =
-      typeof window.resetsAt === "number" && Number.isFinite(window.resetsAt)
-        ? new Date(window.resetsAt * 1000).toISOString()
-        : "unknown"
-
-    return `${tier}=${left}% left (window=${windowMinutes}, resetAt=${resetAt})`
-  }
-
-  private parseRateLimitWindow(
-    headers: Headers,
-    tier: "primary" | "secondary"
-  ): CodexRateLimitWindow | null {
-    const usedPercentStr = headers.get(`x-codex-${tier}-used-percent`)
-    if (!usedPercentStr) {
-      return null
-    }
-
-    const usedPercent = parseFloat(usedPercentStr)
-    if (!Number.isFinite(usedPercent)) {
-      return null
-    }
-
-    const windowMinutesStr = headers.get(`x-codex-${tier}-window-minutes`)
-    const windowMinutes = windowMinutesStr
-      ? parseInt(windowMinutesStr, 10)
-      : null
-
-    const resetsAtStr = headers.get(`x-codex-${tier}-reset-at`)
-    const resetsAt = resetsAtStr ? parseInt(resetsAtStr, 10) : null
-
-    return {
-      usedPercent,
-      windowMinutes: Number.isFinite(windowMinutes) ? windowMinutes : null,
-      resetsAt: Number.isFinite(resetsAt) ? resetsAt : null,
     }
   }
 

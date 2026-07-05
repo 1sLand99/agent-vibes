@@ -1,6 +1,11 @@
 import { Injectable, Logger } from "@nestjs/common"
 import { createHash } from "crypto"
 import { ContextAttachmentSnapshot } from "./context-attachment-builder.service"
+import {
+  processCodexMessageContent,
+  truncateCodexTextByBytes,
+} from "./codex-context-content-policy"
+import { orderCodexMetaMessagesBeforeTranscript } from "./codex-context-message-policy"
 import { ContextCollapseService } from "./context-collapse.service"
 import {
   ContextCompactionCandidate,
@@ -20,6 +25,8 @@ import {
   CodexRawResponseItemBlock,
   CodexReferenceContextItem,
   ContextCollapseCommit,
+  CodexMetaMessageLedgerEntry,
+  CodexMetaMessageLedgerState,
   CodexReplacementHistoryItem,
   CodexTruncationPolicy,
   ContextConversationState,
@@ -181,6 +188,7 @@ export class CodexContextAdapterService {
     const compactMessages = this.projectCodexMessages(state, sourceMessages, {
       maxTokens: options.maxTokens,
       systemPromptTokens: options.systemPromptTokens,
+      truncationPolicy: options.referenceContextItem.truncationPolicy,
     })
     const compactResult = await options.remoteCompactProvider({
       messages: compactMessages,
@@ -282,6 +290,7 @@ export class CodexContextAdapterService {
     const compactMessages = this.projectCodexMessages(state, sourceMessages, {
       maxTokens: options.maxTokens,
       systemPromptTokens: options.systemPromptTokens,
+      truncationPolicy: options.referenceContextItem.truncationPolicy,
     })
     const compactResult = await options.remoteCompactProvider({
       messages: compactMessages,
@@ -321,9 +330,11 @@ export class CodexContextAdapterService {
       maxTokens: number
       systemPromptTokens: number
       pendingToolUseIds?: Iterable<string>
+      truncationPolicy?: CodexTruncationPolicy
     }
   ): UnifiedMessage[] {
     const codex = this.ensureState(state)
+    const truncationPolicy = options.truncationPolicy || codex.truncationPolicy
     let messages = baseMessages
     const replacement = codex.replacementHistory
     if (replacement?.items?.length) {
@@ -342,7 +353,10 @@ export class CodexContextAdapterService {
       }
     }
 
-    messages = this.prepareMessagesForCodex(messages, codex.truncationPolicy)
+    messages = this.projectAppendOnlyLiveMetaMessages(
+      codex,
+      this.prepareMessagesForCodex(messages, truncationPolicy)
+    )
     const hardMaxTokens = Math.max(
       256,
       options.maxTokens - options.systemPromptTokens
@@ -356,7 +370,7 @@ export class CodexContextAdapterService {
       hardMaxTokens,
       { mode: "global" }
     )
-    return this.prepareMessagesForCodex(retained, codex.truncationPolicy)
+    return retained
   }
 
   prepareMessagesForCodex(
@@ -365,7 +379,7 @@ export class CodexContextAdapterService {
   ): UnifiedMessage[] {
     return messages.map((message) => ({
       ...message,
-      content: this.processContentForCodex(message.content, policy),
+      content: processCodexMessageContent(message.content, policy),
     })) as UnifiedMessage[]
   }
 
@@ -467,7 +481,7 @@ export class CodexContextAdapterService {
         .filter((text) => text.trim().length > 0)
         .join("\n\n")
         .trim() || "(no summary available)"
-    return `${CODEX_SUMMARY_PREFIX}\n${this.truncateTextByBytes(body, 32_000)}`
+    return `${CODEX_SUMMARY_PREFIX}\n${truncateCodexTextByBytes(body, 32_000)}`
   }
 
   private replacementHistoryToMessages(
@@ -491,6 +505,235 @@ export class CodexContextAdapterService {
       if (!text) return []
       return [{ role, content: text } satisfies UnifiedMessage]
     })
+  }
+
+  private projectAppendOnlyLiveMetaMessages(
+    codex: CodexContextState,
+    messages: UnifiedMessage[]
+  ): UnifiedMessage[] {
+    const liveMetaMessages: Array<{
+      key: string
+      message: UnifiedMessage
+    }> = []
+    const visibleMessages: UnifiedMessage[] = []
+    const liveMetaOrdinalsByKind = new Map<string, number>()
+
+    for (let index = 0; index < messages.length; index++) {
+      const message = messages[index]!
+      if (this.isAppendOnlyLiveMetaMessage(message)) {
+        const kind = message.attachmentKind || "attachment"
+        const ordinal = liveMetaOrdinalsByKind.get(kind) || 0
+        liveMetaOrdinalsByKind.set(kind, ordinal + 1)
+        liveMetaMessages.push({
+          key: this.buildLiveMetaMessageKey(message, ordinal),
+          message,
+        })
+      } else {
+        visibleMessages.push(message)
+      }
+    }
+
+    if (
+      liveMetaMessages.length === 0 &&
+      !codex.metaMessageLedger?.messages.length
+    ) {
+      return orderCodexMetaMessagesBeforeTranscript(messages)
+    }
+
+    const orderedVisible =
+      orderCodexMetaMessagesBeforeTranscript(visibleMessages)
+    const ledger = this.ensureMetaMessageLedger(codex)
+    const insertionIndex = ledger.initialized
+      ? this.findCurrentTurnInsertionIndex(orderedVisible)
+      : 0
+    const currentByKey = new Map(
+      liveMetaMessages.map((entry) => [entry.key, entry])
+    )
+    const pending: CodexMetaMessageLedgerEntry[] = []
+
+    if (!ledger.initialized) {
+      for (const { key, message } of liveMetaMessages) {
+        pending.push(this.anchorLiveMetaMessage(key, message, insertionIndex))
+      }
+    } else {
+      for (const [key, signature] of Object.entries(
+        ledger.latestSignaturesByKey
+      )) {
+        if (currentByKey.has(key)) {
+          continue
+        }
+        pending.push(
+          this.anchorRemovedLiveMetaMessage(
+            key,
+            signature,
+            ledger.latestKindsByKey[key],
+            insertionIndex
+          )
+        )
+      }
+
+      for (const { key, message } of liveMetaMessages) {
+        const signature = this.signLiveMetaMessage(key, message)
+        if (ledger.latestSignaturesByKey[key] === signature) {
+          continue
+        }
+        pending.push(this.anchorLiveMetaMessage(key, message, insertionIndex))
+      }
+    }
+
+    if (!ledger.initialized || pending.length > 0) {
+      ledger.messages.push(...pending)
+      ledger.initialized = true
+      ledger.latestSignaturesByKey = Object.fromEntries(
+        liveMetaMessages.map(({ key, message }) => [
+          key,
+          this.signLiveMetaMessage(key, message),
+        ])
+      )
+      ledger.latestKindsByKey = Object.fromEntries(
+        liveMetaMessages.map(({ key, message }) => [
+          key,
+          message.attachmentKind || "investigation_memory",
+        ])
+      )
+    }
+
+    return this.mergeAnchoredMetaMessages(ledger.messages, orderedVisible)
+  }
+
+  private ensureMetaMessageLedger(
+    codex: CodexContextState
+  ): CodexMetaMessageLedgerState {
+    if (!codex.metaMessageLedger) {
+      codex.metaMessageLedger = {
+        initialized: false,
+        messages: [],
+        latestSignaturesByKey: {},
+        latestKindsByKey: {},
+      }
+    }
+    return codex.metaMessageLedger
+  }
+
+  private isAppendOnlyLiveMetaMessage(message: UnifiedMessage): boolean {
+    return (
+      message.role === "user" &&
+      message.isMeta === true &&
+      message.source === "attachment" &&
+      !this.getMessageRecordId(message) &&
+      !this.messageContainsToolResult(message)
+    )
+  }
+
+  private messageContainsToolResult(message: UnifiedMessage): boolean {
+    return (
+      Array.isArray(message.content) &&
+      message.content.some((block) => block?.type === "tool_result")
+    )
+  }
+
+  private buildLiveMetaMessageKey(
+    message: UnifiedMessage,
+    ordinal: number
+  ): string {
+    const kind = message.attachmentKind || "attachment"
+    return `attachment:${kind}:${ordinal}`
+  }
+
+  private anchorLiveMetaMessage(
+    key: string,
+    message: UnifiedMessage,
+    beforeVisibleIndex: number
+  ): CodexMetaMessageLedgerEntry {
+    return {
+      key,
+      signature: this.signLiveMetaMessage(key, message),
+      beforeVisibleIndex,
+      role: "user",
+      content: message.content,
+      source: message.source,
+      isMeta: message.isMeta,
+      attachmentKind: message.attachmentKind,
+    }
+  }
+
+  private anchorRemovedLiveMetaMessage(
+    key: string,
+    previousSignature: string,
+    kind: CodexMetaMessageLedgerEntry["attachmentKind"],
+    beforeVisibleIndex: number
+  ): CodexMetaMessageLedgerEntry {
+    return {
+      key,
+      signature: `removed:${previousSignature}`,
+      beforeVisibleIndex,
+      role: "user",
+      content: `[Context attachment removed: ${kind || "attachment"}]`,
+      source: "attachment",
+      isMeta: true,
+      attachmentKind: kind,
+    }
+  }
+
+  private signLiveMetaMessage(key: string, message: UnifiedMessage): string {
+    return this.hashStable({
+      key,
+      role: message.role,
+      source: message.source,
+      attachmentKind: message.attachmentKind,
+      content: message.content,
+    })
+  }
+
+  private mergeAnchoredMetaMessages(
+    metaMessages: CodexMetaMessageLedgerEntry[],
+    visibleMessages: UnifiedMessage[]
+  ): UnifiedMessage[] {
+    const byIndex = new Map<number, CodexMetaMessageLedgerEntry[]>()
+    for (const message of metaMessages) {
+      const index = Math.max(
+        0,
+        Math.min(message.beforeVisibleIndex, visibleMessages.length)
+      )
+      const existing = byIndex.get(index)
+      if (existing) {
+        existing.push(message)
+      } else {
+        byIndex.set(index, [message])
+      }
+    }
+
+    const merged: UnifiedMessage[] = []
+    for (let index = 0; index <= visibleMessages.length; index++) {
+      for (const message of byIndex.get(index) ?? []) {
+        merged.push({
+          role: message.role,
+          content: message.content as UnifiedMessage["content"],
+          source: message.source,
+          isMeta: message.isMeta,
+          attachmentKind: message.attachmentKind,
+        })
+      }
+      const visible = visibleMessages[index]
+      if (visible) {
+        merged.push(visible)
+      }
+    }
+    return merged
+  }
+
+  private findCurrentTurnInsertionIndex(messages: UnifiedMessage[]): number {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      if (messages[index]?.role === "user") {
+        return index
+      }
+    }
+    return messages.length
+  }
+
+  private getMessageRecordId(message: UnifiedMessage): string {
+    const recordId = (message as unknown as { recordId?: unknown }).recordId
+    return typeof recordId === "string" ? recordId : ""
   }
 
   private recordsAfterReplacementAnchor(
@@ -525,172 +768,6 @@ export class CodexContextAdapterService {
     item: CodexReplacementHistoryItem
   ): CodexReplacementHistoryItem {
     return JSON.parse(JSON.stringify(item)) as CodexReplacementHistoryItem
-  }
-
-  private processContentForCodex(
-    content: LooseMessageContent,
-    policy: CodexTruncationPolicy
-  ): LooseMessageContent {
-    if (typeof content === "string") {
-      return content
-    }
-    if (!Array.isArray(content)) {
-      return content
-    }
-
-    return content.flatMap((block) => {
-      if (!block || typeof block !== "object") return []
-      if (block.type === "image") {
-        return []
-      }
-      if (block.type !== "tool_result") {
-        return [{ ...block }]
-      }
-      const nextBlock = { ...block } as Record<string, unknown>
-      nextBlock.content = this.truncateToolResultContent(
-        nextBlock.content,
-        policy
-      )
-      return [nextBlock]
-    }) as LooseMessageContent
-  }
-
-  private truncateToolResultContent(
-    content: unknown,
-    policy: CodexTruncationPolicy
-  ): unknown {
-    if (typeof content === "string") {
-      return this.truncateTextWithMarker(content, policy)
-    }
-    if (!Array.isArray(content)) {
-      return content
-    }
-    return content.flatMap((part) => {
-      if (!part || typeof part !== "object") return []
-      const record = { ...(part as Record<string, unknown>) }
-      if (record.type === "image") return []
-      if (record.type === "text" && typeof record.text === "string") {
-        record.text = this.truncateTextWithMarker(record.text, policy)
-      }
-      return [record]
-    })
-  }
-
-  private truncateTextWithMarker(
-    text: string,
-    policy: CodexTruncationPolicy
-  ): string {
-    return policy.mode === "tokens"
-      ? this.truncateTextByTokens(text, policy.limit)
-      : this.truncateTextByBytes(text, policy.limit)
-  }
-
-  private truncateTextByTokens(text: string, maxTokens: number): string {
-    const limit = Math.max(0, Math.floor(maxTokens * 4))
-    return this.truncateTextWithByteEstimate(text, limit, true)
-  }
-
-  private truncateTextByBytes(text: string, maxBytes: number): string {
-    return this.truncateTextWithByteEstimate(
-      text,
-      Math.max(0, Math.floor(maxBytes)),
-      false
-    )
-  }
-
-  private truncateTextWithByteEstimate(
-    text: string,
-    maxBytes: number,
-    useTokens: boolean
-  ): string {
-    if (!text) return ""
-    const totalBytes = Buffer.byteLength(text, "utf8")
-    const totalChars = Array.from(text).length
-    if (maxBytes > 0 && totalBytes <= maxBytes) return text
-    if (maxBytes === 0) {
-      return this.formatTruncationMarker(
-        useTokens,
-        this.removedUnits(useTokens, totalBytes, totalChars)
-      )
-    }
-
-    const leftBudget = Math.floor(maxBytes / 2)
-    const rightBudget = maxBytes - leftBudget
-    const { removedChars, prefix, suffix } = this.splitStringByUtf8Budget(
-      text,
-      leftBudget,
-      rightBudget
-    )
-    const marker = this.formatTruncationMarker(
-      useTokens,
-      this.removedUnits(
-        useTokens,
-        Math.max(0, totalBytes - maxBytes),
-        removedChars
-      )
-    )
-    return `${prefix}${marker}${suffix}`
-  }
-
-  private splitStringByUtf8Budget(
-    text: string,
-    beginningBytes: number,
-    endBytes: number
-  ): { removedChars: number; prefix: string; suffix: string } {
-    if (!text) return { removedChars: 0, prefix: "", suffix: "" }
-    const totalBytes = Buffer.byteLength(text, "utf8")
-    const tailStartTarget = Math.max(0, totalBytes - endBytes)
-    let prefixEnd = 0
-    let suffixStart = text.length
-    let removedChars = 0
-    let suffixStarted = false
-    let byteOffset = 0
-    let codeUnitOffset = 0
-
-    for (const char of text) {
-      const charBytes = Buffer.byteLength(char, "utf8")
-      const charStart = byteOffset
-      const charEnd = byteOffset + charBytes
-      const nextCodeUnitOffset = codeUnitOffset + char.length
-      if (charEnd <= beginningBytes) {
-        prefixEnd = nextCodeUnitOffset
-      } else if (charStart >= tailStartTarget) {
-        if (!suffixStarted) {
-          suffixStart = codeUnitOffset
-          suffixStarted = true
-        }
-      } else {
-        removedChars++
-      }
-      byteOffset = charEnd
-      codeUnitOffset = nextCodeUnitOffset
-    }
-
-    if (suffixStart < prefixEnd) {
-      suffixStart = prefixEnd
-    }
-    return {
-      removedChars,
-      prefix: text.slice(0, prefixEnd),
-      suffix: text.slice(suffixStart),
-    }
-  }
-
-  private formatTruncationMarker(
-    useTokens: boolean,
-    removedCount: number
-  ): string {
-    return useTokens
-      ? `…${removedCount} tokens truncated…`
-      : `…${removedCount} chars truncated…`
-  }
-
-  private removedUnits(
-    useTokens: boolean,
-    removedBytes: number,
-    removedChars: number
-  ): number {
-    return useTokens ? Math.ceil(removedBytes / 4) : removedChars
   }
 
   private extractResponseItemText(item: CodexReplacementHistoryItem): string {

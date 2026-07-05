@@ -339,7 +339,11 @@ export function translateCodexSseEvent(
         break
       }
 
-      if (item.type !== "function_call" && item.type !== "custom_tool_call") {
+      if (
+        item.type !== "function_call" &&
+        item.type !== "custom_tool_call" &&
+        item.type !== "tool_search_call"
+      ) {
         break
       }
 
@@ -348,7 +352,10 @@ export function translateCodexSseEvent(
       state.hasReceivedArgumentsDelta = false
 
       // Restore original tool name if shortened
-      let name = (item.name as string) || ""
+      let name =
+        item.type === "tool_search_call"
+          ? "tool_search"
+          : (item.name as string) || ""
       const original = reverseToolMap.get(name)
       if (original) name = original
 
@@ -540,8 +547,30 @@ export function translateCodexSseEvent(
         break
       }
 
-      if (item.type !== "function_call" && item.type !== "custom_tool_call") {
+      if (
+        item.type !== "function_call" &&
+        item.type !== "custom_tool_call" &&
+        item.type !== "tool_search_call"
+      ) {
         break
+      }
+
+      if (item.type === "tool_search_call") {
+        const args = item.arguments
+        const rawInput =
+          typeof args === "string" ? args : JSON.stringify(args || {})
+        if (rawInput) {
+          results.push(
+            formatSseEvent("content_block_delta", {
+              type: "content_block_delta",
+              index: state.blockIndex,
+              delta: {
+                type: "input_json_delta",
+                partial_json: rawInput,
+              },
+            })
+          )
+        }
       }
 
       // custom_tool_call：透传原始 input，不做 patch 包装。
@@ -778,6 +807,32 @@ export function translateCodexToClaudeNonStream(
             type: "tool_use",
             id: sanitizeClaudeToolId((item.call_id as string) || ""),
             name,
+            input,
+          })
+          break
+        }
+
+        case "tool_search_call": {
+          hasToolCall = true
+          let input: Record<string, unknown> = {}
+          const args = item.arguments
+          if (typeof args === "string") {
+            try {
+              const parsed = JSON.parse(args) as Record<string, unknown>
+              if (typeof parsed === "object" && parsed !== null) {
+                input = parsed
+              }
+            } catch {
+              input = { query: args }
+            }
+          } else if (args && typeof args === "object") {
+            input = args as Record<string, unknown>
+          }
+
+          content.push({
+            type: "tool_use",
+            id: sanitizeClaudeToolId((item.call_id as string) || ""),
+            name: "tool_search",
             input,
           })
           break

@@ -4099,6 +4099,7 @@ export class CursorGrpcService {
       // an explicit "general-purpose" name produces the same IDE bubble
       // the unset case would, so the IDE renders the default label.
       // falls through
+      case "general":
       case "general-purpose":
       case "general_purpose":
       case "generalpurpose":

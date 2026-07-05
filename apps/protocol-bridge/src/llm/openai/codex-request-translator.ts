@@ -7,11 +7,8 @@
 
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import { resolveThinkingIntentFromDto } from "../shared/thinking-intent"
-import {
-  buildCodexRequest,
-  type CodexExecutionRequest,
-  type CodexRequest,
-} from "./codex-request-builder"
+import type { CodexExecutionRequest, CodexRequest } from "./codex-native-types"
+import { buildCodexRequest } from "./codex-request-builder"
 
 function resolveParallelToolCalls(toolChoice: unknown): boolean {
   if (!toolChoice || typeof toolChoice !== "object") {

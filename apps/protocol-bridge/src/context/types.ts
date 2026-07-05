@@ -215,6 +215,13 @@ export interface ContextTranscriptRecord {
    * by this key.
    */
   messageId?: string
+  /**
+   * cc-style isMeta carried from SessionUserMessage. Message records normally
+   * represent real transcript turns, but internal recovery/context prompts are
+   * also persisted through the same record path and must remain distinguishable
+   * from user-authored input after projection.
+   */
+  isMeta?: boolean
   kind?:
     | "message"
     | "compact_boundary"
@@ -390,6 +397,24 @@ export interface CodexReferenceContextItem {
 
 export type CodexReplacementHistoryItem = Record<string, unknown>
 
+export interface CodexMetaMessageLedgerEntry {
+  key: string
+  signature: string
+  beforeVisibleIndex: number
+  role: "user" | "assistant"
+  content: LooseMessageContent
+  source?: ContextMessageSource
+  isMeta?: boolean
+  attachmentKind?: ContextProjectionAttachment["kind"]
+}
+
+export interface CodexMetaMessageLedgerState {
+  initialized: boolean
+  messages: CodexMetaMessageLedgerEntry[]
+  latestSignaturesByKey: Record<string, string>
+  latestKindsByKey: Record<string, ContextProjectionAttachment["kind"]>
+}
+
 export const CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE = "codex_response_item"
 
 export interface CodexRawResponseItemBlock {
@@ -411,6 +436,7 @@ export interface CodexContextState {
   historyVersion: number
   tokenInfo?: CodexContextTokenInfo
   referenceContextItem?: CodexReferenceContextItem
+  metaMessageLedger?: CodexMetaMessageLedgerState
   replacementHistory?: CodexReplacementHistory
   truncationPolicy: CodexTruncationPolicy
 }

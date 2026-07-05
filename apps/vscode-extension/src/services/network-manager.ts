@@ -242,7 +242,8 @@ export class NetworkManager {
   isForwardingActive(): boolean {
     const hasHosts = this.hasHostEntries()
     const backend = this.getForwardingBackend()
-    if (backend === "relay") return hasHosts && this.isRelayRunning()
+    if (backend === "relay")
+      return hasHosts && this.hasLoopbackAlias() && this.isRelayRunning()
     if (backend === "portproxy")
       return hasHosts && this.hasWindowsPortProxyRule()
     return hasHosts && this.hasIptablesRule()

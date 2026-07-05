@@ -58,7 +58,7 @@ function translateUserContent(
       if (part.text) blocks.push({ type: "text", text: part.text })
     } else if (part.type === "image_url") {
       const url = part.image_url?.url ?? ""
-      blocks.push(translateImageUrl(url))
+      blocks.push(translateImageUrl(url, part.image_url?.detail))
     }
   }
   return blocks
@@ -68,11 +68,12 @@ function translateUserContent(
  * Translate an OpenAI image_url into an Anthropic image block. Supports both
  * data URIs (base64) and remote URLs.
  */
-function translateImageUrl(url: string): AnthropicBlock {
+function translateImageUrl(url: string, detail?: string): AnthropicBlock {
   const dataUriMatch = /^data:([^;]+);base64,(.*)$/s.exec(url)
   if (dataUriMatch) {
     return {
       type: "image",
+      ...(detail ? { detail } : {}),
       source: {
         type: "base64",
         media_type: dataUriMatch[1],
@@ -82,6 +83,7 @@ function translateImageUrl(url: string): AnthropicBlock {
   }
   return {
     type: "image",
+    ...(detail ? { detail } : {}),
     source: { type: "url", url },
   }
 }

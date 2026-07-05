@@ -430,13 +430,17 @@ export class ContextStateService {
                 const result = this.messageStore.appendUserMessage(
                   txn,
                   [block],
-                  { turnId: this.resolveTurnIdForCid(cid) }
+                  {
+                    turnId: this.resolveTurnIdForCid(cid),
+                    isMeta: message.isMeta,
+                  }
                 )
                 if (messageSeq === 0) messageSeq = result.seq
               }
             } else {
               const result = this.messageStore.appendUserMessage(txn, [block], {
                 turnId: this.resolveTurnIdForCid(cid),
+                isMeta: message.isMeta,
               })
               if (messageSeq === 0) messageSeq = result.seq
             }

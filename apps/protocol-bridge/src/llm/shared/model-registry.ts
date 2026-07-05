@@ -23,6 +23,24 @@ export interface ThinkingCapability {
   defaultLevel?: string
 }
 
+export interface CodexRequestCapabilities {
+  supportsVerbosity: boolean
+  defaultVerbosity?: string
+  supportsParallelToolCalls: boolean
+  useResponsesLite: boolean
+  supportsReasoningSummaries: boolean
+  supportsOriginalImageDetail: boolean
+  supportedServiceTiers?: readonly string[]
+  contextTokenLimit?: number
+  contextTokenLimitForMaxMode?: number
+  truncationPolicy?: CodexTruncationPolicyConfig
+}
+
+export interface CodexTruncationPolicyConfig {
+  mode: "bytes" | "tokens"
+  limit: number
+}
+
 export interface ModelEntry {
   /** Canonical Cloud Code model ID */
   cloudCodeId: string
@@ -36,6 +54,8 @@ export interface ModelEntry {
   thinking?: ThinkingCapability
   /** Whether this is a Claude model routed through Google Cloud Code */
   isClaudeThroughGoogle: boolean
+  /** Codex Responses request capabilities, when this is a ChatGPT Codex model */
+  codex?: CodexRequestCapabilities
 }
 
 export interface PublicModelMetadata {
@@ -60,6 +80,47 @@ function createLevelThinkingCapability(
         ? "high"
         : levels[levels.length - 1] || undefined),
   }
+}
+
+const CODEX_PRIORITY_SERVICE_TIERS = ["priority"] as const
+const CODEX_STANDARD_CONTEXT_TOKEN_LIMIT = 272_000
+const CODEX_MAX_CONTEXT_TOKEN_LIMIT = 1_000_000
+const CODEX_TRUNCATION_POLICY_TOKENS_10K = {
+  mode: "tokens",
+  limit: 10_000,
+} as const satisfies CodexTruncationPolicyConfig
+const CODEX_TRUNCATION_POLICY_BYTES_10K = {
+  mode: "bytes",
+  limit: 10_000,
+} as const satisfies CodexTruncationPolicyConfig
+
+function createCodexRequestCapabilities(
+  overrides: Partial<CodexRequestCapabilities> = {}
+): CodexRequestCapabilities {
+  return {
+    supportsVerbosity: true,
+    defaultVerbosity: "low",
+    supportsParallelToolCalls: true,
+    useResponsesLite: false,
+    supportsReasoningSummaries: true,
+    supportsOriginalImageDetail: true,
+    supportedServiceTiers: [],
+    ...overrides,
+    truncationPolicy: overrides.truncationPolicy
+      ? { ...overrides.truncationPolicy }
+      : undefined,
+  }
+}
+
+function createCodexCatalogCapabilities(
+  overrides: Partial<CodexRequestCapabilities> = {}
+): CodexRequestCapabilities {
+  return createCodexRequestCapabilities({
+    contextTokenLimit: CODEX_STANDARD_CONTEXT_TOKEN_LIMIT,
+    contextTokenLimitForMaxMode: CODEX_STANDARD_CONTEXT_TOKEN_LIMIT,
+    truncationPolicy: CODEX_TRUNCATION_POLICY_TOKENS_10K,
+    ...overrides,
+  })
 }
 
 function inferPassthroughGptThinkingCapability(
@@ -412,96 +473,155 @@ const CODEX_MODELS: Record<
     cloudCodeId: "gpt-5",
     displayName: "GPT-5",
     isThinking: true,
-    thinking: createLevelThinkingCapability([
-      "minimal",
-      "low",
-      "medium",
-      "high",
-    ]),
+    thinking: createLevelThinkingCapability(
+      ["minimal", "low", "medium", "high"],
+      "medium"
+    ),
+    codex: createCodexRequestCapabilities({
+      supportsOriginalImageDetail: false,
+    }),
   },
   "gpt-5-codex": {
     cloudCodeId: "gpt-5-codex",
     displayName: "GPT-5 Codex",
     isThinking: true,
-    thinking: createLevelThinkingCapability(["low", "medium", "high"]),
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high"],
+      "medium"
+    ),
+    codex: createCodexRequestCapabilities(),
   },
   "gpt-5-codex-mini": {
     cloudCodeId: "gpt-5-codex-mini",
     displayName: "GPT-5 Codex Mini",
     isThinking: true,
-    thinking: createLevelThinkingCapability(["low", "medium", "high"]),
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high"],
+      "medium"
+    ),
+    codex: createCodexRequestCapabilities(),
   },
   "gpt-5.1": {
     cloudCodeId: "gpt-5.1",
     displayName: "GPT-5.1",
     isThinking: true,
-    thinking: createLevelThinkingCapability(["none", "low", "medium", "high"]),
+    thinking: createLevelThinkingCapability(
+      ["none", "low", "medium", "high"],
+      "medium"
+    ),
+    codex: createCodexRequestCapabilities({
+      supportsOriginalImageDetail: false,
+    }),
   },
   "gpt-5.1-codex": {
     cloudCodeId: "gpt-5.1-codex",
     displayName: "GPT-5.1 Codex",
     isThinking: true,
-    thinking: createLevelThinkingCapability(["low", "medium", "high"]),
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high"],
+      "medium"
+    ),
+    codex: createCodexRequestCapabilities(),
   },
   "gpt-5.1-codex-mini": {
     cloudCodeId: "gpt-5.1-codex-mini",
     displayName: "GPT-5.1 Codex Mini",
     isThinking: true,
-    thinking: createLevelThinkingCapability(["low", "medium", "high"]),
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high"],
+      "medium"
+    ),
+    codex: createCodexRequestCapabilities(),
   },
   "gpt-5.1-codex-max": {
     cloudCodeId: "gpt-5.1-codex-max",
     displayName: "GPT-5.1 Codex Max",
     isThinking: true,
-    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high", "xhigh"],
+      "medium"
+    ),
+    codex: createCodexRequestCapabilities(),
   },
   "gpt-5.2": {
     cloudCodeId: "gpt-5.2",
     displayName: "GPT-5.2",
     isThinking: true,
-    thinking: createLevelThinkingCapability([
-      "none",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]),
+    thinking: createLevelThinkingCapability(
+      ["none", "low", "medium", "high", "xhigh"],
+      "medium"
+    ),
+    codex: createCodexCatalogCapabilities({
+      supportsOriginalImageDetail: false,
+      truncationPolicy: CODEX_TRUNCATION_POLICY_BYTES_10K,
+    }),
   },
   "gpt-5.2-codex": {
     cloudCodeId: "gpt-5.2-codex",
     displayName: "GPT-5.2 Codex",
     isThinking: true,
-    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high", "xhigh"],
+      "medium"
+    ),
+    codex: createCodexRequestCapabilities(),
   },
   "gpt-5.3-codex": {
     cloudCodeId: "gpt-5.3-codex",
     displayName: "GPT-5.3 Codex",
     isThinking: true,
-    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high", "xhigh"],
+      "medium"
+    ),
+    codex: createCodexCatalogCapabilities(),
   },
   "gpt-5.3-codex-spark": {
     cloudCodeId: "gpt-5.3-codex-spark",
     displayName: "GPT-5.3 Codex Spark",
     isThinking: true,
-    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high", "xhigh"],
+      "medium"
+    ),
+    codex: createCodexRequestCapabilities(),
   },
   "gpt-5.5": {
     cloudCodeId: "gpt-5.5",
     displayName: "GPT-5.5",
     isThinking: true,
-    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high", "xhigh"],
+      "medium"
+    ),
+    codex: createCodexCatalogCapabilities({
+      supportedServiceTiers: CODEX_PRIORITY_SERVICE_TIERS,
+    }),
   },
   "gpt-5.4": {
     cloudCodeId: "gpt-5.4",
     displayName: "GPT-5.4",
     isThinking: true,
-    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high", "xhigh"],
+      "medium"
+    ),
+    codex: createCodexCatalogCapabilities({
+      contextTokenLimitForMaxMode: CODEX_MAX_CONTEXT_TOKEN_LIMIT,
+      supportedServiceTiers: CODEX_PRIORITY_SERVICE_TIERS,
+    }),
   },
   "gpt-5.4-mini": {
     cloudCodeId: "gpt-5.4-mini",
     displayName: "GPT-5.4 Mini",
     isThinking: true,
-    thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high", "xhigh"],
+      "medium"
+    ),
+    codex: createCodexCatalogCapabilities({
+      defaultVerbosity: "medium",
+    }),
   },
 
   // --- GPT-4.1 ---
@@ -559,12 +679,14 @@ const CODEX_MODELS: Record<
     displayName: "Codex Mini",
     isThinking: true,
     thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
+    codex: createCodexRequestCapabilities(),
   },
   "codex-mini-latest": {
     cloudCodeId: "codex-mini-latest",
     displayName: "Codex Mini Latest",
     isThinking: true,
     thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
+    codex: createCodexRequestCapabilities(),
   },
 }
 
@@ -878,6 +1000,22 @@ export function resolveCloudCodeModel(alias: string): ModelEntry | null {
   }
 
   return null
+}
+
+export function resolveCodexRequestCapabilities(
+  modelId: string
+): CodexRequestCapabilities | null {
+  const normalized = parseModelRequest(modelId).normalizedBaseModel
+  if (!normalized) {
+    return null
+  }
+
+  const resolved = resolveCloudCodeModel(normalized)
+  if (!resolved || resolved.family !== "gpt") {
+    return null
+  }
+
+  return resolved.codex || null
 }
 
 export function resolveModelThinkingCapability(
@@ -1196,7 +1334,26 @@ const DEFAULT_VISIBLE_CODEX_CURSOR_MODEL_IDS = new Set([
   "gpt-5.2",
 ])
 
-export const BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
+function withCodexCursorDisplayCapabilities(
+  model: CursorDisplayModel
+): CursorDisplayModel {
+  const capabilities = CODEX_MODELS[model.name]?.codex
+  if (!capabilities) {
+    return model
+  }
+
+  return {
+    ...model,
+    contextTokenLimit:
+      capabilities.contextTokenLimit ?? model.contextTokenLimit,
+    contextTokenLimitForMaxMode:
+      capabilities.contextTokenLimitForMaxMode ??
+      capabilities.contextTokenLimit ??
+      model.contextTokenLimitForMaxMode,
+  }
+}
+
+const RAW_BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
   {
     name: "gpt-5.5",
     displayName: "GPT-5.5",
@@ -1296,6 +1453,9 @@ export const BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
     isThinking: true,
   },
 ]
+
+export const BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] =
+  RAW_BASE_CODEX_CURSOR_DISPLAY_MODELS.map(withCodexCursorDisplayCapabilities)
 
 export const CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] =
   BASE_CODEX_CURSOR_DISPLAY_MODELS.map(

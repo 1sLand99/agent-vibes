@@ -59,10 +59,22 @@ export class SubagentRegistryService {
     projectCwd?: string
   ): SubagentDefinition | undefined {
     if (!agentType) return undefined
-    const normalized = agentType.trim().toLowerCase()
+    const normalized = this.normalizeAgentType(agentType)
     if (!normalized) return undefined
     return this.getAll(projectCwd).find(
       (agent) => agent.agentType.trim().toLowerCase() === normalized
     )
+  }
+
+  private normalizeAgentType(agentType: string): string {
+    const normalized = agentType.trim().toLowerCase()
+    switch (normalized) {
+      case "general":
+      case "general_purpose":
+      case "generalpurpose":
+        return "general-purpose"
+      default:
+        return normalized
+    }
   }
 }

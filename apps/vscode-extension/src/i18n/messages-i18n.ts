@@ -19,7 +19,10 @@ const EN: Record<string, string> = {
   "forwarding.enabledRestart":
     "Forwarding is enabled. Fully restart Cursor to apply DNS/hosts changes.",
   "forwarding.action.quit": "Quit Cursor Now",
+  "forwarding.action.enable": "Enable Forwarding",
   "forwarding.alreadyActive": "Forwarding is already active.",
+  "forwarding.needsRepair":
+    "Cursor traffic is pointed at Agent Vibes, but forwarding is not active. Enable forwarding before using Agent Vibes in Cursor.",
   "forwarding.statusLine":
     "Forwarding: {state} | Hosts: {hosts}{loopback} | {backendLabel}: {backend}",
   "forwarding.state.active": "✅ Active",
@@ -192,7 +195,10 @@ const ZH: Record<string, string> = {
   "forwarding.enabledRestart":
     "已启用流量转发。请完整重启 Cursor 以应用 DNS / hosts 改动。",
   "forwarding.action.quit": "立即退出 Cursor",
+  "forwarding.action.enable": "启用转发",
   "forwarding.alreadyActive": "流量转发已经处于启用状态。",
+  "forwarding.needsRepair":
+    "Cursor 流量已指向 Agent Vibes，但本机转发未生效。使用 Cursor 内的 Agent Vibes 前需要启用转发。",
   "forwarding.statusLine":
     "转发：{state} | Hosts：{hosts}{loopback} | {backendLabel}：{backend}",
   "forwarding.state.active": "✅ 已生效",

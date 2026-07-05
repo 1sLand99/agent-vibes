@@ -19,6 +19,15 @@ export interface CodexClientIdentity {
 }
 
 export const CODEX_WS_BETA_HEADER = "responses_websockets=2026-02-06"
+export const CODEX_RESPONSES_LITE_HEADER =
+  "x-openai-internal-codex-responses-lite"
+export const CODEX_RESPONSES_LITE_WS_METADATA_KEY =
+  "ws_request_header_x_openai_internal_codex_responses_lite"
+export const CODEX_WS_TRACEPARENT_METADATA_KEY = "ws_request_header_traceparent"
+export const CODEX_WS_TRACESTATE_METADATA_KEY = "ws_request_header_tracestate"
+export const CODEX_WS_STREAM_REQUEST_START_MS_METADATA_KEY =
+  "x-codex-ws-stream-request-start-ms"
+export const CODEX_TURN_STATE_HEADER = "x-codex-turn-state"
 
 const MAX_CODEX_SESSION_ID_LENGTH = 64
 
@@ -28,11 +37,14 @@ interface BuildCodexHttpHeadersParams {
   stream: boolean
   identity: CodexClientIdentity
   conversationId?: string
+  clientMetadata?: CodexForwardHeaders
   accountId?: string
   workspaceId?: string
   cacheHeaders?: Record<string, string>
   forwardHeaders?: CodexForwardHeaders
   omitAccountId?: boolean
+  useResponsesLite?: boolean
+  includeInstallationIdHeader?: boolean
 }
 
 interface BuildCodexWebSocketHeadersParams {
@@ -40,11 +52,13 @@ interface BuildCodexWebSocketHeadersParams {
   isApiKey: boolean
   identity: CodexClientIdentity
   conversationId?: string
+  clientMetadata?: CodexForwardHeaders
   accountId?: string
   workspaceId?: string
   cacheHeaders?: Record<string, string>
   forwardHeaders?: CodexForwardHeaders
   omitAccountId?: boolean
+  useResponsesLite?: boolean
 }
 
 function normalizeHeaderKey(key: string): string {
@@ -118,6 +132,26 @@ function ensureHeader(
   }
 }
 
+function ensureCompatibilityHeader(
+  target: Record<string, string>,
+  forwardHeaders: CodexForwardHeaders | undefined,
+  clientMetadata: CodexForwardHeaders | undefined,
+  key: string,
+  aliases: string[] = []
+): void {
+  const sourceValue =
+    getForwardHeader(forwardHeaders, key, ...aliases) ||
+    getForwardHeader(clientMetadata, key, ...aliases)
+  if (sourceValue) {
+    target[key] = sourceValue
+    return
+  }
+
+  if (getExistingHeader(target, key, ...aliases)) {
+    return
+  }
+}
+
 function sanitizeHeaders(
   headers: Record<string, string>
 ): Record<string, string> {
@@ -175,6 +209,9 @@ export function buildCodexHttpHeaders(
   if (betaFeatures) {
     headers["X-Codex-Beta-Features"] = betaFeatures
   }
+  if (params.useResponsesLite) {
+    headers[CODEX_RESPONSES_LITE_HEADER] = "true"
+  }
 
   ensureHeader(
     headers,
@@ -183,9 +220,39 @@ export function buildCodexHttpHeaders(
     params.identity.version,
     ["Version"]
   )
-  ensureHeader(headers, params.forwardHeaders, "X-Codex-Turn-Metadata", "", [
+  ensureCompatibilityHeader(
+    headers,
+    params.forwardHeaders,
+    params.clientMetadata,
+    "x-codex-window-id"
+  )
+  ensureCompatibilityHeader(
+    headers,
+    params.forwardHeaders,
+    params.clientMetadata,
     "x-codex-turn-metadata",
-  ])
+    ["X-Codex-Turn-Metadata"]
+  )
+  ensureCompatibilityHeader(
+    headers,
+    params.forwardHeaders,
+    params.clientMetadata,
+    "x-codex-parent-thread-id"
+  )
+  ensureCompatibilityHeader(
+    headers,
+    params.forwardHeaders,
+    params.clientMetadata,
+    "x-openai-subagent"
+  )
+  if (params.includeInstallationIdHeader) {
+    ensureCompatibilityHeader(
+      headers,
+      params.forwardHeaders,
+      params.clientMetadata,
+      "x-codex-installation-id"
+    )
+  }
   ensureHeader(
     headers,
     params.forwardHeaders,
@@ -243,13 +310,37 @@ export function buildCodexWebSocketHeaders(
   if (betaFeatures) {
     headers["x-codex-beta-features"] = betaFeatures
   }
+  if (params.useResponsesLite) {
+    headers[CODEX_RESPONSES_LITE_HEADER] = "true"
+  }
 
   ensureHeader(headers, params.forwardHeaders, "x-codex-turn-state", "", [
     "x-codex-turn-state",
   ])
-  ensureHeader(headers, params.forwardHeaders, "x-codex-turn-metadata", "", [
-    "x-codex-turn-metadata",
-  ])
+  ensureCompatibilityHeader(
+    headers,
+    params.forwardHeaders,
+    params.clientMetadata,
+    "x-codex-window-id"
+  )
+  ensureCompatibilityHeader(
+    headers,
+    params.forwardHeaders,
+    params.clientMetadata,
+    "x-codex-turn-metadata"
+  )
+  ensureCompatibilityHeader(
+    headers,
+    params.forwardHeaders,
+    params.clientMetadata,
+    "x-codex-parent-thread-id"
+  )
+  ensureCompatibilityHeader(
+    headers,
+    params.forwardHeaders,
+    params.clientMetadata,
+    "x-openai-subagent"
+  )
   ensureHeader(
     headers,
     params.forwardHeaders,
@@ -315,4 +406,65 @@ export function buildCodexWebSocketHeaders(
   }
 
   return sanitizeHeaders(headers)
+}
+
+export function buildCodexWebSocketRequestBody(
+  body: Record<string, unknown>,
+  options: {
+    useResponsesLite?: boolean
+    warmup?: boolean
+    forwardHeaders?: CodexForwardHeaders
+    streamRequestStartMs?: number
+    turnState?: string
+  } = {}
+): Record<string, unknown> {
+  const requestBody: Record<string, unknown> = {
+    ...body,
+    type: "response.create",
+  }
+  if (options.warmup) {
+    requestBody.generate = false
+  }
+
+  const existingMetadata =
+    requestBody.client_metadata &&
+    typeof requestBody.client_metadata === "object" &&
+    !Array.isArray(requestBody.client_metadata)
+      ? (requestBody.client_metadata as Record<string, unknown>)
+      : {}
+
+  const websocketMetadata: Record<string, string> = {}
+  if (options.useResponsesLite) {
+    websocketMetadata[CODEX_RESPONSES_LITE_WS_METADATA_KEY] = "true"
+  }
+  if (typeof options.streamRequestStartMs === "number") {
+    websocketMetadata[CODEX_WS_STREAM_REQUEST_START_MS_METADATA_KEY] = String(
+      Math.trunc(options.streamRequestStartMs)
+    )
+  }
+  const turnState = options.turnState?.trim()
+  if (turnState) {
+    websocketMetadata[CODEX_TURN_STATE_HEADER] = turnState
+  }
+
+  const traceparent = getForwardHeader(options.forwardHeaders, "traceparent")
+  if (traceparent) {
+    websocketMetadata[CODEX_WS_TRACEPARENT_METADATA_KEY] = traceparent
+  }
+  const tracestate = getForwardHeader(options.forwardHeaders, "tracestate")
+  if (tracestate) {
+    websocketMetadata[CODEX_WS_TRACESTATE_METADATA_KEY] = tracestate
+  }
+
+  if (Object.keys(websocketMetadata).length === 0) {
+    return requestBody
+  }
+
+  return {
+    ...requestBody,
+    client_metadata: {
+      ...existingMetadata,
+      ...websocketMetadata,
+    },
+  }
 }

@@ -17,6 +17,7 @@
     "test": "jest --passWithNoTests",
     "clean": "node ../../scripts/rm-paths.js dist node_modules .turbo",
     "types": "tsc --noEmit -p tsconfig.build.json",
+    "codex:instructions:sync": "node ../../scripts/codex/sync-codex-model-instructions.js",
     "proto:extract": "node ../../scripts/cursor-static-analysis/cursor_proto_extractor.js --output-json && node ../../scripts/cursor-static-analysis/proto_fixer.js && node ../../scripts/cursor-static-analysis/sync-extracted-proto.js proto",
     "proto:gen": "node ../../scripts/rm-paths.js src/gen && buf generate",
     "proto:all": "npm run proto:extract && npm run proto:gen"

@@ -38,9 +38,36 @@ export async function activate(
   // Create UI
   statusIndicator = new StatusIndicator(() => network!.isForwardingActive())
 
+  let forwardingRepairPromptShown = false
+  const maybePromptForForwardingRepair = async (): Promise<void> => {
+    if (forwardingRepairPromptShown || !bridge?.isRunning || !network) return
+    if (!network.hasHostEntries() || network.isForwardingActive()) return
+
+    forwardingRepairPromptShown = true
+    logger.warn(
+      "Cursor host entries are present but local forwarding is inactive"
+    )
+
+    const action = await vscode.window.showWarningMessage(
+      t("forwarding.needsRepair"),
+      t("forwarding.action.enable"),
+      t("setup.action.later")
+    )
+
+    if (action === t("forwarding.action.enable")) {
+      executePrivileged(
+        network.getEnableCommand(),
+        t("terminal.enableForwarding")
+      )
+    }
+  }
+
   // Update status bar when server state changes
   bridge.on("stateChanged", (state: ServerState) => {
     statusIndicator?.update(state)
+    if (state === "running") {
+      void maybePromptForForwardingRepair()
+    }
   })
 
   // Register all commands
@@ -150,6 +177,7 @@ export async function activate(
       .then(() => {
         if (bridge!.state === "running") {
           logger.info("Bridge auto-started successfully")
+          void maybePromptForForwardingRepair()
         }
       })
       .catch((err) => {

@@ -85,12 +85,17 @@ import { PromptCacheBreakDetectionService } from "../../llm/anthropic/prompt-cac
 import { KiroService } from "../../llm/aws/kiro.service"
 import { GoogleService } from "../../llm/google/google.service"
 import { ImageGenerationService } from "../../llm/image-generation/image-generation.service"
-import { type CodexExecutionRequest } from "../../llm/openai/codex-request-builder"
+import { resolveCodexModelInstructions } from "../../llm/openai/codex-model-instructions"
+import { type CodexExecutionRequest } from "../../llm/openai/codex-native-types"
 import { CodexService } from "../../llm/openai/codex.service"
 import { OpenaiCompatService } from "../../llm/openai/openai-compat.service"
 import { UpstreamRequestAbortedError } from "../../llm/shared/abort-signal"
 import { getBackendCapability } from "../../llm/shared/backend-capability"
-import { detectModelFamily } from "../../llm/shared/model-registry"
+import {
+  detectModelFamily,
+  resolveCodexRequestCapabilities,
+} from "../../llm/shared/model-registry"
+import { buildLanguageDirective } from "../../llm/shared/language-directive"
 import {
   BackendType,
   ModelRouteResult,
@@ -119,10 +124,28 @@ import type { BackendStream } from "./backend/backend-stream"
 import { RawSseBackendStream } from "./backend/raw-sse-backend-stream"
 import { OutboundForbiddenError, TurnOutbound } from "./bidi/bidi-outbound"
 import { BidiStreamController } from "./bidi/bidi-stream-controller"
+import {
+  assembleCursorCodexExecutionRequest,
+  buildCursorCodexClientMetadata,
+  resolveCursorCodexServiceTier,
+  shouldRequestCursorCodexThinkingSummary,
+  shouldSuppressCursorCodexThinkingSummary,
+} from "./cursor-codex-request-assembler"
+import {
+  createCodexContextLedgerState,
+  previewCodexContextLedgerMessages,
+  projectCodexContextLedgerMessages,
+  type CodexContextEntry,
+  type CodexContextLedgerState,
+} from "./codex-context-ledger"
 import { CursorGrpcService } from "./cursor-grpc.service"
 import { KnowledgeBaseService } from "./knowledge-base.service"
 import { KvStorageService } from "./kv-storage.service"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
+import {
+  parseCursorSseEvent,
+  type CursorSseEvent as SseEvent,
+} from "./cursor-sse-event"
 import { BackendStreamAbortRegistry } from "./session/backend-stream-abort-registry"
 import {
   SessionRecord,
@@ -168,6 +191,7 @@ import {
 } from "./subagents/subagent-exec-bridge.service"
 import { buildSubAgentScopedConversationId } from "./subagents/subagent-conversation-scope"
 import { projectSubAgentFinalSynthesisMessages } from "./subagents/subagent-final-synthesis-projector"
+import { SubAgentSseTurnCollector } from "./subagents/subagent-sse-turn-collector"
 import {
   applySubagentOverride,
   TOOL_USE_SUMMARY_SUBAGENT_TYPE,
@@ -221,7 +245,9 @@ import {
   type SnipMessagesResult,
 } from "./tools/snip-tool-handler"
 import {
+  CODEX_TOOL_SEARCH_NAME,
   DISCOVER_TOOL_NAME,
+  isBridgeInternalToolName,
   pickStrategy as pickDeferStrategy,
 } from "./tools/tool-defer-policy"
 import {
@@ -273,60 +299,9 @@ function toLooseShape(m: SessionMessage): {
   return { role: m.message.role, content: m.message.content }
 }
 
-/**
- * SSE Event content block structure (content_block_start)
- */
-interface SseContentBlock {
-  type: "text" | "tool_use" | "thinking"
-  text?: string
-  id?: string
-  name?: string
-  input?: Record<string, unknown>
-  thinking?: string
-  signature?: string
-}
-
-/**
- * SSE Event delta structure (content_block_delta)
- */
-interface SseDelta {
-  type: "text_delta" | "input_json_delta" | "thinking_delta" | "signature_delta"
-  text?: string
-  partial_json?: string
-  thinking?: string
-  signature?: string
-}
-
 interface CursorToolCapabilityOptionsForRoute {
   webSearchEnabled?: boolean
   webFetchEnabled?: boolean
-}
-
-/**
- * SSE Event data structure
- */
-interface SseEventData {
-  content_block?: SseContentBlock
-  delta?: SseDelta
-  message?: {
-    id?: string
-    [key: string]: unknown
-  }
-  index?: number
-  usage?: {
-    input_tokens?: number
-    cache_read_input_tokens?: number
-    cache_creation_input_tokens?: number
-    output_tokens?: number
-  }
-}
-
-/**
- * Parsed SSE Event
- */
-interface SseEvent {
-  type: string
-  data: SseEventData
 }
 
 type PromptContext = Pick<
@@ -453,7 +428,7 @@ interface BufferedToolResultEntry {
   toolInput: Record<string, unknown>
   toolResultContent: string | Array<Record<string, unknown>>
   structuredContent?: Record<string, unknown>
-  toolCallType: "function" | "custom"
+  toolCallType: CodexToolCallType
   arrivalSeq: number
 }
 
@@ -635,6 +610,8 @@ interface ActiveToolCall {
   modelCallId: string
 }
 
+type CodexToolCallType = "function" | "custom" | "tool_search"
+
 interface HistoryToolMetadata {
   toolName: string
   input: Record<string, unknown>
@@ -753,7 +730,7 @@ interface PreparedToolInvocation {
   input: Record<string, unknown>
   historyToolName: string
   historyToolInput: Record<string, unknown>
-  codexToolCallType: "function" | "custom"
+  codexToolCallType: CodexToolCallType
   deferredToolFamily?: DeferredToolFamily
   execDispatchTarget?: ExecDispatchTarget
   dispatchErrorMessage?: string
@@ -1048,6 +1025,10 @@ export class CursorConnectStreamService {
   private readonly logger = new Logger(CursorConnectStreamService.name)
   private readonly codexInstallationId = crypto.randomUUID()
   private readonly backendStreamAbortRegistry = new BackendStreamAbortRegistry()
+  private readonly codexContextLedgersByConversation = new Map<
+    string,
+    CodexContextLedgerState
+  >()
   private lastHeartbeatLog = 0
   private readonly HEARTBEAT_LOG_INTERVAL = 60000 // Log heartbeat once per minute
   // Backend-yield-driven keepalive: how long streamWithHeartbeat waits on
@@ -2619,10 +2600,8 @@ export class CursorConnectStreamService {
         systemPromptTokens: 0,
       }
       if (route.backend === "codex") {
-        const promptContext = this.buildPromptContextFromSession(session)
         const systemPrompt = this.buildCodexSystemPrompt(
-          promptContext,
-          session.deferredToolCatalog
+          route.model || session.model
         )
         const referenceContextItem =
           this.codexContextAdapter.buildReferenceContextItem({
@@ -2635,6 +2614,9 @@ export class CursorConnectStreamService {
             ),
             reasoningEffort: this.resolveRequestedReasoningEffort(
               session.requestedModelParameters
+            ),
+            truncationPolicy: this.resolveCodexTruncationPolicy(
+              route.model || session.model
             ),
           })
         const summarizeSignal =
@@ -3825,6 +3807,16 @@ export class CursorConnectStreamService {
     }
   }
 
+  private getSessionMessageCount(
+    session?: Pick<SessionRecord, "conversationId">
+  ): number | undefined {
+    if (!session?.conversationId) {
+      return undefined
+    }
+    return this.contextState.getContextRecord(session.conversationId)?.messages
+      .length
+  }
+
   /**
    * Resolve the sub-agent tool surface + system addendum that
    * `buildSubAgentStreamingDtoForRoute` and the two Codex sub-agent
@@ -4289,21 +4281,26 @@ export class CursorConnectStreamService {
       ) => CodexExecutionRequest["messages"]
     }
   ): CodexExecutionRequest {
-    const systemPrompt = this.buildCodexSystemPrompt(
+    const model = route.model || options.model
+    const systemPrompt = this.buildCodexSystemPrompt(model)
+    const contextEntries = this.buildCodexContextEntries(
       options.promptContext,
-      options.session?.deferredToolCatalog
+      {
+        model,
+        deferredCatalog: options.session?.deferredToolCatalog,
+        sessionMessageCount: this.getSessionMessageCount(options.session),
+        additionalSystemPrompt: options.additionalSystemPrompt,
+      }
     )
-    const effectiveSystemPrompt = options.additionalSystemPrompt
-      ? [systemPrompt, options.additionalSystemPrompt]
-          .filter((part) => typeof part === "string" && part.trim().length > 0)
-          .join("\n\n")
-      : systemPrompt
     const budget = this.resolveMessageBudget(route.backend, {
       session: options.session,
-      protectedContextTokens: 0,
-      systemPrompt: effectiveSystemPrompt,
+      protectedContextTokens: this.estimateCodexContextLedgerTokens(
+        options.conversationId,
+        contextEntries
+      ),
+      systemPrompt,
       toolDefinitions: options.toolDefinitions,
-      model: options.model,
+      model,
       budgetOverride: options.budgetOverride,
       maxOutputTokensOverride: options.maxOutputTokensOverride,
     })
@@ -4339,28 +4336,30 @@ export class CursorConnectStreamService {
     const historyTokens = historyMessages.length
       ? this.tokenCounter.countMessages(historyMessages as UnifiedMessage[])
       : 0
-    const totalMessageTokens = historyMessages.length
-      ? this.tokenCounter.countMessages(historyMessages as UnifiedMessage[])
+    const codexMessages = this.projectCodexMessagesWithContextLedger(
+      options.conversationId,
+      historyMessages,
+      contextEntries
+    )
+    const totalMessageTokens = codexMessages.messages.length
+      ? this.tokenCounter.countMessages(
+          codexMessages.messages as UnifiedMessage[]
+        )
       : 0
 
-    const shouldRequestThinkingSummary = suppressThinkingSummary
-      ? false
-      : options.thinkingDetailsRequested === true ||
-        (route.backend === "codex" &&
-          ((options.thinkingLevel || 0) > 0 ||
-            (!!requestedReasoningEffort &&
-              requestedReasoningEffort !== "none")))
-
-    const request: CodexExecutionRequest = {
+    const request = assembleCursorCodexExecutionRequest({
       model: route.model,
-      system: effectiveSystemPrompt || undefined,
-      messages: historyMessages,
+      systemPrompt,
+      messages: codexMessages.messages,
       conversationId: options.conversationId,
-      pendingToolUseIds:
-        options.pendingToolUseIds && options.pendingToolUseIds.length > 0
-          ? options.pendingToolUseIds
-          : undefined,
-      includeThinkingSummary: shouldRequestThinkingSummary,
+      pendingToolUseIds: options.pendingToolUseIds,
+      includeThinkingSummary: shouldRequestCursorCodexThinkingSummary({
+        backend: route.backend,
+        thinkingLevel: options.thinkingLevel,
+        thinkingDetailsRequested: options.thinkingDetailsRequested,
+        requestedReasoningEffort,
+        suppressThinkingSummary,
+      }),
       serviceTier: this.resolveRequestedCodexServiceTier(
         options.session?.requestedModelParameters
       ),
@@ -4368,19 +4367,13 @@ export class CursorConnectStreamService {
         options.session,
         options.conversationId
       ),
-      textVerbosity: "low",
-    }
-
-    if (options.toolDefinitions && options.toolDefinitions.length > 0) {
-      request.tools = options.toolDefinitions
-    }
-
-    if (thinkingIntent) {
-      request.thinkingIntent = thinkingIntent
-    }
+      tools: options.toolDefinitions,
+      thinkingIntent,
+    })
 
     this.logger.debug(
-      `Prompt assembly for codex-native: protectedContextMessages=0, ` +
+      `Prompt assembly for codex-native: protectedContextMessages=${codexMessages.contextMessageCount}, ` +
+        `newContextMessages=${codexMessages.addedContextMessageCount}, ` +
         `historyMessages=${historyMessages.length}, historyTokens=${historyTokens}, totalMessageTokens=${totalMessageTokens}, ` +
         `thinkingSummary=${request.includeThinkingSummary === true}, ` +
         `inputMessages=${request.messages.length}`
@@ -4542,31 +4535,64 @@ export class CursorConnectStreamService {
             .length || 0
         : 0) + 1
     )
-    const turnMetadata: Record<string, unknown> = {
-      session_id: normalizedConversationId,
-      thread_source: "user",
-      turn_id: `${normalizedConversationId}:${requestOrdinal}`,
-      sandbox: "none",
-    }
-
-    const rootPath = session?.projectContext?.rootPath?.trim()
-    if (rootPath) {
-      turnMetadata.workspaces = {
-        [rootPath]: {},
-      }
-    }
-
-    return {
-      "x-codex-window-id": `${normalizedConversationId}:${requestOrdinal}`,
-      "x-codex-turn-metadata": JSON.stringify(turnMetadata),
-      "x-codex-installation-id": this.codexInstallationId,
-    }
+    return buildCursorCodexClientMetadata({
+      conversationId: normalizedConversationId,
+      requestOrdinal,
+      installationId: this.codexInstallationId,
+      workspaceRootPath: session?.projectContext?.rootPath,
+    })
   }
 
   private normalizePositiveInteger(value: unknown): number | undefined {
     if (typeof value !== "number") return undefined
     if (!Number.isFinite(value) || value <= 0) return undefined
     return Math.floor(value)
+  }
+
+  private resolveCodexContextTokenLimits(model?: string): {
+    normal?: number
+    max?: number
+  } {
+    if (!model) return {}
+    const capabilities = resolveCodexRequestCapabilities(model)
+    const normal = this.normalizePositiveInteger(
+      capabilities?.contextTokenLimit
+    )
+    const max =
+      this.normalizePositiveInteger(
+        capabilities?.contextTokenLimitForMaxMode
+      ) || normal
+    return { normal, max }
+  }
+
+  private resolveCodexTruncationPolicy(
+    model?: string
+  ): { mode: "bytes" | "tokens"; limit: number } | undefined {
+    if (!model) return undefined
+    const policy = resolveCodexRequestCapabilities(model)?.truncationPolicy
+    const limit = this.normalizePositiveInteger(policy?.limit)
+    if (!policy || !limit) return undefined
+    if (policy.mode !== "bytes" && policy.mode !== "tokens") return undefined
+    return { mode: policy.mode, limit }
+  }
+
+  private syncCodexContextModelCapabilities(
+    session: SessionRecord,
+    model?: string
+  ): void {
+    const policy = this.resolveCodexTruncationPolicy(model || session.model)
+    if (!policy) return
+    const record = this.contextState.getContextRecord(session.conversationId)
+    if (!record) return
+    const codex = this.codexContextAdapter.ensureState(record.contextState)
+    if (
+      codex.truncationPolicy.mode === policy.mode &&
+      codex.truncationPolicy.limit === policy.limit
+    ) {
+      return
+    }
+    codex.truncationPolicy = { ...policy }
+    this.contextState.markContextStateDirty(session.conversationId)
   }
 
   private getBackendContextLimit(
@@ -4593,6 +4619,9 @@ export class CursorConnectStreamService {
     }
     if (backend === "openai-compat") {
       return this.openaiCompatService.getConfiguredMaxContextTokens(model)
+    }
+    if (backend === "codex") {
+      return this.resolveCodexContextTokenLimits(model).max
     }
     return undefined
   }
@@ -4648,7 +4677,11 @@ export class CursorConnectStreamService {
     // claude-api / openai-compat similarly).
     if (session.contextMaxMode === true && route) {
       let extendedWindow: number | undefined
-      if (route.backend === "kiro") {
+      if (route.backend === "codex") {
+        extendedWindow = this.resolveCodexContextTokenLimits(
+          route.model || session.model
+        ).max
+      } else if (route.backend === "kiro") {
         extendedWindow = this.kiroService.getConfiguredMaxContextTokens(
           session.model
         )
@@ -4666,10 +4699,14 @@ export class CursorConnectStreamService {
       }
     }
 
-    // Default (non-MAX) → conventional ceiling per model family. Match
-    // resolveCursorContextTokenLimits in cursor-model-protocol.ts:
-    //   gemini → 1M, everything else (claude / gpt) → 200K.
+    // Default (non-MAX) → conventional ceiling per model family.
     if (route) {
+      if (route.backend === "codex") {
+        const normalWindow = this.resolveCodexContextTokenLimits(
+          route.model || session.model
+        ).normal
+        if (normalWindow) return normalWindow
+      }
       const family = detectModelFamily(session.model)
       if (family === "gemini") return 1_000_000
     }
@@ -4713,9 +4750,11 @@ export class CursorConnectStreamService {
       maxOutputTokensOverride?: number
     }
   ): ContextRequestBudget {
+    const modelForBudget =
+      options?.model || options?.parsed?.model || options?.session?.model
     const backendContextLimit = this.getBackendContextLimit(
       backend,
-      options?.model
+      modelForBudget
     )
     let effectiveBackendContextLimit = backendContextLimit
     if (backend === "google" || backend === "google-claude") {
@@ -4786,11 +4825,17 @@ export class CursorConnectStreamService {
         ? this.CLOUD_CODE_EXTRA_OVERHEAD_TOKENS
         : this.GENERIC_EXTRA_OVERHEAD_TOKENS
 
+    const codexDefaultContextLimit =
+      backend === "codex"
+        ? this.resolveCodexContextTokenLimits(modelForBudget).normal
+        : undefined
+
     const budget = this.contextRequestPlanner.resolveBudget({
       backend,
       protocolMaxTokens: requestedMaxTokens,
       backendMaxTokens: effectiveBackendContextLimit,
-      defaultMaxTokens: this.DEFAULT_HISTORY_MAX_TOKENS,
+      defaultMaxTokens:
+        codexDefaultContextLimit || this.DEFAULT_HISTORY_MAX_TOKENS,
       protectedContextTokens,
       systemPrompt: options?.systemPrompt,
       toolDefinitions: options?.toolDefinitions,
@@ -5577,7 +5622,7 @@ export class CursorConnectStreamService {
     toolInput: Record<string, unknown>,
     toolResultContent: string | Array<Record<string, unknown>>,
     structuredContent?: Record<string, unknown>,
-    toolCallType: "function" | "custom" = "function"
+    toolCallType: CodexToolCallType = "function"
   ): void {
     const batch = this.assistantToolBatch.getActiveAssistantToolBatchSnapshot(
       session.conversationId
@@ -5785,7 +5830,7 @@ export class CursorConnectStreamService {
     toolInput: Record<string, unknown>,
     toolResultContent: string | Array<Record<string, unknown>>,
     structuredContent?: Record<string, unknown>,
-    toolCallType: "function" | "custom" = "function"
+    toolCallType: CodexToolCallType = "function"
   ): void {
     const buildToolResultBlock = (): ToolResultContentItem => ({
       type: "tool_result",
@@ -7233,6 +7278,16 @@ export class CursorConnectStreamService {
         session.conversationId
       )
     }
+    const codexTruncationPolicy =
+      backend === "codex"
+        ? this.resolveCodexTruncationPolicy(options?.model || session.model)
+        : undefined
+    if (backend === "codex" && !options?.dryRun) {
+      this.syncCodexContextModelCapabilities(
+        session,
+        options?.model || session.model
+      )
+    }
     const primary = this.contextRequestPlanner.projectState(
       this.contextState.getContextRecord(session.conversationId)!.contextState,
       this.buildContextAttachmentSnapshot(session),
@@ -7269,6 +7324,7 @@ export class CursorConnectStreamService {
               maxTokens: budget.maxTokens,
               systemPromptTokens: budget.systemPromptTokens,
               pendingToolUseIds: options?.pendingToolUseIds,
+              truncationPolicy: codexTruncationPolicy,
             }
           )
         : primary.messages
@@ -7379,10 +7435,8 @@ export class CursorConnectStreamService {
     }
   ) {
     options.signal.throwIfAborted()
-    const promptContext = this.buildPromptContextFromSession(session)
     const systemPrompt = this.buildCodexSystemPrompt(
-      promptContext,
-      session.deferredToolCatalog
+      options.model || route.model || session.model
     )
     const referenceContextItem =
       this.codexContextAdapter.buildReferenceContextItem({
@@ -7396,6 +7450,9 @@ export class CursorConnectStreamService {
         ),
         reasoningEffort: this.resolveRequestedReasoningEffort(
           session.requestedModelParameters
+        ),
+        truncationPolicy: this.resolveCodexTruncationPolicy(
+          options.model || route.model || session.model
         ),
       })
     return this.codexContextAdapter.compactIfNeeded(
@@ -7630,10 +7687,8 @@ export class CursorConnectStreamService {
       : "global"
     if (route.backend === "codex") {
       let hookUserMessage = options.hookUserMessage
-      const promptContext = this.buildPromptContextFromSession(session)
       const systemPrompt = this.buildCodexSystemPrompt(
-        promptContext,
-        session.deferredToolCatalog
+        options.model || route.model || session.model
       )
       const referenceContextItem =
         this.codexContextAdapter.buildReferenceContextItem({
@@ -7647,6 +7702,9 @@ export class CursorConnectStreamService {
           ),
           reasoningEffort: this.resolveRequestedReasoningEffort(
             session.requestedModelParameters
+          ),
+          truncationPolicy: this.resolveCodexTruncationPolicy(
+            options.model || route.model || session.model
           ),
         })
       const codexRemoteCompactProvider: CodexRemoteCompactProvider = async ({
@@ -9002,6 +9060,7 @@ ${raw}
         const toolCallId = typeof block.id === "string" ? block.id : ""
         const toolName = typeof block.name === "string" ? block.name : ""
         if (!toolCallId || !toolName) continue
+        if (isBridgeInternalToolName(toolName)) continue
         const input = this.isLooseRecord(block.input) ? block.input : {}
         const result = toolResults.get(toolCallId)
         const extraData = this.buildToolCompletionExtraDataForCheckpoint(
@@ -9395,7 +9454,9 @@ ${raw}
           continue
         }
 
-        const event = this.parseSseEvent(item.value)
+        const event = parseCursorSseEvent(item.value, (message) =>
+          this.logger.warn(message)
+        )
         if (!event) continue
 
         if (event.type === "message_start") {
@@ -17902,17 +17963,7 @@ ${raw}
       const route = this.modelRouter.resolveModel(ctx.model)
       const streamModel = route.model
 
-      let fullText = ""
-      const toolCalls: Array<{
-        id: string
-        name: string
-        inputJson: string
-      }> = []
-      let currentToolCall: {
-        id: string
-        name: string
-        inputJson: string
-      } | null = null
+      const sseTurn = new SubAgentSseTurnCollector()
 
       try {
         const stream = this.getBackendStream(streamModel, {
@@ -17935,55 +17986,36 @@ ${raw}
             continue
           }
 
-          const event = this.parseSseEvent(item.value)
+          const event = parseCursorSseEvent(item.value, (message) =>
+            this.logger.warn(message)
+          )
           if (!event) continue
 
-          if (event.type === "content_block_start") {
-            const cb = event.data.content_block
-            if (cb?.type === "tool_use" && cb.id && cb.name) {
-              currentToolCall = {
-                id: cb.id,
-                name: cb.name,
-                inputJson: "",
-              }
-            }
-          } else if (event.type === "content_block_delta") {
-            const delta = event.data.delta
-            if (delta?.type === "text_delta" && delta.text) {
-              fullText += delta.text
-              // Mirror sub-agent assistant text to the IDE in real time
-              // through the parent task tool call's ToolCallDeltaUpdate
-              // envelope so the parent task bubble streams sub-agent
-              // output instead of staying silent until completion.
-              this.emit(
-                conversationId,
-                yieldSubAgentUpdate(
-                  this.grpcService.buildInnerTextDeltaInteractionUpdate(
-                    delta.text
-                  )
+          const update = sseTurn.apply(event)
+          if (update.textDelta) {
+            // Mirror sub-agent assistant text to the IDE in real time through
+            // the parent task tool call's ToolCallDeltaUpdate envelope.
+            this.emit(
+              conversationId,
+              yieldSubAgentUpdate(
+                this.grpcService.buildInnerTextDeltaInteractionUpdate(
+                  update.textDelta
                 )
               )
-            } else if (delta?.type === "thinking_delta" && delta.thinking) {
-              // Mirror sub-agent thinking deltas through the same channel
-              // so the IDE renders them in the dedicated thinking section
-              // of the parent task bubble.
-              this.emit(
-                conversationId,
-                yieldSubAgentUpdate(
-                  this.grpcService.buildInnerThinkingDeltaInteractionUpdate(
-                    delta.thinking,
-                    ctx.model
-                  )
+            )
+          }
+          if (update.thinkingDelta) {
+            // Mirror sub-agent thinking deltas through the same channel so the
+            // IDE renders them in the task bubble's thinking section.
+            this.emit(
+              conversationId,
+              yieldSubAgentUpdate(
+                this.grpcService.buildInnerThinkingDeltaInteractionUpdate(
+                  update.thinkingDelta,
+                  ctx.model
                 )
               )
-            } else if (delta?.type === "input_json_delta" && currentToolCall) {
-              currentToolCall.inputJson += delta.partial_json || ""
-            }
-          } else if (event.type === "content_block_stop") {
-            if (currentToolCall) {
-              toolCalls.push(currentToolCall)
-              currentToolCall = null
-            }
+            )
           }
         }
       } catch (error) {
@@ -17997,6 +18029,7 @@ ${raw}
         return
       }
 
+      const { fullText, toolCalls } = sseTurn.result()
       ctx.accumulatedText = fullText
 
       // Build assistant message for history
@@ -18555,7 +18588,9 @@ ${raw}
           continue
         }
 
-        const event = this.parseSseEvent(item.value)
+        const event = parseCursorSseEvent(item.value, (message) =>
+          this.logger.warn(message)
+        )
         if (!event) continue
 
         if (event.type === "content_block_delta") {
@@ -18800,13 +18835,7 @@ ${raw}
 
     const streamModel = route.model
 
-    let fullText = ""
-    const toolCalls: Array<{ id: string; name: string; inputJson: string }> = []
-    let currentToolCall: {
-      id: string
-      name: string
-      inputJson: string
-    } | null = null
+    const sseTurn = new SubAgentSseTurnCollector()
 
     try {
       // Route the SSE source through the BackendStream adapter so
@@ -18839,46 +18868,25 @@ ${raw}
       for await (const sseEventStr of stream.events()) {
         if (args.abortSignal.aborted) {
           return {
-            fullText,
-            toolCalls,
+            ...sseTurn.result(),
             error: "aborted",
           }
         }
-        const event = this.parseSseEvent(sseEventStr)
+        const event = parseCursorSseEvent(sseEventStr, (message) =>
+          this.logger.warn(message)
+        )
         if (!event) continue
 
-        if (event.type === "content_block_start") {
-          const cb = event.data.content_block
-          if (cb?.type === "tool_use" && cb.id && cb.name) {
-            currentToolCall = {
-              id: cb.id,
-              name: cb.name,
-              inputJson: "",
-            }
-          }
-        } else if (event.type === "content_block_delta") {
-          const delta = event.data.delta
-          if (delta?.type === "text_delta" && delta.text) {
-            fullText += delta.text
-          } else if (delta?.type === "input_json_delta" && currentToolCall) {
-            currentToolCall.inputJson += delta.partial_json || ""
-          }
-        } else if (event.type === "content_block_stop") {
-          if (currentToolCall) {
-            toolCalls.push(currentToolCall)
-            currentToolCall = null
-          }
-        }
+        sseTurn.apply(event)
       }
     } catch (error) {
       return {
-        fullText,
-        toolCalls,
+        ...sseTurn.result(),
         error: String(error),
       }
     }
 
-    return { fullText, toolCalls }
+    return sseTurn.result()
   }
 
   /** Run a single bridge-local / inline tool for a background worker.
@@ -25005,6 +25013,122 @@ ${raw}
     return UNSUPPORTED_DEFERRED_TOOL_MESSAGES[family]
   }
 
+  private async handleCodexToolSearchInvocation(
+    conversationId: string,
+    session: SessionRecord,
+    activeToolCall: ActiveToolCall,
+    input: Record<string, unknown>,
+    options: HandleToolResultOptions = {}
+  ): Promise<void> {
+    const query = typeof input.query === "string" ? input.query.trim() : ""
+    if (!query) {
+      await this.emitInlineToolResult(
+        conversationId,
+        activeToolCall.id,
+        "[tool_search error] query must not be empty",
+        { status: "error", message: "query must not be empty" },
+        undefined,
+        "inline_tool_result",
+        undefined,
+        options,
+        [{ type: "tool_search_output", tools: [] }]
+      )
+      return
+    }
+
+    const limit = this.resolveCodexToolSearchLimit(input.limit)
+    const tools = this.searchCodexDeferredToolCatalog(
+      session.deferredToolCatalog ?? [],
+      query,
+      limit
+    )
+    this.logger.log(
+      `[tool_search] session=${conversationId} query=${JSON.stringify(query)} returned=${tools.length}/${session.deferredToolCatalog?.length ?? 0}`
+    )
+
+    await this.emitInlineToolResult(
+      conversationId,
+      activeToolCall.id,
+      JSON.stringify({ tools }, null, 2),
+      { status: "success" },
+      undefined,
+      "inline_tool_result",
+      undefined,
+      options,
+      [{ type: "tool_search_output", tools }]
+    )
+  }
+
+  private resolveCodexToolSearchLimit(value: unknown): number {
+    const raw =
+      typeof value === "number"
+        ? value
+        : typeof value === "string"
+          ? Number(value)
+          : 8
+    if (!Number.isFinite(raw) || raw <= 0) {
+      return 8
+    }
+    return Math.max(1, Math.min(50, Math.floor(raw)))
+  }
+
+  private searchCodexDeferredToolCatalog(
+    catalog: DeferredToolDescriptor[],
+    query: string,
+    limit: number
+  ): Array<Record<string, unknown>> {
+    const normalizedQuery = query.toLowerCase()
+    const queryTerms = normalizedQuery
+      .split(/[^a-z0-9_./:-]+/i)
+      .map((term) => term.trim().toLowerCase())
+      .filter(Boolean)
+
+    return catalog
+      .map((entry, index) => {
+        const schemaText = JSON.stringify(entry.input_schema || {})
+        const haystack = [
+          entry.name,
+          entry.oneLineDescription,
+          entry.description,
+          schemaText,
+        ]
+          .join("\n")
+          .toLowerCase()
+        let score = 0
+        if (entry.name.toLowerCase() === normalizedQuery) {
+          score += 1000
+        }
+        if (entry.name.toLowerCase().includes(normalizedQuery)) {
+          score += 400
+        }
+        if (haystack.includes(normalizedQuery)) {
+          score += 200
+        }
+        for (const term of queryTerms) {
+          if (entry.name.toLowerCase().includes(term)) {
+            score += 50
+          } else if (haystack.includes(term)) {
+            score += 10
+          }
+        }
+        return { entry, index, score }
+      })
+      .filter((candidate) => candidate.score > 0)
+      .sort((a, b) => b.score - a.score || a.index - b.index)
+      .slice(0, limit)
+      .map(({ entry }) => ({
+        type: "function",
+        name: entry.name,
+        description: entry.description,
+        strict: false,
+        defer_loading: true,
+        parameters: entry.input_schema || {
+          type: "object",
+          properties: {},
+        },
+      }))
+  }
+
   /**
    * Bridge-internal handler for `discover_tool` calls.
    *
@@ -25743,6 +25867,7 @@ ${raw}
       normalized === "request_context" ||
       normalized === "subagent_await" ||
       normalized === SNIP_MESSAGES_TOOL_NAME ||
+      normalized === CODEX_TOOL_SEARCH_NAME ||
       normalized === "truncated" ||
       normalized === "truncated_tool_call" ||
       normalized === "update_project" ||
@@ -25769,6 +25894,7 @@ ${raw}
       compact === "requestcontext" ||
       compact === "subagentawait" ||
       compact === "snipmessages" ||
+      compact === "toolsearch" ||
       compact === "truncated" ||
       compact === "truncatedtoolcall" ||
       compact === "updateproject" ||
@@ -25869,13 +25995,16 @@ ${raw}
 
   private resolveCodexToolCallType(
     ...toolNames: Array<string | undefined>
-  ): "function" | "custom" {
+  ): CodexToolCallType {
     for (const rawToolName of toolNames) {
       const normalizedToolName = (rawToolName || "")
         .trim()
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "_")
         .replace(/^_+|_+$/g, "")
+      if (normalizedToolName === CODEX_TOOL_SEARCH_NAME) {
+        return "tool_search"
+      }
       if (normalizedToolName === "apply_patch") {
         return "custom"
       }
@@ -28087,6 +28216,24 @@ ${raw}
       preparedTool.protocolToolName === DISCOVER_TOOL_NAME
     ) {
       await this.handleDiscoverToolInvocation(
+        conversationId,
+        session,
+        activeToolCall,
+        preparedTool.input,
+        options.inlineResultOptions
+      )
+      return this.sessionManager
+        .getPendingToolCallIds(conversationId)
+        .includes(activeToolCall.id)
+        ? "waiting_for_result"
+        : "completed_inline"
+    }
+
+    if (
+      preparedTool.canonicalToolName === CODEX_TOOL_SEARCH_NAME ||
+      preparedTool.protocolToolName === CODEX_TOOL_SEARCH_NAME
+    ) {
+      await this.handleCodexToolSearchInvocation(
         conversationId,
         session,
         activeToolCall,
@@ -30520,11 +30667,6 @@ ${raw}
       rawMessages = projectedNormalized
     }
 
-    const useGoogleContextMessages = this.isCloudCodeBackend(route.backend)
-    const contextMessages = useGoogleContextMessages
-      ? this.buildGoogleContextMessages(parsed, conversationId)
-      : []
-
     // Tool selection log.  After `getOrCreateSession`, the session
     // already mirrors `parsed`, so the *actual* upstream tools array
     // is produced by `prepareToolBuildForSession(session)` below — the
@@ -30563,6 +30705,18 @@ ${raw}
       session.conversationId,
       apiToolsResult.deferred
     )
+    const useGoogleContextMessages = this.isCloudCodeBackend(route.backend)
+    const contextMessages = useGoogleContextMessages
+      ? this.buildGoogleContextMessages(parsed, conversationId)
+      : []
+    const codexContextEntries =
+      route.backend === "codex"
+        ? this.buildCodexContextEntries(parsed, {
+            model: route.model || session.model,
+            deferredCatalog: apiToolsResult.deferred,
+            sessionMessageCount: this.getSessionMessageCount(session),
+          })
+        : []
 
     // System prompt is built AFTER the defer split so we can advertise
     // the catalog to the model in the same prompt.  Google
@@ -30572,7 +30726,7 @@ ${raw}
     const systemPrompt = useGoogleContextMessages
       ? this.buildGoogleSystemPrompt(parsed)
       : route.backend === "codex"
-        ? this.buildCodexSystemPrompt(parsed, apiToolsResult.deferred)
+        ? this.buildCodexSystemPrompt(route.model || session.model)
         : this.buildSystemPrompt(parsed, apiToolsResult.deferred, {
             sessionMessageCount: this.contextState.getContextRecord(
               session.conversationId
@@ -30583,9 +30737,17 @@ ${raw}
     const budget = this.resolveMessageBudget(route.backend, {
       parsed,
       session,
-      protectedContextTokens: contextMessages.length
-        ? this.tokenCounter.countMessages(contextMessages as UnifiedMessage[])
-        : 0,
+      protectedContextTokens:
+        route.backend === "codex"
+          ? this.estimateCodexContextLedgerTokens(
+              conversationId,
+              codexContextEntries
+            )
+          : contextMessages.length
+            ? this.tokenCounter.countMessages(
+                contextMessages as UnifiedMessage[]
+              )
+            : 0,
       systemPrompt,
       toolDefinitions: apiTools,
       model: session.model,
@@ -30749,10 +30911,20 @@ ${raw}
               streamUseGoogleContextMessages && conversationId
                 ? this.buildGoogleContextMessages(parsed, conversationId)
                 : []
+            const streamCodexContextEntries =
+              streamRoute.backend === "codex"
+                ? this.buildCodexContextEntries(parsed, {
+                    model: streamRoute.model || session.model,
+                    deferredCatalog: apiToolsResult.deferred,
+                    sessionMessageCount: this.getSessionMessageCount(session),
+                  })
+                : []
             const streamSystemPrompt = streamUseGoogleContextMessages
               ? this.buildGoogleSystemPrompt(parsed)
               : streamRoute.backend === "codex"
-                ? this.buildCodexSystemPrompt(parsed, apiToolsResult.deferred)
+                ? this.buildCodexSystemPrompt(
+                    streamRoute.model || session.model
+                  )
                 : this.buildSystemPrompt(parsed, apiToolsResult.deferred, {
                     sessionMessageCount: this.contextState.getContextRecord(
                       session.conversationId
@@ -30763,11 +30935,17 @@ ${raw}
               {
                 parsed,
                 session,
-                protectedContextTokens: streamContextMessages.length
-                  ? this.tokenCounter.countMessages(
-                      streamContextMessages as UnifiedMessage[]
-                    )
-                  : 0,
+                protectedContextTokens:
+                  streamRoute.backend === "codex"
+                    ? this.estimateCodexContextLedgerTokens(
+                        conversationId,
+                        streamCodexContextEntries
+                      )
+                    : streamContextMessages.length
+                      ? this.tokenCounter.countMessages(
+                          streamContextMessages as UnifiedMessage[]
+                        )
+                      : 0,
                 systemPrompt: streamSystemPrompt,
                 toolDefinitions: apiTools,
                 model: session.model,
@@ -31334,12 +31512,23 @@ ${raw}
           const contextMessages = useGoogleMessages
             ? this.buildGoogleContextMessages(activeSession, conversationId)
             : []
+          const promptContext =
+            this.buildPromptContextFromSession(activeSession)
+          const codexContextEntries =
+            streamRoute.backend === "codex"
+              ? this.buildCodexContextEntries(promptContext, {
+                  model: streamRoute.model || activeSession.model,
+                  deferredCatalog: activeSession.deferredToolCatalog,
+                  sessionMessageCount:
+                    this.getSessionMessageCount(activeSession),
+                  additionalSystemPrompt,
+                })
+              : []
           const baseSystemPrompt = useGoogleMessages
             ? this.buildGoogleSystemPrompt(activeSession)
             : streamRoute.backend === "codex"
               ? this.buildCodexSystemPrompt(
-                  activeSession,
-                  activeSession.deferredToolCatalog
+                  streamRoute.model || activeSession.model
                 )
               : this.buildSystemPrompt(
                   activeSession,
@@ -31350,20 +31539,30 @@ ${raw}
                     )!.messages.length,
                   }
                 )
-          const systemPrompt = additionalSystemPrompt
-            ? [baseSystemPrompt, additionalSystemPrompt]
-                .filter(
-                  (part) => typeof part === "string" && part.trim().length > 0
-                )
-                .join("\n\n")
-            : baseSystemPrompt
+          const systemPrompt =
+            streamRoute.backend === "codex"
+              ? baseSystemPrompt
+              : additionalSystemPrompt
+                ? [baseSystemPrompt, additionalSystemPrompt]
+                    .filter(
+                      (part) =>
+                        typeof part === "string" && part.trim().length > 0
+                    )
+                    .join("\n\n")
+                : baseSystemPrompt
           const streamBudget = this.resolveMessageBudget(streamRoute.backend, {
             session: activeSession,
-            protectedContextTokens: contextMessages.length
-              ? this.tokenCounter.countMessages(
-                  contextMessages as UnifiedMessage[]
-                )
-              : 0,
+            protectedContextTokens:
+              streamRoute.backend === "codex"
+                ? this.estimateCodexContextLedgerTokens(
+                    conversationId,
+                    codexContextEntries
+                  )
+                : contextMessages.length
+                  ? this.tokenCounter.countMessages(
+                      contextMessages as UnifiedMessage[]
+                    )
+                  : 0,
             systemPrompt,
             toolDefinitions: continuationTools,
             model: activeSession.model,
@@ -33624,38 +33823,6 @@ ${raw}
   }
 
   /**
-   * Parse SSE event string
-   */
-  private parseSseEvent(sseEvent: string): SseEvent | null {
-    try {
-      // SSE format: "event: type\ndata: {...}\n\n"
-      const lines = sseEvent.split("\n")
-      let eventType = ""
-      let eventData = ""
-
-      for (const line of lines) {
-        if (line.startsWith("event: ")) {
-          eventType = line.substring(7).trim()
-        } else if (line.startsWith("data: ")) {
-          eventData = line.substring(6).trim()
-        }
-      }
-
-      if (!eventType || !eventData) {
-        return null
-      }
-
-      return {
-        type: eventType,
-        data: JSON.parse(eventData) as SseEventData,
-      }
-    } catch (error) {
-      this.logger.warn(`Failed to parse SSE event: ${String(error)}`)
-      return null
-    }
-  }
-
-  /**
    * 格式化 tool result（使用生成的 protobuf 类型解析）
    *
    * 通过 fromBinary(ExecClientMessageSchema) 解析 buffer，
@@ -34954,7 +35121,10 @@ ${raw}
       parts.push("Code Context:\n" + chunkTexts.join("\n\n"))
     }
 
-    const deferredSection = this.buildDeferredToolsSection(deferredCatalog)
+    const deferredSection = this.buildDeferredToolsSection(
+      deferredCatalog,
+      "discover_tool"
+    )
     if (deferredSection) {
       parts.push(deferredSection)
     }
@@ -35026,20 +35196,32 @@ ${raw}
    * 7K-token schemas we trimmed.
    */
   private buildDeferredToolsSection(
-    deferredCatalog?: DeferredToolDescriptor[]
+    deferredCatalog?: DeferredToolDescriptor[],
+    mode: "discover_tool" | "tool_search" = "discover_tool"
   ): string | undefined {
     if (!deferredCatalog || deferredCatalog.length === 0) return undefined
     const lines: string[] = []
     lines.push("<deferred_tools>")
-    lines.push(
-      "Additional tools are available but their full schemas are not " +
-        "loaded by default to save context. To use any of the tools below, " +
-        'call `discover_tool({ tool_name: "<exact_name>" })` first. ' +
-        "The bridge returns the full schema and the tool stays loaded for " +
-        "the rest of this session — you only need to discover each tool " +
-        "once. Names are case-sensitive; do not invent names that aren't " +
-        "in this list."
-    )
+    if (mode === "tool_search") {
+      lines.push(
+        "Additional tools are available but their full schemas are not " +
+          "loaded by default to save context. To use any of the tools below, " +
+          "call `tool_search` with a short query for the tool or task you " +
+          "need. The returned `tool_search_output` exposes matching tool " +
+          "schemas through Codex native dynamic-tool history; do not call " +
+          "`discover_tool` on Codex."
+      )
+    } else {
+      lines.push(
+        "Additional tools are available but their full schemas are not " +
+          "loaded by default to save context. To use any of the tools below, " +
+          'call `discover_tool({ tool_name: "<exact_name>" })` first. ' +
+          "The bridge returns the full schema and the tool stays loaded for " +
+          "the rest of this session — you only need to discover each tool " +
+          "once. Names are case-sensitive; do not invent names that aren't " +
+          "in this list."
+      )
+    }
     lines.push("")
     for (const entry of [...deferredCatalog].sort((a, b) =>
       a.name.localeCompare(b.name)
@@ -35051,42 +35233,83 @@ ${raw}
     return lines.join("\n")
   }
 
-  private buildCodexSystemPrompt(
-    context: PromptContext,
-    deferredCatalog?: DeferredToolDescriptor[]
-  ): string {
-    const parts: string[] = []
+  private buildCodexSystemPrompt(model?: string): string {
+    return resolveCodexModelInstructions(model || "").instructions || ""
+  }
 
-    if (context.customSystemPrompt) {
-      parts.push(context.customSystemPrompt)
+  private buildCodexContextEntries(
+    context: PromptContext,
+    options: {
+      model?: string
+      deferredCatalog?: DeferredToolDescriptor[]
+      sessionMessageCount?: number
+      additionalSystemPrompt?: string
+    } = {}
+  ): CodexContextEntry[] {
+    const entries: CodexContextEntry[] = []
+    const pushEntry = (
+      key: string,
+      role: CodexContextEntry["role"],
+      content: string | undefined
+    ) => {
+      const trimmed = content?.trim()
+      if (!trimmed) {
+        return
+      }
+      entries.push({ key, role, content: trimmed })
     }
 
-    parts.push(this.buildCodexToolUsageSection())
+    const languageDirective = buildLanguageDirective(
+      context.newMessage ? [{ role: "user", content: context.newMessage }] : []
+    )
+    pushEntry("language_directive", "developer", languageDirective)
+    pushEntry("custom_system_prompt", "developer", context.customSystemPrompt)
+    pushEntry("tool_usage", "developer", this.buildCodexToolUsageSection())
 
     const cursorSkillPolicy =
       this.cursorSkillsManager.resolvePolicyForPrompt(context)
     const cursorRulesSection = this.buildCursorRulesSection(
       this.resolveEffectiveRulesForPrompt(context, cursorSkillPolicy)
     )
-    if (cursorRulesSection) {
-      parts.push(cursorRulesSection)
-    }
+    pushEntry("cursor_rules", "developer", cursorRulesSection || undefined)
     const cursorSkillsSection = this.cursorSkillsManager.buildCatalogSection(
       cursorSkillPolicy.availableSkills
     )
-    if (cursorSkillsSection) {
-      parts.push(cursorSkillsSection)
-    }
+    pushEntry("cursor_skills", "developer", cursorSkillsSection || undefined)
 
     if (context.cursorCommands && context.cursorCommands.length > 0) {
       const commandBlocks = context.cursorCommands.map((command) =>
         [`/${command.name}`, command.content].join("\n")
       )
-      parts.push("Selected Cursor Commands:\n" + commandBlocks.join("\n\n"))
+      pushEntry(
+        "cursor_commands",
+        "developer",
+        "Selected Cursor Commands:\n" + commandBlocks.join("\n\n")
+      )
     }
 
+    const deferredSection = this.buildDeferredToolsSection(
+      options.deferredCatalog,
+      "tool_search"
+    )
+    pushEntry("deferred_tools", "developer", deferredSection)
+
+    const contextHint = this.buildContextManagementHintSection(
+      options.sessionMessageCount
+    )
+    pushEntry("context_management_hint", "developer", contextHint)
+    pushEntry(
+      "additional_system_prompt",
+      "developer",
+      options.additionalSystemPrompt
+    )
+
     if (context.explicitContext) {
-      parts.push("Explicit Context:\n" + context.explicitContext)
+      pushEntry(
+        "explicit_context",
+        "user",
+        "Explicit Context:\n" + context.explicitContext
+      )
     }
 
     if (context.projectContext) {
@@ -35098,7 +35321,7 @@ ${raw}
           `Open workspaces: ${context.projectContext.directories.join(", ")}`
         )
       }
-      parts.push(workspaceInfo.join("\n"))
+      pushEntry("workspace_info", "user", workspaceInfo.join("\n"))
     }
 
     if (context.codeChunks && context.codeChunks.length > 0) {
@@ -35108,15 +35331,87 @@ ${raw}
           : ""
         return `--- ${chunk.path}${lineInfo} ---\n${chunk.content}`
       })
-      parts.push("Code Context:\n" + chunkTexts.join("\n\n"))
+      pushEntry(
+        "code_context",
+        "user",
+        "Code Context:\n" + chunkTexts.join("\n\n")
+      )
     }
 
-    const deferredSection = this.buildDeferredToolsSection(deferredCatalog)
-    if (deferredSection) {
-      parts.push(deferredSection)
+    return entries
+  }
+
+  private countCodexContextMessages(
+    messages: CodexExecutionRequest["contextMessages"] | undefined
+  ): number {
+    if (!messages || messages.length === 0) {
+      return 0
     }
 
-    return parts.join("\n\n")
+    let tokens = 3
+    for (const message of messages) {
+      tokens += 4
+      tokens += this.tokenCounter.countText(message.role, false)
+      tokens +=
+        typeof message.content === "string"
+          ? this.tokenCounter.countText(message.content, false)
+          : this.tokenCounter.countJsonValue(message.content, false)
+    }
+    return tokens
+  }
+
+  private getCodexContextLedger(
+    conversationId: string | undefined
+  ): CodexContextLedgerState | undefined {
+    const normalized = conversationId?.trim()
+    if (!normalized) {
+      return undefined
+    }
+    let ledger = this.codexContextLedgersByConversation.get(normalized)
+    if (!ledger) {
+      ledger = createCodexContextLedgerState()
+      this.codexContextLedgersByConversation.set(normalized, ledger)
+    }
+    return ledger
+  }
+
+  private estimateCodexContextLedgerTokens(
+    conversationId: string | undefined,
+    entries: CodexContextEntry[]
+  ): number {
+    const ledger = this.getCodexContextLedger(conversationId)
+    return this.countCodexContextMessages(
+      previewCodexContextLedgerMessages(ledger, entries)
+    )
+  }
+
+  private projectCodexMessagesWithContextLedger(
+    conversationId: string | undefined,
+    historyMessages: CodexExecutionRequest["messages"],
+    entries: CodexContextEntry[]
+  ): {
+    messages: CodexExecutionRequest["messages"]
+    contextMessageCount: number
+    addedContextMessageCount: number
+  } {
+    const ledger = this.getCodexContextLedger(conversationId)
+    if (!ledger) {
+      return {
+        messages: historyMessages,
+        contextMessageCount: 0,
+        addedContextMessageCount: 0,
+      }
+    }
+    const projection = projectCodexContextLedgerMessages(
+      ledger,
+      historyMessages,
+      entries
+    )
+    return {
+      messages: projection.messages,
+      contextMessageCount: projection.contextMessages.length,
+      addedContextMessageCount: projection.addedContextMessages.length,
+    }
   }
 
   private buildGoogleSystemPrompt(context: PromptContext): string {
@@ -35650,56 +35945,10 @@ ${raw}
     requestedModelParameters?: Record<string, string>
   ): string | undefined {
     const defaultServiceTier = this.codexService.getDefaultServiceTier()
-    if (!requestedModelParameters) {
-      return defaultServiceTier
-    }
-
-    const normalizeValue = (rawValue?: string): string | undefined => {
-      if (!rawValue) {
-        return undefined
-      }
-
-      const normalized = rawValue
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "_")
-
-      switch (normalized) {
-        case "priority":
-        case "fast":
-        case "true":
-        case "on":
-        case "enabled":
-        case "1":
-          return "priority"
-        default:
-          return undefined
-      }
-    }
-
-    const exactIds = ["service_tier", "fast_mode", "fast"]
-    for (const id of exactIds) {
-      const resolved = normalizeValue(requestedModelParameters[id])
-      if (resolved) {
-        return resolved
-      }
-    }
-
-    for (const [id, rawValue] of Object.entries(requestedModelParameters)) {
-      if (
-        !id.includes("fast") &&
-        !id.includes("tier") &&
-        !id.includes("speed")
-      ) {
-        continue
-      }
-      const resolved = normalizeValue(rawValue)
-      if (resolved) {
-        return resolved
-      }
-    }
-
-    return defaultServiceTier
+    return resolveCursorCodexServiceTier(
+      requestedModelParameters,
+      defaultServiceTier
+    )
   }
 
   private shouldSuppressThinkingSummaryForRoute(
@@ -35710,13 +35959,11 @@ ${raw}
     if (explicitSuppress === true) {
       return true
     }
-    if (backend !== "codex") {
-      return false
-    }
-    return (
-      this.resolveRequestedCodexServiceTier(requestedModelParameters) ===
-      "priority"
-    )
+    return shouldSuppressCursorCodexThinkingSummary({
+      backend,
+      requestedModelParameters,
+      defaultServiceTier: this.codexService.getDefaultServiceTier(),
+    })
   }
 
   private normalizeRequestedReasoningEffort(

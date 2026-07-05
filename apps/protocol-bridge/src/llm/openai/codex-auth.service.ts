@@ -25,6 +25,7 @@ import {
   CodexModelTier,
   normalizeCodexModelTier,
 } from "../shared/model-registry"
+import { isCodexRefreshTokenInvalidationError } from "./codex-token-refresh-policy"
 
 // ── OAuth Constants (matching codex_cli_rs) ────────────────────────────
 
@@ -294,13 +295,9 @@ export class CodexAuthService {
         return tokenData
       } catch (e) {
         lastError = e as Error
-        const errorMsg = lastError.message.toLowerCase()
 
         // Non-retryable errors (token rotation violation or revoked)
-        if (
-          errorMsg.includes("refresh_token_reused") ||
-          errorMsg.includes("already been used")
-        ) {
+        if (isCodexRefreshTokenInvalidationError(lastError)) {
           this.logger.warn(
             `Token refresh attempt ${attempt + 1} failed with non-retryable error: ${lastError.message}`
           )

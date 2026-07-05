@@ -663,7 +663,7 @@ function pfStatus() {
   }
 
   macBypassStatus()
-  proxyConnectivityCheck()
+  proxyConnectivityCheck().finally(() => process.exit(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -755,7 +755,7 @@ function iptablesStatus() {
   }
 
   linuxBypassStatus()
-  proxyConnectivityCheck()
+  proxyConnectivityCheck().finally(() => process.exit(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -833,7 +833,7 @@ function netshStatus() {
   }
 
   winBypassStatus()
-  proxyConnectivityCheck()
+  proxyConnectivityCheck().finally(() => process.exit(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -845,13 +845,26 @@ function h2HealthCheck(host, port) {
 
   return new Promise((resolve) => {
     let session
-    const timer = setTimeout(() => {
+    let req
+    let settled = false
+    const finish = (ok) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
       try {
-        session.destroy()
+        req?.close()
       } catch {
         /* cleanup */
       }
-      resolve(false)
+      try {
+        session?.destroy()
+      } catch {
+        /* cleanup */
+      }
+      resolve(ok)
+    }
+    const timer = setTimeout(() => {
+      finish(false)
     }, 2000)
 
     try {
@@ -860,39 +873,20 @@ function h2HealthCheck(host, port) {
       })
 
       session.on("error", () => {
-        clearTimeout(timer)
-        try {
-          session.destroy()
-        } catch {
-          /* cleanup */
-        }
-        resolve(false)
+        finish(false)
       })
 
-      const req = session.request({ ":path": "/health" })
+      req = session.request({ ":path": "/health" })
       req.on("response", (headers) => {
-        clearTimeout(timer)
         const status = headers[":status"]
-        try {
-          req.close()
-          session.close()
-        } catch {
-          /* cleanup */
-        }
-        resolve(status >= 200 && status < 500)
+        finish(status >= 200 && status < 500)
       })
       req.on("error", () => {
-        clearTimeout(timer)
-        try {
-          session.destroy()
-        } catch {
-          /* cleanup */
-        }
-        resolve(false)
+        finish(false)
       })
       req.end()
     } catch {
-      /* connect error */
+      finish(false)
     }
   })
 }
@@ -1122,21 +1116,23 @@ switch (subCmd) {
 
   case "status":
     if (OUTPUT_JSON) {
-      printStatusJson().catch((error) => {
-        console.error(
-          JSON.stringify(
-            {
-              ok: false,
-              error: error instanceof Error ? error.message : String(error),
-              platform: platform.PLATFORM,
-              backend,
-            },
-            null,
-            2
+      printStatusJson()
+        .then(() => process.exit(0))
+        .catch((error) => {
+          console.error(
+            JSON.stringify(
+              {
+                ok: false,
+                error: error instanceof Error ? error.message : String(error),
+                platform: platform.PLATFORM,
+                backend,
+              },
+              null,
+              2
+            )
           )
-        )
-        process.exit(1)
-      })
+          process.exit(1)
+        })
       break
     }
     if (backend === "pf") pfStatus()

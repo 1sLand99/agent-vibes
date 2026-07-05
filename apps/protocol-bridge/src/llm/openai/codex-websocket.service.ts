@@ -26,6 +26,7 @@ import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
 import WebSocket from "ws"
 import {
+  buildCodexWebSocketRequestBody,
   buildCodexWebSocketHeaders,
   type CodexForwardHeaders,
 } from "./codex-header-utils"
@@ -141,7 +142,9 @@ export class CodexWebSocketService implements OnModuleDestroy {
     workspaceId?: string,
     cacheHeaders?: Record<string, string>,
     forwardHeaders?: CodexForwardHeaders,
-    omitAccountId: boolean = false
+    omitAccountId: boolean = false,
+    useResponsesLite: boolean = false,
+    clientMetadata?: CodexForwardHeaders
   ): Record<string, string> {
     return buildCodexWebSocketHeaders({
       token,
@@ -152,11 +155,13 @@ export class CodexWebSocketService implements OnModuleDestroy {
         originator: this.identity.originator(),
       },
       conversationId,
+      clientMetadata,
       accountId,
       workspaceId,
       cacheHeaders,
       forwardHeaders,
       omitAccountId,
+      useResponsesLite,
     })
   }
 
@@ -295,9 +300,15 @@ export class CodexWebSocketService implements OnModuleDestroy {
    * Ported from: codex_websockets_executor.go buildCodexWebsocketRequestBody()
    */
   buildWebSocketRequestBody(
-    body: Record<string, unknown>
+    body: Record<string, unknown>,
+    options: {
+      useResponsesLite?: boolean
+      forwardHeaders?: CodexForwardHeaders
+      streamRequestStartMs?: number
+      turnState?: string
+    } = {}
   ): Record<string, unknown> {
-    return { ...body, type: "response.create" }
+    return buildCodexWebSocketRequestBody(body, options)
   }
 
   /**
@@ -308,9 +319,18 @@ export class CodexWebSocketService implements OnModuleDestroy {
    * 这让服务端只预热 prompt cache 而不生成响应。
    */
   buildWarmupRequestBody(
-    body: Record<string, unknown>
+    body: Record<string, unknown>,
+    options: {
+      useResponsesLite?: boolean
+      forwardHeaders?: CodexForwardHeaders
+      streamRequestStartMs?: number
+      turnState?: string
+    } = {}
   ): Record<string, unknown> {
-    return { ...body, type: "response.create", generate: false }
+    return buildCodexWebSocketRequestBody(body, {
+      ...options,
+      warmup: true,
+    })
   }
 
   /**
@@ -539,11 +559,15 @@ export class CodexWebSocketService implements OnModuleDestroy {
    */
   async sendViaWebSocket(
     ws: WebSocket,
-    requestBody: Record<string, unknown>
+    requestBody: Record<string, unknown>,
+    options: {
+      onMessage?: (msg: WebSocketMessage) => void
+    } = {}
   ): Promise<WebSocketMessage> {
     const collectedItems: Array<Record<string, unknown>> = []
 
     for await (const msg of this.streamViaWebSocket(ws, requestBody)) {
+      options.onMessage?.(msg)
       if (msg.type === "response.output_item.done") {
         const item = msg.item as Record<string, unknown> | undefined
         if (item && typeof item === "object") {
@@ -620,96 +644,6 @@ export class CodexWebSocketService implements OnModuleDestroy {
           session.requestTail = Promise.resolve()
         }
       },
-    }
-  }
-
-  /**
-   * 在上一轮 turn 的 response.completed 之后立即触发，异步预热下一轮 WebSocket
-   * 连接。chatgpt.com codex 后端会在 response.completed 后用 code=1005 主动关
-   * 闭连接，下一轮 turn 必须重新握手（约 1s）。prewarm 在 turn 间隙建立新连接
-   * 并挂到 session.conn，使下一轮 turn 进入 ensureSessionConnection 时直接命
-   * 中存活连接。
-   *
-   * 安全保证：
-   * - 如果握手期间已有新 turn 占用 session（activeStream 非空），prewarm 结果
-   *   直接关闭丢弃，不影响进行中的请求。
-   * - 如果 session.conn 已被其它路径替换为 OPEN 状态（说明已经成功复用），同样
-   *   丢弃 prewarm，避免无谓抢占。
-   * - 网络失败时静默丢弃，下一轮 turn 走原有的现场握手路径，无功能降级。
-   */
-  async schedulePrewarmConnection(
-    sessionId: string,
-    wsUrl: string,
-    headers: Record<string, string>,
-    proxyUrl?: string,
-    replacingWs?: WebSocket
-  ): Promise<void> {
-    const initialSession = this.sessions.get(sessionId)
-    if (!initialSession) {
-      return
-    }
-
-    let ws: WebSocket
-    try {
-      ws = await this.connect(wsUrl, headers, proxyUrl)
-    } catch (error) {
-      this.logger.debug(
-        `[Codex][Prewarm] connect failed for session ${sessionId}: ${(error as Error).message}`
-      )
-      return
-    }
-
-    const current = this.sessions.get(sessionId)
-    if (!current) {
-      this.safeCloseWebSocket(ws)
-      return
-    }
-
-    if (current.activeStream) {
-      // 另一个 turn 已经占用此 session，prewarm 不能抢占
-      this.safeCloseWebSocket(ws)
-      this.logger.debug(
-        `[Codex][Prewarm] discarded for session ${sessionId}: active stream in progress`
-      )
-      return
-    }
-
-    const existing = current.conn
-    const existingIsDead =
-      !existing ||
-      existing.readyState === WebSocket.CLOSED ||
-      existing.readyState === WebSocket.CLOSING
-    const existingIsStaleReplacing = !!replacingWs && existing === replacingWs
-
-    if (!existingIsDead && !existingIsStaleReplacing) {
-      // session 已持有另一条活连接，保留现状
-      this.safeCloseWebSocket(ws)
-      return
-    }
-
-    if (
-      existingIsStaleReplacing &&
-      existing &&
-      existing.readyState === WebSocket.OPEN
-    ) {
-      this.safeCloseWebSocket(existing)
-    }
-
-    current.conn = ws
-    current.wsUrl = wsUrl
-    this.attachSessionLifecycle(current, ws)
-    this.logger.debug(
-      `[Codex][Prewarm] adopted prewarmed connection for session ${sessionId}`
-    )
-  }
-
-  private safeCloseWebSocket(ws: WebSocket): void {
-    try {
-      ws.close()
-    } catch (error) {
-      this.logger.debug(
-        `[Codex][WS] close ignored: ${(error as Error).message}`
-      )
     }
   }
 

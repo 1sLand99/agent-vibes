@@ -142,6 +142,7 @@ export class ContextProjectionService {
           // and for every user record (Anthropic only mints message.id
           // on assistant turns).
           ...(record.messageId ? { messageId: record.messageId } : {}),
+          ...(record.isMeta ? { isMeta: true } : {}),
         },
       ]
     }
