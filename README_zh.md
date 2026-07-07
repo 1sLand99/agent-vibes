@@ -151,46 +151,46 @@ Agent Vibes 是一个统一的 AI Agent 网关。它不只是做客户端与后�
 Cursor 客户端侧使用 free 账号即可，不需要开通 Cursor 付费订阅。
 
 从 [GitHub Releases](https://github.com/funny-vibes/agent-vibes/releases) 一键下载并安装：
-兼容 Cursor 版本：`3.9.16`。
+兼容 Cursor 版本：`3.10.17`。
 
 #### macOS Apple Silicon
 
 ```bash
 # Download
-curl -L -o agent-vibes-darwin-arm64-0.1.53.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.53/agent-vibes-darwin-arm64-0.1.53.vsix
+curl -L -o agent-vibes-darwin-arm64-0.1.54.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.54/agent-vibes-darwin-arm64-0.1.54.vsix
 
 # Install
-cursor --install-extension agent-vibes-darwin-arm64-0.1.53.vsix --force
+cursor --install-extension agent-vibes-darwin-arm64-0.1.54.vsix --force
 ```
 
 #### macOS Intel
 
 ```bash
 # Download
-curl -L -o agent-vibes-darwin-x64-0.1.53.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.53/agent-vibes-darwin-x64-0.1.53.vsix
+curl -L -o agent-vibes-darwin-x64-0.1.54.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.54/agent-vibes-darwin-x64-0.1.54.vsix
 
 # Install
-cursor --install-extension agent-vibes-darwin-x64-0.1.53.vsix --force
+cursor --install-extension agent-vibes-darwin-x64-0.1.54.vsix --force
 ```
 
 #### Linux x64
 
 ```bash
 # Download
-curl -L -o agent-vibes-linux-x64-0.1.53.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.53/agent-vibes-linux-x64-0.1.53.vsix
+curl -L -o agent-vibes-linux-x64-0.1.54.vsix https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.54/agent-vibes-linux-x64-0.1.54.vsix
 
 # Install
-cursor --install-extension agent-vibes-linux-x64-0.1.53.vsix --force
+cursor --install-extension agent-vibes-linux-x64-0.1.54.vsix --force
 ```
 
 #### Windows x64
 
 ```powershell
 # Download
-Invoke-WebRequest -Uri "https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.53/agent-vibes-win32-x64-0.1.53.vsix" -OutFile "agent-vibes-win32-x64-0.1.53.vsix"
+Invoke-WebRequest -Uri "https://github.com/funny-vibes/agent-vibes/releases/download/v0.1.54/agent-vibes-win32-x64-0.1.54.vsix" -OutFile "agent-vibes-win32-x64-0.1.54.vsix"
 
 # Install
-cursor --install-extension agent-vibes-win32-x64-0.1.53.vsix --force
+cursor --install-extension agent-vibes-win32-x64-0.1.54.vsix --force
 ```
 
 安装后重启 Cursor，扩展会自动启动代理服务器（仅启动 bridge，不会自动修改 Cursor），
