@@ -48,6 +48,7 @@ import {
 import { KvStorageService } from "../kv-storage.service"
 import { extractWorkspaceFoldersWithPrimary } from "./workspace-folders"
 import { CursorProtocolTraceService } from "../cursor-protocol-trace.service"
+import { safeJsonStringify } from "../safe-json"
 
 // GZIP 魔数
 const GZIP_MAGIC = Buffer.from([0x1f, 0x8b])
@@ -1941,7 +1942,12 @@ export class CursorRequestParser {
       if (requestContext.gitRepos?.length) {
         for (const git of requestContext.gitRepos) {
           this.logger.debug(
-            `[DEBUG] gitRepo: ${JSON.stringify(git).substring(0, 200)}`
+            `[DEBUG] gitRepo: ${safeJsonStringify(git, {
+              maxDepth: 4,
+              maxArrayItems: 20,
+              maxObjectKeys: 50,
+              maxStringLength: 2 * 1024,
+            }).substring(0, 200)}`
           )
         }
       }
@@ -1991,7 +1997,15 @@ export class CursorRequestParser {
     }
     if (req.conversationState) {
       this.logger.debug(
-        `[DEBUG] conversationState: previousWorkspaceUris=${JSON.stringify(req.conversationState.previousWorkspaceUris)}`
+        `[DEBUG] conversationState: previousWorkspaceUris=${safeJsonStringify(
+          req.conversationState.previousWorkspaceUris,
+          {
+            maxDepth: 3,
+            maxArrayItems: 50,
+            maxObjectKeys: 50,
+            maxStringLength: 2 * 1024,
+          }
+        )}`
       )
       if (req.conversationState.tokenDetails) {
         this.logger.debug(
@@ -2201,7 +2215,7 @@ export class CursorRequestParser {
           `isVariant=${req.requestedModel.isVariantStringRepresentation}, ` +
           `parameterCount=${req.requestedModel.parameters.length}, ` +
           `baseModel=${requestedVariantSelection?.baseModel || requestedBaseModel || "(none)"}, ` +
-          `derivedParameters=${requestedModelParameters ? JSON.stringify(requestedModelParameters) : "(none)"}, ` +
+          `derivedParameters=${requestedModelParameters ? safeJsonStringify(requestedModelParameters) : "(none)"}, ` +
           `requestedMaxMode=${req.requestedModel.maxMode}`
       )
     }
@@ -2210,7 +2224,7 @@ export class CursorRequestParser {
       this.logger.debug(
         `ModelDetails: modelId=${modelDetailsModelId}, ` +
           `baseModel=${modelDetailsVariantSelection?.baseModel || modelDetailsBaseModel || "(none)"}, ` +
-          `derivedParameters=${modelDetailsVariantSelection?.parameterValues ? JSON.stringify(modelDetailsVariantSelection.parameterValues) : "(none)"}, ` +
+          `derivedParameters=${modelDetailsVariantSelection?.parameterValues ? safeJsonStringify(modelDetailsVariantSelection.parameterValues) : "(none)"}, ` +
           `modelMaxMode=${req.modelDetails?.maxMode === true}`
       )
     }

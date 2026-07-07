@@ -1376,12 +1376,19 @@ export class ContextCompactionService {
                   },
                 }
               : undefined,
-            replacementHistory: state.codexContext.replacementHistory
+            activeWindow: state.codexContext.activeWindow
               ? {
-                  ...state.codexContext.replacementHistory,
-                  items: state.codexContext.replacementHistory.items.map(
-                    (item) => ({ ...item })
-                  ),
+                  ...state.codexContext.activeWindow,
+                  replacementHistory: state.codexContext.activeWindow
+                    .replacementHistory
+                    ? {
+                        ...state.codexContext.activeWindow.replacementHistory,
+                        items:
+                          state.codexContext.activeWindow.replacementHistory.items.map(
+                            (item) => ({ ...item })
+                          ),
+                      }
+                    : undefined,
                 }
               : undefined,
             truncationPolicy: { ...state.codexContext.truncationPolicy },

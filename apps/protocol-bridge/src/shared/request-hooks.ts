@@ -1,6 +1,7 @@
 import { Logger } from "@nestjs/common"
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify"
 import * as fs from "fs"
+import { safeJsonStringify } from "../protocol/cursor/safe-json"
 
 /**
  * Register request logging hooks for debugging.
@@ -49,7 +50,15 @@ export function registerRequestHooks(
           try {
             const body = Buffer.isBuffer(request.body)
               ? request.body
-              : Buffer.from(JSON.stringify(request.body))
+              : Buffer.from(
+                  safeJsonStringify(request.body, {
+                    maxDepth: 6,
+                    maxArrayItems: 100,
+                    maxObjectKeys: 100,
+                    maxStringLength: 16 * 1024,
+                    includeHashes: true,
+                  })
+                )
             fs.writeFileSync(filename, body)
             logger.debug(
               `Dumped gRPC request to ${filename} (${body.length} bytes)`

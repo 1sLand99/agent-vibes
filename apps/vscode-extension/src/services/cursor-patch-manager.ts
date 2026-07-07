@@ -1,4 +1,5 @@
 import { CursorChecksumsService } from "./cursor-checksums"
+import { CursorPatchService } from "./cursor-patch"
 import {
   CursorPatchBaselineService,
   type CursorPatchResetResult,
@@ -42,6 +43,8 @@ export class CursorPatchManagerService {
   }
 
   resetAllPatches(): CursorPatchResetResult {
+    CursorPatchService.invalidateStatusCache()
+
     const resetState = this.getResetState()
     if (!resetState.canReset) {
       return {

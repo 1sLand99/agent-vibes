@@ -12,6 +12,14 @@ type ProductJson = {
   [key: string]: unknown
 }
 
+const CURSOR_CHECKSUMS_STATUS_CACHE_TTL_MS = 30_000
+
+type CursorChecksumsStatusCache = {
+  includesEntries: boolean
+  expiresAt: number
+  status: CursorChecksumsStatus
+}
+
 export interface CursorChecksumsEntryStatus {
   relativePath: string
   filePath: string
@@ -40,9 +48,32 @@ export interface CursorChecksumsApplyResult {
 }
 
 export class CursorChecksumsService {
+  private static statusCache: CursorChecksumsStatusCache | null = null
   private readonly baseline = new CursorPatchBaselineService()
 
-  getStatus(): CursorChecksumsStatus {
+  static invalidateStatusCache(): void {
+    CursorChecksumsService.statusCache = null
+  }
+
+  invalidateStatusCache(): void {
+    CursorChecksumsService.invalidateStatusCache()
+  }
+
+  getStatus(
+    options: { force?: boolean; includeEntries?: boolean } = {}
+  ): CursorChecksumsStatus {
+    const now = Date.now()
+    const cached = CursorChecksumsService.statusCache
+    const includeEntries = options.includeEntries === true
+    if (
+      !options.force &&
+      cached &&
+      cached.expiresAt > now &&
+      (cached.includesEntries || !includeEntries)
+    ) {
+      return cached.status
+    }
+
     const appRootPath = getCursorAppRootPath()
     const productPath = getCursorProductJsonPath()
     const status: CursorChecksumsStatus = {
@@ -59,46 +90,53 @@ export class CursorChecksumsService {
       allMatched: false,
     }
 
-    if (!appRootPath || !productPath) {
-      return status
-    }
-
-    const product = this.readProductJson(productPath)
-    if (!product?.checksums) {
-      return status
-    }
-
-    status.hasChecksums = true
-    status.entries = Object.entries(product.checksums).map(
-      ([relativePath, expected]) => {
-        const filePath = path.join(appRootPath, "out", relativePath)
-        const fileExists = fs.existsSync(filePath)
-        const actual = fileExists ? this.computeChecksum(filePath) : null
-        return {
-          relativePath,
-          filePath,
-          fileExists,
-          expected,
-          actual,
-          matches: fileExists && actual === expected,
+    if (appRootPath && productPath) {
+      const product = this.readProductJson(productPath)
+      if (product?.checksums) {
+        status.hasChecksums = true
+        for (const [relativePath, expected] of Object.entries(
+          product.checksums
+        )) {
+          const filePath = path.join(appRootPath, "out", relativePath)
+          const fileExists = fs.existsSync(filePath)
+          const actual = fileExists ? this.computeChecksum(filePath) : null
+          const matches = fileExists && actual === expected
+          if (!matches) {
+            status.mismatchCount += 1
+          }
+          if (includeEntries) {
+            status.entries.push({
+              relativePath,
+              filePath,
+              fileExists,
+              expected,
+              actual,
+              matches,
+            })
+          }
+        }
+        status.allMatched =
+          Object.keys(product.checksums).length > 0 &&
+          status.mismatchCount === 0
+        if (status.hasBaseline) {
+          const currentRaw = fs.readFileSync(productPath, "utf-8")
+          const baselineRaw = this.readBaselineRaw(productPath)
+          status.differsFromBaseline =
+            baselineRaw === null ? null : currentRaw !== baselineRaw
         }
       }
-    )
-    status.mismatchCount = status.entries.filter(
-      (entry) => !entry.matches
-    ).length
-    status.allMatched = status.entries.length > 0 && status.mismatchCount === 0
-    if (status.hasBaseline) {
-      const currentRaw = fs.readFileSync(productPath, "utf-8")
-      const baselineRaw = this.readBaselineRaw(productPath)
-      status.differsFromBaseline =
-        baselineRaw === null ? null : currentRaw !== baselineRaw
     }
 
+    CursorChecksumsService.statusCache = {
+      includesEntries: includeEntries,
+      expiresAt: now + CURSOR_CHECKSUMS_STATUS_CACHE_TTL_MS,
+      status,
+    }
     return status
   }
 
   apply(): CursorChecksumsApplyResult {
+    this.invalidateStatusCache()
     try {
       const appRootPath = getCursorAppRootPath()
       const productPath = getCursorProductJsonPath()
@@ -163,6 +201,7 @@ export class CursorChecksumsService {
         errors: [],
       }
     } catch (error) {
+      this.invalidateStatusCache()
       return {
         success: false,
         updated: 0,
@@ -172,6 +211,7 @@ export class CursorChecksumsService {
   }
 
   restore(): CursorChecksumsApplyResult {
+    this.invalidateStatusCache()
     try {
       const productPath = getCursorProductJsonPath()
       if (!productPath || !fs.existsSync(productPath)) {
@@ -189,6 +229,7 @@ export class CursorChecksumsService {
         errors: result.errors,
       }
     } catch (error) {
+      this.invalidateStatusCache()
       return {
         success: false,
         updated: 0,

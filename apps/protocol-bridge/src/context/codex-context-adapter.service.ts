@@ -29,11 +29,13 @@ import { ToolIntegrityService } from "./tool-integrity.service"
 import {
   CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
   CodexContextState,
+  CodexContextWindowState,
   CodexRawResponseItemBlock,
   CodexReferenceContextItem,
   ContextCollapseCommit,
   CodexMetaMessageLedgerEntry,
   CodexMetaMessageLedgerState,
+  CodexReplacementHistory,
   CodexReplacementHistoryItem,
   CodexTruncationPolicy,
   ContextConversationState,
@@ -132,6 +134,68 @@ export class CodexContextAdapterService {
       }
     }
     return state.codexContext
+  }
+
+  resolveCurrentWindowState(
+    state: ContextConversationState,
+    conversationId: string
+  ): CodexContextWindowState {
+    const codex = this.ensureState(state)
+    const activeWindow = this.resolveWindowState(
+      codex,
+      conversationId,
+      Date.now()
+    )
+    codex.activeWindow = activeWindow
+    return activeWindow
+  }
+
+  installReplacementHistoryWindow(
+    state: ContextConversationState,
+    input: {
+      conversationId?: string
+      compactionId: string
+      createdAt?: number
+      injectionMode: "pre_turn" | "mid_turn"
+      anchorRecordId?: string
+      anchorRecordCount: number
+      summary: string
+      items: CodexReplacementHistoryItem[]
+    }
+  ): CodexReplacementHistory {
+    const codex = this.ensureState(state)
+    const createdAt = input.createdAt ?? Date.now()
+    const currentWindow = this.resolveWindowState(
+      codex,
+      input.conversationId,
+      createdAt
+    )
+    const windowNumber = currentWindow.windowNumber + 1
+    const windowId = this.buildWindowId(input.conversationId, windowNumber)
+    const replacementHistory: CodexReplacementHistory = {
+      compactionId: input.compactionId,
+      createdAt,
+      injectionMode: input.injectionMode,
+      windowNumber,
+      firstWindowId: currentWindow.firstWindowId,
+      previousWindowId: currentWindow.windowId,
+      windowId,
+      anchorRecordId: input.anchorRecordId,
+      anchorRecordCount: Math.max(0, Math.floor(input.anchorRecordCount)),
+      summary: input.summary,
+      items: input.items.map((item) => this.cloneReplacementItem(item)),
+    }
+    codex.activeWindow = {
+      windowNumber,
+      firstWindowId: currentWindow.firstWindowId,
+      previousWindowId: currentWindow.windowId,
+      windowId,
+      createdAt,
+      compactionId: input.compactionId,
+      replacementHistory,
+    }
+    codex.historyVersion = codex.historyVersion + 1
+    return replacementHistory
   }
 
   buildReferenceContextItem(
@@ -252,24 +316,25 @@ export class CodexContextAdapterService {
     const anchorRecordId =
       candidate.retainedRecords[candidate.retainedRecords.length - 1]?.id ||
       candidate.archivedRecords[candidate.archivedRecords.length - 1]?.id
-    plan.commit.codexReplacementHistory = {
-      compactionId: plan.commit.id,
-      createdAt: Date.now(),
-      injectionMode: options.injectionMode,
-      anchorRecordId,
-      anchorRecordCount: state.records.length,
-      summary,
-      items: replacementHistory,
-    }
+    plan.commit.codexReplacementHistory = this.installReplacementHistoryWindow(
+      state,
+      {
+        conversationId: options.referenceContextItem.conversationId,
+        compactionId: plan.commit.id,
+        injectionMode: options.injectionMode,
+        anchorRecordId,
+        anchorRecordCount: state.records.length,
+        summary,
+        items: replacementHistory,
+      }
+    )
 
     const codex = this.ensureState(state)
-    codex.historyVersion = codex.historyVersion + 1
     codex.tokenInfo = {
       totalTokens: plan.estimatedTokens,
       modelContextWindow: options.maxTokens,
       updatedAt: Date.now(),
     }
-    codex.replacementHistory = plan.commit.codexReplacementHistory
     codex.referenceContextItem =
       options.injectionMode === "mid_turn"
         ? options.referenceContextItem
@@ -279,7 +344,10 @@ export class CodexContextAdapterService {
     }
 
     this.logger.log(
-      `Codex compact applied commit=${plan.commit.id} mode=${options.injectionMode} replacementItems=${replacementHistory.length}`
+      `Codex compact applied commit=${plan.commit.id} mode=${options.injectionMode} ` +
+        `window=${plan.commit.codexReplacementHistory.windowId} ` +
+        `previousWindow=${plan.commit.codexReplacementHistory.previousWindowId || "none"} ` +
+        `replacementItems=${replacementHistory.length}`
     )
     return plan
   }
@@ -350,8 +418,22 @@ export class CodexContextAdapterService {
       candidate,
       { summary }
     )
+    const codexReplacementHistory = this.installReplacementHistoryWindow(
+      state,
+      {
+        conversationId: options.referenceContextItem.conversationId,
+        compactionId: commit.id,
+        injectionMode: "pre_turn",
+        anchorRecordCount: state.records.length,
+        summary,
+        items: replacementHistory,
+      }
+    )
     this.logger.log(
-      `Codex context collapse applied commit=${commit.id} replacementItems=${replacementHistory.length}`
+      `Codex context collapse applied commit=${commit.id} ` +
+        `window=${codexReplacementHistory.windowId} ` +
+        `previousWindow=${codexReplacementHistory.previousWindowId || "none"} ` +
+        `replacementItems=${replacementHistory.length}`
     )
     return commit
   }
@@ -388,7 +470,7 @@ export class CodexContextAdapterService {
     const truncationPolicy = options.truncationPolicy || codex.truncationPolicy
     let messages = baseMessages
     let protectedPrefixCount = 0
-    const replacement = codex.replacementHistory
+    const replacement = codex.activeWindow?.replacementHistory
     if (replacement?.items?.length) {
       const replacementMessages = this.replacementHistoryToMessages(
         replacement.items
@@ -968,6 +1050,42 @@ export class CodexContextAdapterService {
     item: CodexReplacementHistoryItem
   ): CodexReplacementHistoryItem {
     return JSON.parse(JSON.stringify(item)) as CodexReplacementHistoryItem
+  }
+
+  private resolveWindowState(
+    codex: CodexContextState,
+    conversationId: string | undefined,
+    createdAt: number
+  ): CodexContextWindowState {
+    const windowNumber =
+      typeof codex.activeWindow?.windowNumber === "number" &&
+      Number.isFinite(codex.activeWindow.windowNumber) &&
+      codex.activeWindow.windowNumber >= 0
+        ? Math.floor(codex.activeWindow.windowNumber)
+        : 0
+    const expectedWindowId = this.buildWindowId(conversationId, windowNumber)
+    if (
+      codex.activeWindow?.windowId === expectedWindowId &&
+      typeof codex.activeWindow.firstWindowId === "string" &&
+      codex.activeWindow.firstWindowId.length > 0
+    ) {
+      return codex.activeWindow
+    }
+
+    return {
+      windowNumber: 0,
+      firstWindowId: this.buildWindowId(conversationId, 0),
+      windowId: this.buildWindowId(conversationId, 0),
+      createdAt,
+    }
+  }
+
+  private buildWindowId(
+    conversationId: string | undefined,
+    windowNumber: number
+  ): string {
+    const normalizedConversationId = conversationId?.trim() || "codex"
+    return `${normalizedConversationId}:${Math.max(0, Math.floor(windowNumber))}`
   }
 
   private extractResponseItemText(item: CodexReplacementHistoryItem): string {

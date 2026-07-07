@@ -2,6 +2,11 @@ import { Injectable, Logger } from "@nestjs/common"
 import type { StatementSync } from "node:sqlite"
 import { PersistenceService } from "../../../persistence"
 import type { ConversationId } from "../turn/turn.types"
+import {
+  describeSessionFileStateLimit,
+  isSessionFileStateWithinLimit,
+  SESSION_FILE_STATE_CONTENT_LIMIT_BYTES,
+} from "./file-state-limits"
 
 /**
  * SessionRow — the immutable / config-class fields stored in the
@@ -30,6 +35,12 @@ export interface SessionFileState {
   beforeContent: Buffer
   afterContent: Buffer
   updatedAt: number
+}
+
+type SqliteBlob = Buffer | Uint8Array
+
+function normalizeSqliteBlob(blob: SqliteBlob): Buffer {
+  return Buffer.isBuffer(blob) ? blob : Buffer.from(blob)
 }
 
 export interface SessionTodo {
@@ -231,6 +242,19 @@ export class SessionPersistenceService {
   // ── file states ──────────────────────────────────────────────────
 
   upsertFileState(state: SessionFileState): void {
+    if (
+      !isSessionFileStateWithinLimit(state.beforeContent, state.afterContent)
+    ) {
+      const beforeBytes = state.beforeContent.byteLength
+      const afterBytes = state.afterContent.byteLength
+      this.logger.warn(
+        `Skipping oversized file state for ${state.conversationId} ${state.path}: ` +
+          describeSessionFileStateLimit(beforeBytes, afterBytes)
+      )
+      this.deleteFileState(state.conversationId, state.path)
+      return
+    }
+
     const stmt = (this.stmtUpsertFileState ??= this.persistence.prepare(
       `INSERT INTO session_file_states (
          conversation_id, path, before_content, after_content, updated_at
@@ -254,19 +278,25 @@ export class SessionPersistenceService {
       `SELECT path, before_content, after_content, updated_at
          FROM session_file_states
         WHERE conversation_id = ?
+          AND length(before_content) <= ?
+          AND length(after_content) <= ?
         ORDER BY path ASC`
     ))
-    const rows = stmt.all(conversationId) as unknown as Array<{
+    const rows = stmt.all(
+      conversationId,
+      SESSION_FILE_STATE_CONTENT_LIMIT_BYTES,
+      SESSION_FILE_STATE_CONTENT_LIMIT_BYTES
+    ) as unknown as Array<{
       path: string
-      before_content: Buffer
-      after_content: Buffer
+      before_content: SqliteBlob
+      after_content: SqliteBlob
       updated_at: number
     }>
     return rows.map((row) => ({
       conversationId,
       path: row.path,
-      beforeContent: row.before_content,
-      afterContent: row.after_content,
+      beforeContent: normalizeSqliteBlob(row.before_content),
+      afterContent: normalizeSqliteBlob(row.after_content),
       updatedAt: row.updated_at,
     }))
   }

@@ -97,6 +97,7 @@ export class DashboardPanel {
 
   private accountFileWatchers: vscode.FileSystemWatcher[] = []
   private accountFileDebounceTimer: ReturnType<typeof setTimeout> | null = null
+  private allDataRefreshTimer: ReturnType<typeof setTimeout> | null = null
   private readonly cursorPatchManager = new CursorPatchManagerService()
   private readonly cursorPatchService = new CursorPatchService(logger)
   private readonly cursorChecksums = new CursorChecksumsService()
@@ -568,6 +569,8 @@ export class DashboardPanel {
     const path = require("path") as typeof import("path")
     const fs = require("fs") as typeof import("fs")
     const logFile = path.join(os.tmpdir(), "agent-vibes-bridge.log")
+    const maxLines = 300
+    const maxReadBytes = 256 * 1024
 
     // Strip ANSI escape sequences (colors, bold, cursor, etc.)
     const stripAnsi = (s: string): string =>
@@ -582,9 +585,20 @@ export class DashboardPanel {
     try {
       exists = fs.existsSync(logFile)
       if (exists) {
-        const content = fs.readFileSync(logFile, "utf-8")
-        const all = content.split("\n")
-        lines = all.slice(-300).map(stripAnsi)
+        const stat = fs.statSync(logFile)
+        const bytesToRead = Math.min(stat.size, maxReadBytes)
+        const buffer = Buffer.alloc(bytesToRead)
+        const fd = fs.openSync(logFile, "r")
+        try {
+          fs.readSync(fd, buffer, 0, bytesToRead, stat.size - bytesToRead)
+        } finally {
+          fs.closeSync(fd)
+        }
+        const all = buffer.toString("utf-8").split("\n")
+        if (stat.size > bytesToRead) {
+          all.shift()
+        }
+        lines = all.slice(-maxLines).map(stripAnsi)
       }
     } catch {
       lines = ["(Could not read log file)"]
@@ -1105,6 +1119,24 @@ export class DashboardPanel {
    * Send all dashboard data to the webview.
    */
   private sendAllData(): void {
+    if (!this.panel.visible) {
+      return
+    }
+
+    if (this.allDataRefreshTimer) {
+      return
+    }
+
+    this.allDataRefreshTimer = setTimeout(() => {
+      this.allDataRefreshTimer = null
+      if (!this.panel.visible) {
+        return
+      }
+      this.sendAllDataNow()
+    }, 75)
+  }
+
+  private sendAllDataNow(): void {
     const locale = readDashboardLocale()
     const uiPack = getUiPack(locale)
     const st = getSettingsCopy(locale)
@@ -3258,6 +3290,10 @@ export class DashboardPanel {
       watcher.dispose()
     }
     this.accountFileWatchers = []
+    if (this.allDataRefreshTimer) {
+      clearTimeout(this.allDataRefreshTimer)
+      this.allDataRefreshTimer = null
+    }
     if (this.accountFileDebounceTimer) {
       clearTimeout(this.accountFileDebounceTimer)
       this.accountFileDebounceTimer = null

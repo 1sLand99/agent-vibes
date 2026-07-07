@@ -18,6 +18,11 @@ import {
   type SessionRow,
   type SessionTodo,
 } from "./session-persistence.service"
+import {
+  describeSessionFileStateLimit,
+  getSessionFileStateSize,
+  isSessionFileStateWithinLimit,
+} from "./file-state-limits"
 import { ToolCallLedger } from "./tool-call-ledger.service"
 import {
   normalizePathForBoundaryCheck,
@@ -29,6 +34,8 @@ import type {
   ContextCollapseState,
   ContextConversationState,
   CodexContextState,
+  CodexContextWindowState,
+  CodexReplacementHistory,
   ContentBlock,
   ContextInvestigationMemoryEntry,
   ContextSessionMemoryEntry,
@@ -62,6 +69,7 @@ import {
   EMPTY_SUBAGENT_MODEL_OVERRIDES,
   type SubagentModelOverridesMap,
 } from "../subagents/subagent-model-override"
+import { safeJsonEqual, safeJsonStringify } from "../safe-json"
 import type {
   DeferredToolDescriptor,
   ToolDefinition,
@@ -2276,13 +2284,33 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     })
     this.sessionPersistence.replaceFileStates(
       cid,
-      state.fileStates.map((fileState) => ({
-        conversationId: cid,
-        path: fileState.path,
-        beforeContent: Buffer.from(fileState.beforeContent),
-        afterContent: Buffer.from(fileState.afterContent),
-        updatedAt,
-      }))
+      state.fileStates.flatMap((fileState) => {
+        const size = getSessionFileStateSize(
+          fileState.beforeContent,
+          fileState.afterContent
+        )
+        if (
+          !isSessionFileStateWithinLimit(
+            fileState.beforeContent,
+            fileState.afterContent
+          )
+        ) {
+          this.logger.warn(
+            `Skipping oversized file state persistence for ${conversationId} ${fileState.path}: ` +
+              describeSessionFileStateLimit(size.beforeBytes, size.afterBytes)
+          )
+          return []
+        }
+        return [
+          {
+            conversationId: cid,
+            path: fileState.path,
+            beforeContent: Buffer.from(fileState.beforeContent),
+            afterContent: Buffer.from(fileState.afterContent),
+            updatedAt,
+          },
+        ]
+      })
     )
     this.sessionPersistence.replaceReadPaths(
       cid,
@@ -3311,6 +3339,9 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
             mode: "bytes" as const,
             limit: 10_000,
           }
+    const activeWindow = this.normalizeCodexContextWindowState(
+      input.activeWindow
+    )
     return {
       historyVersion:
         typeof input.historyVersion === "number" && input.historyVersion >= 0
@@ -3344,38 +3375,108 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
                   : Date.now(),
             }
           : undefined,
-      replacementHistory:
-        input.replacementHistory &&
-        typeof input.replacementHistory === "object" &&
-        typeof input.replacementHistory.compactionId === "string" &&
-        Array.isArray(input.replacementHistory.items)
-          ? {
-              ...input.replacementHistory,
-              anchorRecordCount:
-                typeof input.replacementHistory.anchorRecordCount === "number"
-                  ? Math.max(
-                      0,
-                      Math.floor(input.replacementHistory.anchorRecordCount)
-                    )
-                  : 0,
-              createdAt:
-                typeof input.replacementHistory.createdAt === "number"
-                  ? input.replacementHistory.createdAt
-                  : Date.now(),
-              injectionMode:
-                input.replacementHistory.injectionMode === "mid_turn"
-                  ? "mid_turn"
-                  : "pre_turn",
-              summary:
-                typeof input.replacementHistory.summary === "string"
-                  ? input.replacementHistory.summary
-                  : "",
-              items: input.replacementHistory.items.flatMap((item) =>
-                item && typeof item === "object" ? [{ ...item }] : []
-              ),
-            }
-          : undefined,
+      activeWindow,
       truncationPolicy,
+    }
+  }
+
+  private normalizeCodexContextWindowState(
+    value: unknown
+  ): CodexContextWindowState | undefined {
+    const input =
+      value && typeof value === "object"
+        ? (value as Partial<CodexContextWindowState>)
+        : undefined
+    if (!input) return undefined
+    if (
+      typeof input.windowNumber !== "number" ||
+      !Number.isFinite(input.windowNumber) ||
+      input.windowNumber < 0 ||
+      typeof input.windowId !== "string" ||
+      input.windowId.trim().length === 0 ||
+      typeof input.firstWindowId !== "string" ||
+      input.firstWindowId.trim().length === 0
+    ) {
+      return undefined
+    }
+
+    const windowId = input.windowId.trim()
+    const replacementHistory = this.normalizeCodexReplacementHistory(
+      input.replacementHistory
+    )
+    return {
+      windowNumber: Math.floor(input.windowNumber),
+      firstWindowId: input.firstWindowId.trim(),
+      previousWindowId:
+        typeof input.previousWindowId === "string" &&
+        input.previousWindowId.trim().length > 0
+          ? input.previousWindowId.trim()
+          : undefined,
+      windowId,
+      createdAt:
+        typeof input.createdAt === "number" ? input.createdAt : Date.now(),
+      compactionId:
+        typeof input.compactionId === "string" &&
+        input.compactionId.trim().length > 0
+          ? input.compactionId.trim()
+          : replacementHistory?.compactionId,
+      replacementHistory:
+        replacementHistory?.windowId === windowId
+          ? replacementHistory
+          : undefined,
+    }
+  }
+
+  private normalizeCodexReplacementHistory(
+    value: unknown
+  ): CodexReplacementHistory | undefined {
+    const input =
+      value && typeof value === "object"
+        ? (value as Partial<CodexReplacementHistory>)
+        : undefined
+    if (
+      !input ||
+      typeof input.compactionId !== "string" ||
+      input.compactionId.trim().length === 0 ||
+      !Array.isArray(input.items) ||
+      typeof input.windowNumber !== "number" ||
+      !Number.isFinite(input.windowNumber) ||
+      input.windowNumber < 0 ||
+      typeof input.windowId !== "string" ||
+      input.windowId.trim().length === 0 ||
+      typeof input.firstWindowId !== "string" ||
+      input.firstWindowId.trim().length === 0
+    ) {
+      return undefined
+    }
+
+    return {
+      compactionId: input.compactionId.trim(),
+      createdAt:
+        typeof input.createdAt === "number" ? input.createdAt : Date.now(),
+      injectionMode:
+        input.injectionMode === "mid_turn" ? "mid_turn" : "pre_turn",
+      windowNumber: Math.floor(input.windowNumber),
+      firstWindowId: input.firstWindowId.trim(),
+      previousWindowId:
+        typeof input.previousWindowId === "string" &&
+        input.previousWindowId.trim().length > 0
+          ? input.previousWindowId.trim()
+          : undefined,
+      windowId: input.windowId.trim(),
+      anchorRecordId:
+        typeof input.anchorRecordId === "string" &&
+        input.anchorRecordId.trim().length > 0
+          ? input.anchorRecordId.trim()
+          : undefined,
+      anchorRecordCount:
+        typeof input.anchorRecordCount === "number"
+          ? Math.max(0, Math.floor(input.anchorRecordCount))
+          : 0,
+      summary: typeof input.summary === "string" ? input.summary : "",
+      items: input.items.flatMap((item) =>
+        item && typeof item === "object" ? [{ ...item }] : []
+      ),
     }
   }
 
@@ -3919,7 +4020,12 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       return content.length
     }
     try {
-      return JSON.stringify(content).length
+      return safeJsonStringify(content, {
+        maxDepth: 8,
+        maxArrayItems: 200,
+        maxObjectKeys: 100,
+        maxStringLength: 8 * 1024,
+      }).length
     } catch {
       return 0
     }
@@ -3938,7 +4044,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     if (left === right) return true
     if (typeof left !== typeof right) return false
     try {
-      return JSON.stringify(left) === JSON.stringify(right)
+      return safeJsonEqual(left, right)
     } catch {
       return false
     }
@@ -4015,7 +4121,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       state.codexContext = {
         ...(state.codexContext || this.createCodexContextState()),
         historyVersion: (state.codexContext?.historyVersion || 0) + 1,
-        replacementHistory: undefined,
+        activeWindow: undefined,
       }
       return
     }

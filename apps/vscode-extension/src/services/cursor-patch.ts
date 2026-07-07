@@ -1482,11 +1482,30 @@ export interface CursorPatchApplyResult {
   restartRequired?: boolean
 }
 
+const CURSOR_PATCH_STATUS_CACHE_TTL_MS = 30_000
+
+type CursorPatchStatusCache<T> = {
+  key: string
+  expiresAt: number
+  status: T
+}
+
+type CursorPatchStatusOptions = {
+  force?: boolean
+}
+
 /**
  * CursorPatchService — Manages patching and restoring Cursor's
  * workbench.desktop.main.js to inject transport-layer traffic capture.
  */
 export class CursorPatchService {
+  private static bridgeEndpointStatusCache: CursorPatchStatusCache<CursorBridgeEndpointPatchStatus> | null =
+    null
+  private static idleKillerStatusCache: CursorPatchStatusCache<CursorSinglePatchStatus> | null =
+    null
+  private static legacyStatusCache: CursorPatchStatusCache<PatchStatus> | null =
+    null
+
   private readonly logger: Logger
   private readonly baseline = new CursorPatchBaselineService()
   private readonly checksums = new CursorChecksumsService()
@@ -1495,7 +1514,54 @@ export class CursorPatchService {
     this.logger = logger
   }
 
-  getBridgeEndpointPatchStatus(port: number): CursorBridgeEndpointPatchStatus {
+  static invalidateStatusCache(): void {
+    CursorPatchService.bridgeEndpointStatusCache = null
+    CursorPatchService.idleKillerStatusCache = null
+    CursorPatchService.legacyStatusCache = null
+    CursorChecksumsService.invalidateStatusCache()
+    CursorPatchBaselineService.invalidateStatusCache()
+  }
+
+  invalidateStatusCache(): void {
+    CursorPatchService.invalidateStatusCache()
+  }
+
+  private static getCachedStatus<T>(
+    cache: CursorPatchStatusCache<T> | null,
+    key: string,
+    force: boolean | undefined
+  ): T | null {
+    if (force || !cache || cache.key !== key || cache.expiresAt <= Date.now()) {
+      return null
+    }
+    return cache.status
+  }
+
+  private static setCachedStatus<T>(
+    key: string,
+    status: T
+  ): CursorPatchStatusCache<T> {
+    return {
+      key,
+      expiresAt: Date.now() + CURSOR_PATCH_STATUS_CACHE_TTL_MS,
+      status,
+    }
+  }
+
+  getBridgeEndpointPatchStatus(
+    port: number,
+    options: CursorPatchStatusOptions = {}
+  ): CursorBridgeEndpointPatchStatus {
+    const cacheKey = `bridge:${normalizeBridgePort(port)}`
+    const cached = CursorPatchService.getCachedStatus(
+      CursorPatchService.bridgeEndpointStatusCache,
+      cacheKey,
+      options.force
+    )
+    if (cached) {
+      return cached
+    }
+
     const filePaths = getCursorBridgeEndpointWorkbenchPaths()
     const filePath = filePaths[0] ?? getCursorWorkbenchPath()
     const endpointUrl = getCursorBridgeEndpointUrl(port)
@@ -1511,6 +1577,8 @@ export class CursorPatchService {
     }
 
     if (filePaths.length === 0) {
+      CursorPatchService.bridgeEndpointStatusCache =
+        CursorPatchService.setCachedStatus(cacheKey, result)
       return result
     }
 
@@ -1557,10 +1625,14 @@ export class CursorPatchService {
       (entitlementDetails.fileExists && entitlementDetails.changed) ||
       nodeCaDetails.changed
 
+    CursorPatchService.bridgeEndpointStatusCache =
+      CursorPatchService.setCachedStatus(cacheKey, result)
     return result
   }
 
   applyBridgeEndpointPatch(port: number): CursorPatchApplyResult {
+    this.invalidateStatusCache()
+
     const filePaths = getCursorBridgeEndpointWorkbenchPaths()
     if (filePaths.length === 0) {
       return {
@@ -1778,7 +1850,19 @@ export class CursorPatchService {
     return this.finalizePatchApply({ applied, restartRequired })
   }
 
-  getIdleExtensionHostKillerStatus(): CursorSinglePatchStatus {
+  getIdleExtensionHostKillerStatus(
+    options: CursorPatchStatusOptions = {}
+  ): CursorSinglePatchStatus {
+    const cacheKey = "idle-killer"
+    const cached = CursorPatchService.getCachedStatus(
+      CursorPatchService.idleKillerStatusCache,
+      cacheKey,
+      options.force
+    )
+    if (cached) {
+      return cached
+    }
+
     const filePath = getCursorWorkbenchPath()
     const result: CursorSinglePatchStatus = {
       filePath,
@@ -1791,6 +1875,8 @@ export class CursorPatchService {
     }
 
     if (!filePath || !fs.existsSync(filePath)) {
+      CursorPatchService.idleKillerStatusCache =
+        CursorPatchService.setCachedStatus(cacheKey, result)
       return result
     }
 
@@ -1809,10 +1895,14 @@ export class CursorPatchService {
     result.applied = content.includes(IDLE_EXTENSION_HOST_KILLER_PATCH.marker)
     result.canApply = canPatchIdleExtensionHostKillerContent(content)
 
+    CursorPatchService.idleKillerStatusCache =
+      CursorPatchService.setCachedStatus(cacheKey, result)
     return result
   }
 
   applyIdleExtensionHostKillerPatch(): CursorPatchApplyResult {
+    this.invalidateStatusCache()
+
     const filePath = getCursorWorkbenchPath()
     if (!filePath || !fs.existsSync(filePath)) {
       return {
@@ -1863,7 +1953,17 @@ export class CursorPatchService {
   }
 
   /** Get the current patch status of the Cursor installation */
-  getStatus(): PatchStatus {
+  getStatus(options: CursorPatchStatusOptions = {}): PatchStatus {
+    const cacheKey = "legacy"
+    const cached = CursorPatchService.getCachedStatus(
+      CursorPatchService.legacyStatusCache,
+      cacheKey,
+      options.force
+    )
+    if (cached) {
+      return cached
+    }
+
     const filePath = getCursorWorkbenchPath()
     const result: PatchStatus = {
       filePath,
@@ -1875,6 +1975,10 @@ export class CursorPatchService {
     }
 
     if (!filePath || !fs.existsSync(filePath)) {
+      CursorPatchService.legacyStatusCache = CursorPatchService.setCachedStatus(
+        cacheKey,
+        result
+      )
       return result
     }
 
@@ -1904,11 +2008,17 @@ export class CursorPatchService {
     ]
     result.allApplied = result.patches.every((p) => p.applied)
 
+    CursorPatchService.legacyStatusCache = CursorPatchService.setCachedStatus(
+      cacheKey,
+      result
+    )
     return result
   }
 
   /** Apply Agent Vibes patches to Cursor workbench */
   applyPatches(): CursorPatchApplyResult {
+    this.invalidateStatusCache()
+
     const errors: string[] = []
     const filePath = getCursorWorkbenchPath()
 
@@ -2014,7 +2124,7 @@ export class CursorPatchService {
     updated: number
     errors: string[]
   } {
-    const status = this.checksums.getStatus()
+    const status = this.checksums.getStatus({ force: true })
     if (!status.productExists || !status.hasChecksums) {
       return { applied: false, updated: 0, errors: [] }
     }
@@ -2038,6 +2148,8 @@ export class CursorPatchService {
 
   /** Restore Cursor workbench from backup */
   restore(): boolean {
+    this.invalidateStatusCache()
+
     const filePath = getCursorWorkbenchPath()
     if (!filePath) {
       this.logger.error("Cursor workbench file not found")

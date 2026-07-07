@@ -405,6 +405,12 @@ import {
   ValueSchema,
 } from "../../gen/google/protobuf/value_pb"
 import { CursorProtocolTraceService } from "./cursor-protocol-trace.service"
+import { safeJsonByteLength, safeJsonStringify } from "./safe-json"
+import {
+  describeSessionFileStateLimit,
+  getSessionFileStateSize,
+  isSessionFileStateWithinLimit,
+} from "./session/file-state-limits"
 import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
 import { resolveCursorToolDefinitionKey } from "./tools/cursor-tool-mapper"
 import { resolveMcpCallFields as resolveMcpCallFieldsFromContract } from "./tools/mcp-call-contract"
@@ -417,7 +423,14 @@ function safeString(value: unknown, defaultValue: string = ""): string {
   if (value === null || value === undefined) return defaultValue
   if (typeof value === "number" || typeof value === "boolean")
     return String(value)
-  if (typeof value === "object") return JSON.stringify(value)
+  if (typeof value === "object") {
+    return safeJsonStringify(value, {
+      maxDepth: 4,
+      maxArrayItems: 25,
+      maxObjectKeys: 50,
+      maxStringLength: 4 * 1024,
+    })
+  }
   return defaultValue
 }
 
@@ -4729,7 +4742,13 @@ export class CursorGrpcService {
    */
   private estimateToolCallArgsBytes(args: Record<string, unknown>): number {
     try {
-      return Buffer.byteLength(JSON.stringify(args ?? {}), "utf8")
+      return safeJsonByteLength(args ?? {}, {
+        maxDepth: 8,
+        maxArrayItems: 500,
+        maxObjectKeys: 200,
+        maxStringLength: CursorGrpcService.TOOL_CALL_ARGS_SIZE_GUARD_BYTES,
+        includeHashes: true,
+      })
     } catch {
       return Number.POSITIVE_INFINITY
     }
@@ -8569,9 +8588,19 @@ export class CursorGrpcService {
     const fileStatesV2: Record<string, any> = {}
     if (checkpoint.fileStates) {
       for (const [path, state] of Object.entries(checkpoint.fileStates)) {
+        const beforeContent = state.beforeContent || ""
+        const afterContent = state.afterContent || ""
+        const size = getSessionFileStateSize(beforeContent, afterContent)
+        if (!isSessionFileStateWithinLimit(beforeContent, afterContent)) {
+          this.logger.warn(
+            `Skipping oversized checkpoint file state for ${path}: ` +
+              describeSessionFileStateLimit(size.beforeBytes, size.afterBytes)
+          )
+          continue
+        }
         fileStatesV2[path] = create(FileStateStructureSchema, {
-          content: new TextEncoder().encode(state.afterContent || ""),
-          initialContent: new TextEncoder().encode(state.beforeContent || ""),
+          content: new TextEncoder().encode(afterContent),
+          initialContent: new TextEncoder().encode(beforeContent),
         })
       }
     }
@@ -8773,7 +8802,16 @@ export class CursorGrpcService {
     }
 
     // 回退：JSON 编码
-    return Buffer.from(JSON.stringify(args), "utf-8")
+    return Buffer.from(
+      safeJsonStringify(args, {
+        maxDepth: 8,
+        maxArrayItems: 500,
+        maxObjectKeys: 200,
+        maxStringLength: CursorGrpcService.TOOL_CALL_ARGS_SIZE_GUARD_BYTES,
+        includeHashes: true,
+      }),
+      "utf-8"
+    )
   }
 
   createToolParamsField(cursorToolName: string, args: ToolArgs): Buffer {

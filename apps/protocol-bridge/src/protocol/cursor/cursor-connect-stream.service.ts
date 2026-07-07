@@ -150,6 +150,7 @@ import {
   parseCursorSseEvent,
   type CursorSseEvent as SseEvent,
 } from "./cursor-sse-event"
+import { safeJsonEqual, safeJsonStringify, toSafeJson } from "./safe-json"
 import { BackendStreamAbortRegistry } from "./session/backend-stream-abort-registry"
 import {
   SessionRecord,
@@ -1078,6 +1079,12 @@ export class CursorConnectStreamService {
    */
   private readonly lastEmitAtByConversation = new Map<string, number>()
   /**
+   * Conversations that already emitted summaryStarted for an in-flight
+   * context compaction. The matching summary/summaryCompleted is emitted
+   * once the compaction commit is queued for the IDE.
+   */
+  private readonly activeContextSummaryUiStarts = new Set<string>()
+  /**
    * Per-conversation interval handle for the wall-clock transport
    * keepalive watchdog. One entry per active set of BiDi attachments;
    * starts when the first controller attaches and stops when the last
@@ -1387,23 +1394,51 @@ export class CursorConnectStreamService {
 
   /**
    * Codex upstream uses `window_id = <thread_id>:<auto_compact_window_number>`.
-   * Cursor has no native Codex window counter, so the bridge maps this to its
-   * own compaction epoch: stable during a normal turn/tool loop, advanced only
-   * when a compaction commit moves the conversation into a new context window.
+   * Keep that as explicit Codex state instead of deriving it from the generic
+   * compaction epoch; the model history window is the source of truth.
    */
-  private resolveCodexWindowId(
+  private resolveCodexWindowState(
     session: SessionRecord | undefined,
     conversationId: string
-  ): string {
+  ): ReturnType<CodexContextAdapterService["resolveCurrentWindowState"]> {
+    if (session && conversationId !== session.conversationId) {
+      const windowId = this.buildCodexWindowId(conversationId, 0)
+      return {
+        windowNumber: 0,
+        firstWindowId: windowId,
+        windowId,
+        createdAt: Date.now(),
+      }
+    }
     const record = session
       ? this.contextState.getContextRecord(session.conversationId)
       : undefined
-    const rawEpoch = record?.contextState.compactionEpoch
-    const windowNumber =
-      typeof rawEpoch === "number" && Number.isFinite(rawEpoch) && rawEpoch >= 0
-        ? Math.floor(rawEpoch)
-        : 0
-    return `${conversationId}:${windowNumber}`
+    return this.codexContextAdapter.resolveCurrentWindowState(
+      record?.contextState || {
+        records: [],
+        compactionHistory: [],
+        compactionEpoch: 0,
+        usageLedger: {},
+        codexContext: {
+          historyVersion: 0,
+          truncationPolicy: {
+            mode: "bytes",
+            limit: 10_000,
+          },
+        },
+        investigationMemory: [],
+        sessionMemory: [],
+      },
+      conversationId
+    )
+  }
+
+  private buildCodexWindowId(
+    conversationId: string | undefined,
+    windowNumber: number
+  ): string {
+    const normalizedConversationId = conversationId?.trim() || "codex"
+    return `${normalizedConversationId}:${Math.max(0, Math.floor(windowNumber))}`
   }
 
   private readonly activeBackendStreamCountsByConversation = new Map<
@@ -2690,6 +2725,11 @@ export class CursorConnectStreamService {
                     system: systemPrompt,
                     messages: this.toCodexConversationMessages(messages),
                     conversationId,
+                    clientMetadata: this.buildCodexClientMetadata(
+                      session,
+                      conversationId,
+                      { requestKind: "compaction" }
+                    ),
                     serviceTier: this.resolveRequestedCodexServiceTier(
                       session.requestedModelParameters
                     ),
@@ -4588,7 +4628,8 @@ export class CursorConnectStreamService {
 
   private buildCodexClientMetadata(
     session: SessionRecord | undefined,
-    conversationId?: string
+    conversationId?: string,
+    options?: { requestKind?: "turn" | "compaction" }
   ): Record<string, string> | undefined {
     const normalizedConversationId = conversationId?.trim()
     if (!normalizedConversationId) {
@@ -4613,18 +4654,24 @@ export class CursorConnectStreamService {
         normalizedConversationId
       ),
     }) as TurnId | undefined
-    const windowId = this.resolveCodexWindowId(
+    const windowState = this.resolveCodexWindowState(
       session,
       normalizedConversationId
     )
+    const windowId = windowState.windowId
     this.logger.debug(
-      `[Codex][Metadata] conversation=${normalizedConversationId} turn=${activeTurnId || "(none)"} window=${windowId}`
+      `[Codex][Metadata] conversation=${normalizedConversationId} ` +
+        `turn=${activeTurnId || "(none)"} window=${windowId} ` +
+        `window_number=${windowState.windowNumber} ` +
+        `previous_window=${windowState.previousWindowId || "none"} ` +
+        `compaction=${windowState.compactionId || "none"}`
     )
     return buildCursorCodexClientMetadata({
       conversationId: normalizedConversationId,
       requestOrdinal,
       turnId: activeTurnId,
       windowId,
+      requestKind: options?.requestKind,
       installationId: this.codexInstallationId,
       workspaceRootPath: session?.projectContext?.rootPath,
     })
@@ -5589,7 +5636,7 @@ export class CursorConnectStreamService {
       return false
     }
 
-    return JSON.stringify(left) === JSON.stringify(right)
+    return safeJsonEqual(left, right)
   }
 
   private hasStructuredToolContent(
@@ -6624,11 +6671,13 @@ export class CursorConnectStreamService {
     try {
       return structuredClone(value)
     } catch {
-      try {
-        return JSON.parse(JSON.stringify(value)) as unknown
-      } catch {
-        return value
-      }
+      return toSafeJson(value, {
+        maxDepth: 10,
+        maxArrayItems: 500,
+        maxObjectKeys: 200,
+        maxStringLength: 64 * 1024,
+        includeHashes: true,
+      })
     }
   }
 
@@ -6646,7 +6695,13 @@ export class CursorConnectStreamService {
 
   private stringifyHistoryForComparison(value: unknown): string {
     try {
-      return JSON.stringify(value)
+      return safeJsonStringify(value, {
+        includeHashes: true,
+        maxDepth: 10,
+        maxArrayItems: 500,
+        maxObjectKeys: 200,
+        maxStringLength: 64 * 1024,
+      })
     } catch {
       return ""
     }
@@ -7398,6 +7453,30 @@ export class CursorConnectStreamService {
     }
   }
 
+  private emitContextSummaryStartedUiUpdate(
+    conversationId: string,
+    contextLabel: string
+  ): void {
+    if (this.activeContextSummaryUiStarts.has(conversationId)) {
+      return
+    }
+    this.activeContextSummaryUiStarts.add(conversationId)
+    this.emit(conversationId, this.grpcService.createSummaryStartedResponse())
+    this.logger.debug(
+      `Emitted context compaction summary-start UI update for ${conversationId}: ${contextLabel}`
+    )
+  }
+
+  private closeContextSummaryStartedUiUpdate(conversationId: string): void {
+    if (!this.activeContextSummaryUiStarts.delete(conversationId)) {
+      return
+    }
+    this.emit(conversationId, this.grpcService.createSummaryCompletedResponse())
+    this.logger.debug(
+      `Closed context compaction summary-start UI update for ${conversationId} without summary`
+    )
+  }
+
   private queuePendingContextSummaryUiUpdate(
     session: SessionRecord,
     conversationId: string,
@@ -7467,11 +7546,21 @@ export class CursorConnectStreamService {
       ? this.contextState.getContextRecord(session.conversationId)
           ?.pendingContextSummaryUiUpdate
       : undefined
+    const summaryAlreadyStarted =
+      this.activeContextSummaryUiStarts.delete(conversationId)
     if (!session || !pending) {
+      if (summaryAlreadyStarted) {
+        this.emit(
+          conversationId,
+          this.grpcService.createSummaryCompletedResponse()
+        )
+      }
       return
     }
 
-    this.emit(conversationId, this.grpcService.createSummaryStartedResponse())
+    if (!summaryAlreadyStarted) {
+      this.emit(conversationId, this.grpcService.createSummaryStartedResponse())
+    }
     this.emit(
       conversationId,
       this.grpcService.createSummaryResponse(pending.summary)
@@ -7862,6 +7951,11 @@ export class CursorConnectStreamService {
                 tools: options.toolDefinitions,
                 conversationId: session.conversationId,
                 pendingToolUseIds: options.pendingToolUseIds,
+                clientMetadata: this.buildCodexClientMetadata(
+                  session,
+                  session.conversationId,
+                  { requestKind: "compaction" }
+                ),
                 serviceTier: this.resolveRequestedCodexServiceTier(
                   session.requestedModelParameters
                 ),
@@ -7885,6 +7979,7 @@ export class CursorConnectStreamService {
       toolDefinitions?: ToolDefinition[]
       strategy: "auto" | "manual" | "reactive"
       hookUserMessage?: string
+      emitContextSummaryUi?: boolean
       /**
        * Optional override for the AbortSignal that bounds this preparation
        * call. When omitted, the session's current turn AbortController is
@@ -8028,6 +8123,7 @@ export class CursorConnectStreamService {
         contextLabel,
         model: route.model,
         strategy: "auto",
+        emitContextSummaryUi: false,
       })
         .then(() => {
           this.logger.debug(
@@ -8058,6 +8154,7 @@ export class CursorConnectStreamService {
       toolDefinitions?: ToolDefinition[]
       strategy: "auto" | "manual" | "reactive"
       hookUserMessage?: string
+      emitContextSummaryUi?: boolean
       signal: AbortSignal
     }
   ): Promise<void> {
@@ -8089,11 +8186,25 @@ export class CursorConnectStreamService {
             options.model || route.model || session.model
           ),
         })
+      let contextSummaryUiStarted = false
+      const emitContextSummaryUiStart = (): void => {
+        if (options.emitContextSummaryUi === false) return
+        contextSummaryUiStarted = true
+        this.emitContextSummaryStartedUiUpdate(
+          session.conversationId,
+          options.contextLabel
+        )
+      }
+      const closeContextSummaryUiStart = (): void => {
+        if (!contextSummaryUiStarted) return
+        this.closeContextSummaryStartedUiUpdate(session.conversationId)
+      }
       const codexRemoteCompactProvider: CodexRemoteCompactProvider = async ({
         messages,
         signal: innerSignal,
       }) => {
         innerSignal.throwIfAborted()
+        emitContextSummaryUiStart()
         return {
           replacementHistory:
             await this.codexService.compactConversationHistory({
@@ -8103,6 +8214,11 @@ export class CursorConnectStreamService {
               tools: options.toolDefinitions,
               conversationId: session.conversationId,
               pendingToolUseIds: options.pendingToolUseIds,
+              clientMetadata: this.buildCodexClientMetadata(
+                session,
+                session.conversationId,
+                { requestKind: "compaction" }
+              ),
               serviceTier: this.resolveRequestedCodexServiceTier(
                 session.requestedModelParameters
               ),
@@ -8121,40 +8237,49 @@ export class CursorConnectStreamService {
           integrityMode,
         }
       )
-      const plan = await this.codexContextAdapter.compactIfNeeded(
-        this.contextState.getContextRecord(session.conversationId)!
-          .contextState,
-        this.buildContextAttachmentSnapshot(session),
-        {
-          maxTokens: budget.maxTokens,
-          systemPromptTokens: budget.systemPromptTokens,
-          autoCompactTokenLimit: budget.autoCompactTokenLimit,
-          predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
-          projectedTokenOverride,
-          strategy: options.strategy,
-          integrityMode,
-          referenceContextItem,
-          injectionMode:
-            options.strategy === "reactive" ? "mid_turn" : "pre_turn",
-          hookUserMessage,
-          hookProvider: async (candidate) => {
-            options.signal.throwIfAborted()
-            hookUserMessage = await this.runPreCompactHookForCandidate(
-              session,
-              options.strategy,
-              route,
-              budget,
-              candidate,
-              options.model
-            )
-            return hookUserMessage
-          },
-          remoteCompactProvider: codexRemoteCompactProvider,
-          signal: options.signal,
-        }
-      )
-      options.signal.throwIfAborted()
-      if (!plan) return
+      let plan: ContextCompactionPlan | undefined
+      try {
+        plan = await this.codexContextAdapter.compactIfNeeded(
+          this.contextState.getContextRecord(session.conversationId)!
+            .contextState,
+          this.buildContextAttachmentSnapshot(session),
+          {
+            maxTokens: budget.maxTokens,
+            systemPromptTokens: budget.systemPromptTokens,
+            autoCompactTokenLimit: budget.autoCompactTokenLimit,
+            predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
+            projectedTokenOverride,
+            strategy: options.strategy,
+            integrityMode,
+            referenceContextItem,
+            injectionMode:
+              options.strategy === "reactive" ? "mid_turn" : "pre_turn",
+            hookUserMessage,
+            hookProvider: async (candidate) => {
+              options.signal.throwIfAborted()
+              hookUserMessage = await this.runPreCompactHookForCandidate(
+                session,
+                options.strategy,
+                route,
+                budget,
+                candidate,
+                options.model
+              )
+              return hookUserMessage
+            },
+            remoteCompactProvider: codexRemoteCompactProvider,
+            signal: options.signal,
+          }
+        )
+        options.signal.throwIfAborted()
+      } catch (error) {
+        closeContextSummaryUiStart()
+        throw error
+      }
+      if (!plan) {
+        closeContextSummaryUiStart()
+        return
+      }
 
       this.contextState.markContextStateDirty(session.conversationId)
       this.contextState.recordCursorTurnTransition(session.conversationId, {
@@ -8218,35 +8343,61 @@ export class CursorConnectStreamService {
     // retains up to the budget correctly. Old persisted collapse commits
     // still render via ContextCollapseService.projectRecords at read time.
     let hookUserMessage = options.hookUserMessage
-    const plan = await this.contextCompactRunner.compactIfNeeded(
-      this.contextState.getContextRecord(session.conversationId)!.contextState,
-      this.buildContextAttachmentSnapshot(session),
-      {
-        maxTokens: budget.maxTokens,
-        systemPromptTokens: budget.systemPromptTokens,
-        autoCompactTokenLimit: budget.autoCompactTokenLimit,
-        predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
-        strategy: options.strategy,
-        integrityMode,
-        summaryProvider: provider,
-        hookUserMessage,
-        hookProvider: async (candidate) => {
-          options.signal.throwIfAborted()
-          hookUserMessage = await this.runPreCompactHookForCandidate(
-            session,
-            options.strategy,
-            route,
-            budget,
-            candidate,
-            options.model
-          )
-          return hookUserMessage
-        },
-        signal: options.signal,
-      }
-    )
-    options.signal.throwIfAborted()
-    if (!plan) return
+    let contextSummaryUiStarted = false
+    const emitContextSummaryUiStart = (): void => {
+      if (options.emitContextSummaryUi === false) return
+      contextSummaryUiStarted = true
+      this.emitContextSummaryStartedUiUpdate(
+        session.conversationId,
+        options.contextLabel
+      )
+    }
+    const closeContextSummaryUiStart = (): void => {
+      if (!contextSummaryUiStarted) return
+      this.closeContextSummaryStartedUiUpdate(session.conversationId)
+    }
+    let plan: ContextCompactionPlan | undefined
+    try {
+      plan = await this.contextCompactRunner.compactIfNeeded(
+        this.contextState.getContextRecord(session.conversationId)!
+          .contextState,
+        this.buildContextAttachmentSnapshot(session),
+        {
+          maxTokens: budget.maxTokens,
+          systemPromptTokens: budget.systemPromptTokens,
+          autoCompactTokenLimit: budget.autoCompactTokenLimit,
+          predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
+          strategy: options.strategy,
+          integrityMode,
+          summaryProvider: async (request) => {
+            emitContextSummaryUiStart()
+            return provider(request)
+          },
+          hookUserMessage,
+          hookProvider: async (candidate) => {
+            options.signal.throwIfAborted()
+            hookUserMessage = await this.runPreCompactHookForCandidate(
+              session,
+              options.strategy,
+              route,
+              budget,
+              candidate,
+              options.model
+            )
+            return hookUserMessage
+          },
+          signal: options.signal,
+        }
+      )
+      options.signal.throwIfAborted()
+    } catch (error) {
+      closeContextSummaryUiStart()
+      throw error
+    }
+    if (!plan) {
+      closeContextSummaryUiStart()
+      return
+    }
 
     this.contextState.markContextStateDirty(session.conversationId)
     this.contextState.recordCursorTurnTransition(session.conversationId, {
@@ -9514,38 +9665,23 @@ ${raw}
           if (this.isLooseRecord(entry) && typeof entry.text === "string") {
             return entry.text
           }
-          return JSON.stringify(this.toJsonSafe(entry))
+          return safeJsonStringify(entry)
         })
         .filter(Boolean)
         .join("\n")
     }
     if (content == null) return ""
-    return JSON.stringify(this.toJsonSafe(content))
+    return safeJsonStringify(content)
   }
 
   private toJsonSafe(value: unknown): unknown {
-    if (typeof value === "bigint") {
-      return value <= BigInt(Number.MAX_SAFE_INTEGER)
-        ? Number(value)
-        : value.toString()
-    }
-    if (value instanceof Uint8Array) {
-      return Array.from(value)
-    }
-    if (Array.isArray(value)) {
-      return value.map((item) => this.toJsonSafe(item))
-    }
-    if (value && typeof value === "object") {
-      const result: Record<string, unknown> = {}
-      for (const [key, nested] of Object.entries(value)) {
-        if (typeof nested === "undefined" || typeof nested === "function") {
-          continue
-        }
-        result[key] = this.toJsonSafe(nested)
-      }
-      return result
-    }
-    return value
+    return toSafeJson(value, {
+      maxDepth: 10,
+      maxArrayItems: 500,
+      maxObjectKeys: 200,
+      maxStringLength: 64 * 1024,
+      includeHashes: true,
+    })
   }
 
   private getCurrentTurnRuntime(conversationId: string) {
@@ -17296,7 +17432,13 @@ ${raw}
         !Buffer.isBuffer(bodyRaw)
       ) {
         try {
-          body = JSON.stringify(bodyRaw)
+          body = safeJsonStringify(bodyRaw, {
+            maxDepth: 8,
+            maxArrayItems: 200,
+            maxObjectKeys: 100,
+            maxStringLength: 64 * 1024,
+            includeHashes: true,
+          })
         } catch {
           return {
             content: "[fetch error] Failed to serialize request body to JSON",
@@ -20982,7 +21124,15 @@ ${raw}
     args: Record<string, unknown>
   ): string {
     const clip = (value: unknown, max = 80): string => {
-      const text = typeof value === "string" ? value : JSON.stringify(value)
+      const text =
+        typeof value === "string"
+          ? value
+          : safeJsonStringify(value, {
+              maxDepth: 4,
+              maxArrayItems: 25,
+              maxObjectKeys: 40,
+              maxStringLength: 2 * 1024,
+            })
       if (typeof text !== "string") return ""
       const single = text.replace(/\s+/g, " ").trim()
       return single.length > max ? `${single.slice(0, max - 1)}…` : single
@@ -25536,13 +25686,21 @@ ${raw}
       limit
     )
     this.logger.log(
-      `[tool_search] session=${conversationId} query=${JSON.stringify(query)} returned=${tools.length}/${session.deferredToolCatalog?.length ?? 0}`
+      `[tool_search] session=${conversationId} query=${safeJsonStringify(query)} returned=${tools.length}/${session.deferredToolCatalog?.length ?? 0}`
     )
 
     await this.emitInlineToolResult(
       conversationId,
       activeToolCall.id,
-      JSON.stringify({ tools }, null, 2),
+      safeJsonStringify(
+        { tools },
+        {
+          maxDepth: 8,
+          maxArrayItems: 100,
+          maxObjectKeys: 100,
+          maxStringLength: 32 * 1024,
+        }
+      ),
       { status: "success" },
       undefined,
       "inline_tool_result",
@@ -25578,7 +25736,12 @@ ${raw}
 
     return catalog
       .map((entry, index) => {
-        const schemaText = JSON.stringify(entry.input_schema || {})
+        const schemaText = safeJsonStringify(entry.input_schema || {}, {
+          maxDepth: 8,
+          maxArrayItems: 100,
+          maxObjectKeys: 100,
+          maxStringLength: 16 * 1024,
+        })
         const haystack = [
           entry.name,
           entry.oneLineDescription,
@@ -26541,7 +26704,13 @@ ${raw}
   ): string {
     const messageId =
       message.type === "assistant" ? (message.message.id ?? "") : ""
-    return `${messageId}\u0000${JSON.stringify(message.message.content)}`
+    return `${messageId}\u0000${safeJsonStringify(message.message.content, {
+      includeHashes: true,
+      maxDepth: 10,
+      maxArrayItems: 1_000,
+      maxObjectKeys: 200,
+      maxStringLength: 64 * 1024,
+    })}`
   }
 
   private assistantMessageMatchesTurnMessage(
@@ -27148,7 +27317,12 @@ ${raw}
       }
     }
 
-    const serialized = JSON.stringify(input)
+    const serialized = safeJsonStringify(input, {
+      maxDepth: 5,
+      maxArrayItems: 25,
+      maxObjectKeys: 40,
+      maxStringLength: 2_048,
+    })
     return serialized
       ? this.truncateForToolSummary(serialized, 80)
       : "input=unknown"
@@ -34529,7 +34703,13 @@ ${raw}
       return value.length > maxChars ? `${value.slice(0, maxChars)}...` : value
     }
     try {
-      const raw = JSON.stringify(value)
+      const raw = safeJsonStringify(value, {
+        maxDepth: 8,
+        maxArrayItems: 100,
+        maxObjectKeys: 100,
+        maxStringLength: maxChars,
+        includeHashes: true,
+      })
       if (!raw) return ""
       return raw.length > maxChars ? `${raw.slice(0, maxChars)}...` : raw
     } catch {

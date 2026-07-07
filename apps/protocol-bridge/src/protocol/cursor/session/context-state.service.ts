@@ -43,6 +43,12 @@ import type {
 } from "../../../context/types"
 import type { BackendType } from "../../../llm/shared/model-router.service"
 import { ConversationId, type TurnId } from "../turn/turn.types"
+import { safeJsonStringify } from "../safe-json"
+import {
+  describeSessionFileStateLimit,
+  getSessionFileStateSize,
+  isSessionFileStateWithinLimit,
+} from "./file-state-limits"
 import { MessageStore } from "./message-store.service"
 import { ToolCallLedger } from "./tool-call-ledger.service"
 
@@ -488,7 +494,12 @@ export class ContextStateService {
     const contentStr =
       typeof contentForEstimation === "string"
         ? contentForEstimation
-        : JSON.stringify(contentForEstimation)
+        : safeJsonStringify(contentForEstimation, {
+            maxDepth: 8,
+            maxArrayItems: 200,
+            maxObjectKeys: 100,
+            maxStringLength: 8 * 1024,
+          })
     ctx!.usedTokens += Math.ceil(contentStr.length / 4)
     if (this.sessionLifecycle.shouldFlushMessageImmediately(message)) {
       this.sessionLifecycle.clearScheduledPersist(conversationId)
@@ -1009,6 +1020,16 @@ export class ContextStateService {
       session.lastActivityAt = new Date()
       const existing = ctx!.fileStates.get(filePath)
       const baseline = existing ? existing.beforeContent : beforeContent
+      const size = getSessionFileStateSize(baseline, afterContent)
+      if (!isSessionFileStateWithinLimit(baseline, afterContent)) {
+        ctx!.fileStates.delete(filePath)
+        this.logger.warn(
+          `Skipping oversized file state for ${conversationId} ${filePath}: ` +
+            describeSessionFileStateLimit(size.beforeBytes, size.afterBytes)
+        )
+        this.sessionLifecycle.schedulePersist(conversationId)
+        return
+      }
       ctx!.fileStates.set(filePath, {
         beforeContent: baseline,
         afterContent,

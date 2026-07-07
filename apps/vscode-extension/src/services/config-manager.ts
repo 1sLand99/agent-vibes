@@ -5,6 +5,12 @@ import { ensureDir, getDefaultDataDir } from "../utils/platform"
 
 export type CursorTrafficMode = "cursorPatch" | "systemForwarding" | "manual"
 
+type AccountsCacheEntry = {
+  mtimeMs: number
+  size: number
+  accounts: Record<string, unknown>[]
+}
+
 /**
  * Normalize a raw Kiro `authMethod` value to one of the three canonical
  * methods the bridge understands. Mirrors the classification in
@@ -40,6 +46,8 @@ function normalizeCursorTrafficMode(value: unknown): CursorTrafficMode {
  * Manages the extension's configuration and data directory (~/.agent-vibes/).
  */
 export class ConfigManager {
+  private readonly accountsCache = new Map<string, AccountsCacheEntry>()
+
   constructor() {
     this.ensureDirectories()
   }
@@ -258,26 +266,40 @@ export class ConfigManager {
 
   /** Count accounts for a given backend */
   getAccountCount(filePath: string): number {
-    try {
-      if (!fs.existsSync(filePath)) return 0
-      const data = JSON.parse(fs.readFileSync(filePath, "utf-8")) as {
-        accounts?: Record<string, unknown>[]
-      }
-      return Array.isArray(data.accounts) ? data.accounts.length : 0
-    } catch {
-      return 0
-    }
+    return this.readAccounts(filePath).length
   }
 
   /** Read all accounts from a backend JSON file */
   readAccounts(filePath: string): Record<string, unknown>[] {
+    const cacheKey = path.resolve(filePath)
     try {
-      if (!fs.existsSync(filePath)) return []
-      const data = JSON.parse(fs.readFileSync(filePath, "utf-8")) as {
+      const stat = fs.statSync(cacheKey)
+      if (!stat.isFile()) {
+        this.accountsCache.delete(cacheKey)
+        return []
+      }
+
+      const cached = this.accountsCache.get(cacheKey)
+      if (
+        cached &&
+        cached.mtimeMs === stat.mtimeMs &&
+        cached.size === stat.size
+      ) {
+        return this.cloneAccounts(cached.accounts)
+      }
+
+      const data = JSON.parse(fs.readFileSync(cacheKey, "utf-8")) as {
         accounts?: Record<string, unknown>[]
       }
-      return Array.isArray(data.accounts) ? data.accounts : []
+      const accounts = Array.isArray(data.accounts) ? data.accounts : []
+      this.accountsCache.set(cacheKey, {
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        accounts: this.cloneAccounts(accounts),
+      })
+      return this.cloneAccounts(accounts)
     } catch {
+      this.accountsCache.delete(cacheKey)
       return []
     }
   }
@@ -402,6 +424,23 @@ export class ConfigManager {
   writeAccounts(filePath: string, accounts: Record<string, unknown>[]): void {
     ensureDir(path.dirname(filePath))
     fs.writeFileSync(filePath, JSON.stringify({ accounts }, null, 2))
+    const cacheKey = path.resolve(filePath)
+    try {
+      const stat = fs.statSync(cacheKey)
+      this.accountsCache.set(cacheKey, {
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        accounts: this.cloneAccounts(accounts),
+      })
+    } catch {
+      this.accountsCache.delete(cacheKey)
+    }
+  }
+
+  private cloneAccounts(
+    accounts: Record<string, unknown>[]
+  ): Record<string, unknown>[] {
+    return accounts.map((account) => ({ ...account }))
   }
 
   readLocalConfig<T>(key: string, fallback: T): T {

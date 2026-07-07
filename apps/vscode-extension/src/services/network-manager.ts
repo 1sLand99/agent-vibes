@@ -10,6 +10,7 @@ const PID_FILE =
   process.platform === "win32"
     ? path.join(os.tmpdir(), "cursor-proxy-relay.pid")
     : "/tmp/cursor-proxy-relay.pid"
+const FORWARDING_ACTIVE_CACHE_TTL_MS = 2_000
 
 export type ForwardingBackend = "relay" | "portproxy" | "iptables"
 
@@ -39,6 +40,12 @@ interface ForwardingStatusScriptPayload {
   }
 }
 
+type ForwardingActiveCache = {
+  port: number
+  expiresAt: number
+  active: boolean
+}
+
 /**
  * 跨平台的 forwarding 状态管理器。
  *
@@ -52,6 +59,7 @@ interface ForwardingStatusScriptPayload {
 export class NetworkManager {
   private extensionPath: string | null = null
   private _port: number = 2026
+  private forwardingActiveCache: ForwardingActiveCache | null = null
 
   /**
    * Set the extension path so we can find the bundled scripts.
@@ -67,6 +75,11 @@ export class NetworkManager {
    */
   setPort(port: number): void {
     this._port = port
+    this.invalidateForwardingCache()
+  }
+
+  invalidateForwardingCache(): void {
+    this.forwardingActiveCache = null
   }
 
   /**
@@ -236,17 +249,35 @@ export class NetworkManager {
   }
 
   /**
-   * Quick local check — does NOT spawn a subprocess.
-   * Used by hot paths (extension activation, dashboard refresh, status bar).
+   * Quick forwarding check for hot paths. Cached because platform probes may
+   * touch `/etc/hosts`, PID files, or small system commands.
    */
-  isForwardingActive(): boolean {
+  isForwardingActive(options: { force?: boolean } = {}): boolean {
+    const now = Date.now()
+    const cached = this.forwardingActiveCache
+    if (
+      !options.force &&
+      cached &&
+      cached.port === this._port &&
+      cached.expiresAt > now
+    ) {
+      return cached.active
+    }
+
     const hasHosts = this.hasHostEntries()
     const backend = this.getForwardingBackend()
-    if (backend === "relay")
-      return hasHosts && this.hasLoopbackAlias() && this.isRelayRunning()
-    if (backend === "portproxy")
-      return hasHosts && this.hasWindowsPortProxyRule()
-    return hasHosts && this.hasIptablesRule()
+    const active =
+      backend === "relay"
+        ? hasHosts && this.hasLoopbackAlias() && this.isRelayRunning()
+        : backend === "portproxy"
+          ? hasHosts && this.hasWindowsPortProxyRule()
+          : hasHosts && this.hasIptablesRule()
+    this.forwardingActiveCache = {
+      port: this._port,
+      expiresAt: now + FORWARDING_ACTIVE_CACHE_TTL_MS,
+      active,
+    }
+    return active
   }
 
   /**
@@ -259,13 +290,13 @@ export class NetworkManager {
     const startedAt = Date.now()
 
     while (Date.now() - startedAt < timeoutMs) {
-      if (this.isForwardingActive()) {
+      if (this.isForwardingActive({ force: true })) {
         return true
       }
       await new Promise((resolve) => setTimeout(resolve, intervalMs))
     }
 
-    return this.isForwardingActive()
+    return this.isForwardingActive({ force: true })
   }
 
   /**

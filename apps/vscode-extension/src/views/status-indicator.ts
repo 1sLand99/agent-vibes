@@ -4,7 +4,7 @@ import { EXTENSION_DISPLAY_NAME } from "../constants"
 import { t, tFmt } from "../i18n/messages-i18n"
 
 const LOADING_COLOR = "#34d399"
-const FORWARDING_POLL_INTERVAL_MS = 4000
+const CURSOR_CONNECTION_POLL_INTERVAL_MS = 30_000
 
 export type CursorConnectionState = "patched" | "forwarding" | "unwired"
 
@@ -65,7 +65,7 @@ export class StatusIndicator {
       if (next !== previous && !this.transientStatus) {
         this.render()
       }
-    }, FORWARDING_POLL_INTERVAL_MS)
+    }, CURSOR_CONNECTION_POLL_INTERVAL_MS)
   }
 
   private serviceSegment(): {

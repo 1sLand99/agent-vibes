@@ -43,16 +43,21 @@ export function registerContentTypeParsers(
       payload: Readable,
       done: (err: Error | null, body?: Buffer) => void
     ) => {
-      logger.debug("[ContentTypeParser] Handling application/connect+proto")
-      logger.debug(
-        `[ContentTypeParser] HTTP version: ${request.raw.httpVersion}, readable: ${payload.readable}`
-      )
+      const shouldLogProtoTraffic = process.env.LOG_PROTO_TRAFFIC === "true"
+      if (shouldLogProtoTraffic) {
+        logger.debug("[ContentTypeParser] Handling application/connect+proto")
+        logger.debug(
+          `[ContentTypeParser] HTTP version: ${request.raw.httpVersion}, readable: ${payload.readable}`
+        )
+      }
 
       // Check if payload is already a buffer
       if (Buffer.isBuffer(payload)) {
-        logger.debug(
-          `[ContentTypeParser] application/connect+proto: received ${payload.length} bytes (buffer)`
-        )
+        if (shouldLogProtoTraffic) {
+          logger.debug(
+            `[ContentTypeParser] application/connect+proto: received ${payload.length} bytes (buffer)`
+          )
+        }
         done(null, payload)
         return
       }
@@ -88,9 +93,11 @@ export function registerContentTypeParsers(
       const finalize = (source: string) => {
         if (doneCalled) return
         const buffer = Buffer.concat(initialChunks)
-        logger.debug(
-          `[ContentTypeParser] application/connect+proto: received ${buffer.length} bytes (${source})`
-        )
+        if (shouldLogProtoTraffic) {
+          logger.debug(
+            `[ContentTypeParser] application/connect+proto: received ${buffer.length} bytes (${source})`
+          )
+        }
         settleDone(null, buffer)
       }
 
@@ -102,9 +109,11 @@ export function registerContentTypeParsers(
         bidiPayload.write(chunk)
 
         if (!doneCalled) {
-          logger.debug(
-            `[ContentTypeParser] Received chunk: ${chunk.length} bytes`
-          )
+          if (shouldLogProtoTraffic) {
+            logger.debug(
+              `[ContentTypeParser] Received chunk: ${chunk.length} bytes`
+            )
+          }
           initialChunks.push(chunk)
 
           // For BiDi streams, process immediately after first chunk
@@ -122,9 +131,11 @@ export function registerContentTypeParsers(
       }
 
       const onEnd = () => {
-        logger.debug(
-          `[ContentTypeParser] application/connect+proto: stream end event, firstChunkReceived=${firstChunkReceived}, chunks=${initialChunks.length}`
-        )
+        if (shouldLogProtoTraffic) {
+          logger.debug(
+            `[ContentTypeParser] application/connect+proto: stream end event, firstChunkReceived=${firstChunkReceived}, chunks=${initialChunks.length}`
+          )
+        }
         bidiPayload.end()
         if (!doneCalled) {
           // Wait a short time for any pending data

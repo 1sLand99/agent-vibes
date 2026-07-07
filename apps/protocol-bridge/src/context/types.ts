@@ -427,10 +427,24 @@ export interface CodexReplacementHistory {
   compactionId: string
   createdAt: number
   injectionMode: "pre_turn" | "mid_turn"
+  windowNumber: number
+  firstWindowId: string
+  previousWindowId?: string
+  windowId: string
   anchorRecordId?: string
   anchorRecordCount: number
   summary: string
   items: CodexReplacementHistoryItem[]
+}
+
+export interface CodexContextWindowState {
+  windowNumber: number
+  firstWindowId: string
+  previousWindowId?: string
+  windowId: string
+  createdAt: number
+  compactionId?: string
+  replacementHistory?: CodexReplacementHistory
 }
 
 export interface CodexContextState {
@@ -438,7 +452,7 @@ export interface CodexContextState {
   tokenInfo?: CodexContextTokenInfo
   referenceContextItem?: CodexReferenceContextItem
   metaMessageLedger?: CodexMetaMessageLedgerState
-  replacementHistory?: CodexReplacementHistory
+  activeWindow?: CodexContextWindowState
   truncationPolicy: CodexTruncationPolicy
 }
 

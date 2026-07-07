@@ -39,8 +39,27 @@ type CursorPatchRestorePlanEntry = {
   targetPath: string
 }
 
+const CURSOR_PATCH_BASELINE_STATUS_CACHE_TTL_MS = 30_000
+
+type CursorPatchBaselineStatusCache = {
+  expiresAt: number
+  status: CursorPatchBaselineStatus
+}
+
 export class CursorPatchBaselineService {
-  getStatus(): CursorPatchBaselineStatus {
+  private static statusCache: CursorPatchBaselineStatusCache | null = null
+
+  static invalidateStatusCache(): void {
+    CursorPatchBaselineService.statusCache = null
+  }
+
+  getStatus(options: { force?: boolean } = {}): CursorPatchBaselineStatus {
+    const now = Date.now()
+    const cached = CursorPatchBaselineService.statusCache
+    if (!options.force && cached && cached.expiresAt > now) {
+      return cached.status
+    }
+
     const appRootPath = getCursorAppRootPath()
     const installVersion = getCursorInstallVersion()
     const installFingerprint = getCursorInstallFingerprint()
@@ -55,7 +74,7 @@ export class CursorPatchBaselineService {
       : null
     const manifest = manifestPath ? this.readManifest(manifestPath) : null
 
-    return {
+    const status = {
       appRootPath,
       installVersion,
       installFingerprint,
@@ -64,6 +83,11 @@ export class CursorPatchBaselineService {
       manifestExists: Boolean(manifest),
       trackedFiles: manifest?.files ?? [],
     }
+    CursorPatchBaselineService.statusCache = {
+      expiresAt: now + CURSOR_PATCH_BASELINE_STATUS_CACHE_TTL_MS,
+      status,
+    }
+    return status
   }
 
   hasOriginal(filePath: string): boolean {
@@ -150,6 +174,7 @@ export class CursorPatchBaselineService {
 
     manifest.files.sort()
     fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n")
+    CursorPatchBaselineService.invalidateStatusCache()
     return Array.from(new Set(added))
   }
 
@@ -220,6 +245,7 @@ export class CursorPatchBaselineService {
 
     manifest.files.sort()
     fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n")
+    CursorPatchBaselineService.invalidateStatusCache()
     return added
   }
 

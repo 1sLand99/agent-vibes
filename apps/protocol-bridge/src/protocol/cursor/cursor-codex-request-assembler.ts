@@ -32,6 +32,7 @@ export interface CursorCodexClientMetadataInput {
   requestOrdinal?: number
   turnId?: string
   windowId?: string
+  requestKind?: "turn" | "compaction"
   installationId: string
   workspaceRootPath?: string
 }
@@ -221,6 +222,7 @@ export function buildCursorCodexClientMetadata(
   const windowId = normalizeCodexPromptCacheKey(
     input.windowId?.trim() || `${codexConversationId}:0`
   )
+  const requestKind = input.requestKind === "compaction" ? "compaction" : "turn"
   const installationId = input.installationId.trim()
   const turnMetadata: Record<string, unknown> = {
     installation_id: installationId,
@@ -228,7 +230,7 @@ export function buildCursorCodexClientMetadata(
     thread_id: codexConversationId,
     turn_id: turnId,
     window_id: windowId,
-    request_kind: "turn",
+    request_kind: requestKind,
     thread_source: "user",
     sandbox: "none",
   }

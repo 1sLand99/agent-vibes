@@ -115,6 +115,7 @@ import {
 } from "./codex-sse-parsing"
 import {
   buildCodexHttpRequestLogLine,
+  summarizeCodexCompletedResponseForLogs,
   summarizeCodexRequestForLogs,
 } from "./codex-request-log-summary"
 import { prepareCodexRequestForSend } from "./codex-request-sanitizer"
@@ -1959,6 +1960,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     event: Record<string, unknown> | null,
     requestStartedAt?: number
   ): void {
+    if (event?.type === "response.completed") {
+      this.logger.log(
+        `[Codex][${transport === "websocket" ? "WS" : "HTTP"} Response][Completed] ` +
+          summarizeCodexCompletedResponseForLogs(event)
+      )
+    }
+
     const usage = extractCodexCompletedUsage(event)
     if (!usage) return
 
@@ -2287,7 +2295,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const preparedCodexRequest = prepareCodexRequestForSend(codexRequest)
     const payload = buildCodexCompactRequestPayload(preparedCodexRequest)
     this.logger.debug(
-      `[Codex][Compact Request] ${summarizeCodexRequestForLogs(payload)}`
+      `[Codex][Compact Request] ${summarizeCodexRequestForLogs({
+        ...payload,
+        client_metadata: preparedCodexRequest.client_metadata,
+      })}`
     )
     const url = this.buildUrl(requestSlot, "responses/compact")
     const headers = this.buildHeaders(requestSlot, token, false, {
@@ -3076,6 +3087,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         codexRequest: preparedCodexRequest,
       })
     )
+    this.logger.debug(
+      `[Codex][HTTP Request][Payload] ${summarizeCodexRequestForLogs(preparedCodexRequest)}`
+    )
 
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
       method: "POST",
@@ -3275,7 +3289,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         `[Codex] WebSocket non-stream request: model=${modelName}, url=${wsUrl}`
       )
       this.logger.debug(
-        `[Codex][WS Request] ${summarizeCodexRequestForLogs(wsBody)}`
+        `[Codex][WS Request][Payload] ${summarizeCodexRequestForLogs(wsBody)}`
       )
     }
 
@@ -4258,6 +4272,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         codexRequest: preparedCodexRequest,
       })
     )
+    this.logger.debug(
+      `[Codex][HTTP Request][Payload] ${summarizeCodexRequestForLogs(preparedCodexRequest)}`
+    )
 
     const requestSignal = createAbortSignalWithTimeout(600_000, abortSignal)
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
@@ -4626,7 +4643,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           `[Codex] WebSocket stream request: model=${modelName}, url=${wsUrl}`
         )
         this.logger.debug(
-          `[Codex][WS Request] ${summarizeCodexRequestForLogs(
+          `[Codex][WS Request][Payload] ${summarizeCodexRequestForLogs(
             this.wsService.buildWebSocketRequestBody(
               prepareCodexRequestForSend(codexRequest),
               {
