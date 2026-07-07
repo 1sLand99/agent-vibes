@@ -111,17 +111,13 @@ const ENABLED_CURSOR_FEATURES = new Set<string>([
   "react_shell_tool",
   "compact_terminal",
   "long_running_jobs",
-  // 注意：不启用 "use_model_parameters"！
-  // Cursor 源码：P=use_model_parameters, N=use_react_model_picker, F=P||N
-  // 设置页：F() ? (P() ? clientDisplayName : variants[0].displayName) : ...
-  // P()=false + N()=true → 走 variants[0].displayName → 渲染 :icon-brain: 变体效果
+  "use_model_parameters",
   "use_react_model_picker",
 ])
 
 /**
  * Models that are enabled by default in the model picker.
- * GPT variants (High Fast, Extra high Fast, etc.) must be enabled
- * manually in Cursor UI because defaultOn only works at the model level.
+ * Parameterized GPT rows enable their base model when selected as the default.
  */
 const DEFAULT_ON_MODELS = new Set<string>(["gemini-3.1-pro-high"])
 
@@ -998,16 +994,15 @@ export class AiserverMockController {
         "claude-sonnet-4-5",
         "gemini-2.5-pro",
       ])
-      const parameterizedMode = request.useModelParameters
+      const parameterizedMode =
+        request.useModelParameters || request.useReactModelPicker
 
       this.logger.debug(
-        `AvailableModels request flags: nightly=${request.isNightly}, reactPicker=${request.useReactModelPicker}, useModelParameters=${request.useModelParameters}, variantsExploded=${request.variantsWillBeShownInExplodedList}, includeLongContext=${request.includeLongContextModels}, excludeMaxNamedModels=${request.excludeMaxNamedModels}, includeHidden=${request.includeHiddenModels}, doNotUseMarkdown=${request.doNotUseMarkdown}, forAutomations=${request.forAutomations}, scope=${request.scope ?? "unspecified"}, additionalModelNames=${request.additionalModelNames.join(",") || "(none)"}`
+        `AvailableModels request flags: nightly=${request.isNightly}, reactPicker=${request.useReactModelPicker}, useModelParameters=${request.useModelParameters}, effectiveModelParameters=${parameterizedMode}, variantsExploded=${request.variantsWillBeShownInExplodedList}, includeLongContext=${request.includeLongContextModels}, excludeMaxNamedModels=${request.excludeMaxNamedModels}, includeHidden=${request.includeHiddenModels}, doNotUseMarkdown=${request.doNotUseMarkdown}, forAutomations=${request.forAutomations}, scope=${request.scope ?? "unspecified"}, additionalModelNames=${request.additionalModelNames.join(",") || "(none)"}`
       )
 
       const protoModels = allModels.flatMap((model) => {
-        // GPT 变体需要展开成多个顶层模型项，
-        // 设置页通过 variant displayName 的 HTML :icon-brain: 标记渲染变体效果
-        if (model.family === "gpt") {
+        if (model.family === "gpt" && !parameterizedMode) {
           return buildLegacyCursorAvailableModels(
             model,
             this.getNamedModelSectionIndex(model.family),
@@ -1022,7 +1017,8 @@ export class AiserverMockController {
           )
         }
 
-        // 非 GPT 模型使用 grouped 结构
+        // Current Cursor picker consumes grouped models with editable parameters.
+        // The exploded GPT path above is kept only for older picker requests.
         return [
           buildCursorAvailableModel(
             model,
@@ -1030,7 +1026,9 @@ export class AiserverMockController {
             {
               includeParameterDefinitions: parameterizedMode,
               includeVariants: true,
-              defaultOn: DEFAULT_ON_MODELS.has(model.name),
+              defaultOn:
+                DEFAULT_ON_MODELS.has(model.name) ||
+                (parameterizedMode && model.name === defaultSelection.model),
             }
           ),
         ]
@@ -1039,9 +1037,6 @@ export class AiserverMockController {
         defaultSelection.model,
         allModels
       )
-      // 官方 AvailableModels 响应不包含 useModelParameters 字段。
-      // Cursor 客户端从 statsig feature gate 获取这些值并持久化。
-      // 我们不设置此字段，避免覆盖客户端的正确缓存。
       const response = create(AvailableModelsResponseSchema, {
         modelNames: protoModels.map((m) => m.name),
         models: protoModels,
@@ -1052,6 +1047,7 @@ export class AiserverMockController {
         specModelConfig: featureModelConfig,
         deepSearchModelConfig: featureModelConfig,
         quickAgentModelConfig: featureModelConfig,
+        useModelParameters: parameterizedMode,
         displayConfiguration: this.buildModelPickerDisplayConfiguration(),
       })
       const buf = Buffer.from(toBinary(AvailableModelsResponseSchema, response))

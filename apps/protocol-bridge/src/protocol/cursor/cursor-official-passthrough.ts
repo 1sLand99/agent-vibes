@@ -169,6 +169,29 @@ export function registerCursorOfficialPassthroughHook(
 
     await proxyCursorOfficialRequest(request, reply, target, logger)
   })
+
+  fastify.route({
+    method: ["GET", "HEAD", "POST"],
+    url: "/*",
+    handler: async (request, reply) => {
+      if (isCursorOfficialPassthroughEnabled()) {
+        const target = getCursorOfficialPassthroughTarget(
+          request.url,
+          request.method
+        )
+        if (target) {
+          await proxyCursorOfficialRequest(request, reply, target, logger)
+          return
+        }
+      }
+
+      reply.status(404).send({
+        message: `Route ${request.method}:${request.url} not found`,
+        error: "Not Found",
+        statusCode: 404,
+      })
+    },
+  })
 }
 
 function buildUpstreamUrl(

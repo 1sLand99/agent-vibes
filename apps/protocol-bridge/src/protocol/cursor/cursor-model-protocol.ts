@@ -12,6 +12,7 @@ import {
   CloudAgentEffortMode,
   GetModelLabelsResponse_ModelLabelSchema,
   ModelParameterDefinition_BooleanParameterDefinitionSchema,
+  ModelParameterDefinition_BooleanParameterDefinition_BooleanParameterValueSchema,
   ModelParameterDefinition_EnumParameterDefinition_EnumParameterValueSchema,
   ModelParameterDefinition_EnumParameterDefinitionSchema,
   ModelParameterDefinition_ModelParameterTypeSchema,
@@ -115,6 +116,36 @@ function selectEffortValue(
     }
   }
   return values[0] || null
+}
+
+function selectDefaultEffortValue(
+  modelName: string,
+  values: readonly string[],
+  order: readonly string[]
+): string | null {
+  const defaultLevel = resolveModelThinkingCapability(modelName)?.defaultLevel
+  const normalizedDefault = defaultLevel
+    ? normalizeVariantReasoningEffort(defaultLevel)
+    : undefined
+
+  if (normalizedDefault && values.includes(normalizedDefault)) {
+    return normalizedDefault
+  }
+
+  return selectEffortValue(values, order)
+}
+
+function orderEffortValuesForVariants(
+  values: readonly string[],
+  defaultEffort: string | null
+): Array<string | null> {
+  if (values.length === 0) {
+    return [null]
+  }
+  if (!defaultEffort || !values.includes(defaultEffort)) {
+    return [...values]
+  }
+  return [defaultEffort, ...values.filter((value) => value !== defaultEffort)]
 }
 
 function getEffortDisplayName(value: string): string {
@@ -464,8 +495,8 @@ function buildReasoningParameterDefinition(modelName: string) {
   return [
     create(ModelParameterDefinitionSchema, {
       id: CURSOR_REASONING_PARAMETER_ID,
-      name: "Reasoning Effort",
-      markdownTooltip: "Controls Codex reasoning depth for this model.",
+      name: "Thinking",
+      markdownTooltip: "Controls thinking depth for this model.",
       isCycleableByHotkey: true,
       parameterType: create(ModelParameterDefinition_ModelParameterTypeSchema, {
         enumParameter: create(
@@ -501,7 +532,24 @@ function buildFastModeParameterDefinition(model: CursorDisplayModel) {
       parameterType: create(ModelParameterDefinition_ModelParameterTypeSchema, {
         booleanParameter: create(
           ModelParameterDefinition_BooleanParameterDefinitionSchema,
-          {}
+          {
+            values: [
+              create(
+                ModelParameterDefinition_BooleanParameterDefinition_BooleanParameterValueSchema,
+                {
+                  value: CURSOR_FAST_MODE_DISABLED,
+                  displayName: "Off",
+                }
+              ),
+              create(
+                ModelParameterDefinition_BooleanParameterDefinition_BooleanParameterValueSchema,
+                {
+                  value: CURSOR_FAST_MODE_ENABLED,
+                  displayName: "On",
+                }
+              ),
+            ],
+          }
         ),
       }),
     }),
@@ -509,14 +557,11 @@ function buildFastModeParameterDefinition(model: CursorDisplayModel) {
 }
 
 /**
- * 构建 Cursor 官方格式的变体 displayName。
+ * 构建 Cursor picker 使用的变体 displayName。
  *
- * Cursor 前端通过 variant displayName / displayNameOutsidePicker 中的
- * HTML `<span>` + `:icon-brain:` 标记来渲染设置页和聊天界面里的变体效果
- * 图标和副文案。格式参考官方日志中的实际响应：
- *
- *   Composer 2 <span style="color: var(--cursor-text-tertiary); font-size: 0.85em;">:icon-brain: Fast</span>
- *   Grok 4.20 <span style="color: var(--cursor-text-tertiary); font-size: 0.85em;">:icon-brain:</span>
+ * 新版 `use_model_parameters` picker 仍使用 variant displayName /
+ * displayNameOutsidePicker 展示当前参数组合；区别是这些 variants 挂在
+ * 基础模型行上，而不是展开成多个顶层模型。
  */
 function buildVariantRichDisplayName(
   baseDisplayName: string,
@@ -563,12 +608,12 @@ function buildVariant(
 ) {
   const fastMode = options.fastMode === true
   const cursorEffort = effort ? toCursorReasoningValue(effort) : null
-  const richDisplayName = buildVariantRichDisplayName(
+  const displayName = buildVariantRichDisplayName(
     options.displayName,
     effort,
     fastMode
   )
-  const richOutsidePicker = buildVariantRichDisplayName(
+  const displayNameOutsidePicker = buildVariantRichDisplayName(
     options.displayNameOutsidePicker || options.displayName,
     effort,
     fastMode
@@ -603,12 +648,12 @@ function buildVariant(
 
   return create(AvailableModelsResponse_ModelVariantConfigSchema, {
     parameterValues,
-    displayName: richDisplayName,
+    displayName,
     isMaxMode: options.isMaxMode,
     isDefaultMaxConfig: options.isDefaultMaxConfig,
     isDefaultNonMaxConfig: options.isDefaultNonMaxConfig,
     tagline,
-    displayNameOutsidePicker: richOutsidePicker,
+    displayNameOutsidePicker,
     variantStringRepresentation: `${baseModelName}(${variantSegments.join(",")})`,
   })
 }
@@ -679,7 +724,10 @@ function buildReasoningVariants(
     defaultMaxEffort: string | null
   }
 ): ReturnType<typeof buildVariant>[] {
-  const variantEfforts = effortValues.length > 0 ? [...effortValues] : [null]
+  const variantEfforts = orderEffortValuesForVariants(
+    effortValues,
+    options.standardEffort
+  )
   const fastModes = options.supportsCursorFastMode ? [false, true] : [false]
 
   if (options.maxNamedModel) {
@@ -713,7 +761,7 @@ function buildReasoningVariants(
   }
 
   return variantEfforts.flatMap((effort) =>
-    fastModes.flatMap((fastMode) => [
+    fastModes.map((fastMode) =>
       buildVariant(model.name, effort, {
         displayName: model.displayName,
         displayNameOutsidePicker: model.shortName,
@@ -721,16 +769,8 @@ function buildReasoningVariants(
         isMaxMode: false,
         isDefaultNonMaxConfig:
           effort === options.standardEffort && fastMode === false,
-      }),
-      buildVariant(model.name, effort, {
-        displayName: model.displayName,
-        displayNameOutsidePicker: model.shortName,
-        fastMode,
-        isMaxMode: true,
-        isDefaultMaxConfig:
-          effort === options.defaultMaxEffort && fastMode === false,
-      }),
-    ])
+      })
+    )
   )
 }
 
@@ -745,7 +785,11 @@ function resolveAvailableModelMode(model: CursorDisplayModel): {
   const modelName = model.name
   const maxNamedModel = isExplicitMaxNamedModel(modelName)
   const effortValues = resolveEffortValues(modelName)
-  const standardEffort = selectEffortValue(effortValues, STANDARD_EFFORT_ORDER)
+  const standardEffort = selectDefaultEffortValue(
+    modelName,
+    effortValues,
+    STANDARD_EFFORT_ORDER
+  )
   const supportsThinking = effortValues.length > 0
   // For models without explicit ThinkingCapability levels (e.g. Claude, Gemini
   // thinking variants), fall back to the model's isThinking flag so that max
@@ -758,7 +802,8 @@ function resolveAvailableModelMode(model: CursorDisplayModel): {
     ...buildFastModeParameterDefinition(model),
   ]
   const defaultMaxEffort =
-    selectEffortValue(effortValues, STANDARD_EFFORT_ORDER) || standardEffort
+    selectDefaultEffortValue(modelName, effortValues, STANDARD_EFFORT_ORDER) ||
+    standardEffort
 
   if (!supportsThinkingOrIsThinking && !supportsFastMode) {
     return {
@@ -1225,15 +1270,17 @@ export function buildCursorAvailableModel(
   // the thinking-model suppress rule (Claude/Gemini reasoning models keep
   // their displayName as tagline) so we don't accidentally double-decorate
   // a thinking entry.
-  const projectedTagline = shouldSuppressProjectedTagline
-    ? model.displayName
-    : model.tagline ||
-      defaultDisplayVariant?.tagline ||
-      extractVariantSuffix(
-        defaultDisplayVariant?.displayName,
+  const projectedTagline = includeParameterDefinitions
+    ? model.tagline
+    : shouldSuppressProjectedTagline
+      ? model.displayName
+      : model.tagline ||
+        defaultDisplayVariant?.tagline ||
+        extractVariantSuffix(
+          defaultDisplayVariant?.displayName,
+          model.displayName
+        ) ||
         model.displayName
-      ) ||
-      model.displayName
 
   return create(AvailableModelsResponse_AvailableModelSchema, {
     name: model.name,
