@@ -65,8 +65,10 @@ import {
   KnowledgeBaseUpdateRequestSchema,
   KnowledgeBaseUpdateResponseSchema,
   ListBackgroundComposersResponseSchema,
+  ListPersonalEnvironmentsResponseSchema,
   ListPendingFollowupsRequestSchema,
   ListPendingFollowupsResponseSchema,
+  ListTeamEnvironmentsResponseSchema,
   NameTabRequestSchema,
   NameTabResponseSchema,
   PendingFollowupSchema,
@@ -1647,6 +1649,22 @@ export class AiserverMockController {
       participants: [],
     })
     this.sendProto(res, ListBackgroundComposersResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.BackgroundComposerService/ListPersonalEnvironments")
+  handleListPersonalEnvironments(@Res() res: FastifyReply): void {
+    const response = create(ListPersonalEnvironmentsResponseSchema, {
+      environments: [],
+    })
+    this.sendProto(res, ListPersonalEnvironmentsResponseSchema, response)
+  }
+
+  @Post("aiserver.v1.BackgroundComposerService/ListTeamEnvironments")
+  handleListTeamEnvironments(@Res() res: FastifyReply): void {
+    const response = create(ListTeamEnvironmentsResponseSchema, {
+      environments: [],
+    })
+    this.sendProto(res, ListTeamEnvironmentsResponseSchema, response)
   }
 
   @Post("aiserver.v1.BackgroundComposerService/GetGithubAccessTokenForRepos")

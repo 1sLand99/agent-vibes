@@ -85,6 +85,9 @@ export function summarizeCodexRequestForLogs(
   const windowId = clientMetadata
     ? getStringField(clientMetadata, "x-codex-window-id").trim()
     : ""
+  const requestKind = clientMetadata
+    ? getStringField(clientMetadata, "request_kind").trim()
+    : ""
 
   return (
     `type=${getStringField(codexRequest, "type") || "none"} ` +
@@ -95,6 +98,7 @@ export function summarizeCodexRequestForLogs(
     `text=${stringifyLogValue(codexRequest.text as JsonLogValue)} ` +
     `previous_response_id=${previousResponseId || "none"} ` +
     `window_id=${windowId || "none"} ` +
+    `request_kind=${requestKind || "none"} ` +
     `input_items=${inputItems.length} [${inputSummary}] ` +
     `tools=${toolsCount} ` +
     `call_ids=${sampleCallIds}`

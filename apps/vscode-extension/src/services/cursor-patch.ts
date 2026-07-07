@@ -756,7 +756,7 @@ export function patchBridgeEndpointContent(
   return contentWithCredentialsGuard
 }
 
-function getBridgeEndpointDetails(
+export function getBridgeEndpointDetails(
   content: string,
   port: number
 ): {
@@ -764,6 +764,7 @@ function getBridgeEndpointDetails(
   applied: boolean
   canApply: boolean
   requiresPortUpdate: boolean
+  coverage: Omit<CursorBridgeEndpointCoverage, "workbenchFiles">
 } {
   const bridgeUrl = getCursorBridgeEndpointUrl(port)
   const location = locateBridgeEndpointConstants(content)
@@ -773,10 +774,20 @@ function getBridgeEndpointDetails(
       applied: false,
       canApply: false,
       requiresPortUpdate: false,
+      coverage: {
+        apiTargets: 0,
+        agentTargets: 0,
+        localEndpoints: 0,
+        matchingLocalEndpoints: 0,
+        credentialsGuard: false,
+        persistentGuard: false,
+        storageGuardRemoved: false,
+      },
     }
   }
 
   const summary = summarizeBridgeEndpointSegment(location.segment, bridgeUrl)
+  const credentialsGuard = hasCurrentBridgeEndpointCredentialsGuard(content)
   const canApply =
     (hasFreshBridgeEndpointTargets(summary) ||
       hasManagedBridgeEndpointTargets(summary)) &&
@@ -787,7 +798,7 @@ function getBridgeEndpointDetails(
     summary.hasMarker &&
     !summary.hasStorageGuard &&
     summary.hasPersistentGuard &&
-    hasCurrentBridgeEndpointCredentialsGuard(content) &&
+    credentialsGuard &&
     summary.targetCount === 0 &&
     summary.localCount >= BRIDGE_ENDPOINT_MIN_TARGETS &&
     summary.localCount === summary.matchingLocalCount
@@ -798,6 +809,15 @@ function getBridgeEndpointDetails(
     canApply,
     requiresPortUpdate:
       summary.hasMarker && summary.localCount > 0 && canApply && !applied,
+    coverage: {
+      apiTargets: summary.apiTargetCount,
+      agentTargets: summary.agentTargetCount,
+      localEndpoints: summary.localCount,
+      matchingLocalEndpoints: summary.matchingLocalCount,
+      credentialsGuard,
+      persistentGuard: summary.hasPersistentGuard,
+      storageGuardRemoved: !summary.hasStorageGuard,
+    },
   }
 }
 
@@ -1471,6 +1491,18 @@ export interface CursorBridgeEndpointPatchStatus {
   endpointUrl: string
   currentUrl: string | null
   requiresPortUpdate: boolean
+  coverage: CursorBridgeEndpointCoverage
+}
+
+export interface CursorBridgeEndpointCoverage {
+  workbenchFiles: number
+  apiTargets: number
+  agentTargets: number
+  localEndpoints: number
+  matchingLocalEndpoints: number
+  credentialsGuard: boolean
+  persistentGuard: boolean
+  storageGuardRemoved: boolean
 }
 
 export interface CursorPatchApplyResult {
@@ -1574,6 +1606,16 @@ export class CursorPatchService {
       endpointUrl,
       currentUrl: null,
       requiresPortUpdate: false,
+      coverage: {
+        workbenchFiles: 0,
+        apiTargets: 0,
+        agentTargets: 0,
+        localEndpoints: 0,
+        matchingLocalEndpoints: 0,
+        credentialsGuard: false,
+        persistentGuard: false,
+        storageGuardRemoved: false,
+      },
     }
 
     if (filePaths.length === 0) {
@@ -1594,6 +1636,36 @@ export class CursorPatchService {
       getCursorPersistentEndpointPatchDetails(port)
     const entitlementDetails = getCursorEntitlementPatchDetails()
     const nodeCaDetails = getCursorNodeCaPatchDetails()
+    result.coverage = {
+      workbenchFiles: workbenchDetails.length,
+      apiTargets: workbenchDetails.reduce(
+        (sum, details) => sum + details.coverage.apiTargets,
+        0
+      ),
+      agentTargets: workbenchDetails.reduce(
+        (sum, details) => sum + details.coverage.agentTargets,
+        0
+      ),
+      localEndpoints: workbenchDetails.reduce(
+        (sum, details) => sum + details.coverage.localEndpoints,
+        0
+      ),
+      matchingLocalEndpoints: workbenchDetails.reduce(
+        (sum, details) => sum + details.coverage.matchingLocalEndpoints,
+        0
+      ),
+      credentialsGuard:
+        workbenchDetails.length > 0 &&
+        workbenchDetails.every((details) => details.coverage.credentialsGuard),
+      persistentGuard:
+        workbenchDetails.length > 0 &&
+        workbenchDetails.every((details) => details.coverage.persistentGuard),
+      storageGuardRemoved:
+        workbenchDetails.length > 0 &&
+        workbenchDetails.every(
+          (details) => details.coverage.storageGuardRemoved
+        ),
+    }
 
     result.applied =
       workbenchDetails.every((details) => details.applied) &&

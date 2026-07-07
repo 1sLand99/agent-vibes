@@ -44,6 +44,7 @@ export type AbortReason =
   | "bidi_teardown"
   | "turn_superseded"
   | "user_cancelled"
+  | "process_restart"
   | "shutdown"
   | "stream_failed"
   | "deadline_expired"
@@ -75,10 +76,23 @@ interface AbortAllResult {
   }>
 }
 
-interface OpenEntry {
+interface AbortOpenToolCallsArgs {
+  toolUseIds: string[]
+  reason: AbortReason
+}
+
+export interface OpenEntry {
   toolUseId: string
   toolName: string
+  turnId: TurnId
   openMessageSeq: number
+  openedAt: number
+}
+
+export type ToolCallLedgerState = "open" | "closed" | "aborted"
+
+interface AbortConversationResult {
+  abortedToolCallIds: OpenEntry[]
 }
 
 /**
@@ -110,9 +124,11 @@ export class ToolCallLedger {
   private stmtInsertOpen?: StatementSync
   private stmtClose?: StatementSync
   private stmtAbort?: StatementSync
+  private stmtAbortConversation?: StatementSync
   private stmtListOpenForTurn?: StatementSync
   private stmtListOpenForConversation?: StatementSync
   private stmtIsOpen?: StatementSync
+  private stmtGetState?: StatementSync
 
   constructor(private readonly persistence: PersistenceService) {}
 
@@ -233,6 +249,129 @@ export class ToolCallLedger {
   }
 
   /**
+   * Drain every open ledger entry for a restored conversation. Used when the
+   * bridge process starts after tool calls were sent but before their results
+   * arrived. The restored runtime cannot resume those client-side executions,
+   * so the ledger must move them to an explicit process_restart terminal state
+   * before the next model turn is prepared.
+   */
+  abortOpenForConversation(
+    txn: SessionTxn,
+    args: { reason: AbortReason }
+  ): AbortConversationResult {
+    this.assertTxn(txn)
+    const list = (this.stmtListOpenForConversation ??= this.persistence.prepare(
+      `SELECT tool_use_id, tool_name, turn_id, open_message_seq, opened_at
+         FROM tool_call_ledger
+        WHERE conversation_id = ?
+          AND state = 'open'
+        ORDER BY open_message_seq ASC`
+    ))
+    const rows = list.all(txn.conversationId) as unknown as Array<{
+      tool_use_id: string
+      tool_name: string
+      turn_id: string
+      open_message_seq: number
+      opened_at: number
+    }>
+    if (rows.length === 0) {
+      return { abortedToolCallIds: [] }
+    }
+
+    const abort = (this.stmtAbortConversation ??= this.persistence.prepare(
+      `UPDATE tool_call_ledger
+         SET state = 'aborted',
+             closed_at = ?,
+             abort_reason = ?
+       WHERE conversation_id = ?
+         AND tool_use_id = ?
+         AND state = 'open'`
+    ))
+    const now = Date.now()
+    for (const row of rows) {
+      abort.run(now, args.reason, txn.conversationId, row.tool_use_id)
+    }
+
+    this.logger.warn(
+      `Ledger aborted ${rows.length} restored open tool call(s) ` +
+        `conversation=${txn.conversationId} reason=${args.reason}`
+    )
+
+    return {
+      abortedToolCallIds: rows.map((row) => ({
+        toolUseId: row.tool_use_id,
+        toolName: row.tool_name,
+        turnId: row.turn_id as TurnId,
+        openMessageSeq: row.open_message_seq,
+        openedAt: row.opened_at,
+      })),
+    }
+  }
+
+  abortOpenToolCalls(
+    txn: SessionTxn,
+    args: AbortOpenToolCallsArgs
+  ): AbortConversationResult {
+    this.assertTxn(txn)
+    const toolUseIds = Array.from(
+      new Set(args.toolUseIds.map((id) => id.trim()).filter(Boolean))
+    )
+    if (toolUseIds.length === 0) {
+      return { abortedToolCallIds: [] }
+    }
+
+    const placeholders = toolUseIds.map(() => "?").join(", ")
+    const rows = this.persistence
+      .prepare(
+        `SELECT tool_use_id, tool_name, turn_id, open_message_seq, opened_at
+           FROM tool_call_ledger
+          WHERE conversation_id = ?
+            AND state = 'open'
+            AND tool_use_id IN (${placeholders})
+          ORDER BY open_message_seq ASC`
+      )
+      .all(txn.conversationId, ...toolUseIds) as unknown as Array<{
+      tool_use_id: string
+      tool_name: string
+      turn_id: string
+      open_message_seq: number
+      opened_at: number
+    }>
+    if (rows.length === 0) {
+      return { abortedToolCallIds: [] }
+    }
+
+    const abort = (this.stmtAbortConversation ??= this.persistence.prepare(
+      `UPDATE tool_call_ledger
+         SET state = 'aborted',
+             closed_at = ?,
+             abort_reason = ?
+       WHERE conversation_id = ?
+         AND tool_use_id = ?
+         AND state = 'open'`
+    ))
+    const now = Date.now()
+    for (const row of rows) {
+      abort.run(now, args.reason, txn.conversationId, row.tool_use_id)
+    }
+
+    this.logger.warn(
+      `Ledger aborted ${rows.length} selected open tool call(s) ` +
+        `conversation=${txn.conversationId} reason=${args.reason}`
+    )
+
+    return {
+      abortedToolCallIds: rows.map((row) => ({
+        toolUseId: row.tool_use_id,
+        toolName: row.tool_name,
+        turnId: row.turn_id as TurnId,
+        openMessageSeq: row.open_message_seq,
+        openedAt: row.opened_at,
+      })),
+    }
+  }
+
+  /**
    * Read-only check used by the message-store to assert that
    * appendToolResultBlock targets a legitimately open ledger entry.
    */
@@ -248,13 +387,34 @@ export class ToolCallLedger {
     return stmt.get(conversationId, toolUseId) !== undefined
   }
 
+  getState(
+    conversationId: ConversationId,
+    toolUseId: string
+  ): ToolCallLedgerState | undefined {
+    const stmt = (this.stmtGetState ??= this.persistence.prepare(
+      `SELECT state
+         FROM tool_call_ledger
+        WHERE conversation_id = ?
+          AND tool_use_id = ?
+        LIMIT 1`
+    ))
+    const row = stmt.get(conversationId, toolUseId) as
+      | { state?: string }
+      | undefined
+    return row?.state === "open" ||
+      row?.state === "closed" ||
+      row?.state === "aborted"
+      ? row.state
+      : undefined
+  }
+
   /**
    * Snapshot of currently-open tool calls for a conversation. Used by
    * cleanup-coordinator decisions and by diagnostics.
    */
   listOpen(conversationId: ConversationId): OpenEntry[] {
     const stmt = (this.stmtListOpenForConversation ??= this.persistence.prepare(
-      `SELECT tool_use_id, tool_name, open_message_seq
+      `SELECT tool_use_id, tool_name, turn_id, open_message_seq, opened_at
            FROM tool_call_ledger
           WHERE conversation_id = ?
             AND state = 'open'
@@ -263,12 +423,16 @@ export class ToolCallLedger {
     const rows = stmt.all(conversationId) as unknown as Array<{
       tool_use_id: string
       tool_name: string
+      turn_id: string
       open_message_seq: number
+      opened_at: number
     }>
     return rows.map((row) => ({
       toolUseId: row.tool_use_id,
       toolName: row.tool_name,
+      turnId: row.turn_id as TurnId,
       openMessageSeq: row.open_message_seq,
+      openedAt: row.opened_at,
     }))
   }
 

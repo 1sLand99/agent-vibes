@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Query } from "@nestjs/common"
+import { Controller, Get, Logger, Post, Query } from "@nestjs/common"
 import { ApiOperation, ApiTags } from "@nestjs/swagger"
 import { AnthropicApiService } from "./llm/anthropic/anthropic-api.service"
 import type { GoogleQuotaAccountSnapshot } from "./llm/google/process-pool.service"
@@ -12,6 +12,7 @@ import type {
   BackendPoolStatus,
   CodexRateLimitWindow,
 } from "./llm/shared/backend-pool-status"
+import { CursorConnectStreamService } from "./protocol/cursor/cursor-connect-stream.service"
 import { SessionLifecycleService } from "./protocol/cursor/session/session-lifecycle.service"
 import { UsageStatsService } from "./usage"
 
@@ -54,6 +55,8 @@ type GoogleQuotaSortBy = "state" | "remaining" | "resetTime" | "requestCount"
 @ApiTags("Health")
 @Controller()
 export class HealthController {
+  private readonly logger = new Logger(HealthController.name)
+
   /** reloadAccounts throttle: prevent frequent account config file reads within a short window */
   private lastReloadAt = 0
   private readonly RELOAD_THROTTLE_MS = 15_000 // 15 seconds
@@ -65,7 +68,8 @@ export class HealthController {
     private readonly anthropicApiService: AnthropicApiService,
     private readonly kiroService: KiroService,
     private readonly usageStats: UsageStatsService,
-    private readonly chatSessions: SessionLifecycleService
+    private readonly chatSessions: SessionLifecycleService,
+    private readonly cursorStream: CursorConnectStreamService
   ) {}
 
   /** Throttled reloadAccounts: executes at most once per 15 seconds */
@@ -378,7 +382,27 @@ export class HealthController {
   @Post("maintenance/clear-cache")
   @ApiOperation({ summary: "Clear bridge-managed session cache and temp data" })
   clearCache() {
+    const runtime = this.cursorStream.getRuntimeActivitySnapshot()
+    if (!runtime.canRestartWithoutInterruptingRuns) {
+      this.logger.warn(
+        `Refused session reset: busy=${runtime.busySessionCount}, recovery=${runtime.recoverySessionCount}`
+      )
+      return {
+        timestamp: new Date().toISOString(),
+        ok: false,
+        clearedLoadedSessions: 0,
+        clearedPersistedSessions: 0,
+        clearedToolResultDirs: 0,
+        warnings: [
+          `Refused to reset sessions because ${runtime.busySessionCount} active session(s) still have running or pending work.`,
+        ],
+        runtime,
+      }
+    }
     const result = this.chatSessions.clearAllSessionCaches()
+    this.logger.log(
+      `Session reset completed: loaded=${result.clearedLoadedSessions}, persisted=${result.clearedPersistedSessions}, toolResultDirs=${result.clearedToolResultDirs}, warnings=${result.warnings.length}`
+    )
     return {
       timestamp: new Date().toISOString(),
       ok: result.warnings.length === 0,

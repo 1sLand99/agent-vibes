@@ -124,6 +124,7 @@ import { CodexRuntimeCacheStore } from "./codex-runtime-cache-store"
 import {
   buildCodexCompactRequestPayload,
   parseCodexCompactOutputHistory,
+  summarizeCodexCompactResponseForLogs,
 } from "./codex-compact-payload"
 import type { CodexTurnContext } from "./codex-turn-context"
 import { CodexTurnContextManager } from "./codex-turn-context-manager"
@@ -2338,7 +2339,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       )
       markAccountSuccess(requestSlot, modelName)
 
-      return parseCodexCompactOutputHistory(await response.json())
+      const compactResponseBody: unknown = await response.json()
+      this.logger.debug(
+        `[Codex][Compact Response] ${summarizeCodexCompactResponseForLogs(compactResponseBody)}`
+      )
+      return parseCodexCompactOutputHistory(compactResponseBody)
     } catch (error) {
       if (error instanceof CodexApiError) {
         const statusCode = error.getStatus()

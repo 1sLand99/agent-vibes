@@ -98,6 +98,14 @@ export class ContextController {
     }
   }
 
+  @Get("runtime")
+  @ApiOperation({
+    summary: "Live Cursor agent activity used by bridge maintenance commands",
+  })
+  getRuntimeActivity() {
+    return this.cursorStream.getRuntimeActivitySnapshot()
+  }
+
   @Get(":conversationId/working-directories")
   @ApiOperation({
     summary: "List allowed working directories for a Cursor chat session",
@@ -267,10 +275,10 @@ export class ContextController {
       "recent N from the model-facing view (default keep_recent=4). Mirrors " +
       "Claude Code's /force-snip slash command.",
   })
-  forceSnip(
+  async forceSnip(
     @Param("conversationId") conversationId: string,
     @Body() body: { keep_recent?: number; reason?: string } | undefined
-  ): {
+  ): Promise<{
     ok: boolean
     conversationId: string
     applied: boolean
@@ -279,7 +287,7 @@ export class ContextController {
     totalRecords: number
     boundaryId?: string
     reason?: string
-  } {
+  }> {
     const session = this.chatSessions.getSession(conversationId)
     if (!session) {
       throw new HttpException(
@@ -287,6 +295,10 @@ export class ContextController {
         HttpStatus.NOT_FOUND
       )
     }
+    await this.cursorStream.resolveRestartRecoveryBeforeContextMutation(
+      conversationId,
+      "force-snip"
+    )
 
     const requestedKeep =
       typeof body?.keep_recent === "number" && Number.isFinite(body.keep_recent)

@@ -15,6 +15,7 @@ import { TurnId, ConversationId } from "../turn/turn.types"
 import { MessageStore, type PersistedMessage } from "./message-store.service"
 import {
   SessionPersistenceService,
+  type PersistedSessionActivitySummary,
   type SessionRow,
   type SessionTodo,
 } from "./session-persistence.service"
@@ -23,7 +24,7 @@ import {
   getSessionFileStateSize,
   isSessionFileStateWithinLimit,
 } from "./file-state-limits"
-import { ToolCallLedger } from "./tool-call-ledger.service"
+import { ToolCallLedger, type AbortReason } from "./tool-call-ledger.service"
 import {
   normalizePathForBoundaryCheck,
   resolveAllowedWorkspaceRoots,
@@ -36,6 +37,7 @@ import type {
   CodexContextState,
   CodexContextWindowState,
   CodexReplacementHistory,
+  CodexReplacementHistoryItem,
   ContentBlock,
   ContextInvestigationMemoryEntry,
   ContextSessionMemoryEntry,
@@ -44,6 +46,7 @@ import type {
   LooseMessageContent,
 } from "../../../context/types"
 import {
+  extractText,
   isToolResultBlock,
   isToolUseBlock,
   normalizeContent,
@@ -85,6 +88,7 @@ import type {
 // (inlined from the deleted cursor-turn-state.ts module).
 import { type SessionTaskBudgetState } from "./task-budget-state"
 import {
+  buildInterruptedToolResultBlock,
   normalizeToolInterruptionReason,
   type ToolInterruptionReason,
 } from "./tool-interruption"
@@ -100,6 +104,116 @@ export interface ClearSessionCacheResult {
  * Content block types for messages
  */
 export type MessageContent = LooseMessageContent
+
+export type SessionRequestRefreshScope = "full" | "partial" | "control"
+
+export function resolveSessionRequestRefreshScope(
+  request?: Pick<
+    ParsedCursorRequest,
+    | "sessionUpdateScope"
+    | "isAgentControlMessage"
+    | "isResumeAction"
+    | "newMessage"
+    | "attachedImages"
+  >
+): SessionRequestRefreshScope {
+  if (!request) return "control"
+  if (request.sessionUpdateScope) return request.sessionUpdateScope
+  if (request.isAgentControlMessage || request.isResumeAction) return "control"
+  if (request.newMessage || (request.attachedImages?.length ?? 0) > 0) {
+    return "full"
+  }
+  return "partial"
+}
+
+export function canClearSessionRequestScopedFields(
+  request?: Pick<
+    ParsedCursorRequest,
+    | "sessionUpdateScope"
+    | "isAgentControlMessage"
+    | "isResumeAction"
+    | "newMessage"
+    | "attachedImages"
+  >
+): boolean {
+  return resolveSessionRequestRefreshScope(request) === "full"
+}
+
+export interface PendingContextSummaryUiUpdate {
+  compactionId: string
+  summary: string
+  epoch: number
+}
+
+export function restorePendingContextSummaryUiUpdateFromState(input: {
+  contextState: Pick<
+    ContextConversationState,
+    "compactionHistory" | "activeCompactionId" | "compactionEpoch"
+  >
+  lastEmittedContextSummaryCompactionId?: string
+  lastEmittedContextSummaryCompactionEpoch?: number
+  lastContextSummaryCompactionEpoch?: number
+}): PendingContextSummaryUiUpdate | undefined {
+  const history = Array.isArray(input.contextState.compactionHistory)
+    ? input.contextState.compactionHistory.filter(
+        (commit): commit is ContextCompactionCommit =>
+          !!commit &&
+          typeof commit.id === "string" &&
+          commit.id.trim().length > 0 &&
+          typeof commit.summary === "string" &&
+          commit.summary.trim().length > 0
+      )
+    : []
+  if (history.length === 0) return undefined
+
+  const activeCompactionId =
+    typeof input.contextState.activeCompactionId === "string" &&
+    input.contextState.activeCompactionId.trim().length > 0
+      ? input.contextState.activeCompactionId.trim()
+      : history[history.length - 1]?.id
+  if (!activeCompactionId) return undefined
+
+  const activeCommit =
+    history.find((commit) => commit.id === activeCompactionId) ??
+    history[history.length - 1]
+  if (!activeCommit) return undefined
+
+  const epoch =
+    typeof input.lastContextSummaryCompactionEpoch === "number" &&
+    input.lastContextSummaryCompactionEpoch >= 0
+      ? Math.floor(input.lastContextSummaryCompactionEpoch)
+      : typeof activeCommit.epoch === "number" && activeCommit.epoch >= 0
+        ? Math.floor(activeCommit.epoch)
+        : typeof input.contextState.compactionEpoch === "number" &&
+            input.contextState.compactionEpoch >= 0
+          ? Math.floor(input.contextState.compactionEpoch)
+          : 0
+
+  const emittedCompactionId =
+    typeof input.lastEmittedContextSummaryCompactionId === "string" &&
+    input.lastEmittedContextSummaryCompactionId.trim().length > 0
+      ? input.lastEmittedContextSummaryCompactionId.trim()
+      : undefined
+  const emittedEpoch =
+    typeof input.lastEmittedContextSummaryCompactionEpoch === "number" &&
+    input.lastEmittedContextSummaryCompactionEpoch >= 0
+      ? Math.floor(input.lastEmittedContextSummaryCompactionEpoch)
+      : undefined
+  if (
+    emittedCompactionId === activeCommit.id &&
+    (emittedEpoch === epoch ||
+      (emittedEpoch === undefined &&
+        input.lastContextSummaryCompactionEpoch === undefined))
+  ) {
+    return undefined
+  }
+
+  return {
+    compactionId: activeCommit.id,
+    summary: activeCommit.summary,
+    epoch,
+  }
+}
 
 /**
  * Mirrors claude-code/src/services/api/claude.ts AssistantMessage / UserMessage:
@@ -690,11 +804,7 @@ export interface ContextStateRecord {
   topLevelAgentTurnState: SessionTopLevelAgentTurnState
   lastEmittedContextSummaryCompactionId?: string
   lastEmittedContextSummaryCompactionEpoch?: number
-  pendingContextSummaryUiUpdate?: {
-    compactionId: string
-    summary: string
-    epoch: number
-  }
+  pendingContextSummaryUiUpdate?: PendingContextSummaryUiUpdate
 
   // Multi-turn checkpoint tracking.
   usedTokens: number
@@ -1318,15 +1428,31 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   private readonly PERSIST_FLUSH_INTERVAL_MS = 15 * 1000
   private readonly PERSIST_DEBOUNCE_MS = 250
   /**
-   * Wall-clock budget the bridge gives the IDE to process an
+   * Wall-clock budget the bridge gives the IDE to process a short
    * ExecServerMessage before `PendingDeadlineSweeper` synthesises a
-   * timeout error tool_result. Picked at 90s — enough for `ls` over a
-   * slow network mount, conservative enough to surface a stalled IDE
-   * within a reasonable model-loop iteration. Long-running channels
-   * (shell streams, task/await tools, background work) opt out via
-   * `EXEC_DISPATCH_DEADLINE_EXEMPT_TOOLS`.
+   * timeout error tool_result.
    */
   private readonly EXEC_DISPATCH_DEADLINE_MS = 90 * 1000
+
+  /**
+   * Foreground terminal commands are streaming ExecServerMessages. They can
+   * legitimately run longer than short file/search tools, but they still
+   * block the per-conversation exec serializer and the assistant tool-result
+   * join barrier until they produce exit/backgrounded/rejected. If the IDE
+   * only sends `shell_stream.start` and then keeps the exec id alive with
+   * heartbeats, the bridge must finish the tool through the same synthetic
+   * tool_result path as every other deadline.
+   */
+  private readonly FOREGROUND_SHELL_STREAM_DEADLINE_MS = 5 * 60 * 1000
+
+  private readonly FOREGROUND_SHELL_STREAM_TOOLS: ReadonlySet<string> = new Set(
+    [
+      "run_terminal_command",
+      "run_terminal_command_v2",
+      "client_side_tool_v2_run_terminal_command_v2",
+    ]
+  )
+
   /**
    * Tool names whose ExecServerMessage path may legitimately run for
    * minutes / hours. The deadline auto-arm in
@@ -1340,8 +1466,6 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
    */
   private readonly EXEC_DISPATCH_DEADLINE_EXEMPT_TOOLS: ReadonlySet<string> =
     new Set([
-      "run_terminal_command",
-      "run_terminal_command_v2",
       "background_shell_spawn",
       "write_shell_stdin",
       "task",
@@ -1942,23 +2066,8 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       () => this.persistAllSessions(),
       this.PERSIST_FLUSH_INTERVAL_MS
     )
-    // P0-2 (#17) watchdog：每 60 秒兜底回收顶层 shell_stream pending
-    // tool call —— IDE 端 streamClose 控制消息在 service 层无消费者
-    // （cursor-connect-stream.service.ts 完全没消费 streamClose），
-    // 导致 562 次 `Still waiting for pendingToolCalls=N` 反复打印。
-    // 单次 O(N) 遍历，开销可忽略。详见 sweepStaleShellStreamPending。
-    this.shellStreamWatchdogInterval = setInterval(() => {
-      try {
-        this.sweepStaleShellStreamPending()
-      } catch (err) {
-        this.logger.warn(
-          `Shell stream watchdog error: ${err instanceof Error ? err.message : String(err)}`
-        )
-      }
-    }, 60_000)
     this.cleanupInterval.unref?.()
     this.persistFlushInterval.unref?.()
-    this.shellStreamWatchdogInterval.unref?.()
   }
 
   /**
@@ -2031,10 +2140,6 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
 
     clearInterval(this.cleanupInterval)
     clearInterval(this.persistFlushInterval)
-    if (this.shellStreamWatchdogInterval) {
-      clearInterval(this.shellStreamWatchdogInterval)
-      this.shellStreamWatchdogInterval = undefined
-    }
     // PersistenceService handles DB cleanup
   }
 
@@ -2167,6 +2272,137 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         updatedAt: todo.updatedAt,
         dependencies: [...todo.dependencies],
       }))
+  }
+
+  private loadRestoredOpenToolLedger(
+    conversationId: ConversationId
+  ): PersistedPendingToolCall[] {
+    const restored = this.toolCallLedger.listOpen(conversationId).map(
+      (entry, index): PersistedPendingToolCall => ({
+        toolCallId: entry.toolUseId,
+        toolName: entry.toolName,
+        toolInput: {},
+        modelCallId: "",
+        startedEmitted: true,
+        sentAt: entry.openedAt,
+        execIds: [],
+        executionOwner: "client",
+        executionStatus: "aborted",
+        executionRecoveryReason: "session_restore",
+        executionOrder: entry.openMessageSeq || index + 1,
+      })
+    )
+    if (restored.length > 0) {
+      this.logger.warn(
+        `[context-restore] found ${restored.length} open ledger tool call(s) ` +
+          `requiring process_restart recovery for ${conversationId}`
+      )
+    }
+    return restored
+  }
+
+  abortRestoredOpenToolLedger(conversationId: string): number {
+    let abortedCount = 0
+    const conv = ConversationId.of(conversationId)
+    this.messageStore.runInTransaction(conv, (txn) => {
+      const result = this.toolCallLedger.abortOpenForConversation(txn, {
+        reason: "process_restart",
+      })
+      abortedCount = result.abortedToolCallIds.length
+      for (const entry of result.abortedToolCallIds) {
+        this.messageStore.appendAbortToolResultBlock(
+          txn,
+          buildInterruptedToolResultBlock({
+            toolCallId: entry.toolUseId,
+            toolName: entry.toolName,
+            reason: "process_restart",
+          }),
+          { turnId: entry.turnId }
+        )
+      }
+    })
+    if (abortedCount > 0) {
+      this.refreshTranscriptFromMessageStore(conversationId)
+      this.logger.warn(
+        `[context-restore] marked ${abortedCount} restored open ledger tool call(s) ` +
+          `as process_restart aborted and appended synthetic tool_result blocks for ${conversationId}`
+      )
+    }
+    return abortedCount
+  }
+
+  abortInterruptedOpenToolLedger(
+    conversationId: string,
+    interruptedToolCalls: readonly InterruptedToolCallInfo[]
+  ): number {
+    if (interruptedToolCalls.length === 0) return 0
+    let abortedCount = 0
+    const conv = ConversationId.of(conversationId)
+    const interruptedById = new Map(
+      interruptedToolCalls.map((toolCall) => [toolCall.toolCallId, toolCall])
+    )
+    const toolIdsByAbortReason = new Map<AbortReason, string[]>()
+    for (const toolCall of interruptedToolCalls) {
+      const abortReason = this.mapToolInterruptionAbortReason(toolCall.reason)
+      const ids = toolIdsByAbortReason.get(abortReason) ?? []
+      ids.push(toolCall.toolCallId)
+      toolIdsByAbortReason.set(abortReason, ids)
+    }
+
+    this.messageStore.runInTransaction(conv, (txn) => {
+      for (const [abortReason, toolUseIds] of toolIdsByAbortReason) {
+        const result = this.toolCallLedger.abortOpenToolCalls(txn, {
+          toolUseIds,
+          reason: abortReason,
+        })
+        abortedCount += result.abortedToolCallIds.length
+        for (const entry of result.abortedToolCallIds) {
+          const interrupted = interruptedById.get(entry.toolUseId)
+          this.messageStore.appendAbortToolResultBlock(
+            txn,
+            buildInterruptedToolResultBlock({
+              toolCallId: entry.toolUseId,
+              toolName: interrupted?.toolName || entry.toolName,
+              reason: interrupted?.reason ?? "stream_aborted",
+              detail: interrupted?.detail,
+            }),
+            { turnId: entry.turnId }
+          )
+        }
+      }
+    })
+
+    if (abortedCount > 0) {
+      this.refreshTranscriptFromMessageStore(conversationId)
+      this.logger.warn(
+        `[tool-interruption] marked ${abortedCount} open ledger tool call(s) ` +
+          `as aborted and appended synthetic tool_result blocks for ${conversationId}`
+      )
+    }
+    return abortedCount
+  }
+
+  private mapToolInterruptionAbortReason(
+    reason: ToolInterruptionReason
+  ): AbortReason {
+    switch (reason) {
+      case "process_restart":
+        return "process_restart"
+      case "parent_turn_superseded":
+        return "turn_superseded"
+      case "parent_cancelled":
+        return "user_cancelled"
+      case "stream_aborted":
+        return "stream_failed"
+    }
+  }
+
+  private refreshTranscriptFromMessageStore(conversationId: string): void {
+    if (!this.sessions.has(conversationId)) return
+    const messages = this.loadPersistedMessages(
+      ConversationId.of(conversationId)
+    )
+    this.contextState.replaceMessages(conversationId, messages)
   }
 
   private normalizePersistedTodoStatus(value: string): SessionTodoStatus {
@@ -2344,7 +2580,10 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     )
   }
 
-  private loadPersistedSessionState(row: SessionRow): PersistedChatSessionV1 {
+  private loadPersistedSessionState(
+    row: SessionRow,
+    options?: { restoredOpenToolCalls?: PersistedPendingToolCall[] }
+  ): PersistedChatSessionV1 {
     const conversationId = row.conversationId as string
     const config = row.config as Partial<PersistedChatSessionV1>
     const contextStateRow = this.sessionPersistence.loadContextState(
@@ -2352,6 +2591,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     )
     const contextState = (contextStateRow?.state ||
       {}) as Partial<PersistedChatSessionV1>
+    const restoredOpenToolCalls = options?.restoredOpenToolCalls ?? []
     const messages = this.loadPersistedMessages(row.conversationId)
     const fileStates = this.sessionPersistence
       .listFileStates(row.conversationId)
@@ -2371,7 +2611,11 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       version: 15,
       conversationId,
       messages,
-      messageRecords: contextState.messageRecords,
+      messageRecords:
+        restoredOpenToolCalls.length > 0 &&
+        Array.isArray(contextState.messageRecords)
+          ? this.reconcileMessageRecords(contextState.messageRecords, messages)
+          : contextState.messageRecords,
       transcriptEvents: contextState.transcriptEvents,
       nextTranscriptEventSeq: contextState.nextTranscriptEventSeq,
       contextState: contextState.contextState,
@@ -2404,7 +2648,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         typeof config.lastActivityAt === "number"
           ? config.lastActivityAt
           : row.lastActivityAt,
-      pendingToolCalls: [],
+      pendingToolCalls: restoredOpenToolCalls,
       backgroundCommands: Array.isArray(contextState.backgroundCommands)
         ? contextState.backgroundCommands
         : [],
@@ -2492,7 +2736,12 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         return undefined
       }
 
-      const persisted = this.loadPersistedSessionState(row)
+      const restoredOpenToolCalls = this.loadRestoredOpenToolLedger(
+        row.conversationId
+      )
+      const persisted = this.loadPersistedSessionState(row, {
+        restoredOpenToolCalls,
+      })
 
       // Lifecycle:
       //   1. Parse config blob → SessionRecord (pure, no side effects)
@@ -2506,12 +2755,18 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       // SessionLifecycleService corrects after the fact.
       const session = this.parsePersistedSession(persisted)
       this.sessions.set(conversationId, session)
+      const recoveredOrphans =
+        this.contextState.repairRestoredOrphanedToolUses(conversationId)
       const ctx = this.contextState.getContextRecord(conversationId)!
       this.logger.log(
         `>>> Restored persisted session: ${conversationId} ` +
-          `(messages=${ctx.messages.length}, records=${ctx.messageRecords.length}, turns=${ctx.turns.length}, pending=${this.pendingToolCallCount(conversationId)})`
+          `(messages=${ctx.messages.length}, records=${ctx.messageRecords.length}, turns=${ctx.turns.length}, pending=${this.pendingToolCallCount(conversationId)}, recoveredOrphanToolUses=${recoveredOrphans})`
       )
-      this.schedulePersist(conversationId)
+      if (session.restartRecovery) {
+        this.writeSessionRow(conversationId, session)
+      } else {
+        this.schedulePersist(conversationId)
+      }
       return session
     } catch (error) {
       this.logger.error(
@@ -3450,6 +3705,13 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       return undefined
     }
 
+    const items = input.items.flatMap((item) =>
+      this.normalizeCodexReplacementHistoryItem(item)
+    )
+    if (items.length === 0) {
+      return undefined
+    }
+
     return {
       compactionId: input.compactionId.trim(),
       createdAt:
@@ -3473,10 +3735,111 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         typeof input.anchorRecordCount === "number"
           ? Math.max(0, Math.floor(input.anchorRecordCount))
           : 0,
-      summary: typeof input.summary === "string" ? input.summary : "",
-      items: input.items.flatMap((item) =>
-        item && typeof item === "object" ? [{ ...item }] : []
+      summary: this.normalizeCodexReplacementHistorySummary(
+        input.summary,
+        items
       ),
+      items,
+    }
+  }
+
+  private normalizeCodexReplacementHistoryItem(
+    value: unknown
+  ): CodexReplacementHistoryItem[] {
+    if (!value || typeof value !== "object") {
+      return []
+    }
+    const item = { ...(value as CodexReplacementHistoryItem) }
+    return this.shouldKeepCodexReplacementHistoryItem(item) ? [item] : []
+  }
+
+  private shouldKeepCodexReplacementHistoryItem(
+    item: CodexReplacementHistoryItem
+  ): boolean {
+    if (this.isCodexRawCompactionItem(item)) {
+      return true
+    }
+    const role = typeof item.role === "string" ? item.role : ""
+    if (role !== "user" && role !== "assistant") {
+      return false
+    }
+    const text = this.extractCodexReplacementHistoryItemText(item).trim()
+    if (!text) {
+      return false
+    }
+    return role !== "user" || !this.isSyntheticCodexHistoryText(text)
+  }
+
+  private normalizeCodexReplacementHistorySummary(
+    value: unknown,
+    items: CodexReplacementHistoryItem[]
+  ): string {
+    const raw = typeof value === "string" ? value.trim() : ""
+    if (raw && !this.isSyntheticCodexHistoryText(raw)) {
+      return raw
+    }
+    return items
+      .map((item) => this.extractCodexReplacementHistoryItemText(item).trim())
+      .filter(
+        (text) => text.length > 0 && !this.isSyntheticCodexHistoryText(text)
+      )
+      .join("\n\n")
+  }
+
+  private isCodexRawCompactionItem(item: CodexReplacementHistoryItem): boolean {
+    return item.type === "compaction" || item.type === "context_compaction"
+  }
+
+  private isSyntheticCodexHistoryText(text: string): boolean {
+    const normalized = text.trimStart()
+    return (
+      normalized.startsWith("Current Codex turn context:") ||
+      /^(?:\[Context (?:attachment|summary|collapse|attachment removed)|\[Result of an earlier tool call|\[tool_result stored\])/i.test(
+        normalized
+      ) ||
+      /^# AGENTS\.md instructions\b/i.test(normalized) ||
+      /^<environment_context>/i.test(normalized) ||
+      /^<turn_aborted>/i.test(normalized) ||
+      /^Grep completed:\s*pattern=/i.test(normalized) ||
+      /\bDocumentId:\s*tool_result:/i.test(normalized) ||
+      /\/\.agent-vibes\/tool-results\//i.test(normalized) ||
+      /\n(?:Session Memory|Investigation Memory|Recent File Snapshots|Tracked File Changes)\b/i.test(
+        normalized
+      )
+    )
+  }
+
+  private extractCodexReplacementHistoryItemText(
+    item: CodexReplacementHistoryItem
+  ): string {
+    const content = item.content
+    if (typeof content === "string") {
+      return content
+    }
+    if (Array.isArray(content)) {
+      return content
+        .map((block) =>
+          block && typeof block === "object"
+            ? typeof (block as { text?: unknown }).text === "string"
+              ? (block as { text: string }).text
+              : ""
+            : typeof block === "string"
+              ? block
+              : ""
+        )
+        .filter(Boolean)
+        .join("\n")
+    }
+    if (typeof item.summary === "string") {
+      return item.summary
+    }
+    if (typeof item.message === "string") {
+      return item.message
+    }
+    try {
+      return extractText(content as LooseMessageContent)
+    } catch {
+      return ""
     }
   }
 
@@ -4760,7 +5123,16 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
           "number" && persisted.lastEmittedContextSummaryCompactionEpoch >= 0
           ? persisted.lastEmittedContextSummaryCompactionEpoch
           : undefined,
-      pendingContextSummaryUiUpdate: undefined,
+      pendingContextSummaryUiUpdate:
+        restorePendingContextSummaryUiUpdateFromState({
+          contextState,
+          lastEmittedContextSummaryCompactionId:
+            persisted.lastEmittedContextSummaryCompactionId,
+          lastEmittedContextSummaryCompactionEpoch:
+            persisted.lastEmittedContextSummaryCompactionEpoch,
+          lastContextSummaryCompactionEpoch:
+            persisted.lastContextSummaryCompactionEpoch,
+        }),
       usedTokens:
         typeof persisted.usedTokens === "number" ? persisted.usedTokens : 0,
       readPaths: new Set(
@@ -5124,29 +5496,43 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       )
     } else {
       const ctx = this.contextState.getContextRecord(conversationId)!
+      const refreshScope = resolveSessionRequestRefreshScope(initialRequest)
+      const canRefreshProvidedFields = refreshScope !== "control"
+      const canClearRequestScopedFields =
+        canClearSessionRequestScopedFields(initialRequest)
       session.lastActivityAt = new Date()
 
-      // Refresh protocol fields on every turn so continuation strictly follows Cursor request.
-      if (initialRequest?.model) {
+      // Refresh protocol fields only from frames that are authoritative for
+      // them. Cursor sends resume / attach / control frames on the same stream;
+      // treating those as full turns silently clears the last real request's
+      // model parameters, rules, environment, and tool capabilities.
+      if (canRefreshProvidedFields && initialRequest?.model) {
         session.model = initialRequest.model
       }
-      // Subagent model overrides are request-scoped and refreshed on
-      // every AgentRunRequest (Cursor sends the full table per turn).
-      // Treat absence as "no overrides on this turn" — fall back to the
-      // empty singleton so consumers can rely on a stable accessor.
-      if (initialRequest) {
+      if (canClearRequestScopedFields && initialRequest) {
         session.subagentModelOverrides =
           initialRequest.subagentModelOverrides ??
           EMPTY_SUBAGENT_MODEL_OVERRIDES
+      } else if (
+        canRefreshProvidedFields &&
+        initialRequest?.subagentModelOverrides
+      ) {
+        session.subagentModelOverrides = initialRequest.subagentModelOverrides
       }
-      if (initialRequest?.thinkingLevel !== undefined) {
+      if (
+        canClearRequestScopedFields &&
+        initialRequest?.thinkingLevel !== undefined
+      ) {
         session.thinkingLevel = initialRequest.thinkingLevel
       }
-      if (initialRequest?.thinkingDetailsRequested !== undefined) {
+      if (
+        canClearRequestScopedFields &&
+        initialRequest?.thinkingDetailsRequested !== undefined
+      ) {
         session.thinkingDetailsRequested =
           initialRequest.thinkingDetailsRequested === true
       }
-      if (initialRequest?.supportedTools) {
+      if (canClearRequestScopedFields && initialRequest?.supportedTools) {
         // Freeze the array reference we capture onto the session so any
         // downstream code that holds it as a cache key (e.g. the
         // prepared-tool-build memo on `cursor-connect-stream.service`)
@@ -5156,8 +5542,29 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
           initialRequest.supportedTools,
           []
         )
+      } else if (
+        canRefreshProvidedFields &&
+        (initialRequest?.supportedTools?.length ?? 0) > 0
+      ) {
+        session.supportedTools = freezeCacheKeyArray(
+          Array.from(
+            new Set([
+              ...session.supportedTools,
+              ...(initialRequest?.supportedTools ?? []),
+            ])
+          ),
+          []
+        )
       }
-      if (initialRequest?.mcpToolDefs !== undefined) {
+      if (canClearRequestScopedFields && initialRequest) {
+        session.mcpToolDefs =
+          initialRequest.mcpToolDefs !== undefined
+            ? freezeCacheKeyArray(initialRequest.mcpToolDefs)
+            : undefined
+      } else if (
+        canRefreshProvidedFields &&
+        initialRequest?.mcpToolDefs !== undefined
+      ) {
         // AgentService continuation / control requests can omit MCP
         // definitions even though the conversation already learned them from
         // an earlier full request. Absence means "not present on this frame",
@@ -5166,44 +5573,92 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         // MCP names such as cursor-ide-browser-browser_snapshot.
         session.mcpToolDefs = freezeCacheKeyArray(initialRequest.mcpToolDefs)
       }
-      this.logMcpAdvisoryIfMissing(session, "session_reuse")
-      if (initialRequest?.useWeb !== undefined) {
-        session.useWeb = initialRequest.useWeb
+      if (canRefreshProvidedFields) {
+        this.logMcpAdvisoryIfMissing(session, "session_reuse")
       }
-      if (initialRequest) {
+      if (canClearRequestScopedFields && initialRequest?.useWeb !== undefined) {
+        session.useWeb = initialRequest.useWeb
+      } else if (canRefreshProvidedFields && initialRequest?.useWeb === true) {
+        session.useWeb = true
+      }
+      if (canClearRequestScopedFields && initialRequest) {
+        session.requestContextEnv = initialRequest.requestContextEnv
+      } else if (
+        canRefreshProvidedFields &&
+        initialRequest?.requestContextEnv
+      ) {
         session.requestContextEnv = initialRequest.requestContextEnv
       }
-      if (initialRequest?.projectContext) {
+      if (canClearRequestScopedFields && initialRequest) {
+        session.projectContext = initialRequest.projectContext
+      } else if (canRefreshProvidedFields && initialRequest?.projectContext) {
         session.projectContext = initialRequest.projectContext
       }
-      if (initialRequest) {
+      if (canClearRequestScopedFields && initialRequest) {
         session.cursorRules = initialRequest.cursorRules
         session.skillOptions = initialRequest.skillOptions
         session.selectedCursorRulePaths = initialRequest.selectedCursorRulePaths
         session.selectedCursorRuleNames = initialRequest.selectedCursorRuleNames
+      } else if (canRefreshProvidedFields) {
+        if (initialRequest?.cursorRules !== undefined) {
+          session.cursorRules = initialRequest.cursorRules
+        }
+        if (initialRequest?.skillOptions !== undefined) {
+          session.skillOptions = initialRequest.skillOptions
+        }
+        if (initialRequest?.selectedCursorRulePaths !== undefined) {
+          session.selectedCursorRulePaths =
+            initialRequest.selectedCursorRulePaths
+        }
+        if (initialRequest?.selectedCursorRuleNames !== undefined) {
+          session.selectedCursorRuleNames =
+            initialRequest.selectedCursorRuleNames
+        }
       }
-      session.cursorCommands = initialRequest?.cursorCommands
-      session.customSystemPrompt = initialRequest?.customSystemPrompt
-      if (initialRequest?.explicitContext) {
+      if (canClearRequestScopedFields && initialRequest) {
+        session.cursorCommands = initialRequest.cursorCommands
+        session.customSystemPrompt = initialRequest.customSystemPrompt
         session.explicitContext = initialRequest.explicitContext
-      }
-      if (initialRequest?.contextTokenLimit !== undefined) {
         session.contextTokenLimit = initialRequest.contextTokenLimit
-      }
-      if (initialRequest?.contextMaxMode !== undefined) {
         session.contextMaxMode = initialRequest.contextMaxMode
-      }
-      if (initialRequest?.usedContextTokens !== undefined) {
-        session.usedContextTokens = initialRequest.usedContextTokens
-        ctx.usedTokens = initialRequest.usedContextTokens
-      }
-      if (initialRequest?.requestedMaxOutputTokens !== undefined) {
         session.requestedMaxOutputTokens =
           initialRequest.requestedMaxOutputTokens
-      }
-      if (initialRequest) {
         session.requestedModelParameters =
           initialRequest.requestedModelParameters
+      } else if (canRefreshProvidedFields) {
+        if (initialRequest?.cursorCommands !== undefined) {
+          session.cursorCommands = initialRequest.cursorCommands
+        }
+        if (initialRequest?.customSystemPrompt !== undefined) {
+          session.customSystemPrompt = initialRequest.customSystemPrompt
+        }
+        if (initialRequest?.explicitContext !== undefined) {
+          session.explicitContext = initialRequest.explicitContext
+        }
+        if (initialRequest?.contextTokenLimit !== undefined) {
+          session.contextTokenLimit = initialRequest.contextTokenLimit
+        }
+        if (initialRequest?.contextMaxMode !== undefined) {
+          session.contextMaxMode = initialRequest.contextMaxMode
+        }
+        if (initialRequest?.requestedMaxOutputTokens !== undefined) {
+          session.requestedMaxOutputTokens =
+            initialRequest.requestedMaxOutputTokens
+        }
+        if (initialRequest?.requestedModelParameters !== undefined) {
+          session.requestedModelParameters =
+            initialRequest.requestedModelParameters
+        }
+      }
+      if (canRefreshProvidedFields && initialRequest?.explicitContext) {
+        session.explicitContext = initialRequest.explicitContext
+      }
+      if (
+        canRefreshProvidedFields &&
+        initialRequest?.usedContextTokens !== undefined
+      ) {
+        session.usedContextTokens = initialRequest.usedContextTokens
+        ctx.usedTokens = initialRequest.usedContextTokens
       }
       this.loadConfiguredAdditionalRoots(session)
 
@@ -5750,13 +6205,11 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     // Long-running channels (shell, sub-agent) opt out by tool name;
     // a caller may still set an explicit deadline by writing to
     // `pending.deadline` directly after this call returns.
-    if (
-      pending.deadline === undefined &&
-      this.shouldArmExecDispatchDeadline(pending)
-    ) {
-      pending.deadline = Date.now() + this.EXEC_DISPATCH_DEADLINE_MS
+    const deadlineMs = this.resolveExecDispatchDeadlineMs(pending)
+    if (pending.deadline === undefined && deadlineMs !== undefined) {
+      pending.deadline = Date.now() + deadlineMs
       this.logger.debug(
-        `Armed exec-dispatch deadline (+${this.EXEC_DISPATCH_DEADLINE_MS}ms) ` +
+        `Armed exec-dispatch deadline (+${deadlineMs}ms) ` +
           `for tool=${pending.toolName} toolCallId=${toolCallId} ` +
           `execId=${normalizedExecId}`
       )
@@ -5776,27 +6229,37 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
    * dispatched": the new BiDi gets the same fresh 90s window the
    * original dispatch did.
    *
-   * Returns true when a deadline was actually written; false when
-   * the conversation/pending is gone or the tool opted out of the
-   * sweeper (shell / sub-agent — those tools never had a deadline to
-   * begin with, so reset is a no-op rather than an error).
+   * Returns true when a deadline was actually written; false when the
+   * conversation/pending is gone or the tool opted out of the sweeper.
    */
   resetPendingToolDeadline(
     conversationId: string,
     toolCallId: string
   ): boolean {
+    return this.refreshPendingToolDeadline(
+      conversationId,
+      toolCallId,
+      "post-resumeAction reattach"
+    )
+  }
+
+  refreshPendingToolDeadline(
+    conversationId: string,
+    toolCallId: string,
+    reason: string
+  ): boolean {
     const session = this.getSession(conversationId)
     if (!session) return false
     const pending = this.getPendingToolCall(session.conversationId, toolCallId)
     if (!pending) return false
-    if (!this.shouldArmExecDispatchDeadline(pending)) return false
+    const deadlineMs = this.resolveExecDispatchDeadlineMs(pending)
+    if (deadlineMs === undefined) return false
 
-    pending.deadline = Date.now() + this.EXEC_DISPATCH_DEADLINE_MS
+    pending.deadline = Date.now() + deadlineMs
     session.lastActivityAt = new Date()
     this.logger.debug(
-      `Reset exec-dispatch deadline (+${this.EXEC_DISPATCH_DEADLINE_MS}ms) ` +
-        `for tool=${pending.toolName} toolCallId=${toolCallId} ` +
-        `(post-resumeAction reattach)`
+      `Refreshed exec-dispatch deadline (+${deadlineMs}ms) ` +
+        `for tool=${pending.toolName} toolCallId=${toolCallId} (${reason})`
     )
     this.schedulePersist(conversationId)
     return true
@@ -5804,16 +6267,21 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Decide whether `registerPendingToolExecId` should auto-arm the
-   * sweeper deadline. The default is true; tools that legitimately
-   * run for minutes / hours (shell streams, task/await tools,
-   * background work) opt out via `EXEC_DISPATCH_DEADLINE_EXEMPT_TOOLS`.
+   * sweeper deadline. The default is 90s; foreground terminal streams get a
+   * longer activity deadline; background/task/await channels opt out because
+   * they have their own lifecycle.
    */
-  private shouldArmExecDispatchDeadline(pending: PendingToolCall): boolean {
+  private resolveExecDispatchDeadlineMs(
+    pending: PendingToolCall
+  ): number | undefined {
     const normalized = (pending.toolName || "").trim().toLowerCase()
-    if (this.EXEC_DISPATCH_DEADLINE_EXEMPT_TOOLS.has(normalized)) {
-      return false
+    if (this.FOREGROUND_SHELL_STREAM_TOOLS.has(normalized)) {
+      return this.FOREGROUND_SHELL_STREAM_DEADLINE_MS
     }
-    return true
+    if (this.EXEC_DISPATCH_DEADLINE_EXEMPT_TOOLS.has(normalized)) {
+      return undefined
+    }
+    return this.EXEC_DISPATCH_DEADLINE_MS
   }
 
   markPendingToolCallStarted(conversationId: string, toolCallId: string): void {
@@ -6460,15 +6928,18 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     const warnings: string[] = []
     const loadedSessionIds = Array.from(this.sessions.keys())
 
-    // Refuse mid-flight: if any in-memory session still has unresolved
-    // tool calls or in-flight interaction queries, clearing right now
-    // would tear down state under an active turn-runner. The user
-    // sees a warning and the operation is a no-op.
+    // Refuse mid-flight: clearing while a turn runner is active would
+    // tear down session / context / stream records under the running
+    // request. The user sees a warning and the operation is a no-op.
     const busySessionIds = loadedSessionIds.filter((conversationId) => {
       const session = this.sessions.get(conversationId)
       if (!session) return false
       const stream = this.sessionStream.getStreamRecord(conversationId)
+      const activeTurnSignal = this.getCurrentTurnAbortSignal(
+        session.conversationId
+      )
       return (
+        (activeTurnSignal != null && !activeTurnSignal.aborted) ||
         this.pendingToolCallCount(session.conversationId) > 0 ||
         (stream?.pendingInteractionQueries.size ?? 0) > 0
       )
@@ -6476,7 +6947,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
 
     if (busySessionIds.length > 0) {
       warnings.push(
-        `Refused to clear cache because ${busySessionIds.length} active session(s) still have pending work.`
+        `Refused to clear cache because ${busySessionIds.length} active session(s) still have running or pending work.`
       )
       return {
         clearedLoadedSessions: 0,
@@ -6628,6 +7099,11 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       activeSessions,
       oldestSession,
     }
+  }
+
+  listPersistedSessionActivitySummaries(): PersistedSessionActivitySummary[] {
+    if (!this.persistence.isReady) return []
+    return this.sessionPersistence.listSessionActivitySummaries()
   }
 
   getAnalyticsSummary(limit = 12): ChatSessionAnalyticsSummary {
@@ -6995,79 +7471,6 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         `releasedStrandedPending=${strandedOwned})`
     )
     this.schedulePersist(conversationId)
-  }
-
-  /**
-   * P0-2 (#17 extension) / smoke-regression #17:
-   *
-   * Scan all sessions and release pending shell_stream tool calls
-   * whose owning shell process has terminated but never produced a
-   * matching `ExecClientControlMessage.streamClose` consumed by the
-   * service layer. Without this watchdog the parent BiDi loop logs
-   * `Still waiting for pendingToolCalls=N` indefinitely (562 such
-   * lines observed across a single 2-hour smoke session in the
-   * pre-fix bridge log).
-   *
-   * Per Cursor `agent.v1`, `ExecClientControlMessage.streamClose` is
-   * a control-plane signal that the IDE has finished writing stream
-   * chunks for `id`. cursor-request-parser parses it into
-   * `execStreamClose` ParsedCursorRequest, but cursor-connect-stream
-   * has no consumer for that case (verified: `streamClose` does not
-   * appear in the service file at all). Adding a service-layer
-   * handler now would race with `consumePendingToolCallByExecId` on
-   * shell_result frames, so this is a strictly additive watchdog —
-   * only entries demonstrably abandoned past STALE_SHELL_STREAM_MS
-   * are reaped. Live commands and the existing happy path are
-   * unaffected.
-   *
-   * Stale criterion (all must hold):
-   *   1. `pendingToolCall.shellStreamOutput.started === true`
-   *   2. `sentAt` older than STALE_SHELL_STREAM_MS (5 min)
-   *   3. NOT owned by any active sub-agent (already swept by
-   *      `clearSubAgentContext`'s strandedOwned loop on settle)
-   *
-   * Returns the number of pending entries released across all
-   * sessions.
-   */
-  static readonly STALE_SHELL_STREAM_MS = 5 * 60 * 1000
-
-  /** P0-2 (#17) watchdog 计时器句柄，仅进程级状态，不进入持久化。 */
-  private shellStreamWatchdogInterval?: NodeJS.Timeout
-
-  sweepStaleShellStreamPending(now: number = Date.now()): number {
-    let releasedTotal = 0
-    const threshold = SessionLifecycleService.STALE_SHELL_STREAM_MS
-    for (const session of this.sessions.values()) {
-      const subAgentOwnedToolCallIds = new Set<string>()
-      for (const ctx of session.subAgentContexts.values()) {
-        for (const id of ctx.pendingToolCallIds) {
-          subAgentOwnedToolCallIds.add(id)
-        }
-      }
-      let releasedInSession = 0
-      for (const [toolCallId, pending] of this.listPendingToolCallEntries(
-        session.conversationId
-      )) {
-        if (subAgentOwnedToolCallIds.has(toolCallId)) continue
-        if (!pending.shellStreamOutput?.started) continue
-        const idleMs = now - pending.sentAt.getTime()
-        if (idleMs < threshold) continue
-        this.resolvePendingToolCallEntry(session.conversationId, toolCallId)
-        // Phase H7a: view.delete() auto-resolves the store mirror.
-        releasedInSession += 1
-        this.logger.warn(
-          `Released stranded top-level shell_stream pending tool call ` +
-            `${toolCallId} (${pending.toolName}); idle=${idleMs}ms, ` +
-            `streamClose never observed`
-        )
-      }
-      if (releasedInSession > 0) {
-        session.lastActivityAt = new Date()
-        this.schedulePersist(session.conversationId)
-        releasedTotal += releasedInSession
-      }
-    }
-    return releasedTotal
   }
 
   /**

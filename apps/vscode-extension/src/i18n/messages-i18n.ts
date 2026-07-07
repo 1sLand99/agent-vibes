@@ -167,17 +167,19 @@ const EN: Record<string, string> = {
 
   // ── Cache clearing ──
   "cacheClear.bridgeNotRunning":
-    "Agent Vibes bridge is not running. Start it first to clear the cache.",
+    "Agent Vibes bridge is not running. Start it before resetting sessions.",
   "cacheClear.action.startBridge": "Start Bridge",
   "cacheClear.confirm":
-    "Clear all bridge-managed session state? This wipes every conversation transcript, tool-call ledger entry, turn audit log, file-state snapshot, todo list, and on-disk tool-result spool. In-flight conversations will be aborted.",
-  "cacheClear.action.confirm": "Clear Cache",
-  "cacheClear.cancelled": "Cache clear cancelled.",
+    "Reset all bridge-managed Cursor sessions and reload the Cursor window? Existing Cursor chats will no longer resume through Agent Vibes. Running conversations must finish first; start a new Cursor chat after reset.",
+  "cacheClear.action.confirm": "Reset Sessions",
+  "cacheClear.action.reloadWindow": "Reload Window",
+  "cacheClear.cancelled": "Session reset cancelled.",
   "cacheClear.success":
-    "Cleared {loaded} active and {persisted} persisted session(s); removed {dirs} tool-result director(y/ies).",
-  "cacheClear.successZero": "Cache was already empty — nothing to clear.",
-  "cacheClear.failed": "Cache clear failed: {error}",
-  "cacheClear.warning": "Cache clear was refused: {warning}",
+    "Reset {loaded} active and {persisted} persisted session(s); removed {dirs} tool-result director(y/ies). Reloading Cursor window.",
+  "cacheClear.successZero":
+    "No bridge-managed sessions were present. Reloading Cursor window to clear the current chat surface.",
+  "cacheClear.failed": "Session reset failed: {error}",
+  "cacheClear.warning": "Session reset was refused: {warning}",
 
   // ── Status bar ──
   "status.svc.running": "Running",
@@ -335,17 +337,19 @@ const ZH: Record<string, string> = {
 
   // ── 缓存清理 ──
   "cacheClear.bridgeNotRunning":
-    "Agent Vibes 桥接尚未启动，请先启动后再清除缓存。",
+    "Agent Vibes 桥接尚未启动，请先启动后再重置会话。",
   "cacheClear.action.startBridge": "启动桥接",
   "cacheClear.confirm":
-    "确认清除所有由桥接管理的会话状态吗？将清空会话记录、工具调用账本、turn 审计日志、文件快照、todo 列表，以及磁盘上的 tool-result 缓存目录。进行中的会话会被中断。",
-  "cacheClear.action.confirm": "清除缓存",
-  "cacheClear.cancelled": "已取消清除缓存。",
+    "确认重置所有由桥接管理的 Cursor 会话并重载 Cursor 窗口吗？现有 Cursor 聊天将无法再通过 Agent Vibes 恢复。运行中的会话结束后才能重置；重置后请开启新的 Cursor 聊天。",
+  "cacheClear.action.confirm": "重置会话",
+  "cacheClear.action.reloadWindow": "重载窗口",
+  "cacheClear.cancelled": "已取消重置会话。",
   "cacheClear.success":
-    "已清除 {loaded} 个内存会话、{persisted} 个持久化会话，并移除 {dirs} 个 tool-result 目录。",
-  "cacheClear.successZero": "缓存已是空的，没有需要清理的内容。",
-  "cacheClear.failed": "清除缓存失败：{error}",
-  "cacheClear.warning": "本次缓存清理被拒绝：{warning}",
+    "已重置 {loaded} 个内存会话、{persisted} 个持久化会话，并移除 {dirs} 个 tool-result 目录。正在重载 Cursor 窗口。",
+  "cacheClear.successZero":
+    "当前没有由桥接管理的会话。正在重载 Cursor 窗口以清理当前聊天界面。",
+  "cacheClear.failed": "重置会话失败：{error}",
+  "cacheClear.warning": "本次会话重置被拒绝：{warning}",
 
   // ── Status bar ──
   "status.svc.running": "运行中",

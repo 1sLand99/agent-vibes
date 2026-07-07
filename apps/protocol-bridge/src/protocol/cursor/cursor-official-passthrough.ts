@@ -43,6 +43,8 @@ const LOCAL_CURSOR_RPC_PATHS = new Set<string>([
   "aiserver.v1.ServerConfigService/GetServerConfig",
   "aiserver.v1.CppService/AvailableModels",
   "aiserver.v1.BackgroundComposerService/ListBackgroundComposers",
+  "aiserver.v1.BackgroundComposerService/ListPersonalEnvironments",
+  "aiserver.v1.BackgroundComposerService/ListTeamEnvironments",
   "aiserver.v1.NetworkService/IsConnected",
 ])
 

@@ -169,8 +169,8 @@ export class MessageStore {
   }
 
   /**
-   * Append a synthetic abort tool_result block produced by ledger.abortAll.
-   * Skips the `ledger.isOpen` check because abortAll has just transitioned
+   * Append a synthetic abort tool_result block produced by a ledger abort.
+   * Skips the `ledger.isOpen` check because the ledger has just transitioned
    * the entry from `open` to `aborted`; the message append must happen in
    * the same txn so the row is atomically visible alongside the new state.
    */

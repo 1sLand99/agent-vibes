@@ -72,3 +72,39 @@ export function parseCodexCompactOutputHistory(
       : []
   )
 }
+
+export function summarizeCodexCompactResponseForLogs(body: unknown): string {
+  const record =
+    body && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>)
+      : {}
+  const output = Array.isArray(record.output)
+    ? (record.output as unknown[])
+    : []
+  const typeCounts = new Map<string, number>()
+
+  for (const item of output) {
+    const itemRecord =
+      item && typeof item === "object" && !Array.isArray(item)
+        ? (item as Record<string, unknown>)
+        : {}
+    const type =
+      typeof itemRecord.type === "string" && itemRecord.type.trim().length > 0
+        ? itemRecord.type.trim()
+        : "unknown"
+    const role =
+      typeof itemRecord.role === "string" && itemRecord.role.trim().length > 0
+        ? itemRecord.role.trim()
+        : "none"
+    const key = `${type}:${role}`
+    typeCounts.set(key, (typeCounts.get(key) || 0) + 1)
+  }
+
+  const outputSummary =
+    Array.from(typeCounts.entries())
+      .map(([type, count]) => `${type}:${count}`)
+      .join(", ") || "none"
+  const bodyKeys = Object.keys(record).slice(0, 12).join(",") || "none"
+
+  return `output_items=${output.length} [${outputSummary}] body_keys=${bodyKeys}`
+}

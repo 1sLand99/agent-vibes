@@ -76,6 +76,7 @@ export class SessionMemoryCompactionService {
     const byKey = new Map<string, ContextSessionMemoryEntry>()
     for (const entry of [...(existing || []), ...additions]) {
       if (!entry.text.trim()) continue
+      if (!this.isUsefulMemoryEntry(entry)) continue
       const key = this.fingerprint(entry.kind, entry.text)
       const previous = byKey.get(key)
       if (!previous || entry.weight > previous.weight) {
@@ -97,12 +98,14 @@ export class SessionMemoryCompactionService {
     createdAt?: number
     weight?: number
   }> {
-    return (entries || []).map((entry) => ({
-      kind: entry.kind,
-      text: entry.text,
-      createdAt: entry.createdAt,
-      weight: entry.weight,
-    }))
+    return (entries || [])
+      .filter((entry) => this.isUsefulMemoryEntry(entry))
+      .map((entry) => ({
+        kind: entry.kind,
+        text: entry.text,
+        createdAt: entry.createdAt,
+        weight: entry.weight,
+      }))
   }
 
   private collectObjective(
@@ -115,13 +118,19 @@ export class SessionMemoryCompactionService {
       weight: number
     }>
   ): void {
-    const firstUser = records.find((record) => record.role === "user")
+    const firstUser = records.find(
+      (record) =>
+        record.role === "user" && !!this.normalizeUserAuthoredText(record)
+    )
     const lastUser = [...records]
       .reverse()
-      .find((record) => record.role === "user")
+      .find(
+        (record) =>
+          record.role === "user" && !!this.normalizeUserAuthoredText(record)
+      )
     const source = lastUser || firstUser
     if (!source) return
-    const text = this.normalizePlainText(source.content)
+    const text = this.normalizeUserAuthoredText(source)
     if (!text) return
     candidates.push({
       kind: "objective",
@@ -189,10 +198,14 @@ export class SessionMemoryCompactionService {
     }>
   ): void {
     const assistantRecords = records
-      .filter((record) => record.role === "assistant")
+      .filter(
+        (record) =>
+          record.role === "assistant" &&
+          !!this.normalizeConversationText(record)
+      )
       .slice(-4)
     for (const record of assistantRecords) {
-      const text = this.normalizePlainText(record.content)
+      const text = this.normalizeConversationText(record)
       if (text.length < 40) continue
       candidates.push({
         kind: "progress",
@@ -287,7 +300,7 @@ export class SessionMemoryCompactionService {
         })
       }
 
-      const text = this.normalizePlainText(record.content)
+      const text = this.normalizeConversationText(record)
       for (const match of text.matchAll(commandPattern)) {
         const command = this.squash(match[1] || "")
         if (!command || seen.has(command)) continue
@@ -318,7 +331,7 @@ export class SessionMemoryCompactionService {
     const seen = new Set<string>()
     for (let i = records.length - 1; i >= 0 && seen.size < 12; i--) {
       const record = records[i]!
-      const text = this.normalizePlainText(record.content)
+      const text = this.normalizeConversationText(record)
       for (const match of text.matchAll(pathPattern)) {
         const path = match[0]?.trim()
         if (!path || seen.has(path)) continue
@@ -554,7 +567,7 @@ export class SessionMemoryCompactionService {
   ): void {
     for (let i = records.length - 1; i >= 0 && candidates.length < 64; i--) {
       const record = records[i]!
-      const text = this.normalizePlainText(record.content)
+      const text = this.normalizeConversationText(record)
       if (!text) continue
       const sentences = text
         .split(/(?<=[.!?。！？\n])/u)
@@ -623,7 +636,20 @@ export class SessionMemoryCompactionService {
     ) {
       return false
     }
+    if (this.isSyntheticMemoryText(this.stripMemoryPrefix(text))) {
+      return false
+    }
     return true
+  }
+
+  private isUsefulMemoryEntry(entry: {
+    kind: ContextSessionMemoryKind
+    text: string
+  }): boolean {
+    return this.isUsefulCandidate({
+      kind: entry.kind,
+      text: entry.text,
+    })
   }
 
   private stripMemoryPrefix(text: string): string {
@@ -635,23 +661,63 @@ export class SessionMemoryCompactionService {
       .replace(/^Sub-agent result:\s*/i, "")
   }
 
-  private normalizePlainText(
+  private normalizeConversationText(record: ContextTranscriptRecord): string {
+    if (!this.isVisibleConversationRecord(record)) return ""
+    return this.normalizeVisibleText(record.content)
+  }
+
+  private normalizeUserAuthoredText(record: ContextTranscriptRecord): string {
+    if (record.role !== "user") return ""
+    return this.normalizeConversationText(record)
+  }
+
+  private isVisibleConversationRecord(
+    record: ContextTranscriptRecord
+  ): boolean {
+    if (record.kind && record.kind !== "message") return false
+    if (record.isMeta) return false
+    const text = this.normalizeVisibleText(record.content)
+    return !!text && !this.isSyntheticMemoryText(text)
+  }
+
+  private normalizeVisibleText(
     content: ContextTranscriptRecord["content"]
   ): string {
     if (typeof content === "string") {
-      return this.squash(content)
+      const text = this.squash(content)
+      return this.isSyntheticMemoryText(text) ? "" : text
     }
     const parts: string[] = []
     for (const block of normalizeContent(content)) {
-      if (block.type === "text") {
-        parts.push(block.text)
-      } else if (block.type === "tool_use") {
-        parts.push(`${block.name} ${this.safeStringify(block.input)}`)
-      } else if (block.type === "tool_result") {
-        parts.push(extractText(block.content))
+      const record = block as unknown as Record<string, unknown>
+      if (typeof record.text === "string") {
+        parts.push(record.text)
+      } else if (typeof record.input_text === "string") {
+        parts.push(record.input_text)
+      } else if (typeof record.output_text === "string") {
+        parts.push(record.output_text)
       }
     }
-    return this.squash(parts.join("\n"))
+    const text = this.squash(parts.join("\n"))
+    return this.isSyntheticMemoryText(text) ? "" : text
+  }
+
+  private isSyntheticMemoryText(text: string): boolean {
+    const normalized = this.squash(text)
+    if (!normalized) return true
+    return (
+      /^(?:\[Context (?:attachment|summary|collapse|attachment removed)|\[Result of an earlier tool call|\[tool_result stored\])/i.test(
+        normalized
+      ) ||
+      /^Current Codex turn context:/i.test(normalized) ||
+      /^# AGENTS\.md instructions\b/i.test(normalized) ||
+      /^<environment_context>/i.test(normalized) ||
+      /^<turn_aborted>/i.test(normalized) ||
+      /^Grep completed:\s*pattern=/i.test(normalized) ||
+      /\bDocumentId:\s*tool_result:/i.test(normalized) ||
+      /\bStoredPath:\s*\/.*\/\.agent-vibes\/tool-results\//i.test(normalized) ||
+      /\/\.agent-vibes\/tool-results\//i.test(normalized)
+    )
   }
 
   private extractToolCommands(record: ContextTranscriptRecord): string[] {
@@ -722,13 +788,5 @@ export class SessionMemoryCompactionService {
     return normalized.length > maxChars
       ? `${normalized.slice(0, maxChars - 1)}…`
       : normalized
-  }
-
-  private safeStringify(value: unknown): string {
-    try {
-      return JSON.stringify(value)
-    } catch {
-      return String(value)
-    }
   }
 }

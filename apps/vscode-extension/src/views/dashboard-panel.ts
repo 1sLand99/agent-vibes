@@ -1191,7 +1191,12 @@ export class DashboardPanel {
             : locale === "zh"
               ? "不可用"
               : "Unavailable"
-    const bridgeEndpointPatchHint = !bridgeEndpointPatchStatus.fileExists
+    const bridgeEndpointCoverage = bridgeEndpointPatchStatus.coverage
+    const bridgeEndpointCoverageHint =
+      locale === "zh"
+        ? `覆盖详情：本地端点 ${bridgeEndpointCoverage.matchingLocalEndpoints}/${bridgeEndpointCoverage.localEndpoints}，运行凭据 ${bridgeEndpointCoverage.credentialsGuard ? "已覆盖" : "未覆盖"}，持久凭据 ${bridgeEndpointCoverage.persistentGuard ? "已覆盖" : "未覆盖"}，待接入账户/模型端点 ${bridgeEndpointCoverage.apiTargets}，待接入 Agent 聊天端点 ${bridgeEndpointCoverage.agentTargets}。`
+        : `Coverage: local endpoints ${bridgeEndpointCoverage.matchingLocalEndpoints}/${bridgeEndpointCoverage.localEndpoints}; runtime credentials ${bridgeEndpointCoverage.credentialsGuard ? "covered" : "not covered"}; saved credentials ${bridgeEndpointCoverage.persistentGuard ? "covered" : "not covered"}; pending account/model endpoints ${bridgeEndpointCoverage.apiTargets}; pending agent chat endpoints ${bridgeEndpointCoverage.agentTargets}.`
+    const bridgeEndpointPatchBaseHint = !bridgeEndpointPatchStatus.fileExists
       ? locale === "zh"
         ? "未找到 Cursor workbench 文件。"
         : "Cursor workbench file was not found."
@@ -1210,6 +1215,11 @@ export class DashboardPanel {
             : locale === "zh"
               ? "当前 Cursor 构建未匹配到可应用的接入地址。"
               : "No matching endpoint location was found in this Cursor build."
+    const bridgeEndpointPatchHint =
+      bridgeEndpointPatchStatus.fileExists &&
+      bridgeEndpointPatchStatus.coverage.workbenchFiles > 0
+        ? `${bridgeEndpointPatchBaseHint} ${bridgeEndpointCoverageHint}`
+        : bridgeEndpointPatchBaseHint
     const canApplyBridgeEndpointPatch =
       bridgeEndpointPatchStatus.fileExists &&
       bridgeEndpointPatchStatus.canApply &&
@@ -1283,6 +1293,7 @@ export class DashboardPanel {
         canApply: bridgeEndpointPatchStatus.canApply,
         requiresPortUpdate: bridgeEndpointPatchStatus.requiresPortUpdate,
         endpointUrl: bridgeEndpointPatchStatus.endpointUrl,
+        coverage: bridgeEndpointPatchStatus.coverage,
       },
       setup: this.getOverviewPayload(channelAccountsData, locale),
       versions: this.versionInfo,

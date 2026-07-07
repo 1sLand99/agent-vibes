@@ -48,6 +48,7 @@ import {
   type LooseMessageContent,
   type PreCompactHookPayload,
   ReasoningMemoryService,
+  SessionMemoryCompactionService,
   stripSubAgentUiOnlyPayload,
   type SubAgentMemoryFormatInput,
   TokenCounterService,
@@ -59,6 +60,7 @@ import {
   AgentConversationTurnStructureSchema,
   AgentMode,
   type BackgroundShellSpawnResult,
+  ConversationSummaryArchiveSchema,
   type ConversationStep,
   ConversationStepSchema,
   ConversationTurnStructureSchema,
@@ -134,6 +136,7 @@ import {
   shouldRequestCursorCodexThinkingSummary,
   shouldSuppressCursorCodexThinkingSummary,
 } from "./cursor-codex-request-assembler"
+import { getRestartRecoveryControlResolution } from "./control-recovery-policy"
 import {
   createCodexContextLedgerState,
   previewCodexContextLedgerMessages,
@@ -176,7 +179,6 @@ import { normalizeTaskBudgetTotal } from "./session/task-budget-state"
 import { ExecDispatchSerializerService } from "./session/exec-dispatch-serializer.service"
 import { ToolExecutionCoordinatorService } from "./session/tool-execution-coordinator.service"
 import {
-  buildInterruptedToolResultContent,
   getInterruptedToolRepairContextLabel,
   isToolInterruptionReason,
   normalizeToolInterruptionReason,
@@ -1032,6 +1034,116 @@ interface JsonSchemaProperty {
 
 // ToolDefinition type imported from cursor-tool-mapper.ts
 
+export interface CursorRuntimeActivitySession {
+  conversationId: string
+  model: string
+  lastActivityAt: string
+  persistedOnly?: boolean
+  activeTurn: boolean
+  activeBackendStreams: number
+  pendingToolCalls: number
+  pendingInteractionQueries: number
+  deferredControlContinuations: number
+  restartRecoveryToolCalls: number
+  busy: boolean
+}
+
+export interface CursorRuntimeActivitySnapshot {
+  timestamp: string
+  canRestartWithoutInterruptingRuns: boolean
+  busySessionCount: number
+  recoverySessionCount: number
+  sessions: CursorRuntimeActivitySession[]
+}
+
+export function isUnboundResumeAction(
+  parsed: Pick<ParsedCursorRequest, "isResumeAction" | "conversationId">,
+  boundConversationId: string | undefined
+): boolean {
+  return (
+    parsed.isResumeAction === true &&
+    !parsed.conversationId &&
+    !boundConversationId
+  )
+}
+
+export function isUnboundRecoverableControlAction(
+  parsed: Pick<
+    ParsedCursorRequest,
+    "isAgentControlMessage" | "agentControlType" | "conversationId"
+  >,
+  boundConversationId: string | undefined
+): boolean {
+  return (
+    parsed.isAgentControlMessage === true &&
+    !parsed.conversationId &&
+    !boundConversationId &&
+    getRestartRecoveryControlResolution(parsed.agentControlType).resolve
+  )
+}
+
+export interface UnboundResumeConversationCandidate {
+  conversationId: string
+}
+
+export type UnboundResumeConversationResolution =
+  | {
+      kind: "matched"
+      conversationId: string
+      candidateCount: number
+    }
+  | {
+      kind: "none" | "ambiguous"
+      candidateCount: number
+    }
+
+export function resolveUnboundResumeConversation(
+  candidates: readonly UnboundResumeConversationCandidate[]
+): UnboundResumeConversationResolution {
+  const candidateIds = new Set(
+    candidates
+      .map((candidate) => candidate.conversationId.trim())
+      .filter(Boolean)
+  )
+  if (candidateIds.size === 0) {
+    return { kind: "none", candidateCount: 0 }
+  }
+  if (candidateIds.size === 1) {
+    return {
+      kind: "matched",
+      conversationId: Array.from(candidateIds)[0]!,
+      candidateCount: 1,
+    }
+  }
+  return { kind: "ambiguous", candidateCount: candidateIds.size }
+}
+
+export function resolveSessionCleanupBackends(input: {
+  lastAssistantBackend?: BackendType
+  model?: string
+  resolveModelBackend: (model: string) => BackendType | undefined
+  onResolveError?: (error: unknown, model: string) => void
+}): BackendType[] {
+  const cleanupBackends = new Set<BackendType>()
+  if (input.lastAssistantBackend) {
+    cleanupBackends.add(input.lastAssistantBackend)
+  }
+
+  const model = input.model?.trim()
+  if (model) {
+    try {
+      const modelBackend = input.resolveModelBackend(model)
+      if (modelBackend) {
+        cleanupBackends.add(modelBackend)
+      }
+    } catch (error) {
+      input.onResolveError?.(error, model)
+    }
+  }
+
+  return Array.from(cleanupBackends)
+}
+
 /**
  * ConnectRPC Bidirectional Streaming Service
  * Handles the full lifecycle of Cursor's bidirectional streaming protocol
@@ -1130,12 +1242,12 @@ export class CursorConnectStreamService {
    * fall straight through to `appendToolResultBlockNow`, preserving the
    * pre-barrier behaviour for every non-fan-out path.
    *
-   * Crash-safety note: an un-flushed buffer lives only in memory, so a
-   * process crash mid-batch drops the partial batch. That is acceptable
-   * — the batch never completed, and on resume the dangling tool_use is
-   * handled by `ensureToolResultPairing`'s 第 2 类 fallback. The buffer
-   * is dropped at every per-conversation teardown point (see
-   * `dropToolResultBuffer`).
+   * Teardown-safety note: an un-flushed buffer cannot be discarded when a
+   * BiDi attachment closes. The received tool_results are already facts; only
+   * their siblings are still pending. On teardown we durably flush the partial
+   * buffer without completing the active batch, so a later resumeAction can
+   * settle the remaining siblings instead of re-running or orphaning already
+   * completed tools.
    */
   private readonly bufferedToolResultsByConversation = new Map<
     string,
@@ -1520,6 +1632,7 @@ export class CursorConnectStreamService {
     private readonly contextManager: ContextManagerService,
     private readonly contextTelemetry: ContextTelemetryService,
     private readonly contextCompactRunner: ContextCompactRunnerService,
+    private readonly sessionMemory: SessionMemoryCompactionService,
     private readonly codexContextAdapter: CodexContextAdapterService,
     private readonly contextRequestPlanner: ContextRequestPlannerService,
     private readonly contextNativeManagement: ContextNativeManagementService,
@@ -1602,8 +1715,18 @@ export class CursorConnectStreamService {
     // This ensures provider resources (Codex WS connections, warmup caches) are released.
     this.sessionManager.registerSessionCleanupHandler(
       (conversationId, session) => {
-        const backend = session.lastAssistantBackend
-        if (backend) {
+        const cleanupBackends = resolveSessionCleanupBackends({
+          lastAssistantBackend: session.lastAssistantBackend,
+          model: session.model,
+          resolveModelBackend: (model) =>
+            this.modelRouter.resolveModel(model).backend,
+          onResolveError: (error, model) => {
+            this.logger.debug(
+              `Session cleanup could not resolve backend for model=${model}: ${String(error)}`
+            )
+          },
+        })
+        for (const backend of cleanupBackends) {
           this.resolveProviderAdapter(backend)?.dispose(conversationId)
         }
       }
@@ -2664,8 +2787,8 @@ export class CursorConnectStreamService {
       ReturnType<ContextCompactRunnerService["compactIfNeeded"]>
     >
     let hookUserMessage: string | undefined
+    const route = this.modelRouter.resolveModel(session.model)
     try {
-      const route = this.modelRouter.resolveModel(session.model)
       const manualBudget = {
         maxTokens: MANUAL_SUMMARIZE_BUDGET,
         systemPromptTokens: 0,
@@ -2674,11 +2797,23 @@ export class CursorConnectStreamService {
         const systemPrompt = this.buildCodexSystemPrompt(
           route.model || session.model
         )
+        const pendingToolUseIds =
+          this.sessionManager.getPendingToolCallIds(conversationId)
+        const preparedToolBuild = this.prepareToolBuildForSession(session)
+        const toolDefinitions = preparedToolBuild.apiTools
+        session.deferredToolCatalog = preparedToolBuild.deferred
+        const compactInputBudget = this.resolveMessageBudget(route.backend, {
+          session,
+          model: route.model || session.model,
+          systemPrompt,
+          toolDefinitions,
+        })
         const referenceContextItem =
           this.codexContextAdapter.buildReferenceContextItem({
             conversationId,
             model: route.model || session.model,
             systemPrompt,
+            toolDefinitions,
             contextTokenLimit: manualBudget.maxTokens,
             serviceTier: this.resolveRequestedCodexServiceTier(
               session.requestedModelParameters
@@ -2699,7 +2834,11 @@ export class CursorConnectStreamService {
           this.buildContextAttachmentSnapshot(session),
           {
             ...manualBudget,
+            compactInputMaxTokens: compactInputBudget.maxTokens,
+            compactInputSystemPromptTokens:
+              compactInputBudget.systemPromptTokens,
             strategy: "manual",
+            pendingToolUseIds,
             referenceContextItem,
             injectionMode: "pre_turn",
             hookProvider: async (candidate) => {
@@ -2724,7 +2863,9 @@ export class CursorConnectStreamService {
                     model: route.model || session.model,
                     system: systemPrompt,
                     messages: this.toCodexConversationMessages(messages),
+                    tools: toolDefinitions,
                     conversationId,
+                    pendingToolUseIds,
                     clientMetadata: this.buildCodexClientMetadata(
                       session,
                       conversationId,
@@ -2790,6 +2931,13 @@ export class CursorConnectStreamService {
     }
 
     this.contextState.markContextStateDirty(conversationId)
+    this.resetCodexStateAfterCompaction(
+      session,
+      route,
+      route.model || session.model,
+      applied,
+      `manual summarize: ${conversationId}`
+    )
     this.logger.warn(
       `Summarize action applied for ${conversationId}: ` +
         `commit=${applied.commit.id} ` +
@@ -2798,10 +2946,6 @@ export class CursorConnectStreamService {
         (hookUserMessage ? " (with preCompact hook)" : "")
     )
 
-    const renderedSummary = hookUserMessage
-      ? `${hookUserMessage}\n\n${applied.commit.summary}`
-      : applied.commit.summary
-
     // Queue the summary lifecycle so any later turn that runs through
     // `emitPendingContextSummaryUiUpdate` will pick it up. We also
     // yield the three frames eagerly right here so the IDE updates its
@@ -2809,11 +2953,16 @@ export class CursorConnectStreamService {
     // message to start.
     this.queuePendingContextSummaryUiUpdate(session, conversationId, {
       compactionId: applied.commit.id,
-      summary: renderedSummary,
+      summary: applied.commit.summary,
       epoch:
         this.contextState.getContextRecord(session.conversationId)!.contextState
           .compactionEpoch || 0,
     })
+    this.flushContextCompactionState(
+      conversationId,
+      applied.commit.id,
+      "manual summarize commit"
+    )
     await this.emitPendingContextSummaryUiUpdate(conversationId)
     return true
   }
@@ -2831,6 +2980,10 @@ export class CursorConnectStreamService {
     if (!session) {
       throw new Error(`Session not found: ${conversationId}`)
     }
+    await this.resolveRestartRecoveryBeforeContextMutation(
+      conversationId,
+      "manual compact api"
+    )
     const route = this.modelRouter.resolveModel(session.model)
     let hookUserMessage: string | undefined
     const manualBudget = { maxTokens, systemPromptTokens: 0 }
@@ -2891,22 +3044,41 @@ export class CursorConnectStreamService {
       return { applied: false }
     }
     this.contextState.markContextStateDirty(conversationId)
-    const renderedSummary = hookUserMessage
-      ? `${hookUserMessage}\n\n${plan.commit.summary}`
-      : plan.commit.summary
+    this.resetCodexStateAfterCompaction(
+      session,
+      route,
+      route.model || session.model,
+      plan,
+      `manual compact api: ${conversationId}`
+    )
     this.queuePendingContextSummaryUiUpdate(session, conversationId, {
       compactionId: plan.commit.id,
-      summary: renderedSummary,
+      summary: plan.commit.summary,
       epoch:
         this.contextState.getContextRecord(session.conversationId)!.contextState
           .compactionEpoch || 0,
     })
+    this.flushContextCompactionState(
+      conversationId,
+      plan.commit.id,
+      "manual compact api commit"
+    )
     return {
       applied: true,
       estimatedTokens: plan.estimatedTokens,
       archivedMessageCount: plan.commit.archivedMessageCount,
       summaryTokenCount: plan.commit.summaryTokenCount,
     }
+  }
+
+  async resolveRestartRecoveryBeforeContextMutation(
+    conversationId: string,
+    source: string
+  ): Promise<boolean> {
+    return this.resolveRestartRecoveryBeforeContinuation(
+      conversationId,
+      `context mutation ${source}`
+    )
   }
 
   private async handleBackgroundShellAction(
@@ -3123,11 +3295,32 @@ export class CursorConnectStreamService {
       this.releaseExecDispatchSlot(conversationId, execId)
     }
 
+    const content = `[${pending.toolName} timeout] ${reason}`
+    const normalizedToolName = (pending.toolName || "").trim().toLowerCase()
+    const isForegroundShell =
+      normalizedToolName === "run_terminal_command" ||
+      normalizedToolName === "run_terminal_command_v2" ||
+      normalizedToolName === "client_side_tool_v2_run_terminal_command_v2"
+    const inlineExtraData = isForegroundShell
+      ? {
+          shellResult: {
+            stdout: "",
+            stderr: content,
+            exitCode: 124,
+            aborted: true,
+            localExecutionTimeMs: Date.now() - pending.sentAt.getTime(),
+          },
+        }
+      : undefined
+
     await this.emitInlineToolResult(
       conversationId,
       toolCallId,
-      `[${pending.toolName} timeout] ${reason}`,
-      { status: "error", message: reason }
+      content,
+      { status: "error", message: reason },
+      undefined,
+      "inline_tool_result",
+      inlineExtraData
     )
     return true
   }
@@ -5168,15 +5361,10 @@ export class CursorConnectStreamService {
           status: todo.status,
           dependencies: [...todo.dependencies],
         })),
-      sessionMemory: (
+      sessionMemory: this.sessionMemory.toAttachmentSummaries(
         this.contextState.getContextRecord(session.conversationId)!.contextState
           .sessionMemory || []
-      ).map((entry) => ({
-        kind: entry.kind,
-        text: entry.text,
-        createdAt: entry.createdAt,
-        weight: entry.weight,
-      })),
+      ),
       investigationSummaries:
         this.contextState.getInvestigationMemoryAttachmentSnapshot(
           session.conversationId
@@ -5252,6 +5440,132 @@ export class CursorConnectStreamService {
     )
   }
 
+  private resolveConversationIdForUnboundResumeAction(): UnboundResumeConversationResolution {
+    const candidates: UnboundResumeConversationCandidate[] = []
+    const seen = new Set<string>()
+    const addCandidate = (conversationId: string | undefined): void => {
+      const normalized = conversationId?.trim()
+      if (!normalized || seen.has(normalized)) return
+      seen.add(normalized)
+      candidates.push({ conversationId: normalized })
+    }
+
+    for (const [
+      conversationId,
+      session,
+    ] of this.sessionManager.iterateSessions()) {
+      const hasRestartRecovery =
+        (session.restartRecovery?.interruptedToolCalls.length ?? 0) > 0
+      const hasDeferredControl = session.deferredControlContinuations.length > 0
+      if (
+        this.hasPendingStreamWork(session) ||
+        hasRestartRecovery ||
+        hasDeferredControl
+      ) {
+        addCandidate(conversationId)
+      }
+    }
+
+    for (const persisted of this.sessionManager.listPersistedSessionActivitySummaries()) {
+      const hasPersistedRecovery =
+        persisted.hasRestartRecovery ||
+        persisted.restartRecoveryToolCallCount > 0 ||
+        persisted.restartRecoveryInteractionQueryCount > 0 ||
+        persisted.openToolCallCount > 0
+      if (hasPersistedRecovery) {
+        addCandidate(persisted.conversationId as string)
+      }
+    }
+
+    return resolveUnboundResumeConversation(candidates)
+  }
+
+  getRuntimeActivitySnapshot(): CursorRuntimeActivitySnapshot {
+    const sessions: CursorRuntimeActivitySession[] = []
+    const loadedSessionIds = new Set<string>()
+
+    for (const [
+      conversationId,
+      session,
+    ] of this.sessionManager.iterateSessions()) {
+      loadedSessionIds.add(conversationId)
+      const stream = this.sessionStream.getStreamRecord(conversationId)
+      const activeTurnSignal =
+        this.sessionManager.getCurrentTurnAbortSignal(conversationId)
+      const activeBackendStreams =
+        this.activeBackendStreamCountsByConversation.get(conversationId) ?? 0
+      const pendingToolCalls =
+        this.sessionManager.pendingToolCallCount(conversationId)
+      const pendingInteractionQueries =
+        stream?.pendingInteractionQueries.size ?? 0
+      const deferredControlContinuations =
+        session.deferredControlContinuations.length
+      const activeTurn =
+        activeTurnSignal != null && activeTurnSignal.aborted !== true
+      const busy =
+        activeTurn ||
+        activeBackendStreams > 0 ||
+        pendingToolCalls > 0 ||
+        pendingInteractionQueries > 0 ||
+        deferredControlContinuations > 0
+
+      sessions.push({
+        conversationId,
+        model: session.model || "",
+        lastActivityAt: session.lastActivityAt.toISOString(),
+        persistedOnly: false,
+        activeTurn,
+        activeBackendStreams,
+        pendingToolCalls,
+        pendingInteractionQueries,
+        deferredControlContinuations,
+        restartRecoveryToolCalls:
+          session.restartRecovery?.interruptedToolCalls.length ?? 0,
+        busy,
+      })
+    }
+
+    for (const persisted of this.sessionManager.listPersistedSessionActivitySummaries()) {
+      const conversationId = persisted.conversationId as string
+      if (loadedSessionIds.has(conversationId)) continue
+      sessions.push({
+        conversationId,
+        model: persisted.model || "",
+        lastActivityAt: new Date(persisted.lastActivityAt).toISOString(),
+        persistedOnly: true,
+        activeTurn: false,
+        activeBackendStreams: 0,
+        pendingToolCalls: persisted.openToolCallCount,
+        pendingInteractionQueries:
+          persisted.restartRecoveryInteractionQueryCount,
+        deferredControlContinuations: 0,
+        restartRecoveryToolCalls: persisted.restartRecoveryToolCallCount,
+        busy: false,
+      })
+    }
+
+    sessions.sort(
+      (a, b) =>
+        new Date(b.lastActivityAt).getTime() -
+        new Date(a.lastActivityAt).getTime()
+    )
+
+    const busySessionCount = sessions.filter((session) => session.busy).length
+    return {
+      timestamp: new Date().toISOString(),
+      canRestartWithoutInterruptingRuns: busySessionCount === 0,
+      busySessionCount,
+      recoverySessionCount: sessions.filter(
+        (session) =>
+          session.restartRecoveryToolCalls > 0 ||
+          (session.persistedOnly === true &&
+            (session.pendingToolCalls > 0 ||
+              session.pendingInteractionQueries > 0))
+      ).length,
+      sessions,
+    }
+  }
+
   private clearSupersededControlStateForNewUserTurn(
     conversationId: string,
     streamId: string | undefined
@@ -5272,6 +5586,36 @@ export class CursorConnectStreamService {
         `stream=${this.summarizeStreamId(streamId)} ` +
         `deferredContinuations=${deferredCount} pendingInteractionQueries=${interactionQueryCount}`
     )
+  }
+
+  private async resolveRestartRecoveryBeforeContinuation(
+    conversationId: string,
+    source: string,
+    options?: {
+      emitNotice?: boolean
+      endStream?: boolean
+    }
+  ): Promise<boolean> {
+    const session = this.sessionManager.getSession(conversationId)
+    const recovery = session?.restartRecovery
+    if (!session || !recovery) {
+      return false
+    }
+
+    this.logger.warn(
+      `Resolving restart recovery before ${source}: conversation=${conversationId} ` +
+        `interruptedToolCalls=${recovery.interruptedToolCalls.length}`
+    )
+    this.sessionManager.abortRestoredOpenToolLedger(conversationId)
+    this.repairInterruptedToolProtocol(session, recovery)
+    this.sessionManager.clearRestartRecovery(conversationId)
+    this.sessionManager.flushPersistImmediate(conversationId)
+
+    if (options?.emitNotice) {
+      await this.emitAgentFinalTextResponse(session, recovery.notice)
+    }
+
+    return options?.endStream === true
   }
 
   private describePendingStreamWork(
@@ -5990,20 +6334,27 @@ export class CursorConnectStreamService {
   private flushBufferedToolResults(
     session: SessionRecord,
     declarationOrder: string[],
-    options?: { batchId?: string }
-  ): void {
+    options?: {
+      batchId?: string
+      completeBatch?: boolean
+      reason?: string
+      warnMissingDeclared?: boolean
+    }
+  ): number {
+    const completeBatch = options?.completeBatch !== false
+    const warnMissingDeclared = options?.warnMissingDeclared !== false
     const buffer = this.bufferedToolResultsByConversation.get(
       session.conversationId
     )
     if (!buffer || buffer.size === 0) {
-      if (options?.batchId) {
+      if (completeBatch && options?.batchId) {
         this.assistantToolBatch.completeAssistantToolBatch(
           session.conversationId,
           options.batchId,
           "tool result buffer already empty"
         )
       }
-      return
+      return 0
     }
 
     const flushOrder = orderBufferedToolResultIdsForFlush(
@@ -6024,10 +6375,11 @@ export class CursorConnectStreamService {
     const bufferedIds = new Set(
       [...buffer.values()].map((entry) => entry.toolCallId)
     )
+    const cid = ConversationId.of(session.conversationId)
     const missingDeclared = declarationOrder.filter(
-      (id) => !bufferedIds.has(id)
+      (id) => !bufferedIds.has(id) && this.toolCallLedger.isOpen(cid, id)
     )
-    if (missingDeclared.length > 0) {
+    if (missingDeclared.length > 0 && warnMissingDeclared) {
       this.logger.warn(
         `flushBufferedToolResults: ${missingDeclared.length}/${declarationOrder.length} ` +
           `declared batch member(s) have NO buffered result and will orphan ` +
@@ -6088,7 +6440,8 @@ export class CursorConnectStreamService {
       }
       this.logger.debug(
         `[tool-result-write] flush durable-append ${batchBlocks.length} result(s) ` +
-          `as one user turn for ${session.conversationId}: [${writtenIds.join(", ")}]`
+          `as one user turn for ${session.conversationId}: [${writtenIds.join(", ")}]` +
+          (options?.reason ? ` (${options.reason})` : "")
       )
     }
     if (droppedStale > 0) {
@@ -6099,31 +6452,59 @@ export class CursorConnectStreamService {
     }
 
     this.bufferedToolResultsByConversation.delete(session.conversationId)
-    this.assistantToolBatch.completeAssistantToolBatch(
-      session.conversationId,
-      options?.batchId,
-      "tool results flushed"
-    )
+    if (completeBatch) {
+      this.assistantToolBatch.completeAssistantToolBatch(
+        session.conversationId,
+        options?.batchId,
+        "tool results flushed"
+      )
+    }
+    return writtenIds.length
   }
 
   /**
-   * Drop the per-turn tool_result buffer for a conversation without
-   * flushing. Called on every per-conversation teardown / supersede point
-   * so an un-flushed partial batch never leaks into a fresh BiDi
-   * attachment. Returns the number of buffered results discarded (for
-   * diagnostics).
+   * Persist any already-received tool_results before a BiDi attachment is
+   * detached. The active assistant batch remains open when siblings are still
+   * unsettled; resumeAction/deadline expiry will settle those remaining ids
+   * later. This prevents teardown from losing facts that arrived before the
+   * stream closed.
    */
-  private dropToolResultBuffer(conversationId: string): number {
+  private flushToolResultBufferForTeardown(
+    conversationId: string,
+    reason: string
+  ): number {
     const buffer = this.bufferedToolResultsByConversation.get(conversationId)
     if (!buffer) return 0
-    const dropped = buffer.size
-    this.bufferedToolResultsByConversation.delete(conversationId)
-    if (dropped > 0) {
-      this.logger.debug(
-        `Dropped ${dropped} un-flushed buffered tool_result(s) for ${conversationId}`
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) {
+      this.logger.warn(
+        `Discarding ${buffer.size} buffered tool_result(s) for missing session ${conversationId}`
+      )
+      this.bufferedToolResultsByConversation.delete(conversationId)
+      return 0
+    }
+    const batch =
+      this.assistantToolBatch.getActiveAssistantToolBatchSnapshot(
+        conversationId
+      )
+    const declarationOrder =
+      batch?.toolCallIds && batch.toolCallIds.length > 0
+        ? batch.toolCallIds
+        : [...buffer.values()].map((entry) => entry.toolCallId)
+
+    const flushed = this.flushBufferedToolResults(session, declarationOrder, {
+      batchId: batch?.id,
+      completeBatch: false,
+      reason,
+      warnMissingDeclared: false,
+    })
+    if (flushed > 0) {
+      this.logger.warn(
+        `Flushed ${flushed} buffered tool_result(s) during ${reason} for ${conversationId}; ` +
+          `remaining batch members stay pending for resume/deadline`
       )
     }
-    return dropped
+    return flushed
   }
 
   private appendToolResultBlockNow(
@@ -6419,17 +6800,6 @@ export class CursorConnectStreamService {
     return ids
   }
 
-  private buildInterruptedToolResultContent(
-    toolCall: InterruptedToolCallInfo
-  ): string {
-    return buildInterruptedToolResultContent({
-      toolCallId: toolCall.toolCallId,
-      toolName: toolCall.toolName,
-      reason: toolCall.reason,
-      detail: toolCall.detail,
-    })
-  }
-
   private getInterruptedToolRepairTelemetryEvent(
     reasons: ToolInterruptionReason[]
   ): ContextTelemetryEvent {
@@ -6457,72 +6827,51 @@ export class CursorConnectStreamService {
       return
     }
 
+    const abortedLedgerCount =
+      this.sessionManager.abortInterruptedOpenToolLedger(
+        session.conversationId,
+        recovery.interruptedToolCalls
+      )
     const interruptedById = new Map(
       recovery.interruptedToolCalls.map((toolCall) => [
         toolCall.toolCallId,
         toolCall,
       ])
     )
-    const repairedMessages = [
-      ...this.contextState.getContextRecord(session.conversationId)!.messages,
-    ]
-    let changed = false
+    const messages = this.contextState.getContextRecord(
+      session.conversationId
+    )!.messages
+    const existingToolResultIds = new Set<string>()
+    for (const message of messages) {
+      for (const toolResultId of this.extractToolResultIds(
+        message.message.content
+      )) {
+        existingToolResultIds.add(toolResultId)
+      }
+    }
+    const cid = ConversationId.of(session.conversationId)
+    const unresolvedToolUses: Array<{
+      toolUseId: string
+      ledgerState: string
+    }> = []
 
-    for (let i = 0; i < repairedMessages.length; i++) {
-      const message = repairedMessages[i]
+    for (const message of messages) {
       if (!message || message.message.role !== "assistant") continue
 
-      const interruptedToolUses = this.extractToolUseBlocks(
+      for (const toolUse of this.extractToolUseBlocks(
         message.message.content
-      ).filter((toolUse) => interruptedById.has(toolUse.id))
-      if (interruptedToolUses.length === 0) continue
-
-      const syntheticResults: ToolResultContentItem[] = interruptedToolUses.map(
-        (toolUse) => ({
-          type: "tool_result",
-          tool_use_id: toolUse.id,
-          content: this.buildInterruptedToolResultContent(
-            interruptedById.get(toolUse.id)!
-          ),
+      )) {
+        if (!interruptedById.has(toolUse.id)) continue
+        if (existingToolResultIds.has(toolUse.id)) continue
+        unresolvedToolUses.push({
+          toolUseId: toolUse.id,
+          ledgerState:
+            this.toolCallLedger.getState(cid, toolUse.id) ?? "missing",
         })
-      )
-
-      const nextMessage = repairedMessages[i + 1]
-      if (
-        nextMessage?.message.role === "user" &&
-        Array.isArray(nextMessage.message.content)
-      ) {
-        const existingToolResultIds = this.extractToolResultIds(
-          nextMessage.message.content
-        )
-        const missingResults = syntheticResults.filter(
-          (toolResult) => !existingToolResultIds.has(toolResult.tool_use_id)
-        )
-        if (missingResults.length === 0) continue
-        repairedMessages[i + 1] = {
-          ...nextMessage,
-          message: {
-            ...nextMessage.message,
-            content: [
-              ...nextMessage.message.content,
-              ...missingResults,
-            ] as MessageContent,
-          },
-        } as SessionMessage
-        changed = true
-        continue
       }
-
-      repairedMessages.splice(
-        i + 1,
-        0,
-        makeSessionMessage("user", syntheticResults as MessageContent)
-      )
-      changed = true
-      i++
     }
 
-    if (!changed) return
+    if (abortedLedgerCount === 0 && unresolvedToolUses.length === 0) return
 
     const repairReasons = recovery.interruptedToolCalls.map(
       (toolCall) => toolCall.reason
@@ -6531,29 +6880,27 @@ export class CursorConnectStreamService {
       session.conversationId,
       repairReasons
     )
-    const normalizedMessages = this.normalizeHistoryForBackend(
-      repairedMessages,
-      repairContextLabel,
-      {
-        conversationId: session.conversationId,
-        replacementState: this.contextState.getContextRecord(
-          session.conversationId
-        )!.contextState.toolResultReplacementState,
-      }
-    )
-    this.contextTelemetry.recordEvent({
-      event: this.getInterruptedToolRepairTelemetryEvent(repairReasons),
-      scope: session.conversationId,
-      metadata: {
-        interruptedToolCalls: recovery.interruptedToolCalls.length,
-        reasons:
-          new Set(repairReasons).size === 1 ? repairReasons[0]! : "mixed",
-      },
-    })
-    this.contextState.replaceMessages(
-      session.conversationId,
-      normalizedMessages
-    )
+    if (abortedLedgerCount > 0) {
+      this.contextTelemetry.recordEvent({
+        event: this.getInterruptedToolRepairTelemetryEvent(repairReasons),
+        scope: session.conversationId,
+        metadata: {
+          interruptedToolCalls: recovery.interruptedToolCalls.length,
+          repairedToolCalls: abortedLedgerCount,
+          reasons:
+            new Set(repairReasons).size === 1 ? repairReasons[0]! : "mixed",
+          context: repairContextLabel,
+        },
+      })
+    }
+    if (unresolvedToolUses.length > 0) {
+      this.logger.error(
+        `Interrupted tool protocol invariant violation: conversation=${session.conversationId} ` +
+          `missingResults=${unresolvedToolUses
+            .map((entry) => `${entry.toolUseId}:${entry.ledgerState}`)
+            .join(", ")}`
+      )
+    }
   }
 
   private normalizeHistoryForBackend(
@@ -7580,8 +7927,21 @@ export class CursorConnectStreamService {
       undefined
     )
     this.sessionManager.markSessionDirty(conversationId)
+    this.sessionManager.flushPersistImmediate(conversationId)
     this.logger.log(
       `Emitted context compaction summary UI update for ${conversationId}: ${pending.compactionId}`
+    )
+  }
+
+  private flushContextCompactionState(
+    conversationId: string,
+    compactionId: string,
+    reason: string
+  ): void {
+    this.contextState.markContextStateDirty(conversationId)
+    this.sessionManager.flushPersistImmediate(conversationId)
+    this.logger.debug(
+      `Persisted context compaction state for ${conversationId}: ${reason}, compactionId=${compactionId}`
     )
   }
 
@@ -7909,6 +8269,12 @@ export class CursorConnectStreamService {
     const systemPrompt = this.buildCodexSystemPrompt(
       options.model || route.model || session.model
     )
+    const compactInputBudget = this.resolveMessageBudget(route.backend, {
+      session,
+      model: options.model || route.model || session.model,
+      systemPrompt,
+      toolDefinitions: options.toolDefinitions,
+    })
     const referenceContextItem =
       this.codexContextAdapter.buildReferenceContextItem({
         conversationId: session.conversationId,
@@ -7932,10 +8298,13 @@ export class CursorConnectStreamService {
       {
         maxTokens: budget.maxTokens,
         systemPromptTokens: budget.systemPromptTokens,
+        compactInputMaxTokens: compactInputBudget.maxTokens,
+        compactInputSystemPromptTokens: compactInputBudget.systemPromptTokens,
         autoCompactTokenLimit: budget.autoCompactTokenLimit,
         predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
         strategy: options.strategy,
         integrityMode: "global",
+        pendingToolUseIds: options.pendingToolUseIds,
         referenceContextItem,
         injectionMode: options.injectionMode,
         hookUserMessage: options.hookUserMessage,
@@ -8251,6 +8620,7 @@ export class CursorConnectStreamService {
             projectedTokenOverride,
             strategy: options.strategy,
             integrityMode,
+            pendingToolUseIds: options.pendingToolUseIds,
             referenceContextItem,
             injectionMode:
               options.strategy === "reactive" ? "mid_turn" : "pre_turn",
@@ -8296,12 +8666,9 @@ export class CursorConnectStreamService {
         },
       })
       this.applyTaskBudgetDeductionForCompaction(session, plan)
-      const renderedSummary = hookUserMessage
-        ? `${hookUserMessage}\n\n${plan.commit.summary}`
-        : plan.commit.summary
       this.queuePendingContextSummaryUiUpdate(session, session.conversationId, {
         compactionId: plan.commit.id,
-        summary: renderedSummary,
+        summary: plan.commit.summary,
         epoch:
           this.contextState.getContextRecord(session.conversationId)!
             .contextState.compactionEpoch || 0,
@@ -8311,21 +8678,17 @@ export class CursorConnectStreamService {
           `strategy=${options.strategy}, budget=${budget.maxTokens}, estimatedTokens=${plan.estimatedTokens}, ` +
           `compactionId=${plan.commit.id}`
       )
-      this.resetCodexContextLedger(
-        session.conversationId,
-        `context compaction applied (${plan.commit.id})`
-      )
-      this.resetCodexContinuationAfterProjectionRewrite(
-        route.backend,
-        session.conversationId,
+      this.resetCodexStateAfterCompaction(
+        session,
+        route,
         options.model || session.model,
-        {
-          messages: [],
-          projectedMessages: [],
-          estimatedTokens: plan.estimatedTokens,
-          wasCompacted: true,
-        },
+        plan,
         options.contextLabel
+      )
+      this.flushContextCompactionState(
+        session.conversationId,
+        plan.commit.id,
+        `${options.strategy} codex compaction commit`
       )
       return
     }
@@ -8414,12 +8777,9 @@ export class CursorConnectStreamService {
       },
     })
     this.applyTaskBudgetDeductionForCompaction(session, plan)
-    const renderedSummary = hookUserMessage
-      ? `${hookUserMessage}\n\n${plan.commit.summary}`
-      : plan.commit.summary
     this.queuePendingContextSummaryUiUpdate(session, session.conversationId, {
       compactionId: plan.commit.id,
-      summary: renderedSummary,
+      summary: plan.commit.summary,
       epoch:
         this.contextState.getContextRecord(session.conversationId)!.contextState
           .compactionEpoch || 0,
@@ -8444,6 +8804,11 @@ export class CursorConnectStreamService {
         wasCompacted: true,
       },
       options.contextLabel
+    )
+    this.flushContextCompactionState(
+      session.conversationId,
+      plan.commit.id,
+      `${options.strategy} ${route.backend} compaction commit`
     )
   }
 
@@ -8806,6 +9171,34 @@ export class CursorConnectStreamService {
       conversationId,
       modelName,
       `context projection rewritten (${contextLabel})`
+    )
+  }
+
+  private resetCodexStateAfterCompaction(
+    session: SessionRecord,
+    route: ModelRouteResult,
+    modelName: string | undefined,
+    plan: ContextCompactionPlan,
+    contextLabel: string
+  ): void {
+    if (route.backend !== "codex") {
+      return
+    }
+    this.resetCodexContextLedger(
+      session.conversationId,
+      `context compaction applied (${plan.commit.id})`
+    )
+    this.resetCodexContinuationAfterProjectionRewrite(
+      route.backend,
+      session.conversationId,
+      modelName,
+      {
+        messages: [],
+        projectedMessages: [],
+        estimatedTokens: plan.estimatedTokens,
+        wasCompacted: true,
+      },
+      contextLabel
     )
   }
 
@@ -9386,9 +9779,10 @@ ${raw}
     session: SessionRecord,
     conversationId: string,
     model: string
-  ): Buffer {
+  ): { checkpoint: Buffer; blobMessages: Buffer[] } {
     const tokenDetails = this.resolveCheckpointTokenDetails(session)
-    return this.grpcService.createConversationCheckpointResponse(
+    const summaryArchiveBlobs = this.materializeSummaryArchiveBlobs(session)
+    const checkpoint = this.grpcService.createConversationCheckpointResponse(
       conversationId,
       model,
       {
@@ -9411,8 +9805,10 @@ ${raw}
         todos: this.contextState.getContextRecord(session.conversationId)!
           .todos,
         compactionHistory: this.extractCompactionHistoryForCheckpoint(session),
+        summaryArchiveBlobIds: summaryArchiveBlobs.summaryArchiveBlobIds,
       }
     )
+    return { checkpoint, blobMessages: summaryArchiveBlobs.blobMessages }
   }
 
   private encodeBlobId(blobId: string): Uint8Array {
@@ -9433,6 +9829,31 @@ ${raw}
       blobId,
       buffer: this.grpcService.createKvServerMessageResponse(kvMessage),
     }
+  }
+
+  private materializeSummaryArchiveBlobs(session: SessionRecord): {
+    summaryArchiveBlobIds: string[]
+    blobMessages: Buffer[]
+  } {
+    const blobMessages: Buffer[] = []
+    const summaryArchiveBlobIds = this.extractCompactionHistoryForCheckpoint(
+      session
+    ).map((entry) => {
+      const archive = create(ConversationSummaryArchiveSchema, {
+        summary: entry.summary,
+        windowTail: Math.max(0, Math.floor(entry.archivedMessageCount || 0)),
+        summarizedMessages: [],
+        summaryMessage: new Uint8Array(),
+      })
+      const archiveBlob = this.createProtocolBlobSetMessage(
+        ConversationSummaryArchiveSchema,
+        archive
+      )
+      blobMessages.push(archiveBlob.buffer)
+      return archiveBlob.blobId
+    })
+
+    return { summaryArchiveBlobIds, blobMessages }
   }
 
   private materializeConversationTurnBlobs(session: SessionRecord): {
@@ -9803,30 +10224,15 @@ ${raw}
       this.emit(conversationId, blobMessage)
     }
     const completedSession = completedTurn.session
-    const completedCtx = this.contextState.getContextRecord(
-      completedSession.conversationId
-    )!
-    const tokenDetails = this.resolveCheckpointTokenDetails(completedSession)
-
-    const checkpoint = this.grpcService.createConversationCheckpointResponse(
+    const checkpoint = this.buildConversationCheckpoint(
+      completedSession,
       completedSession.conversationId,
-      completedSession.model,
-      {
-        messageBlobIds: completedCtx.messageBlobIds,
-        usedTokens: tokenDetails.usedTokens,
-        maxTokens: tokenDetails.maxTokens,
-        workspaceUri: completedSession.projectContext?.rootPath
-          ? `file://${completedSession.projectContext.rootPath}`
-          : undefined,
-        readPaths: Array.from(completedCtx.readPaths),
-        fileStates: Object.fromEntries(completedCtx.fileStates),
-        turns: completedCtx.turns,
-        todos: completedCtx.todos,
-        compactionHistory:
-          this.extractCompactionHistoryForCheckpoint(completedSession),
-      }
+      completedSession.model
     )
-    this.emit(conversationId, checkpoint)
+    for (const blobMessage of checkpoint.blobMessages) {
+      this.emit(conversationId, blobMessage)
+    }
+    this.emit(conversationId, checkpoint.checkpoint)
     this.logger.log("Sent conversationCheckpointUpdate")
     this.emit(conversationId, this.grpcService.createServerHeartbeatResponse())
     this.emit(conversationId, this.grpcService.createAgentTurnEndedResponse())
@@ -10858,14 +11264,15 @@ ${raw}
     }
     const completedSession = completedTurn.session
 
-    this.emit(
+    const checkpoint = this.buildConversationCheckpoint(
+      completedSession,
       conversationId,
-      this.buildConversationCheckpoint(
-        completedSession,
-        conversationId,
-        completedSession.model
-      )
+      completedSession.model
     )
+    for (const blobMessage of checkpoint.blobMessages) {
+      this.emit(conversationId, blobMessage)
+    }
+    this.emit(conversationId, checkpoint.checkpoint)
     this.emit(conversationId, this.grpcService.createServerHeartbeatResponse())
     this.emit(conversationId, this.grpcService.createAgentTurnEndedResponse())
     this.contextState.recordCursorTurnTransition(conversationId, {
@@ -10939,30 +11346,15 @@ ${raw}
       this.emit(session.conversationId, blobMessage)
     }
     const completedSession = completedTurn.session
-    const completedCtx = this.contextState.getContextRecord(
-      completedSession.conversationId
-    )!
-    const tokenDetails = this.resolveCheckpointTokenDetails(completedSession)
-
-    const checkpoint = this.grpcService.createConversationCheckpointResponse(
+    const checkpoint = this.buildConversationCheckpoint(
+      completedSession,
       completedSession.conversationId,
-      completedSession.model,
-      {
-        messageBlobIds: completedCtx.messageBlobIds,
-        usedTokens: tokenDetails.usedTokens,
-        maxTokens: tokenDetails.maxTokens,
-        workspaceUri: completedSession.projectContext?.rootPath
-          ? `file://${completedSession.projectContext.rootPath}`
-          : undefined,
-        readPaths: Array.from(completedCtx.readPaths),
-        fileStates: Object.fromEntries(completedCtx.fileStates),
-        turns: completedCtx.turns,
-        todos: completedCtx.todos,
-        compactionHistory:
-          this.extractCompactionHistoryForCheckpoint(completedSession),
-      }
+      completedSession.model
     )
-    this.emit(session.conversationId, checkpoint)
+    for (const blobMessage of checkpoint.blobMessages) {
+      this.emit(session.conversationId, blobMessage)
+    }
+    this.emit(session.conversationId, checkpoint.checkpoint)
     this.emit(
       session.conversationId,
       this.grpcService.createServerHeartbeatResponse()
@@ -29627,10 +30019,11 @@ ${raw}
         // fresh execId numbering. Frames left on the queue would
         // never be flushed and would block the next turn.
         this.execDispatchSerializer.clearConversation(cid)
-        // Drop any un-flushed per-turn tool_result buffer for this BiDi
-        // attachment too — the partial batch never completed and its
-        // results would otherwise leak into the next attachment's batch.
-        this.dropToolResultBuffer(cid)
+        // A BiDi attachment can close after some parallel tool results arrived
+        // but before every sibling settled. Persist those received results now;
+        // the still-unsettled siblings remain in the active batch for
+        // resumeAction/deadline recovery.
+        this.flushToolResultBufferForTeardown(cid, "bidi teardown")
         // Drop only the parent-turn-stack entries that belong to
         // THIS BiDi attachment. A naïve `delete(cid)` would stomp
         // on a fresh BiDi that registered its own chat-parent
@@ -29688,8 +30081,26 @@ ${raw}
           if (parsed.isAgentControlMessage) {
             // Resume/control requests may arrive first on a retried stream.
             // Bind the stream to conversationId early so subsequent tool results can be matched.
-            if (!conversationId && parsed.conversationId) {
-              conversationId = parsed.conversationId
+            let controlConversationId = parsed.conversationId
+            const controlActionName = parsed.agentControlType || "unknown"
+            if (isUnboundRecoverableControlAction(parsed, conversationId)) {
+              const controlResolution =
+                this.resolveConversationIdForUnboundResumeAction()
+              if (controlResolution.kind === "matched") {
+                controlConversationId = controlResolution.conversationId
+                this.logger.warn(
+                  `Bound unscoped ${controlActionName} to the only recoverable conversation: ${controlConversationId}`
+                )
+              } else {
+                this.logger.warn(
+                  `Received unscoped ${controlActionName} with ${controlResolution.candidateCount} recoverable conversation candidate(s); ending stream without creating a new conversation`
+                )
+                return
+              }
+            }
+
+            if (!conversationId && controlConversationId) {
+              conversationId = controlConversationId
               this.sessionManager.getOrCreateSession(
                 conversationId,
                 this.sanitizeParsedRequestForSession(parsed)
@@ -29713,6 +30124,23 @@ ${raw}
 
             if (conversationId) {
               this.sessionManager.touchSession(conversationId)
+            }
+
+            const restartRecoveryResolution =
+              getRestartRecoveryControlResolution(parsed.agentControlType)
+            if (conversationId && restartRecoveryResolution.resolve) {
+              const shouldEndStream =
+                await this.resolveRestartRecoveryBeforeContinuation(
+                  conversationId,
+                  `control action ${controlActionName}`,
+                  {
+                    emitNotice: restartRecoveryResolution.emitNotice,
+                    endStream: restartRecoveryResolution.endStream,
+                  }
+                )
+              if (shouldEndStream) {
+                return
+              }
             }
 
             // Respond to heartbeat messages with server heartbeat
@@ -29906,6 +30334,16 @@ ${raw}
           // Handle different message types
           // 1. InteractionResponse（客户端回复 InteractionQuery）
           if (parsed.interactionResponse && conversationId) {
+            const shouldEndAfterRecovery =
+              await this.resolveRestartRecoveryBeforeContinuation(
+                conversationId,
+                `interactionResponse id=${parsed.interactionResponse.id}`,
+                { emitNotice: true, endStream: true }
+              )
+            if (shouldEndAfterRecovery) {
+              return
+            }
+
             const { id, resultCase, approved, rawResponse } =
               parsed.interactionResponse
             const hasSession = this.sessionManager.touchSession(conversationId)
@@ -29985,6 +30423,16 @@ ${raw}
 
             this.sessionManager.touchSession(conversationId)
 
+            const shouldEndAfterRecovery =
+              await this.resolveRestartRecoveryBeforeContinuation(
+                conversationId,
+                `tool result ${parsed.toolResults[0]!.toolCallId || "(will match by order)"}`,
+                { emitNotice: true, endStream: true }
+              )
+            if (shouldEndAfterRecovery) {
+              return
+            }
+
             this.logger.log(
               `Received tool result: ${parsed.toolResults[0]!.toolCallId || "(will match by order)"}`
             )
@@ -30054,9 +30502,27 @@ ${raw}
 
             // On first message: establish conversationId for this BiDi stream
             if (isFirstMessage) {
+              if (isUnboundResumeAction(parsed, conversationId)) {
+                const resumeResolution =
+                  this.resolveConversationIdForUnboundResumeAction()
+                if (resumeResolution.kind === "matched") {
+                  conversationId = resumeResolution.conversationId
+                  this.logger.warn(
+                    `Bound unscoped resumeAction to the only recoverable conversation: ${conversationId}`
+                  )
+                } else {
+                  this.logger.warn(
+                    `Received unscoped resumeAction with ${resumeResolution.candidateCount} recoverable conversation candidate(s); ending stream without creating a new conversation`
+                  )
+                  return
+                }
+              }
+
               // Use conversationId from message if present, otherwise generate new one
               conversationId =
-                parsed.conversationId || this.generateConversationId()
+                conversationId ||
+                parsed.conversationId ||
+                this.generateConversationId()
               this.logger.log(
                 `BiDi stream started for conversation: ${conversationId}`
               )
@@ -30160,28 +30626,31 @@ ${raw}
               isFirstMessage = false
             }
 
-            const sessionBeforeRun = this.sessionManager.getSession(
+            if (parsed.isResumeAction) {
+              const shouldEndStream =
+                await this.resolveRestartRecoveryBeforeContinuation(
+                  conversationId!,
+                  "resumeAction",
+                  { emitNotice: true, endStream: true }
+                )
+              if (shouldEndStream) {
+                return
+              }
+            }
+            if (!parsed.isResumeAction) {
+              await this.resolveRestartRecoveryBeforeContinuation(
+                conversationId!,
+                "new user turn"
+              )
+            }
+
+            const sessionAfterRestartRecovery = this.sessionManager.getSession(
               conversationId!
             )
-            if (parsed.isResumeAction && sessionBeforeRun?.restartRecovery) {
-              this.logger.warn(
-                `resumeAction hit restored interrupted state for ${conversationId}`
-              )
-              this.repairInterruptedToolProtocol(
-                sessionBeforeRun,
-                sessionBeforeRun.restartRecovery
-              )
-              await this.emitAgentFinalTextResponse(
-                sessionBeforeRun,
-                sessionBeforeRun.restartRecovery.notice
-              )
-              this.sessionManager.clearRestartRecovery(conversationId!)
-              return
-            }
             if (
               parsed.isResumeAction &&
-              sessionBeforeRun &&
-              this.hasPendingStreamWork(sessionBeforeRun)
+              sessionAfterRestartRecovery &&
+              this.hasPendingStreamWork(sessionAfterRestartRecovery)
             ) {
               // resumeAction is Cursor's reconnect path for tool calls whose
               // ExecServerMessage was already delivered on an earlier stream. Tool
@@ -30214,27 +30683,21 @@ ${raw}
               )
               return
             }
-            if (!parsed.isResumeAction && sessionBeforeRun?.restartRecovery) {
-              this.sessionManager.clearRestartRecovery(conversationId!)
-              this.logger.warn(
-                `Cleared stale restart recovery for ${conversationId} on a new user turn`
-              )
-            }
-            if (!parsed.isResumeAction && sessionBeforeRun) {
+            if (!parsed.isResumeAction && sessionAfterRestartRecovery) {
               this.clearSupersededControlStateForNewUserTurn(
                 conversationId!,
                 streamId
               )
             }
             if (
-              sessionBeforeRun &&
+              sessionAfterRestartRecovery &&
               this.sessionManager.pendingToolCallCount(
-                sessionBeforeRun.conversationId
+                sessionAfterRestartRecovery.conversationId
               ) > 0
             ) {
               const currentPendingIds = Array.from(
                 this.sessionManager.listPendingToolCallIds(
-                  sessionBeforeRun.conversationId
+                  sessionAfterRestartRecovery.conversationId
                 )
               )
               // Only resumeAction is a protocol-level instruction to wait for
@@ -31980,6 +32443,200 @@ ${raw}
   }
 
   private async continueAssistantAfterToolResult(
+    params: AssistantToolContinuationParams
+  ): Promise<void> {
+    if (this.getCurrentParentTurnId(params.conversationId)) {
+      await this.continueAssistantAfterToolResultImpl(params)
+      return
+    }
+
+    await this.runToolContinuationParentTurn(params)
+  }
+
+  private async runToolContinuationParentTurn(
+    params: AssistantToolContinuationParams
+  ): Promise<void> {
+    const { conversationId, streamId, source, toolCallId } = params
+    const controller = this.getLatestController(conversationId)
+    if (!controller) {
+      this.logger.warn(
+        `[turn-integrity] continuing tool result without parent turn scope ` +
+          `conversation=${conversationId} toolCallId=${toolCallId} ` +
+          `reason=no_bidi_controller`
+      )
+      await this.continueAssistantAfterToolResultImpl(params)
+      return
+    }
+
+    const session =
+      this.sessionManager.getSession(conversationId) || params.session
+    const resolvedStreamId =
+      streamId ??
+      this.sessionStream.getStreamRecord(session.conversationId)
+        ?.currentStreamId ??
+      "tool-continuation"
+    const bidiId = BidiId.of(controller.attachment.bidiId)
+    const umbrellaTurnId = this.turnSupervisor.getUmbrellaForBidi(bidiId)
+    const displayName =
+      source === "shell" ? "user:shell-continuation" : "user:tool-continuation"
+
+    let resolveRunner!: (r: TurnTerminalResult) => void
+    const runnerSettle = new Promise<TurnTerminalResult>((resolve) => {
+      resolveRunner = resolve
+    })
+
+    const turnSpawn = this.turnSupervisor.spawn({
+      turnKind: "user",
+      conversationId: ConversationId.of(conversationId),
+      streamId: StreamId.of(resolvedStreamId),
+      bidiId,
+      parentTurnId: umbrellaTurnId,
+      outbound: controller.outbound,
+      buildRunner: () => ({
+        displayName,
+        async run(handle: TurnHandle): Promise<TurnTerminalResult> {
+          const aborted = new Promise<TurnTerminalResult>((resolve) => {
+            const onAbort = () => {
+              const reason = handle.cancellationReason() ?? {
+                kind: "bidi-closed" as const,
+              }
+              resolve({ status: "cancelled", reason })
+            }
+            if (handle.signal.aborted) {
+              onAbort()
+              return
+            }
+            handle.signal.addEventListener("abort", onAbort, { once: true })
+          })
+          return Promise.race([runnerSettle, aborted])
+        },
+      }),
+      onFinalize: (result, handle) => {
+        if (result.status === "completed") {
+          try {
+            this.sessionManager.commitTurn(conversationId, handle.turnId)
+          } catch (commitErr) {
+            this.logger.error(
+              `commitTurn failed for continuation turn=${handle.turnId} ` +
+                `conversation=${conversationId}: ${(commitErr as Error).message}`
+            )
+          }
+          return
+        }
+
+        try {
+          const dropped = this.sessionManager.abortTurn(
+            conversationId,
+            handle.turnId
+          )
+          if (dropped > 0) {
+            this.logger.warn(
+              `abortTurn rewound ${dropped} message(s) on continuation ` +
+                `turn=${handle.turnId} conversation=${conversationId} ` +
+                `(status=${result.status})`
+            )
+          }
+        } catch (abortErr) {
+          this.logger.error(
+            `abortTurn failed for continuation turn=${handle.turnId} ` +
+              `conversation=${conversationId}: ${(abortErr as Error).message}`
+          )
+        }
+      },
+    })
+    const handle = turnSpawn.handle
+
+    let stack = this.parentTurnStackByConversation.get(conversationId)
+    if (!stack) {
+      stack = []
+      this.parentTurnStackByConversation.set(conversationId, stack)
+    }
+    stack.push(handle)
+
+    let popped = false
+    const popOnce = () => {
+      if (popped) return
+      popped = true
+      const s = this.parentTurnStackByConversation.get(conversationId)
+      if (s) {
+        const idx = s.lastIndexOf(handle)
+        if (idx >= 0) s.splice(idx, 1)
+        if (s.length === 0) {
+          this.parentTurnStackByConversation.delete(conversationId)
+        }
+      }
+    }
+
+    const staleTurnId =
+      this.sessionManager.openTurnIdForConversation(conversationId)
+    if (staleTurnId && staleTurnId !== handle.turnId) {
+      this.logger.warn(
+        `Awaiting stale chat-parent turn ${staleTurnId} terminal before ` +
+          `begin continuation ${handle.turnId} on ${conversationId}`
+      )
+      try {
+        await this.turnCleanupCoordinator.cleanup({
+          kind: "turn-superseded",
+          oldTurnId: staleTurnId,
+          newTurnId: handle.turnId,
+          conversationId: ConversationId.of(conversationId),
+        })
+      } catch (err) {
+        this.logger.error(
+          `cleanup(turn-superseded) threw for stale turn ${staleTurnId}: ${(err as Error).message}`
+        )
+      }
+    }
+    this.sessionManager.beginTurn(conversationId, handle.turnId)
+
+    let bodyFailed = false
+    let bodyError: unknown
+    try {
+      await this.runWithTurnContext(handle, () =>
+        this.continueAssistantAfterToolResultImpl(params)
+      )
+      if (handle.signal.aborted) {
+        popOnce()
+        resolveRunner({
+          status: "cancelled",
+          reason: handle.cancellationReason() ?? {
+            kind: "bidi-closed" as const,
+          },
+        })
+        try {
+          await turnSpawn.awaitTerminal
+        } catch {
+          /* terminal never rejects */
+        }
+        return
+      }
+      popOnce()
+      resolveRunner({ status: "completed", summary: "" })
+      try {
+        await turnSpawn.awaitTerminal
+      } catch {
+        /* terminal never rejects */
+      }
+    } catch (err) {
+      bodyFailed = true
+      bodyError = err
+    }
+
+    if (bodyFailed) {
+      popOnce()
+      const e =
+        bodyError instanceof Error ? bodyError : new Error(String(bodyError))
+      resolveRunner({ status: "failed", error: e })
+      try {
+        await turnSpawn.awaitTerminal
+      } catch {
+        /* terminal never rejects */
+      }
+      throw bodyError
+    }
+  }
+
+  private async continueAssistantAfterToolResultImpl(
     params: AssistantToolContinuationParams
   ): Promise<void> {
     const {

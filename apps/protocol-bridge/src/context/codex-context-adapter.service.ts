@@ -15,6 +15,7 @@ import {
 import { repairOrphanedToolPairs } from "./orphan-tool-pair-repair"
 import {
   isAttachmentRecord,
+  isCompactSummaryRecord,
   isContextCollapseSummaryRecord,
   isHookResultRecord,
   isMessageRecord,
@@ -226,11 +227,14 @@ export class CodexContextAdapterService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      compactInputMaxTokens?: number
+      compactInputSystemPromptTokens?: number
       autoCompactTokenLimit?: number
       predictiveCompactTokenLimit?: number
       projectedTokenOverride?: number
       strategy?: "auto" | "manual" | "reactive"
       integrityMode?: "strict-adjacent" | "global"
+      pendingToolUseIds?: Iterable<string>
       referenceContextItem: CodexReferenceContextItem
       injectionMode: "pre_turn" | "mid_turn"
       hookUserMessage?: string
@@ -274,17 +278,25 @@ export class CodexContextAdapterService {
       continuityGuard
     )
     options.signal.throwIfAborted()
-    const sourceRecords = [
-      ...candidate.archivedRecords,
-      ...candidate.retainedRecords,
-    ]
-    const sourceMessages = this.recordsToMessages(sourceRecords)
-    const compactMessages = this.projectCodexMessages(state, sourceMessages, {
-      maxTokens: options.maxTokens,
-      systemPromptTokens: options.systemPromptTokens,
-      truncationPolicy: options.referenceContextItem.truncationPolicy,
-      replacementRecords: sourceRecords,
-    })
+    const compactMessages = this.projectRemoteCompactInputMessages(
+      state,
+      candidate,
+      {
+        maxTokens: options.compactInputMaxTokens ?? options.maxTokens,
+        systemPromptTokens:
+          options.compactInputSystemPromptTokens ?? options.systemPromptTokens,
+        truncationPolicy: options.referenceContextItem.truncationPolicy,
+        pendingToolUseIds: options.pendingToolUseIds,
+      }
+    )
+    if (compactMessages.length === 0) {
+      throw new Error(
+        `Codex compact projection produced empty input history ` +
+          `conversation=${options.meta?.conversationId || options.referenceContextItem.conversationId || "(unknown)"} ` +
+          `archived=${candidate.archivedRecords.length} retained=${candidate.retainedRecords.length} ` +
+          `sourceTokens=${candidate.sourceTokenCount}`
+      )
+    }
     const compactResult = await options.remoteCompactProvider({
       messages: compactMessages,
       maxTokens: candidate.summaryBudget,
@@ -299,7 +311,13 @@ export class CodexContextAdapterService {
       options.referenceContextItem
     )
     if (replacementHistory.length === 0) {
-      throw new Error("Codex remote compact returned empty replacement history")
+      throw new Error(
+        `Codex compact returned empty replacement history ` +
+          `conversation=${options.meta?.conversationId || options.referenceContextItem.conversationId || "(unknown)"} ` +
+          `archived=${candidate.archivedRecords.length} retained=${candidate.retainedRecords.length} ` +
+          `rawItems=${compactResult.replacementHistory.length} ` +
+          `rawTypes=${this.summarizeReplacementHistoryItems(compactResult.replacementHistory)}`
+      )
     }
 
     const summary = this.buildReplacementSummary(replacementHistory)
@@ -313,16 +331,13 @@ export class CodexContextAdapterService {
         meta: options.meta,
       }
     )
-    const anchorRecordId =
-      candidate.retainedRecords[candidate.retainedRecords.length - 1]?.id ||
-      candidate.archivedRecords[candidate.archivedRecords.length - 1]?.id
     plan.commit.codexReplacementHistory = this.installReplacementHistoryWindow(
       state,
       {
         conversationId: options.referenceContextItem.conversationId,
         compactionId: plan.commit.id,
         injectionMode: options.injectionMode,
-        anchorRecordId,
+        anchorRecordId: `compact_summary_${plan.commit.id}`,
         anchorRecordCount: state.records.length,
         summary,
         items: replacementHistory,
@@ -358,10 +373,13 @@ export class CodexContextAdapterService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      compactInputMaxTokens?: number
+      compactInputSystemPromptTokens?: number
       autoCompactTokenLimit?: number
       predictiveCompactTokenLimit?: number
       strategy?: "auto" | "manual" | "reactive"
       integrityMode?: "strict-adjacent" | "global"
+      pendingToolUseIds?: Iterable<string>
       referenceContextItem: CodexReferenceContextItem
       remoteCompactProvider: CodexRemoteCompactProvider
       signal: AbortSignal
@@ -382,17 +400,25 @@ export class CodexContextAdapterService {
     )
     if (!candidate) return undefined
 
-    const sourceRecords = [
-      ...candidate.archivedRecords,
-      ...candidate.retainedRecords,
-    ]
-    const sourceMessages = this.recordsToMessages(sourceRecords)
-    const compactMessages = this.projectCodexMessages(state, sourceMessages, {
-      maxTokens: options.maxTokens,
-      systemPromptTokens: options.systemPromptTokens,
-      truncationPolicy: options.referenceContextItem.truncationPolicy,
-      replacementRecords: sourceRecords,
-    })
+    const compactMessages = this.projectRemoteCompactInputMessages(
+      state,
+      candidate,
+      {
+        maxTokens: options.compactInputMaxTokens ?? options.maxTokens,
+        systemPromptTokens:
+          options.compactInputSystemPromptTokens ?? options.systemPromptTokens,
+        truncationPolicy: options.referenceContextItem.truncationPolicy,
+        pendingToolUseIds: options.pendingToolUseIds,
+      }
+    )
+    if (compactMessages.length === 0) {
+      throw new Error(
+        `Codex collapse projection produced empty input history ` +
+          `conversation=${options.referenceContextItem.conversationId || "(unknown)"} ` +
+          `archived=${candidate.archivedRecords.length} retained=${candidate.retainedRecords.length} ` +
+          `sourceTokens=${candidate.sourceTokenCount}`
+      )
+    }
     const compactResult = await options.remoteCompactProvider({
       messages: compactMessages,
       maxTokens: candidate.summaryBudget,
@@ -408,7 +434,11 @@ export class CodexContextAdapterService {
     )
     if (replacementHistory.length === 0) {
       throw new Error(
-        "Codex remote collapse returned empty replacement history"
+        `Codex collapse returned empty replacement history ` +
+          `conversation=${options.referenceContextItem.conversationId || "(unknown)"} ` +
+          `archived=${candidate.archivedRecords.length} retained=${candidate.retainedRecords.length} ` +
+          `rawItems=${compactResult.replacementHistory.length} ` +
+          `rawTypes=${this.summarizeReplacementHistoryItems(compactResult.replacementHistory)}`
       )
     }
 
@@ -424,6 +454,7 @@ export class CodexContextAdapterService {
         conversationId: options.referenceContextItem.conversationId,
         compactionId: commit.id,
         injectionMode: "pre_turn",
+        anchorRecordId: commit.summaryRecordId,
         anchorRecordCount: state.records.length,
         summary,
         items: replacementHistory,
@@ -448,10 +479,96 @@ export class CodexContextAdapterService {
       truncationPolicy?: CodexTruncationPolicy
       allowHardFit?: boolean
       replacementRecords?: readonly ContextTranscriptRecord[]
+      useActiveReplacementHistory?: boolean
+      includeLiveMetaMessages?: boolean
     }
   ): UnifiedMessage[] {
     return this.projectCodexMessagesWithMetadata(state, baseMessages, options)
       .messages
+  }
+
+  private projectRemoteCompactInputMessages(
+    state: ContextConversationState,
+    candidate: ContextCompactionCandidate,
+    options: {
+      maxTokens: number
+      systemPromptTokens: number
+      pendingToolUseIds?: Iterable<string>
+      truncationPolicy?: CodexTruncationPolicy
+    }
+  ): UnifiedMessage[] {
+    return this.projectCompactInputMessages(
+      state,
+      this.recordsToMessages(candidate.archivedRecords),
+      options
+    )
+  }
+
+  private projectCompactInputMessages(
+    state: ContextConversationState,
+    baseMessages: UnifiedMessage[],
+    options: {
+      maxTokens: number
+      systemPromptTokens: number
+      pendingToolUseIds?: Iterable<string>
+      truncationPolicy?: CodexTruncationPolicy
+    }
+  ): UnifiedMessage[] {
+    const codex = this.ensureState(state)
+    const truncationPolicy = options.truncationPolicy || codex.truncationPolicy
+    const pendingToolUseIds = new Set(options.pendingToolUseIds ?? [])
+    let messages = repairOrphanedToolPairs(
+      this.prepareMessagesForCodex(baseMessages, truncationPolicy),
+      {
+        pendingToolUseIds,
+      }
+    )
+    const hardMaxTokens = Math.max(
+      256,
+      options.maxTokens - options.systemPromptTokens
+    )
+    const beforeHardFitTokens = this.tokenCounter.countMessages(messages)
+    if (beforeHardFitTokens <= hardMaxTokens) {
+      return messages
+    }
+
+    const fitted = this.extractCompactInputSuffix(
+      messages,
+      hardMaxTokens,
+      pendingToolUseIds
+    )
+    const afterHardFitTokens = this.tokenCounter.countMessages(fitted)
+    this.logger.warn(
+      `[codex-compact-input] fitted archived compact input ` +
+        `messages=${messages.length}->${fitted.length} ` +
+        `tokens=${beforeHardFitTokens}->${afterHardFitTokens} ` +
+        `budget=${hardMaxTokens}`
+    )
+    messages = fitted
+    return messages
+  }
+
+  private extractCompactInputSuffix(
+    messages: UnifiedMessage[],
+    hardMaxTokens: number,
+    pendingToolUseIds?: Iterable<string>
+  ): UnifiedMessage[] {
+    const startIndex = this.tokenCounter.findTruncationIndex(
+      messages,
+      hardMaxTokens
+    )
+    for (let index = startIndex; index <= messages.length; index++) {
+      const candidate = repairOrphanedToolPairs(messages.slice(index), {
+        pendingToolUseIds,
+      })
+      if (
+        candidate.length > 0 &&
+        this.tokenCounter.countMessages(candidate) <= hardMaxTokens
+      ) {
+        return candidate
+      }
+    }
+    return []
   }
 
   projectCodexMessagesWithMetadata(
@@ -464,13 +581,18 @@ export class CodexContextAdapterService {
       truncationPolicy?: CodexTruncationPolicy
       allowHardFit?: boolean
       replacementRecords?: readonly ContextTranscriptRecord[]
+      useActiveReplacementHistory?: boolean
+      includeLiveMetaMessages?: boolean
     }
   ): CodexProjectedMessagesResult {
     const codex = this.ensureState(state)
     const truncationPolicy = options.truncationPolicy || codex.truncationPolicy
     let messages = baseMessages
     let protectedPrefixCount = 0
-    const replacement = codex.activeWindow?.replacementHistory
+    const replacement =
+      options.useActiveReplacementHistory === false
+        ? undefined
+        : codex.activeWindow?.replacementHistory
     if (replacement?.items?.length) {
       const replacementMessages = this.replacementHistoryToMessages(
         replacement.items
@@ -489,11 +611,14 @@ export class CodexContextAdapterService {
       }
     }
 
+    const preparedMessages = this.prepareMessagesForCodex(
+      messages,
+      truncationPolicy
+    )
     messages = repairOrphanedToolPairs(
-      this.projectAppendOnlyLiveMetaMessages(
-        codex,
-        this.prepareMessagesForCodex(messages, truncationPolicy)
-      ),
+      options.includeLiveMetaMessages === false
+        ? preparedMessages
+        : this.projectAppendOnlyLiveMetaMessages(codex, preparedMessages),
       {
         pendingToolUseIds: options.pendingToolUseIds,
       }
@@ -582,90 +707,48 @@ export class CodexContextAdapterService {
 
   private processRemoteReplacementHistory(
     items: CodexReplacementHistoryItem[],
-    injectionMode: "pre_turn" | "mid_turn",
-    referenceContextItem: CodexReferenceContextItem
+    _injectionMode: "pre_turn" | "mid_turn",
+    _referenceContextItem: CodexReferenceContextItem
   ): CodexReplacementHistoryItem[] {
     const filtered = items.filter((item) =>
       this.shouldKeepRemoteHistoryItem(item)
     )
-    if (injectionMode !== "mid_turn") {
-      return filtered
-    }
-    const contextItem = this.referenceContextAsMessage(referenceContextItem)
-    const insertionIndex = this.findLastRealUserOrSummaryIndex(filtered)
-    if (insertionIndex < 0) {
-      return [...filtered, contextItem]
-    }
-    return [
-      ...filtered.slice(0, insertionIndex),
-      contextItem,
-      ...filtered.slice(insertionIndex),
-    ]
+    return filtered
   }
 
   private shouldKeepRemoteHistoryItem(
     item: CodexReplacementHistoryItem
   ): boolean {
-    if (item.type === "compaction") return true
+    if (item.type === "compaction" || item.type === "context_compaction") {
+      return true
+    }
+    if (item.type === "compaction_trigger") return false
     const role = typeof item.role === "string" ? item.role : undefined
     if (role === "developer" || role === "system") return false
     if (role === "assistant") return true
     if (role !== "user") return false
-    return this.extractResponseItemText(item).trim().length > 0
+    const text = this.extractResponseItemText(item).trim()
+    if (!text) return false
+    return !this.isSyntheticCodexHistoryText(text)
   }
 
-  private referenceContextAsMessage(
-    reference: CodexReferenceContextItem
-  ): CodexReplacementHistoryItem {
-    const lines = [
-      "Current Codex turn context:",
-      reference.model ? `model: ${reference.model}` : undefined,
-      reference.conversationId
-        ? `conversation_id: ${reference.conversationId}`
-        : undefined,
-      reference.contextTokenLimit
-        ? `context_window: ${reference.contextTokenLimit}`
-        : undefined,
-      reference.serviceTier
-        ? `service_tier: ${reference.serviceTier}`
-        : undefined,
-      reference.systemPromptHash
-        ? `system_prompt_hash: ${reference.systemPromptHash}`
-        : undefined,
-      reference.toolSpecHash
-        ? `tool_spec_hash: ${reference.toolSpecHash}`
-        : undefined,
-    ].filter((line): line is string => !!line)
-    return {
-      type: "message",
-      role: "user",
-      content: [{ type: "input_text", text: lines.join("\n") }],
-    }
+  private isCodexReferenceContextText(text: string): boolean {
+    return text.trimStart().startsWith("Current Codex turn context:")
   }
 
-  private findLastRealUserOrSummaryIndex(
-    items: CodexReplacementHistoryItem[]
-  ): number {
-    let lastUserOrSummaryIndex: number | undefined
-    let lastCompactionIndex: number | undefined
-    for (let index = items.length - 1; index >= 0; index--) {
-      const item = items[index]!
-      if (item.type === "compaction") {
-        lastCompactionIndex ??= index
-        continue
-      }
-      if (item.role !== "user") continue
-      lastUserOrSummaryIndex ??= index
-      if (!this.isSummaryHistoryItem(item)) {
-        return index
-      }
-    }
-    return lastUserOrSummaryIndex ?? lastCompactionIndex ?? -1
-  }
-
-  private isSummaryHistoryItem(item: CodexReplacementHistoryItem): boolean {
-    return this.extractResponseItemText(item).startsWith(
-      `${CODEX_SUMMARY_PREFIX}\n`
+  private isSyntheticCodexHistoryText(text: string): boolean {
+    const trimmed = text.trimStart()
+    return (
+      this.isCodexReferenceContextText(trimmed) ||
+      /^(?:\[Context (?:attachment|summary|collapse|attachment removed)|\[Result of an earlier tool call|\[tool_result stored\])/i.test(
+        trimmed
+      ) ||
+      /^# AGENTS\.md instructions\b/i.test(trimmed) ||
+      /^<environment_context>/i.test(trimmed) ||
+      /^<turn_aborted>/i.test(trimmed) ||
+      /^Grep completed:\s*pattern=/i.test(trimmed) ||
+      /\bDocumentId:\s*tool_result:/i.test(trimmed) ||
+      /\/\.agent-vibes\/tool-results\//i.test(trimmed)
     )
   }
 
@@ -674,7 +757,7 @@ export class CodexContextAdapterService {
   ): string {
     const body =
       items
-        .map((item) => this.extractResponseItemText(item))
+        .map((item) => this.extractReplacementSummaryText(item))
         .filter((text) => text.trim().length > 0)
         .join("\n\n")
         .trim() || "(no summary available)"
@@ -687,11 +770,33 @@ export class CodexContextAdapterService {
     ].join("\n")
   }
 
+  private summarizeReplacementHistoryItems(
+    items: CodexReplacementHistoryItem[]
+  ): string {
+    if (items.length === 0) return "none"
+    const counts = new Map<string, number>()
+    for (const item of items) {
+      const type =
+        typeof item.type === "string" && item.type.trim()
+          ? item.type.trim()
+          : "unknown"
+      const role =
+        typeof item.role === "string" && item.role.trim()
+          ? item.role.trim()
+          : "none"
+      const key = `${type}:${role}`
+      counts.set(key, (counts.get(key) || 0) + 1)
+    }
+    return Array.from(counts.entries())
+      .map(([key, count]) => `${key}:${count}`)
+      .join(",")
+  }
+
   private replacementHistoryToMessages(
     items: CodexReplacementHistoryItem[]
   ): UnifiedMessage[] {
     return items.flatMap((item) => {
-      if (item.type === "compaction") {
+      if (item.type === "compaction" || item.type === "context_compaction") {
         const rawBlock: CodexRawResponseItemBlock = {
           type: CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
           item: this.cloneReplacementItem(item),
@@ -706,8 +811,19 @@ export class CodexContextAdapterService {
       const role = item.role === "assistant" ? "assistant" : "user"
       const text = this.extractResponseItemText(item).trim()
       if (!text) return []
+      if (this.isSyntheticCodexHistoryText(text)) return []
       return [{ role, content: text } satisfies UnifiedMessage]
     })
+  }
+
+  private extractReplacementSummaryText(
+    item: CodexReplacementHistoryItem
+  ): string {
+    if (item.type === "compaction" || item.type === "context_compaction") {
+      return ""
+    }
+    const text = this.extractResponseItemText(item).trim()
+    return this.isSyntheticCodexHistoryText(text) ? "" : text
   }
 
   private projectAppendOnlyLiveMetaMessages(
@@ -947,7 +1063,7 @@ export class CodexContextAdapterService {
   ): ContextTranscriptRecord[] {
     if (!anchorRecordId) return []
     const anchorIndex = records.findIndex(
-      (record) => isMessageRecord(record) && record.id === anchorRecordId
+      (record) => record.id === anchorRecordId
     )
     if (anchorIndex >= 0) return records.slice(anchorIndex + 1)
 
@@ -955,7 +1071,7 @@ export class CodexContextAdapterService {
     const lastRecord = records[records.length - 1]
     if (!firstRecord || !lastRecord) return []
     const fullAnchorIndex = fullRecords.findIndex(
-      (record) => isMessageRecord(record) && record.id === anchorRecordId
+      (record) => record.id === anchorRecordId
     )
     const fullFirstIndex = fullRecords.findIndex(
       (record) => record.id === firstRecord.id
@@ -977,7 +1093,9 @@ export class CodexContextAdapterService {
     return records
       .filter(
         (record) =>
-          isMessageRecord(record) || isContextCollapseSummaryRecord(record)
+          isMessageRecord(record) ||
+          isContextCollapseSummaryRecord(record) ||
+          isCompactSummaryRecord(record)
       )
       .map((record) => ({
         role: record.role,
@@ -992,7 +1110,11 @@ export class CodexContextAdapterService {
   ): UnifiedMessage[] {
     const lastUserInputIndex = this.findLastUserInputIndex(records)
     return records.flatMap((record, index) => {
-      if (isMessageRecord(record) || isContextCollapseSummaryRecord(record)) {
+      if (
+        isMessageRecord(record) ||
+        isCompactSummaryRecord(record) ||
+        isContextCollapseSummaryRecord(record)
+      ) {
         return [
           {
             role: record.role,

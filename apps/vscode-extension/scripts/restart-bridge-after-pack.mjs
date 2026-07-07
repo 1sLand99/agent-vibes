@@ -39,6 +39,8 @@ const PREVIOUS_LOG_FILE = path.join(
   "agent-vibes-bridge.previous.log"
 )
 const STARTUP_HEALTH_TIMEOUT_MS = 45000
+const RUNTIME_ACTIVITY_TIMEOUT_MS = 3000
+const AGENT_VIBES_EXTENSION_LOG_SUFFIX = "Agent Vibes.log"
 
 function stripJsonComments(input) {
   return input
@@ -224,6 +226,138 @@ function listBridgePids() {
   return [...pids]
 }
 
+function listCursorAgentVibesExtensionHostPids() {
+  if (process.platform === "win32") return []
+
+  try {
+    const psOutput = execFileSync("ps", ["-axo", "pid=,command="], {
+      encoding: "utf-8",
+    })
+    return psOutput
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .flatMap((line) => {
+        const match = line.match(/^(\d+)\s+(.*)$/)
+        if (!match) return []
+        const pid = Number.parseInt(match[1], 10)
+        const command = match[2] || ""
+        if (
+          Number.isFinite(pid) &&
+          command.includes("extension-host") &&
+          command.includes("agent-vibes")
+        ) {
+          return [pid]
+        }
+        return []
+      })
+  } catch {
+    return []
+  }
+}
+
+function getCursorLogsDir() {
+  if (process.platform === "darwin") {
+    return path.join(
+      os.homedir(),
+      "Library",
+      "Application Support",
+      "Cursor",
+      "logs"
+    )
+  }
+  if (process.platform === "win32") {
+    const appData =
+      process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming")
+    return path.join(appData, "Cursor", "logs")
+  }
+  return path.join(os.homedir(), ".config", "Cursor", "logs")
+}
+
+function findLatestAgentVibesExtensionLog() {
+  const logsDir = getCursorLogsDir()
+  if (!fs.existsSync(logsDir)) return null
+
+  const stack = [logsDir]
+  let latest = null
+  while (stack.length > 0) {
+    const dir = stack.pop()
+    if (!dir) continue
+    let entries
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      const entryPath = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        stack.push(entryPath)
+        continue
+      }
+      if (
+        !entry.isFile() ||
+        !entry.name.endsWith(AGENT_VIBES_EXTENSION_LOG_SUFFIX)
+      ) {
+        continue
+      }
+      let stat
+      try {
+        stat = fs.statSync(entryPath)
+      } catch {
+        continue
+      }
+      if (!latest || stat.mtimeMs > latest.mtimeMs) {
+        latest = { path: entryPath, mtimeMs: stat.mtimeMs }
+      }
+    }
+  }
+  return latest?.path || null
+}
+
+function detectLoadedExtensionVersionFromLog(logPath) {
+  if (!logPath || !fs.existsSync(logPath)) return null
+  try {
+    const content = fs.readFileSync(logPath, "utf-8")
+    const escapedId = `${publisher}.${extensionName}`.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&"
+    )
+    const match = content.match(
+      new RegExp(`${escapedId}-([^/\\\\\\s]+)[/\\\\]bridge`)
+    )
+    return match?.[1] || null
+  } catch {
+    return null
+  }
+}
+
+function warnIfCursorWindowsNeedReload() {
+  const hostPids = listCursorAgentVibesExtensionHostPids()
+  if (hostPids.length > 0) {
+    console.warn(
+      `[restart:bridge] Cursor Agent Vibes extension host(s) still running: ${hostPids.join(", ")}`
+    )
+  }
+
+  const latestLog = findLatestAgentVibesExtensionLog()
+  const loadedVersion = detectLoadedExtensionVersionFromLog(latestLog)
+  if (loadedVersion && loadedVersion !== version) {
+    console.warn(
+      `[restart:bridge] Latest Agent Vibes extension log loaded version ${loadedVersion}, but the installed package is ${version}. ` +
+        "Reload or quit Cursor before testing; otherwise the bridge binary can be new while UI commands still run old extension code."
+    )
+    console.warn(`[restart:bridge] Latest extension log: ${latestLog}`)
+    return
+  }
+
+  if (hostPids.length > 0) {
+    console.warn(
+      '[restart:bridge] VSIX install does not reload open Cursor windows. Run "Developer: Reload Window" before testing extension UI or command changes.'
+    )
+  }
+}
+
 function isAlive(pid) {
   try {
     process.kill(pid, 0)
@@ -231,6 +365,128 @@ function isAlive(pid) {
   } catch {
     return false
   }
+}
+
+function requestBridgeJson(port, caCertPath, requestPath, timeoutMs) {
+  const ca = fs.existsSync(caCertPath) ? fs.readFileSync(caCertPath) : undefined
+
+  return new Promise((resolve) => {
+    const req = https.get(
+      {
+        hostname: "localhost",
+        port,
+        path: requestPath,
+        method: "GET",
+        ca,
+        rejectUnauthorized: !!ca,
+      },
+      (res) => {
+        const chunks = []
+        res.on("data", (chunk) => chunks.push(chunk))
+        res.on("end", () => {
+          const body = Buffer.concat(chunks).toString("utf-8")
+          if (res.statusCode !== 200) {
+            resolve({
+              ok: false,
+              statusCode: res.statusCode,
+              error: `HTTP ${res.statusCode}`,
+              body,
+            })
+            return
+          }
+          try {
+            resolve({
+              ok: true,
+              statusCode: res.statusCode,
+              value: JSON.parse(body),
+            })
+          } catch (error) {
+            resolve({
+              ok: false,
+              statusCode: res.statusCode,
+              error: `invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+              body,
+            })
+          }
+        })
+      }
+    )
+
+    req.on("error", (error) => {
+      resolve({
+        ok: false,
+        code:
+          error && typeof error === "object" && "code" in error
+            ? String(error.code)
+            : undefined,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    })
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`timed out after ${timeoutMs}ms`))
+    })
+  })
+}
+
+function formatBusyRuntimeSession(session) {
+  return [
+    session.conversationId,
+    `model=${session.model || "(unknown)"}`,
+    `activeTurn=${session.activeTurn === true}`,
+    `backendStreams=${Number(session.activeBackendStreams) || 0}`,
+    `pendingToolCalls=${Number(session.pendingToolCalls) || 0}`,
+    `pendingInteractionQueries=${Number(session.pendingInteractionQueries) || 0}`,
+    `deferredContinuations=${Number(session.deferredControlContinuations) || 0}`,
+  ].join(" ")
+}
+
+async function assertSafeToRestartBridge(port, caCertPath) {
+  const result = await requestBridgeJson(
+    port,
+    caCertPath,
+    "/api/context/runtime",
+    RUNTIME_ACTIVITY_TIMEOUT_MS
+  )
+
+  if (!result.ok) {
+    const errorText = result.error || "unknown error"
+    if (result.code === "ECONNREFUSED" || errorText.includes("ECONNREFUSED")) {
+      console.log(
+        "[restart:bridge] No running bridge answered the runtime activity check"
+      )
+      return
+    }
+    throw new Error(
+      `Cannot verify bridge runtime activity before restart (${errorText}); refusing to interrupt unknown Cursor Agent state.`
+    )
+  }
+
+  const snapshot = result.value || {}
+  const sessions = Array.isArray(snapshot.sessions) ? snapshot.sessions : []
+  const busySessions = sessions.filter((session) => session?.busy === true)
+
+  if (
+    snapshot.canRestartWithoutInterruptingRuns !== true ||
+    busySessions.length > 0
+  ) {
+    const details = busySessions.map(formatBusyRuntimeSession).join("; ")
+    throw new Error(
+      `Refusing to restart bridge because ${busySessions.length} active Cursor Agent session(s) would be interrupted.` +
+        (details ? ` ${details}` : "")
+    )
+  }
+
+  const recoverySessionCount = Number(snapshot.recoverySessionCount) || 0
+  if (recoverySessionCount > 0) {
+    console.warn(
+      `[restart:bridge] ${recoverySessionCount} session(s) have restart recovery state; restart is allowed because no live work is active`
+    )
+  }
+
+  console.log(
+    `[restart:bridge] Runtime activity check passed: sessions=${sessions.length}, busy=0`
+  )
 }
 
 async function stopExistingBridge() {
@@ -333,6 +589,7 @@ async function main() {
 
   const { env, port, dataDir, caCertPath } = resolveConfig()
   fs.mkdirSync(env.AGENT_VIBES_LOG_DIR, { recursive: true })
+  await assertSafeToRestartBridge(port, caCertPath)
   await stopExistingBridge()
   rotateLogFile()
 
@@ -358,6 +615,7 @@ async function main() {
       `[restart:bridge] Bridge restarted successfully on https://localhost:${port} ` +
         `(dataDir=${dataDir}, trace=${env.CURSOR_PROTOCOL_TRACE_FILE})`
     )
+    warnIfCursorWindowsNeedReload()
     return
   }
 

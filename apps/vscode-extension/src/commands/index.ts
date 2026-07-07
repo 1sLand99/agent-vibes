@@ -905,7 +905,7 @@ export function registerCommands(
         const startLabel = t("cacheClear.action.startBridge") || "Start Bridge"
         const choice = await vscode.window.showInformationMessage(
           t("cacheClear.bridgeNotRunning") ||
-            "Agent Vibes bridge is not running. Start it first to clear the cache.",
+            "Agent Vibes bridge is not running. Start it before resetting sessions.",
           startLabel
         )
         if (choice === startLabel) {
@@ -914,10 +914,10 @@ export function registerCommands(
         return
       }
 
-      const confirmLabel = t("cacheClear.action.confirm") || "Clear Cache"
+      const confirmLabel = t("cacheClear.action.confirm") || "Reset Sessions"
       const confirmed = await vscode.window.showInformationMessage(
         t("cacheClear.confirm") ||
-          "Clear all bridge-managed session state? This wipes every conversation transcript, tool-call ledger entry, turn audit log, file-state snapshot, todo list, and on-disk tool-result spool. In-flight conversations will be aborted.",
+          "Reset all bridge-managed Cursor sessions and reload the Cursor window? Existing Cursor chats will no longer resume through Agent Vibes. Running conversations must finish first; start a new Cursor chat after reset.",
         confirmLabel
       )
       if (confirmed !== confirmLabel) {
@@ -950,22 +950,22 @@ export function registerCommands(
         const loaded = result?.clearedLoadedSessions ?? 0
         const persisted = result?.clearedPersistedSessions ?? 0
         const dirs = result?.clearedToolResultDirs ?? 0
+        let message: string
         if (loaded === 0 && persisted === 0 && dirs === 0) {
-          vscode.window.showInformationMessage(
+          message =
             t("cacheClear.successZero") ||
-              "Cache was already empty — nothing to clear."
-          )
-          return
-        }
-        vscode.window.showInformationMessage(
-          tFmt("cacheClear.success", {
+            "No bridge-managed sessions were present. Reloading Cursor window to clear the current chat surface."
+        } else {
+          message = tFmt("cacheClear.success", {
             loaded: String(loaded),
             persisted: String(persisted),
             dirs: String(dirs),
           })
-        )
+        }
+        vscode.window.showInformationMessage(message)
+        await vscode.commands.executeCommand("workbench.action.reloadWindow")
       } catch (err) {
-        logger.error("Clear cache failed", err)
+        logger.error("Session reset failed", err)
         vscode.window.showErrorMessage(
           tFmt("cacheClear.failed", {
             error: err instanceof Error ? err.message : String(err),

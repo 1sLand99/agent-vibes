@@ -334,13 +334,14 @@ export class ContextStateService {
   }
 
   /**
-   * Step 4 终结: addMessage variant that returns the v2 message_seq
+   * Step 4 final: addMessage variant that returns the v2 message_seq
    * (real append-only sequence id from session_messages SQLite table)
-   * alongside the v1 record id. Used by callers that need the seq to
-   * pair with a same-txn ToolCallLedger.open / .close.
+   * alongside the v1 record id. Assistant tool_use blocks open their
+   * ledger entry in the same transaction; user tool_result blocks close
+   * through MessageStore.appendToolResultBlock.
    *
    * Internally runs messageStore.runInTransaction so the v2 row +
-   * ledger pair land atomically; the v1 SessionRecord.messages array
+   * ledger pair lands atomically; the v1 SessionRecord.messages array
    * stays in sync as a pure in-memory mirror for hot-path reads.
    */
   appendMessageWithSeq(
@@ -349,7 +350,6 @@ export class ContextStateService {
     contentMaybe?: MessageContent,
     opts?: {
       ledgerOpen?: { toolUseId: string; toolName: string; turnId: TurnId }
-      ledgerClose?: { toolUseId: string }
     }
   ): { recordId: string; messageSeq: number } | undefined {
     const session = this.sessionLifecycle.getSession(conversationId)
@@ -403,29 +403,56 @@ export class ContextStateService {
           // Multi-block assistant message: append each block as its
           // own v2 row but stamp them with the same anthropic
           // message_id so split-sibling merge at send time still
-          // groups them. Take the first block's seq as the canonical
-          // messageSeq returned; ledger.open is bound to that seq.
+          // groups them. Every assistant tool_use opens a ledger row in
+          // the same transaction as its message row; callers may supply a
+          // real parent turn id, otherwise the conversation-scoped ctx turn
+          // keeps restart recovery addressable.
           for (let i = 0; i < blocks.length; i++) {
             const block = blocks[i]
             if (!block) continue
             if (block.type === "tool_result" || block.type === "cache_edits") {
               continue
             }
+            const explicitLedgerOpen =
+              opts?.ledgerOpen &&
+              block.type === "tool_use" &&
+              opts.ledgerOpen.toolUseId === block.id
+                ? opts.ledgerOpen
+                : undefined
+            const turnId =
+              explicitLedgerOpen?.turnId || this.resolveTurnIdForCid(cid)
             const result = this.messageStore.appendAssistantBlock(txn, block, {
-              turnId: this.resolveTurnIdForCid(cid),
+              turnId,
               messageId: message.message.id,
             })
             if (i === 0) messageSeq = result.seq
+            if (block.type === "tool_use") {
+              this.toolCallLedger.open(txn, {
+                toolUseId: block.id,
+                toolName: block.name ?? "unknown",
+                turnId,
+                openMessageSeq: result.seq,
+              })
+              if (!explicitLedgerOpen) {
+                this.logger.warn(
+                  `[tool-ledger-integrity] auto-opened missing ledger entry ` +
+                    `conversation=${conversationId} toolUseId=${block.id} ` +
+                    `toolName=${block.name ?? "unknown"} turnId=${turnId} ` +
+                    `messageSeq=${result.seq} reason=assistant_tool_use_without_explicit_ledger`
+                )
+              }
+            }
           }
         } else {
           // user message — single envelope (may contain tool_result blocks)
           for (const block of blocks) {
             if (block.type === "tool_result") {
+              const turnId = this.resolveTurnIdForCid(cid)
               if (this.toolCallLedger.isOpen(cid, block.tool_use_id)) {
                 const result = this.messageStore.appendToolResultBlock(
                   txn,
                   block,
-                  { turnId: this.resolveTurnIdForCid(cid) }
+                  { turnId }
                 )
                 if (messageSeq === 0) messageSeq = result.seq
               } else {
@@ -437,11 +464,17 @@ export class ContextStateService {
                   txn,
                   [block],
                   {
-                    turnId: this.resolveTurnIdForCid(cid),
+                    turnId,
                     isMeta: message.isMeta,
                   }
                 )
                 if (messageSeq === 0) messageSeq = result.seq
+                this.logger.warn(
+                  `[tool-ledger-integrity] appended tool_result without open ledger ` +
+                    `conversation=${conversationId} toolUseId=${block.tool_use_id} ` +
+                    `turnId=${turnId} messageSeq=${result.seq} ` +
+                    `reason=tool_result_without_open_ledger`
+                )
               }
             } else {
               const result = this.messageStore.appendUserMessage(txn, [block], {
@@ -451,20 +484,6 @@ export class ContextStateService {
               if (messageSeq === 0) messageSeq = result.seq
             }
           }
-        }
-        if (opts?.ledgerOpen) {
-          this.toolCallLedger.open(txn, {
-            toolUseId: opts.ledgerOpen.toolUseId,
-            toolName: opts.ledgerOpen.toolName,
-            turnId: opts.ledgerOpen.turnId,
-            openMessageSeq: messageSeq,
-          })
-        }
-        if (opts?.ledgerClose) {
-          this.toolCallLedger.close(txn, {
-            toolUseId: opts.ledgerClose.toolUseId,
-            closeMessageSeq: messageSeq,
-          })
         }
       })
     } catch (err) {
@@ -508,6 +527,79 @@ export class ContextStateService {
       this.sessionLifecycle.schedulePersist(conversationId)
     }
     return { recordId: record.id, messageSeq }
+  }
+
+  repairRestoredOrphanedToolUses(conversationId: string): number {
+    const ctx = this.contextRecords.get(conversationId)
+    if (!ctx || ctx.messages.length === 0) return 0
+
+    const answered = new Set<string>()
+    for (const message of ctx.messages) {
+      const content = message.message.content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (
+          block &&
+          typeof block === "object" &&
+          block.type === "tool_result" &&
+          typeof block.tool_use_id === "string"
+        ) {
+          answered.add(block.tool_use_id)
+        }
+      }
+    }
+
+    const orphaned: Array<{ id: string; name: string }> = []
+    for (let index = ctx.messages.length - 1; index >= 0; index--) {
+      const message = ctx.messages[index]!
+      if (message.type === "user") break
+      const content = message.message.content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (
+          block &&
+          typeof block === "object" &&
+          block.type === "tool_use" &&
+          typeof block.id === "string" &&
+          block.id.length > 0 &&
+          !answered.has(block.id)
+        ) {
+          orphaned.push({
+            id: block.id,
+            name: typeof block.name === "string" ? block.name : "tool",
+          })
+        }
+      }
+    }
+
+    if (orphaned.length === 0) return 0
+    orphaned.reverse()
+    this.logger.warn(
+      `[context-restore] recovering restored orphan tool_use block(s) ` +
+        `conversation=${conversationId} count=${orphaned.length} ` +
+        `tools=${orphaned.map((tool) => `${tool.name}:${tool.id}`).join(",")}`
+    )
+    this.appendMessageWithSeq(conversationId, {
+      type: "user",
+      message: {
+        role: "user",
+        content: orphaned.map((tool) => ({
+          type: "tool_result",
+          tool_use_id: tool.id,
+          content:
+            `[The bridge restarted before the ${tool.name} result was ` +
+            `persisted. The restored transcript marks this earlier tool ` +
+            `call as closed so work can continue. Re-run the tool if its ` +
+            `result is still needed.]`,
+          is_error: false,
+        })),
+      },
+    })
+    this.logger.warn(
+      `[context-restore] recovered restored orphan tool_use block(s) ` +
+        `conversation=${conversationId} count=${orphaned.length}`
+    )
+    return orphaned.length
   }
 
   private resolveTurnIdForCid(cid: ConversationId): TurnId {

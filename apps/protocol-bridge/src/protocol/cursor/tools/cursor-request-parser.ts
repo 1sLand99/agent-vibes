@@ -21,6 +21,7 @@ import {
   ExecClientMessage,
   ExecClientMessageSchema,
   InteractionResponse,
+  type ResumeAction,
   type RequestedModel_ModelParameterValue,
   UserMessage,
   UserMessageAction,
@@ -248,6 +249,14 @@ export interface AttachedImage {
 
 // 已解析的请求结构（保持与旧版相同的接口约定）
 export interface ParsedCursorRequest {
+  /**
+   * How authoritative this frame is for refreshing session-level request
+   * configuration. Full AgentRunRequest user turns may replace request-scoped
+   * fields; partial ConversationAction and control/reattach frames must not
+   * clear existing model parameters, rules, or tool capabilities.
+   */
+  sessionUpdateScope?: "full" | "partial" | "control"
+
   // 对话历史
   conversation: Array<{
     role: "user" | "assistant"
@@ -381,6 +390,8 @@ export interface ParsedCursorRequest {
     | "execThrow"
     | "cancelAction"
     | "prewarm"
+    | "attachOnly"
+    | "unknownConversationAction"
     // ConversationAction 补齐
     | "summarizeAction"
     | "shellCommandAction"
@@ -658,26 +669,12 @@ function normalizeAsyncAskQuestionCompletionAction(
 /**
  * 创建空控制消息的辅助函数
  */
+type ParsedAgentControlType = NonNullable<
+  ParsedCursorRequest["agentControlType"]
+>
+
 function makeControlMessage(
-  agentControlType:
-    | "heartbeat"
-    | "streamClose"
-    | "execHeartbeat"
-    | "execStreamClose"
-    | "execThrow"
-    | "cancelAction"
-    | "prewarm"
-    // ConversationAction 补齐
-    | "summarizeAction"
-    | "shellCommandAction"
-    | "startPlanAction"
-    | "executePlanAction"
-    | "asyncAskQuestionCompletionAction"
-    | "cancelSubagentAction"
-    | "backgroundTaskCompletionAction"
-    | "backgroundShellAction"
-    | "backgroundSubagentAction"
-    | "other",
+  agentControlType: ParsedAgentControlType,
   options?: {
     conversationId?: string
     model?: string
@@ -694,6 +691,7 @@ function makeControlMessage(
   }
 ): ParsedCursorRequest {
   return {
+    sessionUpdateScope: "control",
     conversation: [],
     newMessage: "",
     model: options?.model || "",
@@ -1480,6 +1478,11 @@ export class CursorRequestParser {
           )
         }
 
+        if (message.value.action.case === "resumeAction") {
+          this.logger.log("收到 conversationAction.resumeAction")
+          return this.parseConversationResumeAction(message.value.action.value)
+        }
+
         if (message.value.action.case === "cancelAction") {
           const reason = (message.value.action.value.reason || "").trim()
           this.logger.warn(
@@ -1588,7 +1591,7 @@ export class CursorRequestParser {
         this.logger.debug(
           `收到 conversationAction（未识别） action=${message.value.action.case || "(none)"}`
         )
-        return makeControlMessage("other", triggeringFields)
+        return makeControlMessage("unknownConversationAction", triggeringFields)
       }
 
       case "kvClientMessage":
@@ -1796,6 +1799,7 @@ export class CursorRequestParser {
     )
 
     return {
+      sessionUpdateScope: "partial",
       conversation,
       newMessage: prompt,
       model: "",
@@ -1822,6 +1826,58 @@ export class CursorRequestParser {
           }
         : undefined,
       attachedImages: attachedImages.length > 0 ? attachedImages : undefined,
+    }
+  }
+
+  private parseConversationResumeAction(
+    action: ResumeAction
+  ): ParsedCursorRequest {
+    const requestContext = action.requestContext
+    const { rootPath, workspaceFolders } = extractWorkspaceFoldersWithPrimary(
+      requestContext,
+      undefined
+    )
+    const directories = workspaceFolders.map((f) => f.path)
+    const builtInToolCapabilityOptions = {
+      webSearchEnabled: requestContext?.webSearchEnabled,
+      webFetchEnabled: requestContext?.webFetchEnabled,
+      readLintsEnabled: requestContext?.readLintsEnabled,
+    }
+    const supportedTools = getDefaultAgentToolNames(
+      builtInToolCapabilityOptions
+    )
+    const useWeb =
+      requestContext?.webSearchEnabled === true ||
+      requestContext?.webFetchEnabled === true
+
+    return {
+      sessionUpdateScope: "control",
+      conversation: [],
+      newMessage: "",
+      model: "",
+      thinkingLevel: 0,
+      unifiedMode: "AGENT",
+      isAgentic: true,
+      supportedTools,
+      useWeb,
+      projectContext: rootPath
+        ? { rootPath, directories, files: [], workspaceFolders }
+        : undefined,
+      requestContextEnv: requestContext?.env
+        ? {
+            terminalsFolder:
+              requestContext.env.terminalsFolder?.trim() || undefined,
+            projectFolder:
+              requestContext.env.projectFolder?.trim() || undefined,
+            shell: requestContext.env.shell?.trim() || undefined,
+            timeZone: requestContext.env.timeZone?.trim() || undefined,
+            agentTranscriptsFolder:
+              requestContext.env.agentTranscriptsFolder?.trim() || undefined,
+            artifactsFolder:
+              requestContext.env.artifactsFolder?.trim() || undefined,
+          }
+        : undefined,
+      isResumeAction: true,
     }
   }
 
@@ -2477,6 +2533,7 @@ export class CursorRequestParser {
           `AgentRunRequest resumeAction: conversationId=${conversationId || "(none)"}, pendingToolCalls=${req.conversationState?.pendingToolCalls?.length || 0}`
         )
         return {
+          sessionUpdateScope: "control",
           conversation: stateHistory,
           newMessage: "",
           model,
@@ -2518,6 +2575,7 @@ export class CursorRequestParser {
       }
 
       if (action && actionCase && actionCase !== "userMessageAction") {
+        const controlActionName: string = actionCase
         const control = (() => {
           switch (actionCase) {
             case "summarizeAction":
@@ -2631,9 +2689,9 @@ export class CursorRequestParser {
             }
             default:
               this.logger.log(
-                `AgentRunRequest control action: conversationId=${conversationId || "(none)"}`
+                `AgentRunRequest unknown control action: conversationId=${conversationId || "(none)"} action=${controlActionName || "(none)"}`
               )
-              return makeControlMessage("other", {
+              return makeControlMessage("unknownConversationAction", {
                 conversationId,
                 model,
               })
@@ -2642,6 +2700,7 @@ export class CursorRequestParser {
 
         return {
           ...control,
+          sessionUpdateScope: "control",
           conversation: stateHistory,
           model: control.model || model,
           thinkingLevel,
@@ -2689,6 +2748,7 @@ export class CursorRequestParser {
             `history=${stateHistory.length}, tools=${supportedTools.length}`
         )
         return {
+          sessionUpdateScope: "control",
           conversation: stateHistory,
           newMessage: "",
           model,
@@ -2722,7 +2782,7 @@ export class CursorRequestParser {
           requestedModelParameters,
           requestContextEnv,
           isAgentControlMessage: true,
-          agentControlType: "other",
+          agentControlType: "attachOnly",
           statePendingToolCallIds,
           mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
           subagentModelOverrides,
@@ -2747,6 +2807,7 @@ export class CursorRequestParser {
     }
 
     return {
+      sessionUpdateScope: "full",
       conversation,
       newMessage: prompt,
       model,
@@ -2815,6 +2876,7 @@ export class CursorRequestParser {
     // 使用 execId 作为 toolCallId（与 ExecServerMessage.execId 配对）
     // numericId 用于 ExecServerMessage.id ↔ ExecClientMessage.id 的请求/响应匹配
     return {
+      sessionUpdateScope: "control",
       conversation: [],
       newMessage: "",
       model: "",

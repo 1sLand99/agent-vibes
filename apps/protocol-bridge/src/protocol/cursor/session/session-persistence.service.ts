@@ -71,6 +71,17 @@ export interface SessionContextStateRow {
   state: Record<string, unknown>
 }
 
+export interface PersistedSessionActivitySummary {
+  conversationId: ConversationId
+  lastActivityAt: number
+  model: string
+  openToolCallCount: number
+  contextStateUpdatedAt?: number
+  hasRestartRecovery: boolean
+  restartRecoveryToolCallCount: number
+  restartRecoveryInteractionQueryCount: number
+}
+
 /**
  * SessionPersistenceService
  *
@@ -116,6 +127,7 @@ export class SessionPersistenceService {
 
   private stmtUpsertContextState?: StatementSync
   private stmtSelectContextState?: StatementSync
+  private stmtListSessionActivitySummaries?: StatementSync
 
   private stmtDeleteFileStatesForConversation?: StatementSync
   private stmtDeleteMessageBlobsForConversation?: StatementSync
@@ -216,27 +228,78 @@ export class SessionPersistenceService {
   }
 
   /**
-   * Wipe every row in the v2 session schema. Relies on the
-   * `ON DELETE CASCADE` foreign keys defined in migration 009 to fan
-   * out the truncate to session_messages, tool_call_ledger,
-   * turn_events, session_file_states, session_todos,
-   * session_message_blobs, and session_read_paths in a single
-   * transaction.
+   * Wipe every row in the v2 session schema. Cache clear is an
+   * operator-level reset, so it truncates every session-owned domain
+   * table explicitly instead of relying on parent-table cascade.
    *
    * Returns the count of `sessions` rows that were deleted so the
    * caller can report a progress number to the UI.
    */
   deleteAllSessions(): number {
-    // Re-assert FK cascade on this connection. node:sqlite defaults to
-    // foreign_keys=ON but the PRAGMA is per-connection, so we keep the
-    // truncate path defensive in case the connection was opened by an
-    // older runtime that flipped it off.
+    // Re-assert FK handling on this connection. The cache-clear command is
+    // an operator action, so clear every v2 domain table explicitly instead
+    // of depending on cascade side effects to catch all persisted state.
     this.persistence.exec("PRAGMA foreign_keys = ON")
     const before = this.persistence
       .prepare(`SELECT COUNT(*) AS n FROM sessions`)
       .get() as { n: number } | undefined
-    this.persistence.exec(`DELETE FROM sessions`)
+    this.persistence.runInTransaction(() => {
+      this.persistence.exec(`DELETE FROM tool_call_ledger`)
+      this.persistence.exec(`DELETE FROM session_messages`)
+      this.persistence.exec(`DELETE FROM turn_events`)
+      this.persistence.exec(`DELETE FROM session_file_states`)
+      this.persistence.exec(`DELETE FROM session_todos`)
+      this.persistence.exec(`DELETE FROM session_message_blobs`)
+      this.persistence.exec(`DELETE FROM session_read_paths`)
+      this.persistence.exec(`DELETE FROM session_context_state`)
+      this.persistence.exec(`DELETE FROM sessions`)
+    })
     return before?.n ?? 0
+  }
+
+  listSessionActivitySummaries(): PersistedSessionActivitySummary[] {
+    const stmt = (this.stmtListSessionActivitySummaries ??=
+      this.persistence.prepare(
+        `SELECT s.conversation_id,
+                s.last_activity_at,
+                s.model,
+                COALESCE(open_ledger.open_tool_call_count, 0) AS open_tool_call_count,
+                state.updated_at AS context_state_updated_at,
+                state.state_json AS context_state_json
+           FROM sessions s
+           LEFT JOIN (
+             SELECT conversation_id, COUNT(*) AS open_tool_call_count
+               FROM tool_call_ledger
+              WHERE state = 'open'
+              GROUP BY conversation_id
+           ) open_ledger ON open_ledger.conversation_id = s.conversation_id
+           LEFT JOIN session_context_state state
+             ON state.conversation_id = s.conversation_id
+          ORDER BY s.last_activity_at DESC`
+      ))
+    const rows = stmt.all() as unknown as Array<{
+      conversation_id: string
+      last_activity_at: number
+      model: string
+      open_tool_call_count: number
+      context_state_updated_at: number | null
+      context_state_json: string | null
+    }>
+
+    return rows.map((row) => {
+      const recovery = this.parseRestartRecoveryActivity(
+        row.conversation_id,
+        row.context_state_json
+      )
+      return {
+        conversationId: row.conversation_id as ConversationId,
+        lastActivityAt: row.last_activity_at,
+        model: row.model,
+        openToolCallCount: row.open_tool_call_count || 0,
+        contextStateUpdatedAt: row.context_state_updated_at ?? undefined,
+        ...recovery,
+      }
+    })
   }
 
   // ── file states ──────────────────────────────────────────────────
@@ -543,6 +606,63 @@ export class SessionPersistenceService {
       conversationId,
       updatedAt: row.updated_at,
       state,
+    }
+  }
+
+  private parseRestartRecoveryActivity(
+    conversationId: string,
+    stateJson: string | null
+  ): Pick<
+    PersistedSessionActivitySummary,
+    | "hasRestartRecovery"
+    | "restartRecoveryToolCallCount"
+    | "restartRecoveryInteractionQueryCount"
+  > {
+    if (!stateJson) {
+      return {
+        hasRestartRecovery: false,
+        restartRecoveryToolCallCount: 0,
+        restartRecoveryInteractionQueryCount: 0,
+      }
+    }
+
+    let state: Record<string, unknown>
+    try {
+      state = JSON.parse(stateJson) as Record<string, unknown>
+    } catch (err) {
+      this.logger.warn(
+        `listSessionActivitySummaries(${conversationId}): bad state_json: ${(err as Error).message}`
+      )
+      return {
+        hasRestartRecovery: false,
+        restartRecoveryToolCallCount: 0,
+        restartRecoveryInteractionQueryCount: 0,
+      }
+    }
+
+    const restartRecovery = state.restartRecovery
+    if (!restartRecovery || typeof restartRecovery !== "object") {
+      return {
+        hasRestartRecovery: false,
+        restartRecoveryToolCallCount: 0,
+        restartRecoveryInteractionQueryCount: 0,
+      }
+    }
+
+    const recovery = restartRecovery as {
+      interruptedToolCalls?: unknown
+      interruptedInteractionQueryCount?: unknown
+    }
+    return {
+      hasRestartRecovery: true,
+      restartRecoveryToolCallCount: Array.isArray(recovery.interruptedToolCalls)
+        ? recovery.interruptedToolCalls.length
+        : 0,
+      restartRecoveryInteractionQueryCount:
+        typeof recovery.interruptedInteractionQueryCount === "number" &&
+        Number.isFinite(recovery.interruptedInteractionQueryCount)
+          ? Math.max(0, Math.floor(recovery.interruptedInteractionQueryCount))
+          : 0,
     }
   }
 }

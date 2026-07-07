@@ -1,8 +1,12 @@
+import type { ToolResultBlock } from "../../../context/types"
+
 export type ToolInterruptionReason =
   | "process_restart"
   | "parent_turn_superseded"
   | "stream_aborted"
   | "parent_cancelled"
+
+export type InterruptedToolLedgerState = "open" | "closed" | "aborted"
 
 const TOOL_INTERRUPTION_REASONS = new Set<string>([
   "process_restart",
@@ -60,6 +64,28 @@ export function buildInterruptedToolResultContent(input: {
   }
   lines.push(`tool: ${tool}`)
   return lines.join("\n")
+}
+
+export function buildInterruptedToolResultBlock(input: {
+  toolCallId: string
+  toolName: string
+  reason: ToolInterruptionReason
+  detail?: string
+}): ToolResultBlock {
+  return {
+    type: "tool_result",
+    tool_use_id: input.toolCallId,
+    content: buildInterruptedToolResultContent(input),
+    is_error: true,
+  }
+}
+
+export function shouldRepairInterruptedToolResult(input: {
+  hasToolResultInTranscript: boolean
+  ledgerState: InterruptedToolLedgerState | undefined
+}): boolean {
+  if (input.hasToolResultInTranscript) return false
+  return input.ledgerState === "open"
 }
 
 export function getInterruptedToolRepairContextLabel(

@@ -8568,20 +8568,21 @@ export class CursorGrpcService {
        */
       activeSummary?: string
       /**
-       * Full bridge-side compaction history (oldest → newest). Each
-       * entry maps to a serialized `ConversationSummaryArchive` and is
-       * placed into `ConversationStateStructure.summary_archives` so
-       * the IDE chat view can render the entire compaction trail when
-       * the user scrolls back. The bridge does not retain the
-       * pre-compaction message bytes (`summarized_messages` /
-       * `summary_message`) — those fields are intentionally left
-       * empty; the IDE only needs `summary` + `window_tail` for its
-       * "compacted N messages" UI affordance.
+       * Full bridge-side compaction history (oldest → newest). Used to
+       * compute the active summary text and as a legacy fallback when
+       * callers have not materialized `summaryArchiveBlobIds`.
        */
       compactionHistory?: Array<{
         summary: string
         archivedMessageCount: number
       }>
+      /**
+       * Blob ids for serialized `ConversationSummaryArchive` records.
+       * Newer Cursor clients hydrate `summary_archives` through the
+       * blob store, so the state structure must carry ids, not inline
+       * archive protobuf bytes.
+       */
+      summaryArchiveBlobIds?: string[]
     }
   ): Buffer {
     // 构建 file_states_v2 (map<string, FileStateStructure>)
@@ -8618,18 +8619,13 @@ export class CursorGrpcService {
       new TextEncoder().encode(t)
     )
 
-    // 构建 summary_archives (repeated bytes) — 把 bridge 自己的
-    // compactionHistory 转成 cursor 协议要求的 ConversationSummaryArchive
-    // 序列化字节。每条 commit 一个 archive 条目；按时间正序（最旧 → 最新）
-    // 推给 IDE，让 IDE 可以按顺序渲染历次压缩。
-    //
-    // window_tail 字段在 cursor 协议里指向"压缩窗口末位的消息序号"——bridge
-    // 端的等价物是 `archivedMessageCount`，两者语义一致：被这个 archive
-    // 吞掉的消息数量。`summarized_messages` 与 `summary_message` 字段
-    // bridge 不保留原始 bytes，按协议留空即可（IDE 端只读时把它们当成
-    // "未持久化原文"，UI 上仍能正常显示 summary 文本）。
+    // Newer Cursor clients hydrate `summary_archives` by treating each
+    // bytes value as a blob id, then loading a serialized
+    // ConversationSummaryArchive from the blob store. Prefer the
+    // caller-materialized ids; keep inline archive bytes only as a legacy
+    // fallback for older bridge call sites.
     const compactionHistory = checkpoint.compactionHistory || []
-    const summaryArchivesBytes = compactionHistory.map((entry) => {
+    const legacyInlineSummaryArchives = compactionHistory.map((entry) => {
       const archive = create(ConversationSummaryArchiveSchema, {
         summary: entry.summary,
         windowTail: Math.max(0, Math.floor(entry.archivedMessageCount || 0)),
@@ -8638,6 +8634,15 @@ export class CursorGrpcService {
       })
       return toBinary(ConversationSummaryArchiveSchema, archive)
     })
+    const summaryArchiveBlobIds = (checkpoint.summaryArchiveBlobIds || [])
+      .map((blobId) => blobId.trim())
+      .filter((blobId) => blobId.length > 0)
+    const summaryArchivesBytes =
+      summaryArchiveBlobIds.length > 0
+        ? summaryArchiveBlobIds.map((blobId) =>
+            new TextEncoder().encode(blobId)
+          )
+        : legacyInlineSummaryArchives
 
     // 构建 summary (optional bytes) — 当前 active summary。Cursor 把它
     // 渲染在 chat 顶部"已压缩 X 条消息"的 banner 上。bridge 没有显式的

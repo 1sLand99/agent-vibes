@@ -38,9 +38,6 @@ import type { TurnId } from "../turn/turn.types"
 export class SessionStreamService {
   private readonly logger = new Logger(SessionStreamService.name)
 
-  /** Threshold after which a shell-stream pending tool call is considered stranded. */
-  static readonly STALE_SHELL_STREAM_MS = 5 * 60 * 1000
-
   // Step 4 物理拆: 独立持有 SessionStreamRecord 对象。
   private readonly streamRecords = new Map<string, SessionStreamRecord>()
 
@@ -107,6 +104,11 @@ export class SessionStreamService {
     if (pendingCall?.shellStreamOutput) {
       session.lastActivityAt = new Date()
       pendingCall.shellStreamOutput.stdout.push(data)
+      this.sessionLifecycle.refreshPendingToolDeadline(
+        conversationId,
+        toolCallId,
+        "shell stdout"
+      )
       this.logger.debug(`Appended ${data.length} chars stdout to ${toolCallId}`)
     }
   }
@@ -126,6 +128,11 @@ export class SessionStreamService {
     if (pendingCall?.shellStreamOutput) {
       session.lastActivityAt = new Date()
       pendingCall.shellStreamOutput.stderr.push(data)
+      this.sessionLifecycle.refreshPendingToolDeadline(
+        conversationId,
+        toolCallId,
+        "shell stderr"
+      )
       this.logger.debug(`Appended ${data.length} chars stderr to ${toolCallId}`)
     }
   }
@@ -141,6 +148,11 @@ export class SessionStreamService {
     if (pendingCall?.shellStreamOutput) {
       session.lastActivityAt = new Date()
       pendingCall.shellStreamOutput.started = true
+      this.sessionLifecycle.refreshPendingToolDeadline(
+        conversationId,
+        toolCallId,
+        "shell start"
+      )
       this.logger.debug(`Marked shell started for ${toolCallId}`)
     }
   }
