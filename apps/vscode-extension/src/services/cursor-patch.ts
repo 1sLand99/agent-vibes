@@ -35,15 +35,22 @@ const CURSOR_FIRST_WINDOW_OPEN_GLASS_TREATMENT_KEY =
 const CURSOR_GLASS_STARTUP_HANDOFF_KEY = "cursor.glass.startupHandoff"
 const CURSOR_APPLICATION_USER_STORAGE_KEY =
   "src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser"
+const CURSOR_AUTH_MEMBERSHIP_TYPE_KEY = "cursorAuth/stripeMembershipType"
+const CURSOR_AUTH_SUBSCRIPTION_STATUS_KEY =
+  "cursorAuth/stripeSubscriptionStatus"
+const CURSOR_ENTITLEMENT_MEMBERSHIP_TYPE = "ultra"
+const CURSOR_ENTITLEMENT_SUBSCRIPTION_STATUS = "active"
 const CURSOR_NODE_EXTRA_CA_CERTS_ENV_KEY = "NODE_EXTRA_CA_CERTS"
 const CURSOR_CREDS_ENDPOINT_FIELDS = [
   "backendUrl",
+  "repoBackendUrl",
   "cppBackendUrl",
   "telemBackendUrl",
   "cmdkBackendUrl",
   "geoCppBackendUrl",
   "cppConfigBackendUrl",
   "bcProxyUrl",
+  "agentUrl",
 ] as const
 const CURSOR_CREDS_AGENT_ENDPOINT_FIELDS = [
   "agentBackendUrlPrivacy",
@@ -58,6 +65,10 @@ const IDLE_EXTENSION_HOST_KILLER_PATCH = {
 const BRIDGE_ENDPOINT_PATCH = {
   name: "Cursor Bridge Endpoint",
   marker: BRIDGE_ENDPOINT_PATCH_MARKER,
+}
+
+const CURSOR_ENTITLEMENT_PATCH = {
+  name: "Cursor Entitlement State",
 }
 
 /**
@@ -170,6 +181,18 @@ type CursorPersistentEndpointPatchDetails = {
   error: string | null
 }
 
+type CursorEntitlementPatchDetails = {
+  filePath: string | null
+  fileExists: boolean
+  applied: boolean
+  canApply: boolean
+  changed: boolean
+  currentMembershipType: string | null
+  currentSubscriptionStatus: string | null
+  sql: string | null
+  error: string | null
+}
+
 type CursorNodeCaPatchDetails = {
   caCertPath: string | null
   fileExists: boolean
@@ -184,6 +207,13 @@ type CursorApplicationUserEndpointNormalization = {
   value: string
   changed: boolean
   currentUrl: string | null
+}
+
+type CursorApplicationUserEntitlementNormalization = {
+  value: string
+  changed: boolean
+  currentMembershipType: string | null
+  currentSubscriptionStatus: string | null
 }
 
 export function locateIdleExtensionHostKillerMethod(
@@ -296,6 +326,9 @@ function getCursorBridgeEndpointKind(
       return null
     }
     if (/^api\d+\.cursor\.sh$/u.test(url.hostname)) {
+      return "api"
+    }
+    if (/^repo\d+\.cursor\.sh$/u.test(url.hostname)) {
       return "api"
     }
     if (/^agent[a-z0-9-]*\.api\d+\.cursor\.sh$/u.test(url.hostname)) {
@@ -492,7 +525,7 @@ function locateBridgeEndpointMigrationInsertion(
 }
 
 function getBridgeEndpointPersistentGuard(bridgeUrl: string): string {
-  return `/*${BRIDGE_ENDPOINT_PERSISTENT_GUARD_MARKER}*/(e,t)=>{const n="${bridgeUrl}",r=t?.cursorCreds;if(!r||typeof r!="object")return t;const a=e=>{const t={...(e||{})};for(const e in t)typeof t[e]=="string"&&(t[e]=n);return t.default=n,t},s={...r,backendUrl:n,cppBackendUrl:n,telemBackendUrl:n,cmdkBackendUrl:n,geoCppBackendUrl:n,cppConfigBackendUrl:n,bcProxyUrl:n,agentBackendUrlPrivacy:a(r.agentBackendUrlPrivacy),agentBackendUrlNonPrivacy:a(r.agentBackendUrlNonPrivacy)};let o={...t,cursorCreds:s};return o.cppConfig&&typeof o.cppConfig=="object"&&typeof o.cppConfig.cppUrl=="string"?{...o,cppConfig:{...o.cppConfig,cppUrl:n}}:o},`
+  return `/*${BRIDGE_ENDPOINT_PERSISTENT_GUARD_MARKER}*/(e,t)=>{const n="${bridgeUrl}",r=t?.cursorCreds;if(!r||typeof r!="object")return t;const a=e=>{const t={...(e||{})};for(const e in t)typeof t[e]=="string"&&(t[e]=n);return t.default=n,t},s={...r,backendUrl:n,repoBackendUrl:n,cppBackendUrl:n,telemBackendUrl:n,cmdkBackendUrl:n,geoCppBackendUrl:n,cppConfigBackendUrl:n,bcProxyUrl:n,agentUrl:n,agentBackendUrlPrivacy:a(r.agentBackendUrlPrivacy),agentBackendUrlNonPrivacy:a(r.agentBackendUrlNonPrivacy)};let o={...t,cursorCreds:s};return o.cppConfig&&typeof o.cppConfig=="object"&&typeof o.cppConfig.cppUrl=="string"?{...o,cppConfig:{...o.cppConfig,cppUrl:n}}:o},`
 }
 
 function canPatchBridgeEndpointPersistentGuard(segment: string): boolean {
@@ -527,6 +560,49 @@ function getBridgeEndpointCredentialsGuard(): string {
   return `/*${BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER}*/`
 }
 
+function getBridgeEndpointCredentialsGuardMethod(bridgeUrl: string): string {
+  return `getEffectiveCredentials(){const e=this.reactiveStorageService.applicationUserPersistentStorage.cursorCreds,t=this.testBackendUrlOverride,agentVibesNormalize=${getBridgeEndpointCredentialsGuard()}(base,url="${bridgeUrl}")=>({...base,backendUrl:url,repoBackendUrl:url,cppBackendUrl:url,telemBackendUrl:url,geoCppBackendUrl:url,cppConfigBackendUrl:url,cmdkBackendUrl:url,bcProxyUrl:url,agentUrl:url,agentBackendUrlPrivacy:{default:url},agentBackendUrlNonPrivacy:{default:url}});if(!t)return agentVibesNormalize(e);const n=this.getAgentBackendUrls(t);return agentVibesNormalize({...e,backendUrl:t,repoBackendUrl:t,cppBackendUrl:t,telemBackendUrl:t,geoCppBackendUrl:t,cppConfigBackendUrl:t,cmdkBackendUrl:t,bcProxyUrl:t,agentUrl:t,agentBackendUrlNonPrivacy:n},t)}`
+}
+
+function locateExistingBridgeEndpointCredentialsGuard(
+  content: string
+): { start: number; end: number } | null {
+  const markerIndex = content.indexOf(BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER)
+  if (markerIndex < 0) {
+    return null
+  }
+
+  const methodStart = content.lastIndexOf(
+    "getEffectiveCredentials(){",
+    markerIndex
+  )
+  if (methodStart < 0) {
+    return null
+  }
+
+  const bodyStart = content.indexOf("{", methodStart)
+  if (bodyStart < 0 || bodyStart > markerIndex) {
+    return null
+  }
+
+  const bodyEnd = findMatchingBrace(content, bodyStart)
+  if (bodyEnd === null) {
+    return null
+  }
+
+  return { start: methodStart, end: bodyEnd + 1 }
+}
+
+function hasCurrentBridgeEndpointCredentialsGuard(content: string): boolean {
+  const existingGuard = locateExistingBridgeEndpointCredentialsGuard(content)
+  if (existingGuard === null) {
+    return false
+  }
+
+  const guard = content.slice(existingGuard.start, existingGuard.end)
+  return guard.includes("repoBackendUrl:url") && guard.includes("agentUrl:url")
+}
+
 function locateBridgeEndpointCredentialsGuard(
   content: string
 ): RegExpExecArray | null {
@@ -540,7 +616,8 @@ function locateBridgeEndpointCredentialsGuard(
 
 function canPatchBridgeEndpointCredentialsGuard(content: string): boolean {
   return (
-    content.includes(BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER) ||
+    (content.includes(BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER) &&
+      locateExistingBridgeEndpointCredentialsGuard(content) !== null) ||
     locateBridgeEndpointCredentialsGuard(content) !== null
   )
 }
@@ -550,9 +627,15 @@ function patchBridgeEndpointCredentialsGuard(
   bridgeUrl: string
 ): string | null {
   if (content.includes(BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER)) {
-    return content.replace(
-      /\/\*\[AGENT_VIBES_CURSOR_CREDENTIALS_GUARD\]\*\/\(base,url="https:\/\/localhost:\d+"\)=>/u,
-      `${getBridgeEndpointCredentialsGuard()}(base,url="${bridgeUrl}")=>`
+    const existingGuard = locateExistingBridgeEndpointCredentialsGuard(content)
+    if (existingGuard === null) {
+      return null
+    }
+
+    return (
+      content.slice(0, existingGuard.start) +
+      getBridgeEndpointCredentialsGuardMethod(bridgeUrl) +
+      content.slice(existingGuard.end)
     )
   }
 
@@ -561,18 +644,13 @@ function patchBridgeEndpointCredentialsGuard(
     return null
   }
 
-  const credentials = match[1]
-  const override = match[2]
-  const agentUrls = match[3]
-  if (!credentials || !override || !agentUrls) {
+  if (!match[1] || !match[2] || !match[3]) {
     return null
   }
 
-  const replacement = `getEffectiveCredentials(){const ${credentials}=this.reactiveStorageService.applicationUserPersistentStorage.cursorCreds,${override}=this.testBackendUrlOverride,agentVibesNormalize=${getBridgeEndpointCredentialsGuard()}(base,url="${bridgeUrl}")=>({...base,backendUrl:url,cppBackendUrl:url,telemBackendUrl:url,geoCppBackendUrl:url,cppConfigBackendUrl:url,cmdkBackendUrl:url,bcProxyUrl:url,agentBackendUrlPrivacy:{default:url},agentBackendUrlNonPrivacy:{default:url}});if(!${override})return agentVibesNormalize(${credentials});const ${agentUrls}=this.getAgentBackendUrls(${override});return agentVibesNormalize({...${credentials},backendUrl:${override},repoBackendUrl:${override},telemBackendUrl:${override},geoCppBackendUrl:${override},cppConfigBackendUrl:${override},cmdkBackendUrl:${override},bcProxyUrl:${override},agentBackendUrlNonPrivacy:${agentUrls}},${override})}`
-
   return (
     content.slice(0, match.index) +
-    replacement +
+    getBridgeEndpointCredentialsGuardMethod(bridgeUrl) +
     content.slice(match.index + match[0].length)
   )
 }
@@ -667,10 +745,15 @@ export function patchBridgeEndpointContent(
 
   const contentWithEndpointPatch =
     content.slice(0, location.start) + segment + content.slice(location.end)
-  return patchBridgeEndpointCredentialsGuard(
+  const contentWithCredentialsGuard = patchBridgeEndpointCredentialsGuard(
     contentWithEndpointPatch,
     bridgeUrl
   )
+  if (contentWithCredentialsGuard === null) {
+    return null
+  }
+
+  return contentWithCredentialsGuard
 }
 
 function getBridgeEndpointDetails(
@@ -704,7 +787,7 @@ function getBridgeEndpointDetails(
     summary.hasMarker &&
     !summary.hasStorageGuard &&
     summary.hasPersistentGuard &&
-    content.includes(BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER) &&
+    hasCurrentBridgeEndpointCredentialsGuard(content) &&
     summary.targetCount === 0 &&
     summary.localCount >= BRIDGE_ENDPOINT_MIN_TARGETS &&
     summary.localCount === summary.matchingLocalCount
@@ -874,6 +957,46 @@ export function normalizeCursorApplicationUserEndpointValue(
   }
 }
 
+export function normalizeCursorApplicationUserEntitlementValue(
+  value: string
+): CursorApplicationUserEntitlementNormalization | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    return null
+  }
+
+  if (!isRecord(parsed)) {
+    return null
+  }
+
+  const currentMembershipType =
+    typeof parsed.membershipType === "string" ? parsed.membershipType : null
+  const currentSubscriptionStatus =
+    typeof parsed.subscriptionStatus === "string"
+      ? parsed.subscriptionStatus
+      : null
+  const nextUser: Record<string, unknown> = { ...parsed }
+  let changed = false
+
+  if (parsed.membershipType !== CURSOR_ENTITLEMENT_MEMBERSHIP_TYPE) {
+    nextUser.membershipType = CURSOR_ENTITLEMENT_MEMBERSHIP_TYPE
+    changed = true
+  }
+  if (parsed.subscriptionStatus !== CURSOR_ENTITLEMENT_SUBSCRIPTION_STATUS) {
+    nextUser.subscriptionStatus = CURSOR_ENTITLEMENT_SUBSCRIPTION_STATUS
+    changed = true
+  }
+
+  return {
+    value: changed ? JSON.stringify(nextUser) : value,
+    changed,
+    currentMembershipType,
+    currentSubscriptionStatus,
+  }
+}
+
 function getCursorPersistentEndpointPatchDetails(
   port: number
 ): CursorPersistentEndpointPatchDetails {
@@ -931,6 +1054,99 @@ function getCursorPersistentEndpointPatchDetails(
     result.sql = `INSERT OR REPLACE INTO ItemTable(key,value) VALUES(${toSqlString(
       CURSOR_APPLICATION_USER_STORAGE_KEY
     )},${toSqlString(normalized.value)});`
+  }
+
+  return result
+}
+
+function getCursorEntitlementPatchDetails(): CursorEntitlementPatchDetails {
+  const filePath = getCursorGlobalStorageStateDbPath()
+  const result: CursorEntitlementPatchDetails = {
+    filePath,
+    fileExists: false,
+    applied: true,
+    canApply: false,
+    changed: false,
+    currentMembershipType: null,
+    currentSubscriptionStatus: null,
+    sql: null,
+    error: null,
+  }
+
+  if (!filePath || !fs.existsSync(filePath)) {
+    return result
+  }
+
+  result.fileExists = true
+  const selectedKeys = [
+    CURSOR_AUTH_MEMBERSHIP_TYPE_KEY,
+    CURSOR_AUTH_SUBSCRIPTION_STATUS_KEY,
+    CURSOR_APPLICATION_USER_STORAGE_KEY,
+  ]
+    .map(toSqlString)
+    .join(",")
+  const selectResult = runSqlite(
+    filePath,
+    `SELECT key || char(9) || value FROM ItemTable WHERE key IN (${selectedKeys});`
+  )
+  if (!selectResult.success) {
+    result.applied = false
+    result.error = selectResult.error
+    return result
+  }
+
+  const rows = parseSqliteKeyValueRows(selectResult.stdout)
+  const membershipType = rows.get(CURSOR_AUTH_MEMBERSHIP_TYPE_KEY) ?? null
+  const subscriptionStatus =
+    rows.get(CURSOR_AUTH_SUBSCRIPTION_STATUS_KEY) ?? null
+  const applicationUser = rows.get(CURSOR_APPLICATION_USER_STORAGE_KEY)
+  result.currentMembershipType = membershipType
+  result.currentSubscriptionStatus = subscriptionStatus
+
+  const statements: string[] = []
+  if (membershipType !== CURSOR_ENTITLEMENT_MEMBERSHIP_TYPE) {
+    statements.push(
+      `INSERT OR REPLACE INTO ItemTable(key,value) VALUES(${toSqlString(
+        CURSOR_AUTH_MEMBERSHIP_TYPE_KEY
+      )},${toSqlString(CURSOR_ENTITLEMENT_MEMBERSHIP_TYPE)});`
+    )
+  }
+  if (subscriptionStatus !== CURSOR_ENTITLEMENT_SUBSCRIPTION_STATUS) {
+    statements.push(
+      `INSERT OR REPLACE INTO ItemTable(key,value) VALUES(${toSqlString(
+        CURSOR_AUTH_SUBSCRIPTION_STATUS_KEY
+      )},${toSqlString(CURSOR_ENTITLEMENT_SUBSCRIPTION_STATUS)});`
+    )
+  }
+
+  if (applicationUser !== undefined) {
+    const normalized =
+      normalizeCursorApplicationUserEntitlementValue(applicationUser)
+    if (normalized === null) {
+      result.applied = false
+      result.error =
+        "Cursor applicationUser entitlement storage is not writable"
+      return result
+    }
+
+    result.currentMembershipType =
+      normalized.currentMembershipType ?? result.currentMembershipType
+    result.currentSubscriptionStatus =
+      normalized.currentSubscriptionStatus ?? result.currentSubscriptionStatus
+    if (normalized.changed) {
+      statements.push(
+        `INSERT OR REPLACE INTO ItemTable(key,value) VALUES(${toSqlString(
+          CURSOR_APPLICATION_USER_STORAGE_KEY
+        )},${toSqlString(normalized.value)});`
+      )
+    }
+  }
+
+  result.canApply = true
+  result.changed = statements.length > 0
+  result.applied = !result.changed
+  if (statements.length > 0) {
+    result.sql = `BEGIN IMMEDIATE;${statements.join("")}COMMIT;`
   }
 
   return result
@@ -1308,6 +1524,7 @@ export class CursorPatchService {
     const startupPreferenceDetails = getCursorStartupPreferencePatchDetails()
     const persistentEndpointDetails =
       getCursorPersistentEndpointPatchDetails(port)
+    const entitlementDetails = getCursorEntitlementPatchDetails()
     const nodeCaDetails = getCursorNodeCaPatchDetails()
 
     result.applied =
@@ -1316,6 +1533,7 @@ export class CursorPatchService {
         startupPreferenceDetails.applied) &&
       (!persistentEndpointDetails.fileExists ||
         persistentEndpointDetails.applied) &&
+      (!entitlementDetails.fileExists || entitlementDetails.applied) &&
       nodeCaDetails.applied
     result.canApply =
       workbenchDetails.some((details) => details.canApply) ||
@@ -1323,6 +1541,7 @@ export class CursorPatchService {
         startupPreferenceDetails.canApply) ||
       (persistentEndpointDetails.fileExists &&
         persistentEndpointDetails.canApply) ||
+      (entitlementDetails.fileExists && entitlementDetails.canApply) ||
       nodeCaDetails.canApply
     result.currentUrl =
       persistentEndpointDetails.currentUrl ??
@@ -1335,6 +1554,7 @@ export class CursorPatchService {
         startupPreferenceDetails.changed) ||
       (persistentEndpointDetails.fileExists &&
         persistentEndpointDetails.changed) ||
+      (entitlementDetails.fileExists && entitlementDetails.changed) ||
       nodeCaDetails.changed
 
     return result
@@ -1363,6 +1583,7 @@ export class CursorPatchService {
     const startupPreferenceStatus = getCursorStartupPreferencePatchDetails()
     const persistentEndpointStatus =
       getCursorPersistentEndpointPatchDetails(port)
+    const entitlementStatus = getCursorEntitlementPatchDetails()
     const nodeCaStatus = getCursorNodeCaPatchDetails()
     if (
       workbenchStatuses.every(({ status }) => status.applied) &&
@@ -1370,6 +1591,7 @@ export class CursorPatchService {
         startupPreferenceStatus.applied) &&
       (!persistentEndpointStatus.fileExists ||
         persistentEndpointStatus.applied) &&
+      (!entitlementStatus.fileExists || entitlementStatus.applied) &&
       nodeCaStatus.applied
     ) {
       return this.finalizePatchApply({ applied: 0, forceChecksum: true })
@@ -1481,6 +1703,43 @@ export class CursorPatchService {
         checksumUpdated: 0,
         errors: [
           `Failed to read Cursor endpoint storage: ${persistentEndpointStatus.error}`,
+        ],
+        restartRequired,
+      }
+    }
+
+    if (
+      entitlementStatus.fileExists &&
+      entitlementStatus.canApply &&
+      entitlementStatus.sql !== null &&
+      entitlementStatus.filePath
+    ) {
+      const updateResult = runSqlite(
+        entitlementStatus.filePath,
+        entitlementStatus.sql
+      )
+      if (!updateResult.success) {
+        return {
+          success: false,
+          applied,
+          checksumApplied: false,
+          checksumUpdated: 0,
+          errors: [
+            `Failed to update Cursor entitlement storage: ${updateResult.error}`,
+          ],
+          restartRequired,
+        }
+      }
+      applied += 1
+      restartRequired = true
+    } else if (entitlementStatus.fileExists && entitlementStatus.error) {
+      return {
+        success: false,
+        applied,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: [
+          `Failed to read Cursor entitlement storage: ${entitlementStatus.error}`,
         ],
         restartRequired,
       }
@@ -1623,11 +1882,16 @@ export class CursorPatchService {
     result.backupExists = fs.existsSync(filePath + BACKUP_SUFFIX)
 
     const content = fs.readFileSync(filePath, "utf-8")
+    const entitlementDetails = getCursorEntitlementPatchDetails()
     result.isPatched = PATCH_MARKERS.some((m) => content.includes(m))
     result.patches = [
       {
         name: BRIDGE_ENDPOINT_PATCH.name,
         applied: content.includes(BRIDGE_ENDPOINT_PATCH.marker),
+      },
+      {
+        name: CURSOR_ENTITLEMENT_PATCH.name,
+        applied: !entitlementDetails.fileExists || entitlementDetails.applied,
       },
       {
         name: IDLE_EXTENSION_HOST_KILLER_PATCH.name,

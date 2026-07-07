@@ -18,6 +18,7 @@ import * as path from "path"
 import { AppModule } from "./app.module"
 import { ForwardProxyServer } from "./forward-proxy"
 import { ModelRouterService } from "./llm/shared/model-router.service"
+import { registerCursorOfficialPassthroughHook } from "./protocol/cursor/cursor-official-passthrough"
 import { registerContentTypeParsers } from "./shared/content-type-parsers"
 import { registerRequestHooks } from "./shared/request-hooks"
 
@@ -222,6 +223,7 @@ async function bootstrap() {
 
   // Register request logging hooks
   registerRequestHooks(fastifyInstance, logger)
+  registerCursorOfficialPassthroughHook(fastifyInstance, logger)
 
   // Global validation pipe
   app.useGlobalPipes(
