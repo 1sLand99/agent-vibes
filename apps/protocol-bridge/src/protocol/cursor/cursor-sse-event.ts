@@ -30,6 +30,7 @@ export interface CursorSseEventData {
     cache_creation_input_tokens?: number
     output_tokens?: number
   }
+  item?: Record<string, unknown>
 }
 
 export interface CursorSseEvent {

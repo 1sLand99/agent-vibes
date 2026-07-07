@@ -4,6 +4,12 @@ import type { ThinkingIntent } from "../shared/thinking-types"
 export interface CodexConversationMessage {
   role: "user" | "assistant" | "developer"
   content: LooseMessageContent
+  /**
+   * Split-sibling assistant message id. Main Cursor streaming persists each
+   * content block separately while sharing this id; Codex projection uses it
+   * to suppress rendered shadow siblings when raw response items are present.
+   */
+  messageId?: string
 }
 
 export interface CodexConversationTool {
@@ -38,6 +44,7 @@ export interface CodexExecutionRequest {
   tools?: CodexConversationTool[]
   conversationId?: string
   pendingToolUseIds?: string[]
+  inputToolIntegrity?: "sanitize" | "preserve"
   thinkingIntent?: ThinkingIntent | null
   includeThinkingSummary?: boolean
   serviceTier?: string
@@ -105,6 +112,10 @@ export interface CodexContextCompactionInputItem extends Record<
   encrypted_content?: string
 }
 
+export interface CodexCompactionTriggerInputItem {
+  type: "compaction_trigger"
+}
+
 export interface CodexAdditionalTools {
   type: "additional_tools"
   role: string
@@ -122,7 +133,7 @@ export interface CodexReasoningInputItem extends Record<string, unknown> {
   type: "reasoning"
   summary?: Array<Record<string, unknown>>
   content?: Array<Record<string, unknown>>
-  encrypted_content?: string
+  encrypted_content?: string | null
 }
 
 export interface CodexLocalShellCallInputItem extends Record<string, unknown> {
@@ -174,6 +185,7 @@ export type CodexInputItem =
   | CodexFunctionCallOutput
   | CodexCustomToolCallOutput
   | CodexCompactionInputItem
+  | CodexCompactionTriggerInputItem
   | CodexAdditionalTools
   | CodexContextCompactionInputItem
   | CodexAgentMessageInputItem

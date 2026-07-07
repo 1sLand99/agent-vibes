@@ -74,7 +74,7 @@ while routing requests across Antigravity, Claude-compatible, Codex, OpenAI-comp
 | Cursor protocol implementation   | Direct implementation of the Cursor protocol, including the full streaming tool loop and the related tool protocol mapping, not just compatibility endpoints or simple forwarding.                                                                         |
 | Routing and backends             | Routes requests across Antigravity IDE, Claude-compatible API, Codex CLI, OpenAI-compatible API, and Kiro (AWS CodeWhisperer); covers Gemini, Claude, and GPT / O-series models with routing decisions based on backend availability and model capability. |
 | Account pools and quotas         | Native worker / process pools, backend account state, cooldowns, model-level cooldowns, Google / Codex / Kiro quota views, rate-limit views, and multi-account rotation for availability.                                                                  |
-| Extension and operations         | Dashboard, account management, OAuth / token import, manual account JSON editing, SSL certificate generation, forwarding setup, logs, built-in diagnostics, usage / analytics, and update checks.                                                          |
+| Extension and operations         | Dashboard, account management, OAuth / token import, manual account JSON editing, SSL certificate generation, Cursor direct-connection patching, legacy forwarding setup, logs, built-in diagnostics, usage / analytics, and update checks.                |
 | Sessions, context, and toolchain | Session state management, context compaction / projection / summary, tool integrity handling, knowledge base support, semantic search, MCP tool integration, and related persistence.                                                                      |
 
 ## Quick Start
@@ -100,16 +100,16 @@ Follow these steps in order:
      <https://github.com/funny-vibes/agent-vibes/releases>
    - Install it with the correct command for my platform.
 
-3. First launch and forwarding setup
+3. First launch and Cursor direct-connection patch
    - After installation, tell me to open or fully restart Cursor.
-   - The extension should auto-start the local bridge (start only — it does
-     not enable Cursor forwarding automatically).
-   - Because Cursor IDE needs its traffic intercepted, guide me to enable
-     forwarding from Dashboard > API > Cursor IDE Protocol (the Wire toggle),
-     or via Command Palette > Agent Vibes: Enable Port Forwarding.
+   - The extension should auto-start the local bridge and keep Cursor on the
+     direct-connection patch by default (`agentVibes.trafficMode=cursorPatch`).
+   - If the Dashboard reports that the patch still needs to be applied, use
+     Dashboard > API > Cursor IDE Protocol or Command Palette > Agent Vibes:
+     Apply Cursor Bridge Endpoint Patch.
 
 4. Full Cursor restart
-   - After forwarding is completed, explicitly remind me that I must fully restart Cursor once before continuing.
+   - After the patch is applied, explicitly remind me that I must fully restart Cursor once before continuing.
 
 5. Account configuration
    - Use Dashboard > Accounts as the primary path for account setup.
@@ -117,10 +117,10 @@ Follow these steps in order:
 
 6. Testing and verification
    - Verify the service is running.
-   - Verify forwarding is active.
+   - Verify the Cursor direct-connection patch is active.
    - Verify at least one backend account is configured.
    - Use Dashboard > Diagnostics to run all checks and confirm each one passes:
-     proxy bypass, SSL certificates, DNS resolution, traffic forwarding, bridge health,
+     proxy bypass, SSL certificates, Cursor patch status, bridge health,
      end-to-end TLS (H2), and backend accounts.
    - Note: some Diagnostics tests may silently pass on platforms where the check is not
      actually implemented. Cross-check the test source code against the user's current
@@ -200,11 +200,10 @@ cursor --install-extension agent-vibes-win32-x64-0.1.53.vsix --force
 
 Restart Cursor after installation.
 The extension auto-starts the proxy server (the bridge only — it does not
-enable Cursor forwarding automatically) and guides you through first-run setup
-(SSL certificates and account sync from the Command Palette). Cursor traffic
-forwarding is an independent, opt-in step: enable it from Dashboard > API >
-Cursor IDE Protocol (the Wire toggle) only when you want to drive Cursor IDE
-through the bridge.
+modify Cursor automatically) and guides you through first-run setup
+(SSL certificates and account sync from the Command Palette). To drive Cursor
+IDE through the bridge, apply the Cursor direct-connection patch from
+Dashboard > API > Cursor IDE Protocol.
 
 ### Install Option 3: From Source (All Platforms)
 
@@ -227,13 +226,11 @@ mkcert -install
 agent-vibes cert
 ```
 
-Cursor requires HTTPS interception — one-time setup:
+Cursor direct connection — one-time setup:
 
 ```bash
-agent-vibes forward hosts        # Add DNS redirect to hosts file
-agent-vibes forward on           # Enable port forwarding
-agent-vibes                      # Start the proxy
-agent-vibes forward status       # Verify everything is working
+agent-vibes                      # Start the bridge
+# Then apply "Agent Vibes: Apply Cursor Bridge Endpoint Patch" from Cursor.
 ```
 
 ### Choose One Upstream Source
@@ -277,45 +274,47 @@ The extension keeps a small set of installation / configuration commands in the 
 
 #### Installation / configuration commands
 
-| Step | Command Palette title                             | Command ID                            | Purpose                                                                                    |
-| ---- | ------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------ |
-| 1    | Agent Vibes: Open Dashboard                       | `agentVibes.openDashboard`            | Open the main Dashboard and review setup status.                                           |
-| 2    | Agent Vibes: Generate SSL Certificates            | `agentVibes.generateCert`             | Generate local certificates required for HTTPS interception.                               |
-| 3    | Dashboard → Accounts                              | _primary path_                        | Configure accounts in the Accounts tab, including add/edit flows, OAuth, and token import. |
-| 3    | Agent Vibes: Sync Antigravity IDE Credentials     | `agentVibes.syncAntigravityIDE`       | Import credentials from Antigravity IDE.                                                   |
-| 3    | Agent Vibes: Sync Antigravity Tool Credentials    | `agentVibes.syncAntigravityTools`     | Import credentials from Antigravity Manager / tools.                                       |
-| 3    | Agent Vibes: Sync Claude Credentials              | `agentVibes.syncClaude`               | Sync Claude-compatible credentials into Agent Vibes.                                       |
-| 3    | Agent Vibes: Sync Codex Credentials               | `agentVibes.syncCodex`                | Sync Codex credentials into Agent Vibes.                                                   |
-| 3    | Agent Vibes: Open OpenAI-Compatible Accounts JSON | `agentVibes.openOpenAICompatAccounts` | Open `openai-compat-accounts.json` for manual configuration.                               |
-| 3    | Agent Vibes: Open Claude API Accounts JSON        | `agentVibes.openClaudeApiAccounts`    | Open `claude-api-accounts.json` for manual configuration.                                  |
-| 3    | Agent Vibes: Open Kiro Accounts JSON              | `agentVibes.openKiroAccounts`         | Open `kiro-accounts.json` for manual configuration.                                        |
-| 3    | Agent Vibes: Sync Kiro IDE Credentials            | `agentVibes.syncKiroIDE`              | Import Kiro / AWS SSO tokens cached locally by Kiro IDE or AWS CLI.                        |
-| 4    | Agent Vibes: Start Server                         | `agentVibes.startServer`              | Start the local bridge only (no forwarding) after certs and one account are ready.         |
-| 5    | Agent Vibes: Enable Port Forwarding               | `agentVibes.enableForwarding`         | Enable local forwarding required for Cursor traffic interception.                          |
-| 5    | Agent Vibes: Disable Port Forwarding              | `agentVibes.disableForwarding`        | Disable local forwarding.                                                                  |
-| 6    | Agent Vibes: Port Forwarding Status               | `agentVibes.forwardingStatus`         | Check forwarding and hosts setup status.                                                   |
-| 7    | Agent Vibes: Edit Configuration                   | `agentVibes.openConfig`               | Open `agentVibes` settings in Cursor.                                                      |
-| 8    | Agent Vibes: Check Extension Updates              | `agentVibes.checkExtensionUpdates`    | Check GitHub Releases for a newer VSIX.                                                    |
+| Step | Command Palette title                             | Command ID                                  | Purpose                                                                                                         |
+| ---- | ------------------------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| 1    | Agent Vibes: Open Dashboard                       | `agentVibes.openDashboard`                  | Open the main Dashboard and review setup status.                                                                |
+| 2    | Agent Vibes: Generate SSL Certificates            | `agentVibes.generateCert`                   | Generate local certificates required for HTTPS interception.                                                    |
+| 3    | Dashboard → Accounts                              | _primary path_                              | Configure accounts in the Accounts tab, including add/edit flows, OAuth, and token import.                      |
+| 3    | Agent Vibes: Sync Antigravity IDE Credentials     | `agentVibes.syncAntigravityIDE`             | Import credentials from Antigravity IDE.                                                                        |
+| 3    | Agent Vibes: Sync Antigravity Tool Credentials    | `agentVibes.syncAntigravityTools`           | Import credentials from Antigravity Manager / tools.                                                            |
+| 3    | Agent Vibes: Sync Claude Credentials              | `agentVibes.syncClaude`                     | Sync Claude-compatible credentials into Agent Vibes.                                                            |
+| 3    | Agent Vibes: Sync Codex Credentials               | `agentVibes.syncCodex`                      | Sync Codex credentials into Agent Vibes.                                                                        |
+| 3    | Agent Vibes: Open OpenAI-Compatible Accounts JSON | `agentVibes.openOpenAICompatAccounts`       | Open `openai-compat-accounts.json` for manual configuration.                                                    |
+| 3    | Agent Vibes: Open Claude API Accounts JSON        | `agentVibes.openClaudeApiAccounts`          | Open `claude-api-accounts.json` for manual configuration.                                                       |
+| 3    | Agent Vibes: Open Kiro Accounts JSON              | `agentVibes.openKiroAccounts`               | Open `kiro-accounts.json` for manual configuration.                                                             |
+| 3    | Agent Vibes: Sync Kiro IDE Credentials            | `agentVibes.syncKiroIDE`                    | Import Kiro / AWS SSO tokens cached locally by Kiro IDE or AWS CLI.                                             |
+| 4    | Agent Vibes: Start Server                         | `agentVibes.startServer`                    | Start the local bridge only (no forwarding) after certs and one account are ready.                              |
+| 5    | Agent Vibes: Apply Cursor Bridge Endpoint Patch   | `agentVibes.applyCursorBridgeEndpointPatch` | Patch Cursor account, model, and agent traffic to connect to the local bridge without hosts or port forwarding. |
+| 6    | Agent Vibes: Enable Port Forwarding               | `agentVibes.enableForwarding`               | Legacy fallback for local forwarding.                                                                           |
+| 6    | Agent Vibes: Disable Port Forwarding              | `agentVibes.disableForwarding`              | Disable legacy local forwarding.                                                                                |
+| 6    | Agent Vibes: Port Forwarding Status               | `agentVibes.forwardingStatus`               | Check legacy forwarding and hosts setup status.                                                                 |
+| 7    | Agent Vibes: Edit Configuration                   | `agentVibes.openConfig`                     | Open `agentVibes` settings in Cursor.                                                                           |
+| 8    | Agent Vibes: Check Extension Updates              | `agentVibes.checkExtensionUpdates`          | Check GitHub Releases for a newer VSIX.                                                                         |
 
 #### Dashboard tabs
 
-| Tab             | Purpose                                                                                                 |
-| --------------- | ------------------------------------------------------------------------------------------------------- |
-| **Overview**    | Setup status, quick actions (start/stop/restart), backend summary                                       |
-| **API**         | Exposed HTTP endpoints; Cursor IDE Protocol forwarding (Wire) toggle, Claude Code CLI wiring, copy/test |
-| **Accounts**    | Account management, OAuth, token import, pool and quota details                                         |
-| **Analytics**   | Usage summary and backend/runtime statistics                                                            |
-| **Settings**    | Extension settings and path overrides                                                                   |
-| **Diagnostics** | Built-in checks                                                                                         |
-| **Logs**        | Bridge logs and debug toggles                                                                           |
+| Tab             | Purpose                                                                                   |
+| --------------- | ----------------------------------------------------------------------------------------- |
+| **Overview**    | Setup status, quick actions (start/stop/restart), backend summary                         |
+| **API**         | Exposed HTTP endpoints; Cursor direct-connection patch, Claude Code CLI wiring, copy/test |
+| **Accounts**    | Account management, OAuth, token import, pool and quota details                           |
+| **Analytics**   | Usage summary and backend/runtime statistics                                              |
+| **Settings**    | Extension settings and path overrides                                                     |
+| **Diagnostics** | Built-in checks                                                                           |
+| **Logs**        | Bridge logs and debug toggles                                                             |
 
 ### Daily Use
 
 #### Cursor IDE
 
 - Open Cursor; the extension will auto-start the local bridge (start only).
-- To drive Cursor IDE through the bridge, enable Cursor traffic forwarding
-  separately from Dashboard > API > Cursor IDE Protocol (the Wire toggle).
+- To drive Cursor IDE through the bridge, keep Settings > Bridge > Cursor Connection
+  on Cursor Direct Patch. If the API tab reports that the patch is missing,
+  apply it from Dashboard > API > Cursor IDE Protocol.
   Skip this if you only use the bridge as a relay for Claude Code CLI / API clients.
 - To confirm runtime status, open the Dashboard and check Overview, API, Accounts, Logs, and Diagnostics.
 - Send a real request in Cursor to verify that account setup, routing, and tool calls are working.

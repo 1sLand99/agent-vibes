@@ -73,7 +73,7 @@ Agent Vibes 是一个统一的 AI Agent 网关。它不只是做客户端与后�
 | Cursor 协议实现      | 直接实现 Cursor 协议本身，包含完整的流式工具调用循环（streaming tool loop）与相关工具协议映射，而不只是兼容接口或简单转发。                                                                   |
 | 路由与后端           | 在 Antigravity IDE、Claude 兼容 API、Codex CLI、OpenAI-compatible API 与 Kiro (AWS CodeWhisperer) 之间路由请求；覆盖 Gemini、Claude、GPT / O 系列模型，并结合后端可用性与模型能力做路由决策。 |
 | 账号池与配额         | 包含原生 worker / process pool、账号池状态、cooldown、模型级 cooldown、Google / Codex / Kiro 配额视图、速率限制视图，以及面向多账号的轮转与可用性管理。                                       |
-| 扩展与运维           | 提供 Dashboard、账号管理、OAuth / token 导入、账号 JSON 手动配置、SSL 证书生成、forwarding 配置、日志查看、内置诊断、usage / analytics 与更新检查。                                           |
+| 扩展与运维           | 提供 Dashboard、账号管理、OAuth / token 导入、账号 JSON 手动配置、SSL 证书生成、Cursor 直连接入补丁、legacy forwarding 配置、日志查看、内置诊断、usage / analytics 与更新检查。               |
 | 会话、上下文与工具链 | 包含会话状态管理、context compaction / projection / summary、tool integrity、knowledge base、semantic search、MCP 工具接入以及相关持久化能力。                                                |
 
 <!-- markdownlint-enable MD060 -->
@@ -100,14 +100,15 @@ Agent Vibes 是一个统一的 AI Agent 网关。它不只是做客户端与后�
      <https://github.com/funny-vibes/agent-vibes/releases>
    - 按我的平台给出正确的安装命令。
 
-3. 首次启动与 forwarding
+3. 首次启动与 Cursor 直连接入补丁
    - 安装完成后，提醒我打开或完全重启 Cursor。
-   - 扩展应自动启动本地 bridge（仅启动服务，不会自动开启 Cursor 转发）。
-   - 由于 Cursor IDE 需要拦截流量，指导我从 Dashboard > API > Cursor IDE Protocol
-     （Wire 开关）开启转发，或通过命令面板 > Agent Vibes: Enable Port Forwarding 开启。
+   - 扩展应自动启动本地 bridge，并默认保持 Cursor 直连接入补丁
+     （`agentVibes.trafficMode=cursorPatch`）。
+   - 如果 Dashboard 显示补丁仍需应用，从 Dashboard > API > Cursor IDE Protocol
+     或命令面板 > Agent Vibes: Apply Cursor Bridge Endpoint Patch 应用。
 
 4. 完全重启 Cursor
-   - 在 forwarding 完成后，明确提醒我：必须完整重启 Cursor 一次，然后再继续下一步。
+   - 在补丁应用后，明确提醒我：必须完整重启 Cursor 一次，然后再继续下一步。
 
 5. 账号配置
    - 以 Dashboard > Accounts 作为账号配置主入口。
@@ -115,10 +116,10 @@ Agent Vibes 是一个统一的 AI Agent 网关。它不只是做客户端与后�
 
 6. 测试与验证
    - 验证服务是否已启动。
-   - 验证 forwarding 是否已生效。
+   - 验证 Cursor 直连接入补丁是否已生效。
    - 验证是否至少配置好了一个后端账号。
    - 用 Dashboard > Diagnostics 运行所有检查项并确认全部通过：
-     代理绕过、SSL 证书、DNS 解析、流量转发、bridge 健康、端到端 TLS (H2)、后端账号。
+     代理绕过、SSL 证书、Cursor 补丁状态、bridge 健康、端到端 TLS (H2)、后端账号。
    - 注意：部分 Diagnostics 测试在未适配的平台上可能直接显示通过但实际并未检查。
      请结合测试源码和用户当前平台/环境判断结果是否可信。
 
@@ -192,9 +193,9 @@ Invoke-WebRequest -Uri "https://github.com/funny-vibes/agent-vibes/releases/down
 cursor --install-extension agent-vibes-win32-x64-0.1.53.vsix --force
 ```
 
-安装后重启 Cursor，扩展会自动启动代理服务器（仅启动 bridge，不会自动开启 Cursor 转发），
-并引导你完成首次配置（SSL 证书与账号同步均可在命令面板中操作）。Cursor 流量转发是独立的可选步骤：
-仅当你希望让 Cursor IDE 走 bridge 时，才从 Dashboard > API > Cursor IDE Protocol（Wire 开关）开启。
+安装后重启 Cursor，扩展会自动启动代理服务器（仅启动 bridge，不会自动修改 Cursor），
+并引导你完成首次配置（SSL 证书与账号同步均可在命令面板中操作）。如需让 Cursor IDE 走 bridge，
+请从 Dashboard > API > Cursor IDE Protocol 应用 Cursor 直连接入补丁。
 
 ### 安装方式三：源码安装（全平台）
 
@@ -216,13 +217,11 @@ mkcert -install
 agent-vibes cert
 ```
 
-Cursor 需要 HTTPS 拦截，以下为一次性设置：
+Cursor 直连接入，以下为一次性设置：
 
 ```bash
-agent-vibes forward hosts        # 在 hosts 中添加 DNS 重定向
-agent-vibes forward on           # 开启端口转发
-agent-vibes                      # 启动代理
-agent-vibes forward status       # 验证是否正常工作
+agent-vibes                      # 启动 bridge
+# 然后在 Cursor 命令面板执行 "Agent Vibes: Apply Cursor Bridge Endpoint Patch"
 ```
 
 ### 选择一个上游来源
@@ -267,44 +266,45 @@ Kiro（AWS Builder ID / IdC / Kiro IDE）：
 
 #### 安装 / 配置命令
 
-| 步骤 | 命令面板标题                                      | Command ID                            | 用途                                                                     |
-| ---- | ------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------ |
-| 1    | Agent Vibes: Open Dashboard                       | `agentVibes.openDashboard`            | 打开主 Dashboard，先查看当前安装状态。                                   |
-| 2    | Agent Vibes: Generate SSL Certificates            | `agentVibes.generateCert`             | 生成 HTTPS 拦截所需的本地证书。                                          |
-| 3    | Dashboard → Accounts                              | _主入口_                              | 在账号管理 tab 中完成账号配置；支持新增、编辑、OAuth、token 导入等操作。 |
-| 3    | Agent Vibes: Sync Antigravity IDE Credentials     | `agentVibes.syncAntigravityIDE`       | 从 Antigravity IDE 导入凭据。                                            |
-| 3    | Agent Vibes: Sync Antigravity Tool Credentials    | `agentVibes.syncAntigravityTools`     | 从 Antigravity Manager / tools 导入凭据。                                |
-| 3    | Agent Vibes: Sync Claude Credentials              | `agentVibes.syncClaude`               | 将 Claude 兼容凭据同步到 Agent Vibes。                                   |
-| 3    | Agent Vibes: Sync Codex Credentials               | `agentVibes.syncCodex`                | 将 Codex 凭据同步到 Agent Vibes。                                        |
-| 3    | Agent Vibes: Open OpenAI-Compatible Accounts JSON | `agentVibes.openOpenAICompatAccounts` | 打开 `openai-compat-accounts.json` 进行手动配置。                        |
-| 3    | Agent Vibes: Open Claude API Accounts JSON        | `agentVibes.openClaudeApiAccounts`    | 打开 `claude-api-accounts.json` 进行手动配置。                           |
-| 3    | Agent Vibes: Open Kiro Accounts JSON              | `agentVibes.openKiroAccounts`         | 打开 `kiro-accounts.json` 进行手动配置。                                 |
-| 3    | Agent Vibes: Sync Kiro IDE Credentials            | `agentVibes.syncKiroIDE`              | 导入 Kiro IDE 或 AWS CLI 在本地缓存的 Kiro / AWS SSO token。             |
-| 4    | Agent Vibes: Start Server                         | `agentVibes.startServer`              | 在证书和至少一个账号准备完成后仅启动本地 bridge（不开启转发）。          |
-| 5    | Agent Vibes: Enable Port Forwarding               | `agentVibes.enableForwarding`         | 启用 Cursor 流量拦截所需的本地转发。                                     |
-| 5    | Agent Vibes: Disable Port Forwarding              | `agentVibes.disableForwarding`        | 关闭本地转发。                                                           |
-| 6    | Agent Vibes: Port Forwarding Status               | `agentVibes.forwardingStatus`         | 检查 forwarding 与 hosts 配置状态。                                      |
-| 7    | Agent Vibes: Edit Configuration                   | `agentVibes.openConfig`               | 打开 Cursor 中的 `agentVibes` 设置。                                     |
-| 8    | Agent Vibes: Check Extension Updates              | `agentVibes.checkExtensionUpdates`    | 检查 GitHub Releases 上是否有新的 VSIX。                                 |
+| 步骤 | 命令面板标题                                      | Command ID                                  | 用途                                                                                |
+| ---- | ------------------------------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------- |
+| 1    | Agent Vibes: Open Dashboard                       | `agentVibes.openDashboard`                  | 打开主 Dashboard，先查看当前安装状态。                                              |
+| 2    | Agent Vibes: Generate SSL Certificates            | `agentVibes.generateCert`                   | 生成 HTTPS 拦截所需的本地证书。                                                     |
+| 3    | Dashboard → Accounts                              | _主入口_                                    | 在账号管理 tab 中完成账号配置；支持新增、编辑、OAuth、token 导入等操作。            |
+| 3    | Agent Vibes: Sync Antigravity IDE Credentials     | `agentVibes.syncAntigravityIDE`             | 从 Antigravity IDE 导入凭据。                                                       |
+| 3    | Agent Vibes: Sync Antigravity Tool Credentials    | `agentVibes.syncAntigravityTools`           | 从 Antigravity Manager / tools 导入凭据。                                           |
+| 3    | Agent Vibes: Sync Claude Credentials              | `agentVibes.syncClaude`                     | 将 Claude 兼容凭据同步到 Agent Vibes。                                              |
+| 3    | Agent Vibes: Sync Codex Credentials               | `agentVibes.syncCodex`                      | 将 Codex 凭据同步到 Agent Vibes。                                                   |
+| 3    | Agent Vibes: Open OpenAI-Compatible Accounts JSON | `agentVibes.openOpenAICompatAccounts`       | 打开 `openai-compat-accounts.json` 进行手动配置。                                   |
+| 3    | Agent Vibes: Open Claude API Accounts JSON        | `agentVibes.openClaudeApiAccounts`          | 打开 `claude-api-accounts.json` 进行手动配置。                                      |
+| 3    | Agent Vibes: Open Kiro Accounts JSON              | `agentVibes.openKiroAccounts`               | 打开 `kiro-accounts.json` 进行手动配置。                                            |
+| 3    | Agent Vibes: Sync Kiro IDE Credentials            | `agentVibes.syncKiroIDE`                    | 导入 Kiro IDE 或 AWS CLI 在本地缓存的 Kiro / AWS SSO token。                        |
+| 4    | Agent Vibes: Start Server                         | `agentVibes.startServer`                    | 在证书和至少一个账号准备完成后仅启动本地 bridge（不开启转发）。                     |
+| 5    | Agent Vibes: Apply Cursor Bridge Endpoint Patch   | `agentVibes.applyCursorBridgeEndpointPatch` | 让 Cursor 的账号、模型和 Agent 流量直接连接本机 bridge，不再依赖 hosts 或端口转发。 |
+| 6    | Agent Vibes: Enable Port Forwarding               | `agentVibes.enableForwarding`               | legacy 本地转发备用路径。                                                           |
+| 6    | Agent Vibes: Disable Port Forwarding              | `agentVibes.disableForwarding`              | 关闭 legacy 本地转发。                                                              |
+| 6    | Agent Vibes: Port Forwarding Status               | `agentVibes.forwardingStatus`               | 检查 legacy forwarding 与 hosts 配置状态。                                          |
+| 7    | Agent Vibes: Edit Configuration                   | `agentVibes.openConfig`                     | 打开 Cursor 中的 `agentVibes` 设置。                                                |
+| 8    | Agent Vibes: Check Extension Updates              | `agentVibes.checkExtensionUpdates`          | 检查 GitHub Releases 上是否有新的 VSIX。                                            |
 
 #### Dashboard tabs
 
-| Tab             | 用途                                                                                      |
-| --------------- | ----------------------------------------------------------------------------------------- |
-| **Overview**    | 安装状态、快捷操作（启动 / 停止 / 重启）、后端概览                                        |
-| **API**         | 暴露的 HTTP 端点；Cursor IDE Protocol 转发（Wire）开关、Claude Code CLI 接入、复制 / 测试 |
-| **Accounts**    | 账号管理、OAuth、token 导入、pool / quota 详情                                            |
-| **Analytics**   | usage summary 与后端 / 运行期统计                                                         |
-| **Settings**    | 扩展设置与路径覆盖                                                                        |
-| **Diagnostics** | 内置检查项                                                                                |
-| **Logs**        | bridge 日志与 debug 开关                                                                  |
+| Tab             | 用途                                                                     |
+| --------------- | ------------------------------------------------------------------------ |
+| **Overview**    | 安装状态、快捷操作（启动 / 停止 / 重启）、后端概览                       |
+| **API**         | 暴露的 HTTP 端点；Cursor 直连接入补丁、Claude Code CLI 接入、复制 / 测试 |
+| **Accounts**    | 账号管理、OAuth、token 导入、pool / quota 详情                           |
+| **Analytics**   | usage summary 与后端 / 运行期统计                                        |
+| **Settings**    | 扩展设置与路径覆盖                                                       |
+| **Diagnostics** | 内置检查项                                                               |
+| **Logs**        | bridge 日志与 debug 开关                                                 |
 
 ### 日常使用
 
 #### Cursor IDE
 
 - 打开 Cursor，扩展会自动启动本地 bridge（仅启动服务）。
-- 如需让 Cursor IDE 走 bridge，请单独从 Dashboard > API > Cursor IDE Protocol（Wire 开关）开启 Cursor 流量转发。若仅把 bridge 当作 Claude Code CLI / API 客户端的中转，可跳过此步。
+- 如需让 Cursor IDE 走 bridge，请保持 Settings > Bridge > Cursor 接入方式为 Cursor 直连补丁。如果 API 页显示补丁缺失，再从 Dashboard > API > Cursor IDE Protocol 应用。若仅把 bridge 当作 Claude Code CLI / API 客户端的中转，可跳过此步。
 - 如需确认运行状态，打开 Dashboard 查看 Overview、API、Accounts、Logs 与 Diagnostics。
 - 在 Cursor 中直接发起一次真实请求，验证账号、路由与工具调用是否正常。
 

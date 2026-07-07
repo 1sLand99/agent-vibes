@@ -462,9 +462,10 @@ export class ContextStateService {
         }
       })
     } catch (err) {
-      this.logger.warn(
-        `appendMessageWithSeq v2 write failed for ${conversationId}: ${(err as Error).message} — continuing with v1-only path`
+      this.logger.error(
+        `appendMessageWithSeq v2 write failed for ${conversationId}: ${(err as Error).message}`
       )
+      throw err
     }
 
     // v1 in-memory mirror (kept for hot-path SessionMessage[] reads).
@@ -1459,7 +1460,8 @@ export class ContextStateService {
     conversationId: string,
     recordId: string,
     usage: ContextUsageSnapshot,
-    usageLedgerState?: ContextUsageLedgerState
+    usageLedgerState?: ContextUsageLedgerState,
+    reportedContextTokens?: number
   ): void {
     const session = this.sessionLifecycle.getSession(conversationId)
     const ctx = this.contextRecords.get(conversationId)
@@ -1469,9 +1471,12 @@ export class ContextStateService {
       lastUsage: usage,
     }
     const inputContextTokens =
-      usage.inputTokens +
-      usage.cachedInputTokens +
-      usage.cacheCreationInputTokens
+      typeof reportedContextTokens === "number" &&
+      Number.isFinite(reportedContextTokens)
+        ? Math.max(0, Math.round(reportedContextTokens))
+        : usage.inputTokens +
+          usage.cachedInputTokens +
+          usage.cacheCreationInputTokens
     ctx!.usedTokens = inputContextTokens
     session.usedContextTokens = inputContextTokens
     ctx!.pendingRequestContextLedger = undefined
@@ -1484,6 +1489,7 @@ export class ContextStateService {
     if (!session) return
     ctx!.todos = todos
     session.lastActivityAt = new Date()
+    this.sessionLifecycle.persistTodos(conversationId, todos)
     this.sessionLifecycle.schedulePersist(conversationId)
   }
   nextExecId(conversationId: string): number {

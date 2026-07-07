@@ -12,8 +12,12 @@ import { AssistantToolBatchService } from "./assistant-tool-batch.service"
 import { ContextStateService } from "./context-state.service"
 import { SessionStreamService } from "./session-stream.service"
 import { TurnId, ConversationId } from "../turn/turn.types"
-import { MessageStore } from "./message-store.service"
-import { SessionPersistenceService } from "./session-persistence.service"
+import { MessageStore, type PersistedMessage } from "./message-store.service"
+import {
+  SessionPersistenceService,
+  type SessionRow,
+  type SessionTodo,
+} from "./session-persistence.service"
 import { ToolCallLedger } from "./tool-call-ledger.service"
 import {
   normalizePathForBoundaryCheck,
@@ -25,6 +29,7 @@ import type {
   ContextCollapseState,
   ContextConversationState,
   CodexContextState,
+  ContentBlock,
   ContextInvestigationMemoryEntry,
   ContextSessionMemoryEntry,
   ContextTranscriptRecord,
@@ -602,6 +607,7 @@ export interface SessionLifecycleRecord {
   projectContext?: ParsedCursorRequest["projectContext"]
   codeChunks?: ParsedCursorRequest["codeChunks"]
   cursorRules?: ParsedCursorRequest["cursorRules"]
+  skillOptions?: ParsedCursorRequest["skillOptions"]
   selectedCursorRulePaths?: ParsedCursorRequest["selectedCursorRulePaths"]
   selectedCursorRuleNames?: ParsedCursorRequest["selectedCursorRuleNames"]
   activeCursorSkillNames?: string[]
@@ -628,7 +634,7 @@ export interface SessionLifecycleRecord {
   deferredControlContinuations: Array<{
     parsed: ParsedCursorRequest
     newMessage: string
-    streamId?: string
+    streamId: string
     reason: string
     enqueuedAt: number
   }>
@@ -746,6 +752,7 @@ export interface SessionStreamRecord {
       turnId?: TurnId
       kind?: string
       deadline?: number
+      streamId?: string
       createdAt: number
     }
   >
@@ -2117,6 +2124,52 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     this.writeSessionRow(conversationId, session)
   }
 
+  persistTodos(conversationId: string, todos: SessionTodoItem[]): void {
+    try {
+      this.sessionPersistence.replaceTodos(
+        ConversationId.of(conversationId),
+        todos.map(
+          (todo): SessionTodo => ({
+            conversationId: ConversationId.of(conversationId),
+            id: todo.id,
+            content: todo.content,
+            status: todo.status,
+            createdAt: todo.createdAt,
+            updatedAt: todo.updatedAt,
+            dependencies: [...todo.dependencies],
+          })
+        )
+      )
+    } catch (error) {
+      this.logger.error(
+        `Failed to persist todos for ${conversationId}: ${String(error)}`
+      )
+      throw error
+    }
+  }
+
+  private loadPersistedTodos(conversationId: string): SessionTodoItem[] {
+    return this.sessionPersistence
+      .listTodos(ConversationId.of(conversationId))
+      .map((todo) => ({
+        id: todo.id,
+        content: todo.content,
+        status: this.normalizePersistedTodoStatus(todo.status),
+        createdAt: todo.createdAt,
+        updatedAt: todo.updatedAt,
+        dependencies: [...todo.dependencies],
+      }))
+  }
+
+  private normalizePersistedTodoStatus(value: string): SessionTodoStatus {
+    return value === "pending" ||
+      value === "in_progress" ||
+      value === "completed" ||
+      value === "cancelled"
+      ? value
+      : "pending"
+  }
+
   /**
    * Write a session row to SQLite without depending on `this.sessions`.
    *
@@ -2138,18 +2191,262 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         createdAt: session.createdAt.getTime(),
         lastActivityAt: session.lastActivityAt.getTime(),
         model: session.model,
-        // The serialised PersistedChatSessionV1 is stored verbatim as
-        // the config blob. This preserves backward-compatible
-        // round-trip for every legacy field (messages, transcripts,
-        // turn states, file states, todos, etc.) until step 8 moves
-        // each domain into its dedicated v2 table.
-        config: state as unknown as Record<string, unknown>,
+        config: this.serializeSessionConfig(state),
       })
+      this.persistInitialTranscriptMessages(
+        ConversationId.of(conversationId),
+        state.messages
+      )
+      this.writeSessionDomainState(conversationId, state)
     } catch (error) {
       this.logger.error(
         `Failed to persist session ${conversationId}: ${String(error)}`
       )
     }
+  }
+
+  private serializeSessionConfig(
+    state: PersistedChatSessionV1
+  ): Record<string, unknown> {
+    return {
+      version: state.version,
+      conversationId: state.conversationId,
+      model: state.model,
+      lastAssistantBackend: state.lastAssistantBackend,
+      lastAssistantModel: state.lastAssistantModel,
+      thinkingLevel: state.thinkingLevel,
+      thinkingDetailsRequested: state.thinkingDetailsRequested,
+      isAgentic: state.isAgentic,
+      supportedTools: state.supportedTools,
+      mcpToolDefs: state.mcpToolDefs,
+      useWeb: state.useWeb,
+      requestContextEnv: state.requestContextEnv,
+      createdAt: state.createdAt,
+      lastActivityAt: state.lastActivityAt,
+      projectContext: state.projectContext,
+      codeChunks: state.codeChunks,
+      cursorCommands: state.cursorCommands,
+      customSystemPrompt: state.customSystemPrompt,
+      explicitContext: state.explicitContext,
+      contextTokenLimit: state.contextTokenLimit,
+      contextMaxMode: state.contextMaxMode,
+      usedContextTokens: state.usedContextTokens,
+      requestedMaxOutputTokens: state.requestedMaxOutputTokens,
+      requestedModelParameters: state.requestedModelParameters,
+      additionalRoots: state.additionalRoots,
+    }
+  }
+
+  private writeSessionDomainState(
+    conversationId: string,
+    state: PersistedChatSessionV1
+  ): void {
+    const cid = ConversationId.of(conversationId)
+    const updatedAt = Date.now()
+    this.sessionPersistence.upsertContextState({
+      conversationId: cid,
+      updatedAt,
+      state: {
+        version: state.version,
+        messageRecords: state.messageRecords,
+        transcriptEvents: state.transcriptEvents,
+        nextTranscriptEventSeq: state.nextTranscriptEventSeq,
+        contextState: state.contextState,
+        taskBudgetState: state.taskBudgetState,
+        topLevelAgentTurnState: state.topLevelAgentTurnState,
+        lastEmittedContextSummaryCompactionId:
+          state.lastEmittedContextSummaryCompactionId,
+        lastEmittedContextSummaryCompactionEpoch:
+          state.lastEmittedContextSummaryCompactionEpoch,
+        lastContextSummaryCompactionEpoch:
+          state.lastContextSummaryCompactionEpoch,
+        pendingInteractionQueryCount: state.pendingInteractionQueryCount,
+        backgroundCommands: state.backgroundCommands,
+        currentAssistantMessage: state.currentAssistantMessage,
+        usedTokens: state.usedTokens,
+        toolMetrics: state.toolMetrics,
+        readSnapshots: state.readSnapshots,
+        turns: state.turns,
+        stepId: state.stepId,
+        execId: state.execId,
+        interactionQueryId: state.interactionQueryId,
+        subAgentContexts: state.subAgentContexts,
+        restartRecovery: state.restartRecovery,
+      },
+    })
+    this.sessionPersistence.replaceFileStates(
+      cid,
+      state.fileStates.map((fileState) => ({
+        conversationId: cid,
+        path: fileState.path,
+        beforeContent: Buffer.from(fileState.beforeContent),
+        afterContent: Buffer.from(fileState.afterContent),
+        updatedAt,
+      }))
+    )
+    this.sessionPersistence.replaceReadPaths(
+      cid,
+      state.readPaths.map((readPath) => ({
+        conversationId: cid,
+        path: readPath,
+        readAt: updatedAt,
+      }))
+    )
+    this.sessionPersistence.replaceMessageBlobs(
+      cid,
+      state.messageBlobIds.map((blobId) => ({
+        conversationId: cid,
+        blobId,
+        addedAt: updatedAt,
+      }))
+    )
+    this.sessionPersistence.replaceTodos(
+      cid,
+      state.todos.map(
+        (todo): SessionTodo => ({
+          conversationId: cid,
+          id: todo.id,
+          content: todo.content,
+          status: todo.status,
+          createdAt: todo.createdAt,
+          updatedAt: todo.updatedAt,
+          dependencies: [...todo.dependencies],
+        })
+      )
+    )
+  }
+
+  private loadPersistedSessionState(row: SessionRow): PersistedChatSessionV1 {
+    const conversationId = row.conversationId as string
+    const config = row.config as Partial<PersistedChatSessionV1>
+    const contextStateRow = this.sessionPersistence.loadContextState(
+      row.conversationId
+    )
+    const contextState = (contextStateRow?.state ||
+      {}) as Partial<PersistedChatSessionV1>
+    const messages = this.loadPersistedMessages(row.conversationId)
+    const fileStates = this.sessionPersistence
+      .listFileStates(row.conversationId)
+      .map((fileState) => ({
+        path: fileState.path,
+        beforeContent: fileState.beforeContent.toString(),
+        afterContent: fileState.afterContent.toString(),
+      }))
+    const readPaths = this.sessionPersistence
+      .listReadPaths(row.conversationId)
+      .map((readPath) => readPath.path)
+    const messageBlobIds = this.sessionPersistence
+      .listMessageBlobs(row.conversationId)
+      .map((blob) => blob.blobId)
+
+    return {
+      version: 15,
+      conversationId,
+      messages,
+      messageRecords: contextState.messageRecords,
+      transcriptEvents: contextState.transcriptEvents,
+      nextTranscriptEventSeq: contextState.nextTranscriptEventSeq,
+      contextState: contextState.contextState,
+      taskBudgetState: contextState.taskBudgetState,
+      topLevelAgentTurnState: contextState.topLevelAgentTurnState,
+      lastEmittedContextSummaryCompactionId:
+        contextState.lastEmittedContextSummaryCompactionId,
+      lastEmittedContextSummaryCompactionEpoch:
+        contextState.lastEmittedContextSummaryCompactionEpoch,
+      lastContextSummaryCompactionEpoch:
+        contextState.lastContextSummaryCompactionEpoch,
+      model: row.model,
+      lastAssistantBackend: config.lastAssistantBackend,
+      lastAssistantModel: config.lastAssistantModel,
+      lastCodexResponseId: undefined,
+      lastCodexRequestSignature: undefined,
+      thinkingLevel:
+        typeof config.thinkingLevel === "number" ? config.thinkingLevel : 0,
+      thinkingDetailsRequested: config.thinkingDetailsRequested === true,
+      isAgentic: config.isAgentic === true,
+      supportedTools: Array.isArray(config.supportedTools)
+        ? config.supportedTools
+        : [],
+      mcpToolDefs: config.mcpToolDefs,
+      useWeb: config.useWeb === true,
+      requestContextEnv: config.requestContextEnv,
+      createdAt:
+        typeof config.createdAt === "number" ? config.createdAt : row.createdAt,
+      lastActivityAt:
+        typeof config.lastActivityAt === "number"
+          ? config.lastActivityAt
+          : row.lastActivityAt,
+      pendingToolCalls: [],
+      backgroundCommands: Array.isArray(contextState.backgroundCommands)
+        ? contextState.backgroundCommands
+        : [],
+      pendingInteractionQueryCount:
+        typeof contextState.pendingInteractionQueryCount === "number"
+          ? contextState.pendingInteractionQueryCount
+          : 0,
+      projectContext: config.projectContext,
+      codeChunks: config.codeChunks,
+      cursorCommands: config.cursorCommands,
+      customSystemPrompt: config.customSystemPrompt,
+      explicitContext: config.explicitContext,
+      contextTokenLimit: config.contextTokenLimit,
+      contextMaxMode: config.contextMaxMode,
+      usedContextTokens: config.usedContextTokens,
+      requestedMaxOutputTokens: config.requestedMaxOutputTokens,
+      requestedModelParameters: config.requestedModelParameters,
+      additionalRoots: config.additionalRoots,
+      usedTokens:
+        typeof contextState.usedTokens === "number"
+          ? contextState.usedTokens
+          : 0,
+      readPaths,
+      readSnapshots: Array.isArray(contextState.readSnapshots)
+        ? contextState.readSnapshots
+        : [],
+      fileStates,
+      toolMetrics: contextState.toolMetrics,
+      messageBlobIds,
+      turns: Array.isArray(contextState.turns) ? contextState.turns : [],
+      currentAssistantMessage: contextState.currentAssistantMessage,
+      stepId: typeof contextState.stepId === "number" ? contextState.stepId : 0,
+      execId: typeof contextState.execId === "number" ? contextState.execId : 1,
+      interactionQueryId:
+        typeof contextState.interactionQueryId === "number"
+          ? contextState.interactionQueryId
+          : 0,
+      todos: this.loadPersistedTodos(conversationId),
+      subAgentContexts: Array.isArray(contextState.subAgentContexts)
+        ? contextState.subAgentContexts
+        : undefined,
+      restartRecovery: contextState.restartRecovery,
+    }
+  }
+
+  private loadPersistedMessages(
+    conversationId: ConversationId
+  ): SessionMessage[] {
+    return this.messageStore
+      .getMessages(conversationId)
+      .map((message) => this.sessionMessageFromPersistedMessage(message))
+  }
+
+  private sessionMessageFromPersistedMessage(
+    message: PersistedMessage
+  ): SessionMessage {
+    const timestamp = new Date(message.timestamp).toISOString()
+    const content = message.content as MessageContent
+    if (message.role === "assistant") {
+      return makeSessionMessage("assistant", content, {
+        uuid: message.uuid,
+        timestamp,
+        messageId: message.messageId,
+      })
+    }
+    return makeSessionMessage("user", content, {
+      uuid: message.uuid,
+      timestamp,
+      isMeta: message.isMeta,
+    })
   }
 
   private loadPersistedSession(
@@ -2167,7 +2464,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         return undefined
       }
 
-      const persisted = row.config as unknown as PersistedChatSessionV1
+      const persisted = this.loadPersistedSessionState(row)
 
       // Lifecycle:
       //   1. Parse config blob → SessionRecord (pure, no side effects)
@@ -2897,6 +3194,65 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     return makeSessionMessage(role, content, {
       timestamp: new Date(seedTime).toISOString(),
     })
+  }
+
+  private persistInitialTranscriptMessages(
+    conversationId: ConversationId,
+    messages: SessionMessage[]
+  ): void {
+    if (messages.length === 0) {
+      return
+    }
+    if (this.messageStore.getMessages(conversationId).length > 0) {
+      return
+    }
+    this.messageStore.runInTransaction(conversationId, (txn) => {
+      for (const message of messages) {
+        const blocks = this.messageContentToBlocks(message.message.content)
+        if (message.type === "assistant") {
+          for (const block of blocks) {
+            if (block.type === "tool_result" || block.type === "cache_edits") {
+              continue
+            }
+            const result = this.messageStore.appendAssistantBlock(txn, block, {
+              turnId: ("initial:" + conversationId) as unknown as TurnId,
+              messageId: message.message.id,
+            })
+            if (isToolUseBlock(block)) {
+              this.toolCallLedger.open(txn, {
+                toolUseId: block.id,
+                toolName: block.name,
+                turnId: ("initial:" + conversationId) as unknown as TurnId,
+                openMessageSeq: result.seq,
+              })
+            }
+          }
+          continue
+        }
+
+        for (const block of blocks) {
+          if (
+            isToolResultBlock(block) &&
+            this.toolCallLedger.isOpen(conversationId, block.tool_use_id)
+          ) {
+            this.messageStore.appendToolResultBlock(txn, block, {
+              turnId: ("initial:" + conversationId) as unknown as TurnId,
+            })
+          } else {
+            this.messageStore.appendUserMessage(txn, [block], {
+              turnId: ("initial:" + conversationId) as unknown as TurnId,
+              isMeta: message.isMeta,
+            })
+          }
+        }
+      }
+    })
+  }
+
+  private messageContentToBlocks(content: MessageContent): ContentBlock[] {
+    return Array.isArray(content)
+      ? (content as ContentBlock[])
+      : [{ type: "text", text: typeof content === "string" ? content : "" }]
   }
 
   createContextState(
@@ -4225,6 +4581,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       // user/resume action. Restoring them from persisted session state causes
       // stale/duplicated default rules to leak across turns.
       cursorRules: undefined,
+      skillOptions: undefined,
       selectedCursorRulePaths: undefined,
       selectedCursorRuleNames: undefined,
       activeCursorSkillNames: [],
@@ -4515,6 +4872,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       projectContext: initialRequest?.projectContext,
       codeChunks: initialRequest?.codeChunks,
       cursorRules: initialRequest?.cursorRules,
+      skillOptions: initialRequest?.skillOptions,
       selectedCursorRulePaths: initialRequest?.selectedCursorRulePaths,
       selectedCursorRuleNames: initialRequest?.selectedCursorRuleNames,
       activeCursorSkillNames: [],
@@ -4714,6 +5072,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       }
       if (initialRequest) {
         session.cursorRules = initialRequest.cursorRules
+        session.skillOptions = initialRequest.skillOptions
         session.selectedCursorRulePaths = initialRequest.selectedCursorRulePaths
         session.selectedCursorRuleNames = initialRequest.selectedCursorRuleNames
       }
@@ -5564,6 +5923,19 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     if (!s) return
     s.cursorRules = rules
   }
+  getSkillOptions(
+    conversationId: string
+  ): ParsedCursorRequest["skillOptions"] | undefined {
+    return this.getSession(conversationId)?.skillOptions
+  }
+  setSkillOptions(
+    conversationId: string,
+    skillOptions: ParsedCursorRequest["skillOptions"]
+  ): void {
+    const s = this.getSession(conversationId)
+    if (!s) return
+    s.skillOptions = skillOptions
+  }
   getCustomSystemPrompt(conversationId: string): string | undefined {
     return this.getSession(conversationId)?.customSystemPrompt
   }
@@ -5718,6 +6090,21 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     const drained = [...s.deferredControlContinuations]
     s.deferredControlContinuations.length = 0
     return drained
+  }
+  clearDeferredControlContinuations(
+    conversationId: string,
+    reason: string
+  ): number {
+    const s = this.getSession(conversationId)
+    if (!s) return 0
+    const count = s.deferredControlContinuations.length
+    if (count === 0) return 0
+    s.deferredControlContinuations.length = 0
+    this.logger.warn(
+      `Cleared ${count} deferred control continuation(s) for ${conversationId}: ${reason}`
+    )
+    this.schedulePersist(conversationId)
+    return count
   }
   getRequestedMaxOutputTokens(conversationId: string): number | undefined {
     return this.getSession(conversationId)?.requestedMaxOutputTokens
@@ -6161,7 +6548,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
               ConversationId.of(conversationId)
             )
             if (!row) continue
-            const persisted = row.config as unknown as PersistedChatSessionV1
+            const persisted = this.loadPersistedSessionState(row)
 
             // Analytics-side lifecycle:
             //   1. Parse config blob → SessionRecord (pure)

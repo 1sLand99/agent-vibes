@@ -54,6 +54,12 @@ export interface SessionReadPath {
   readAt: number
 }
 
+export interface SessionContextStateRow {
+  conversationId: ConversationId
+  updatedAt: number
+  state: Record<string, unknown>
+}
+
 /**
  * SessionPersistenceService
  *
@@ -88,12 +94,20 @@ export class SessionPersistenceService {
   private stmtUpsertTodo?: StatementSync
   private stmtListTodos?: StatementSync
   private stmtDeleteTodo?: StatementSync
+  private stmtDeleteTodosForConversation?: StatementSync
 
   private stmtInsertMessageBlob?: StatementSync
   private stmtListMessageBlobs?: StatementSync
 
   private stmtUpsertReadPath?: StatementSync
   private stmtListReadPaths?: StatementSync
+  private stmtDeleteReadPathsForConversation?: StatementSync
+
+  private stmtUpsertContextState?: StatementSync
+  private stmtSelectContextState?: StatementSync
+
+  private stmtDeleteFileStatesForConversation?: StatementSync
+  private stmtDeleteMessageBlobsForConversation?: StatementSync
 
   constructor(private readonly persistence: PersistenceService) {}
 
@@ -266,6 +280,23 @@ export class SessionPersistenceService {
     stmt.run(conversationId, path)
   }
 
+  replaceFileStates(
+    conversationId: ConversationId,
+    states: SessionFileState[]
+  ): void {
+    this.persistence.runInTransaction(() => {
+      const deleteStmt = (this.stmtDeleteFileStatesForConversation ??=
+        this.persistence.prepare(
+          `DELETE FROM session_file_states
+            WHERE conversation_id = ?`
+        ))
+      deleteStmt.run(conversationId)
+      for (const state of states) {
+        this.upsertFileState(state)
+      }
+    })
+  }
+
   // ── todos ────────────────────────────────────────────────────────
 
   upsertTodo(todo: SessionTodo): void {
@@ -334,6 +365,20 @@ export class SessionPersistenceService {
     stmt.run(conversationId, id)
   }
 
+  replaceTodos(conversationId: ConversationId, todos: SessionTodo[]): void {
+    this.persistence.runInTransaction(() => {
+      const deleteStmt = (this.stmtDeleteTodosForConversation ??=
+        this.persistence.prepare(
+          `DELETE FROM session_todos
+            WHERE conversation_id = ?`
+        ))
+      deleteStmt.run(conversationId)
+      for (const todo of todos) {
+        this.upsertTodo(todo)
+      }
+    })
+  }
+
   // ── message blobs ────────────────────────────────────────────────
 
   insertMessageBlob(blob: SessionMessageBlob): void {
@@ -362,6 +407,23 @@ export class SessionPersistenceService {
       blobId: row.blob_id,
       addedAt: row.added_at,
     }))
+  }
+
+  replaceMessageBlobs(
+    conversationId: ConversationId,
+    blobs: SessionMessageBlob[]
+  ): void {
+    this.persistence.runInTransaction(() => {
+      const deleteStmt = (this.stmtDeleteMessageBlobsForConversation ??=
+        this.persistence.prepare(
+          `DELETE FROM session_message_blobs
+            WHERE conversation_id = ?`
+        ))
+      deleteStmt.run(conversationId)
+      for (const blob of blobs) {
+        this.insertMessageBlob(blob)
+      }
+    })
   }
 
   // ── read paths ───────────────────────────────────────────────────
@@ -393,5 +455,64 @@ export class SessionPersistenceService {
       path: row.path,
       readAt: row.read_at,
     }))
+  }
+
+  replaceReadPaths(
+    conversationId: ConversationId,
+    records: SessionReadPath[]
+  ): void {
+    this.persistence.runInTransaction(() => {
+      const deleteStmt = (this.stmtDeleteReadPathsForConversation ??=
+        this.persistence.prepare(
+          `DELETE FROM session_read_paths
+            WHERE conversation_id = ?`
+        ))
+      deleteStmt.run(conversationId)
+      for (const record of records) {
+        this.upsertReadPath(record)
+      }
+    })
+  }
+
+  // ── context state ────────────────────────────────────────────────
+
+  upsertContextState(row: SessionContextStateRow): void {
+    const stmt = (this.stmtUpsertContextState ??= this.persistence.prepare(
+      `INSERT INTO session_context_state (
+         conversation_id, updated_at, state_json
+       ) VALUES (?, ?, ?)
+       ON CONFLICT(conversation_id) DO UPDATE SET
+         updated_at = excluded.updated_at,
+         state_json = excluded.state_json`
+    ))
+    stmt.run(row.conversationId, row.updatedAt, JSON.stringify(row.state))
+  }
+
+  loadContextState(
+    conversationId: ConversationId
+  ): SessionContextStateRow | undefined {
+    const stmt = (this.stmtSelectContextState ??= this.persistence.prepare(
+      `SELECT updated_at, state_json
+         FROM session_context_state
+        WHERE conversation_id = ?`
+    ))
+    const row = stmt.get(conversationId) as
+      | { updated_at: number; state_json: string }
+      | undefined
+    if (!row) return undefined
+    let state: Record<string, unknown>
+    try {
+      state = JSON.parse(row.state_json) as Record<string, unknown>
+    } catch (err) {
+      this.logger.warn(
+        `loadContextState(${conversationId}): bad state_json: ${(err as Error).message}`
+      )
+      state = {}
+    }
+    return {
+      conversationId,
+      updatedAt: row.updated_at,
+      state,
+    }
   }
 }

@@ -10,14 +10,15 @@
  * 这里把这些决策集中沉淀在 skills/ 目录中。
  */
 
-import type { CursorRule } from "../../../gen/agent/v1_pb"
+import type { CursorRule, SkillOptions } from "../../../gen/agent/v1_pb"
 
 /**
  * Skill 被认定为 active 的原因。
  *
- * 优先级 manual > selected > previously_loaded > path_match。
+ * 优先级 required > manual > selected > previously_loaded > path_match。
  */
 export type CursorSkillActivationReason =
+  | "required"
   | "manual"
   | "selected"
   | "previously_loaded"
@@ -37,6 +38,17 @@ export interface CursorSkillMetadata {
   fullPath: string
   content: string
   ruleType?: string
+  enabled?: boolean
+  parseError?: string
+  folderPath?: string
+  readmeFilePath?: string
+  packageType?: number
+  ruleSource?: CursorRule["source"]
+  gitRemoteOrigin?: string
+  plugin?: string
+  marketplace?: string
+  pluginId?: string
+  marketplaceId?: string
   active: boolean
   activationReason?: CursorSkillActivationReason
 }
@@ -50,14 +62,19 @@ export interface CursorSkillMetadata {
  * - activeSkillNames：会话历史中已经激活过的 Skill（持久状态）
  * - projectRoot：用于 paths glob 匹配时的相对路径解析
  * - contextPaths：当前轮次涉及的文件路径（用于 path_match 自动激活）
+ * - environmentNames：当前 bridge/IDE 环境名，用于 environments / disabled_environments
+ * - scopePaths：当前项目/工作区路径，用于 scoped_to
  */
 export interface CursorSkillPolicyInput {
   rules?: CursorRule[]
+  skillOptions?: SkillOptions
   selectedRulePaths?: string[]
   selectedRuleNames?: string[]
   activeSkillNames?: string[]
   projectRoot?: string
   contextPaths?: string[]
+  environmentNames?: string[]
+  scopePaths?: string[]
 }
 
 /**

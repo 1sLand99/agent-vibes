@@ -1,3 +1,5 @@
+import { CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE } from "../../../context"
+
 export interface SubAgentSseToolCall {
   id: string
   name: string
@@ -7,6 +9,7 @@ export interface SubAgentSseToolCall {
 export interface SubAgentSseTurnResult {
   fullText: string
   toolCalls: SubAgentSseToolCall[]
+  rawResponseItems: Record<string, unknown>[]
 }
 
 export interface SubAgentSseEvent {
@@ -23,6 +26,7 @@ export interface SubAgentSseEvent {
       thinking?: string
       partial_json?: string
     }
+    item?: Record<string, unknown>
   }
 }
 
@@ -35,9 +39,19 @@ export interface SubAgentSseTurnUpdate {
 export class SubAgentSseTurnCollector {
   private fullText = ""
   private readonly toolCalls: SubAgentSseToolCall[] = []
+  private readonly rawResponseItems: Record<string, unknown>[] = []
   private currentToolCall: SubAgentSseToolCall | null = null
 
   apply(event: SubAgentSseEvent): SubAgentSseTurnUpdate {
+    if (
+      event.type === CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE &&
+      event.data.item &&
+      typeof event.data.item === "object"
+    ) {
+      this.rawResponseItems.push({ ...event.data.item })
+      return {}
+    }
+
     if (event.type === "content_block_start") {
       const block = event.data.content_block
       if (block?.type === "tool_use" && block.id && block.name) {
@@ -79,6 +93,7 @@ export class SubAgentSseTurnCollector {
     return {
       fullText: this.fullText,
       toolCalls: [...this.toolCalls],
+      rawResponseItems: this.rawResponseItems.map((item) => ({ ...item })),
     }
   }
 }

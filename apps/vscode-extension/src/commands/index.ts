@@ -199,10 +199,8 @@ export function registerCommands(
 
   context.subscriptions.push(
     vscode.commands.registerCommand(CMD.START_SERVER, async () => {
-      // Start only manages the bridge process. Cursor traffic forwarding is
-      // an independent concern controlled from the API tab's Cursor IDE
-      // Protocol toggle, so the service can run purely as a relay without
-      // intercepting Cursor.
+      // Start only manages the bridge process. Cursor IDE connection is
+      // controlled from the API tab, so the service can run purely as a relay.
       await bridge.start()
     })
   )
@@ -247,6 +245,57 @@ export function registerCommands(
         await vscode.commands.executeCommand("workbench.action.quit")
       }
     })
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      CMD.APPLY_CURSOR_BRIDGE_ENDPOINT_PATCH,
+      async () => {
+        const result = cursorPatch.applyBridgeEndpointPatch(config.port)
+        if (!result.success) {
+          const detail = result.errors.join("; ") || t("checksums.unknownError")
+          void vscode.window.showErrorMessage(
+            tFmt("patches.bridgeEndpointFailed", { detail })
+          )
+          return
+        }
+
+        await vscode.workspace
+          .getConfiguration("agentVibes")
+          .update(
+            "trafficMode",
+            "cursorPatch",
+            vscode.ConfigurationTarget.Global
+          )
+
+        let message =
+          result.restartRequired === true
+            ? t("patches.bridgeEndpointApplied")
+            : result.applied > 0
+              ? t("patches.bridgeEndpointRepaired")
+              : t("patches.bridgeEndpointAlreadyApplied")
+        if (result.checksumUpdated > 0) {
+          message +=
+            " " +
+            tFmt("patches.checksumsAutoUpdated", {
+              count: result.checksumUpdated,
+            })
+        }
+
+        if (result.restartRequired === true) {
+          const action = await vscode.window.showInformationMessage(
+            message,
+            t("forwarding.action.quit"),
+            t("setup.action.later")
+          )
+          if (action === t("forwarding.action.quit")) {
+            await vscode.commands.executeCommand("workbench.action.quit")
+          }
+        } else {
+          void vscode.window.showInformationMessage(message)
+        }
+      }
+    )
   )
 
   context.subscriptions.push(
@@ -717,6 +766,13 @@ export function registerCommands(
         return
       }
 
+      void vscode.workspace
+        .getConfiguration("agentVibes")
+        .update(
+          "trafficMode",
+          "systemForwarding",
+          vscode.ConfigurationTarget.Global
+        )
       executePrivileged(
         network.getEnableCommand(),
         t("terminal.enableForwarding")

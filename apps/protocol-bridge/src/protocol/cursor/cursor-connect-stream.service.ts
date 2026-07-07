@@ -14,7 +14,9 @@ import * as os from "os"
 import * as path from "path"
 import {
   buildSubAgentMemorySourceCompactionId,
+  CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
   CodexContextAdapterService,
+  type CodexRawResponseItemBlock,
   type CodexRemoteCompactProvider,
   type ContextAttachmentSnapshot,
   type ContextCompactionCandidate,
@@ -135,6 +137,7 @@ import {
 import {
   createCodexContextLedgerState,
   previewCodexContextLedgerMessages,
+  previewCodexContextLedgerProjection,
   projectCodexContextLedgerMessages,
   type CodexContextEntry,
   type CodexContextLedgerState,
@@ -296,8 +299,17 @@ import {
 function toLooseShape(m: SessionMessage): {
   role: "user" | "assistant"
   content: MessageContent
+  messageId?: string
+  isMeta?: boolean
 } {
-  return { role: m.message.role, content: m.message.content }
+  return {
+    role: m.message.role,
+    content: m.message.content,
+    ...(m.type === "assistant" && m.message.id
+      ? { messageId: m.message.id }
+      : {}),
+    ...(m.type === "user" && m.isMeta ? { isMeta: true } : {}),
+  }
 }
 
 interface CursorToolCapabilityOptionsForRoute {
@@ -310,6 +322,7 @@ type PromptContext = Pick<
   | "projectContext"
   | "codeChunks"
   | "cursorRules"
+  | "skillOptions"
   | "cursorCommands"
   | "customSystemPrompt"
   | "explicitContext"
@@ -357,6 +370,7 @@ type MessageContentItem =
   | ToolUseContentItem
   | ToolResultContentItem
   | ThinkingContentItem
+  | CodexRawResponseItemBlock
 
 /**
  * Message content type — re-exported from session-lifecycle.service to keep
@@ -3234,6 +3248,7 @@ export class CursorConnectStreamService {
       projectContext: session.projectContext,
       codeChunks: session.codeChunks,
       cursorRules: session.cursorRules,
+      skillOptions: session.skillOptions,
       selectedCursorRulePaths: session.selectedCursorRulePaths,
       selectedCursorRuleNames: session.selectedCursorRuleNames,
       cursorCommands: session.cursorCommands,
@@ -3286,6 +3301,24 @@ export class CursorConnectStreamService {
     // `drainDeferredControlContinuations` replay it once the
     // current turn settles.
     if (this.hasPendingStreamWork(session)) {
+      if (!streamId) {
+        this.logger.warn(
+          `Dropping control continuation (${reason}) for ${conversationId}: missing streamId while ${this.describePendingStreamWork(
+            session
+          )}`
+        )
+        return false
+      }
+      const currentStreamId =
+        this.sessionStream.getCurrentStreamId(conversationId)
+      if (!currentStreamId || currentStreamId !== streamId) {
+        this.logger.warn(
+          `Dropping control continuation (${reason}) for ${conversationId}: stale stream ${this.summarizeStreamId(
+            streamId
+          )} current=${this.summarizeStreamId(currentStreamId)}`
+        )
+        return false
+      }
       this.sessionManager.enqueueDeferredControlContinuation(conversationId, {
         parsed,
         newMessage,
@@ -3368,6 +3401,17 @@ export class CursorConnectStreamService {
 
         const entry = current.deferredControlContinuations.shift()
         if (!entry) return
+        const currentStreamId =
+          this.sessionStream.getCurrentStreamId(conversationId)
+        if (!currentStreamId || entry.streamId !== currentStreamId) {
+          this.logger.warn(
+            `Dropping stale deferred control continuation (${entry.reason}) for ${conversationId}: ` +
+              `entryStream=${this.summarizeStreamId(entry.streamId)} current=${this.summarizeStreamId(
+                currentStreamId
+              )}`
+          )
+          continue
+        }
         const waitedMs = Date.now() - entry.enqueuedAt
         this.logger.log(
           `Draining deferred control continuation (${entry.reason}) for ${conversationId} after ${waitedMs}ms (trigger=${triggerReason}); remaining=${current.deferredControlContinuations.length}`
@@ -3818,6 +3862,7 @@ export class CursorConnectStreamService {
       projectContext: session.projectContext,
       codeChunks: session.codeChunks,
       cursorRules: session.cursorRules,
+      skillOptions: session.skillOptions,
       selectedCursorRulePaths: session.selectedCursorRulePaths,
       selectedCursorRuleNames: session.selectedCursorRuleNames,
       activeCursorSkillNames: session.activeCursorSkillNames,
@@ -4591,6 +4636,56 @@ export class CursorConnectStreamService {
     return Math.floor(value)
   }
 
+  private normalizeNonNegativeInteger(value: unknown): number | undefined {
+    if (typeof value !== "number") return undefined
+    if (!Number.isFinite(value) || value < 0) return undefined
+    return Math.floor(value)
+  }
+
+  private resolveSessionRouteForContextAccounting(
+    session: Pick<SessionRecord, "model" | "conversationId">
+  ): ModelRouteResult | undefined {
+    try {
+      return this.modelRouter.resolveModel(session.model)
+    } catch (error) {
+      this.logger.warn(
+        `Failed to resolve backend for context accounting ` +
+          `(conversation=${session.conversationId}, model=${session.model}): ${String(error)}`
+      )
+      return undefined
+    }
+  }
+
+  private sanitizeParsedRequestForSession(
+    parsed: ParsedCursorRequest
+  ): ParsedCursorRequest {
+    const usedContextTokens = this.normalizePositiveInteger(
+      parsed.usedContextTokens
+    )
+    if (!usedContextTokens) {
+      return parsed
+    }
+
+    let route: ModelRouteResult
+    try {
+      route = this.modelRouter.resolveModel(parsed.model)
+    } catch {
+      return parsed
+    }
+    if (route.backend !== "codex") {
+      return parsed
+    }
+
+    this.logger.debug(
+      `[Codex][ContextAccounting] Ignoring Cursor conversationState.tokenDetails.usedTokens=${usedContextTokens} ` +
+        `for session import; checkpoint usage is derived from Codex projection.`
+    )
+    return {
+      ...parsed,
+      usedContextTokens: undefined,
+    }
+  }
+
   private resolveCodexContextTokenLimits(model?: string): {
     normal?: number
     max?: number
@@ -4753,6 +4848,83 @@ export class CursorConnectStreamService {
       if (family === "gemini") return 1_000_000
     }
     return 200_000
+  }
+
+  private resolveCheckpointTokenDetails(session: SessionRecord): {
+    usedTokens: number
+    maxTokens: number
+  } {
+    const maxTokens = this.resolveCheckpointMaxTokens(session)
+    return {
+      usedTokens: this.resolveCheckpointUsedTokens(session),
+      maxTokens,
+    }
+  }
+
+  private resolveCheckpointUsedTokens(session: SessionRecord): number {
+    const ctx = this.contextState.getContextRecord(session.conversationId)
+    if (!ctx) return 0
+
+    const route = this.resolveSessionRouteForContextAccounting(session)
+    if (route?.backend !== "codex") {
+      return this.normalizeNonNegativeInteger(ctx.usedTokens) ?? 0
+    }
+
+    const projectedTokens = this.resolveCodexProjectedContextTokens(session)
+    if (projectedTokens !== undefined) {
+      return projectedTokens
+    }
+
+    this.logger.warn(
+      `[Codex][ContextAccounting] Missing projected context token ledger for checkpoint ` +
+        `(conversation=${session.conversationId}); reporting 0 used tokens.`
+    )
+    return 0
+  }
+
+  private resolveCodexProjectedContextTokens(
+    session: SessionRecord,
+    options?: { preferUsageLedger?: boolean }
+  ): number | undefined {
+    const ctx = this.contextState.getContextRecord(session.conversationId)
+    if (!ctx) return undefined
+
+    const pendingPromptTokens =
+      ctx.pendingRequestContextLedger?.promptTokenCount
+    const ledgerProjectedTokens =
+      ctx.contextState.usageLedger.projectedTokenCount
+    const candidates = options?.preferUsageLedger
+      ? [ledgerProjectedTokens, pendingPromptTokens]
+      : [pendingPromptTokens, ledgerProjectedTokens]
+    for (const candidate of candidates) {
+      const normalized = this.normalizeNonNegativeInteger(candidate)
+      if (normalized !== undefined) {
+        return normalized
+      }
+    }
+    return undefined
+  }
+
+  private resolveAssistantUsageReportedContextTokens(
+    session: SessionRecord
+  ): number | undefined {
+    const route = this.resolveSessionRouteForContextAccounting(session)
+    if (route?.backend !== "codex") {
+      return undefined
+    }
+
+    const projectedTokens = this.resolveCodexProjectedContextTokens(session, {
+      preferUsageLedger: true,
+    })
+    if (projectedTokens !== undefined) {
+      return projectedTokens
+    }
+
+    this.logger.warn(
+      `[Codex][ContextAccounting] Missing projected context token ledger for assistant usage ` +
+        `(conversation=${session.conversationId}); reporting 0 used tokens.`
+    )
+    return 0
   }
 
   private resolveMaxOutputTokens(
@@ -4944,8 +5116,10 @@ export class CursorConnectStreamService {
       todos: this.contextState
         .getContextRecord(session.conversationId)!
         .todos.map((todo) => ({
+          id: todo.id,
           content: todo.content,
           status: todo.status,
+          dependencies: [...todo.dependencies],
         })),
       sessionMemory: (
         this.contextState.getContextRecord(session.conversationId)!.contextState
@@ -5028,6 +5202,28 @@ export class CursorConnectStreamService {
         this.sessionManager.pendingToolCallCount(session.conversationId) > 0 ||
         this.sessionStream.getStreamRecord(session.conversationId)!
           .pendingInteractionQueries.size > 0)
+    )
+  }
+
+  private clearSupersededControlStateForNewUserTurn(
+    conversationId: string,
+    streamId: string | undefined
+  ): void {
+    const deferredCount = this.sessionManager.clearDeferredControlContinuations(
+      conversationId,
+      `new user turn on stream ${this.summarizeStreamId(streamId)}`
+    )
+    const interactionQueryCount =
+      this.sessionStream.interruptPendingInteractionQueries(
+        conversationId,
+        `new user turn on stream ${this.summarizeStreamId(streamId)}`
+      )
+    if (deferredCount === 0 && interactionQueryCount === 0) return
+
+    this.logger.warn(
+      `Cleared superseded control state before new user turn: conversation=${conversationId} ` +
+        `stream=${this.summarizeStreamId(streamId)} ` +
+        `deferredContinuations=${deferredCount} pendingInteractionQueries=${interactionQueryCount}`
     )
   }
 
@@ -5371,7 +5567,8 @@ export class CursorConnectStreamService {
 
     if (
       blocks.every(
-        (block) => block.type === "text" && typeof block.text === "string"
+        (block): block is TextContentItem =>
+          block.type === "text" && typeof block.text === "string"
       )
     ) {
       return blocks.map((block) => String(block.text || "")).join("\n\n")
@@ -5719,7 +5916,9 @@ export class CursorConnectStreamService {
       this.logger.debug(
         `[tool-result-write] flush-trigger (opportunistic) for batch members=[${batch.toolCallIds.join(",")}] buffered=[${[...(this.bufferedToolResultsByConversation.get(session.conversationId)?.keys() ?? [])].join(",")}]`
       )
-      this.flushBufferedToolResults(session, batch.toolCallIds)
+      this.flushBufferedToolResults(session, batch.toolCallIds, {
+        batchId: batch.id,
+      })
     }
   }
 
@@ -5743,12 +5942,22 @@ export class CursorConnectStreamService {
    */
   private flushBufferedToolResults(
     session: SessionRecord,
-    declarationOrder: string[]
+    declarationOrder: string[],
+    options?: { batchId?: string }
   ): void {
     const buffer = this.bufferedToolResultsByConversation.get(
       session.conversationId
     )
-    if (!buffer || buffer.size === 0) return
+    if (!buffer || buffer.size === 0) {
+      if (options?.batchId) {
+        this.assistantToolBatch.completeAssistantToolBatch(
+          session.conversationId,
+          options.batchId,
+          "tool result buffer already empty"
+        )
+      }
+      return
+    }
 
     const flushOrder = orderBufferedToolResultIdsForFlush(
       declarationOrder,
@@ -5843,6 +6052,11 @@ export class CursorConnectStreamService {
     }
 
     this.bufferedToolResultsByConversation.delete(session.conversationId)
+    this.assistantToolBatch.completeAssistantToolBatch(
+      session.conversationId,
+      options?.batchId,
+      "tool results flushed"
+    )
   }
 
   /**
@@ -6331,7 +6545,12 @@ export class CursorConnectStreamService {
       replacementState: options?.replacementState,
     })
     const stripped = this.stripTransientAssistantInfrastructureMessages(
-      compacted.messages.map((m) => makeSessionMessage(m.role, m.content))
+      compacted.messages.map((m) =>
+        makeSessionMessage(m.role, m.content, {
+          messageId: m.messageId,
+          isMeta: m.isMeta,
+        })
+      )
     )
     if (
       compacted.compactedToolInputs > 0 ||
@@ -6886,9 +7105,19 @@ export class CursorConnectStreamService {
   }
 
   private applyToolResultReplacementMap(
-    messages: Array<{ role: "user" | "assistant"; content: MessageContent }>,
+    messages: Array<{
+      role: "user" | "assistant"
+      content: MessageContent
+      messageId?: string
+      isMeta?: boolean
+    }>,
     replacementByToolUseId: ReadonlyMap<string, string>
-  ): Array<{ role: "user" | "assistant"; content: MessageContent }> {
+  ): Array<{
+    role: "user" | "assistant"
+    content: MessageContent
+    messageId?: string
+    isMeta?: boolean
+  }> {
     return messages.map((message) => {
       if (message.role !== "user" || !Array.isArray(message.content)) {
         return message
@@ -6939,13 +7168,23 @@ export class CursorConnectStreamService {
   }
 
   private enforceAggregateToolResultBudgetForHistory(
-    messages: Array<{ role: "user" | "assistant"; content: MessageContent }>,
+    messages: Array<{
+      role: "user" | "assistant"
+      content: MessageContent
+      messageId?: string
+      isMeta?: boolean
+    }>,
     options?: {
       conversationId?: string
       replacementState?: ContextToolResultReplacementState
     }
   ): {
-    messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
+    messages: Array<{
+      role: "user" | "assistant"
+      content: MessageContent
+      messageId?: string
+      isMeta?: boolean
+    }>
     changed: boolean
     storedToolResults: number
   } {
@@ -7022,13 +7261,20 @@ export class CursorConnectStreamService {
     messages: Array<{
       role: "user" | "assistant"
       content: MessageContent
+      messageId?: string
+      isMeta?: boolean
     }>,
     options?: {
       conversationId?: string
       replacementState?: ContextToolResultReplacementState
     }
   ): {
-    messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
+    messages: Array<{
+      role: "user" | "assistant"
+      content: MessageContent
+      messageId?: string
+      isMeta?: boolean
+    }>
     compactedToolInputs: number
     compactedToolResults: number
   } {
@@ -7356,9 +7602,9 @@ export class CursorConnectStreamService {
       )
     }
 
-    const projectedForBackend =
+    const codexProjection =
       backend === "codex"
-        ? this.codexContextAdapter.projectCodexMessages(
+        ? this.codexContextAdapter.projectCodexMessagesWithMetadata(
             this.contextState.getContextRecord(session.conversationId)!
               .contextState,
             primary.messages,
@@ -7367,9 +7613,27 @@ export class CursorConnectStreamService {
               systemPromptTokens: budget.systemPromptTokens,
               pendingToolUseIds: options?.pendingToolUseIds,
               truncationPolicy: codexTruncationPolicy,
+              allowHardFit: !options?.dryRun,
             }
           )
-        : primary.messages
+        : undefined
+    const projectedForBackend = codexProjection?.messages || primary.messages
+    if (
+      backend === "codex" &&
+      codexProjection?.hardFitApplied &&
+      !options?.dryRun
+    ) {
+      this.codexService.resetConversationContinuationState(
+        session.conversationId,
+        options?.model || session.model,
+        `codex projection hard-fit (${contextLabel})`
+      )
+      this.logger.warn(
+        `Codex projection hard-fit applied (${contextLabel}): ` +
+          `before=${codexProjection.beforeHardFitTokens}, ` +
+          `hardMax=${codexProjection.hardMaxTokens}`
+      )
+    }
 
     const truncatedMessages = projectedForBackend as Array<{
       role: "user" | "assistant"
@@ -7453,9 +7717,85 @@ export class CursorConnectStreamService {
         {
           role: message.role,
           content: message.content,
+          ...(message.messageId ? { messageId: message.messageId } : {}),
         },
       ]
     })
+  }
+
+  private estimateCodexProjectedPromptTokens(
+    session: SessionRecord,
+    route: ModelRouteResult,
+    budget: ContextProjectionBudget,
+    options: {
+      model?: string
+      pendingToolUseIds?: string[]
+      strategy?: "auto" | "manual" | "reactive"
+      integrityMode?: "strict-adjacent" | "global"
+    }
+  ): number | undefined {
+    const contextRecord = this.contextState.getContextRecord(
+      session.conversationId
+    )
+    if (!contextRecord) {
+      return undefined
+    }
+    const model = options.model || route.model || session.model
+    try {
+      const primary = this.contextRequestPlanner.projectState(
+        contextRecord.contextState,
+        this.buildContextAttachmentSnapshot(session),
+        budget,
+        {
+          pendingToolUseIds: options.pendingToolUseIds,
+          integrityMode: options.integrityMode || "global",
+          strategy: options.strategy || "auto",
+          dryRun: true,
+        }
+      )
+      const codexProjection =
+        this.codexContextAdapter.projectCodexMessagesWithMetadata(
+          contextRecord.contextState,
+          primary.messages,
+          {
+            maxTokens: budget.maxTokens,
+            systemPromptTokens: budget.systemPromptTokens,
+            pendingToolUseIds: options.pendingToolUseIds,
+            truncationPolicy: this.resolveCodexTruncationPolicy(model),
+            allowHardFit: false,
+          }
+        )
+      const contextEntries = this.buildCodexContextEntries(
+        this.buildPromptContextFromSession(session),
+        {
+          model,
+          deferredCatalog: session.deferredToolCatalog,
+          sessionMessageCount: this.getSessionMessageCount(session),
+        }
+      )
+      const projected = previewCodexContextLedgerProjection(
+        this.peekCodexContextLedger(session.conversationId),
+        this.toCodexConversationMessages(codexProjection.messages),
+        contextEntries
+      )
+      const projectedTokens = projected.messages.length
+        ? this.tokenCounter.countMessages(
+            projected.messages as UnifiedMessage[]
+          )
+        : 0
+      this.logger.debug(
+        `Codex compaction trigger projection: conversation=${session.conversationId}, ` +
+          `tokens=${projectedTokens}, historyBeforeHardFit=${codexProjection.beforeHardFitTokens}, ` +
+          `hardMax=${codexProjection.hardMaxTokens}, contextMessages=${projected.contextMessages.length}, ` +
+          `addedContextMessages=${projected.addedContextMessages.length}`
+      )
+      return projectedTokens || undefined
+    } catch (error) {
+      this.logger.warn(
+        `Codex compaction trigger projection failed for ${session.conversationId}: ${String(error)}`
+      )
+      return undefined
+    }
   }
 
   private async compactCodexSessionForRoute(
@@ -7770,40 +8110,17 @@ export class CursorConnectStreamService {
             }),
         }
       }
-      const collapseCommit =
-        await this.codexContextAdapter.applyCollapsesIfNeeded(
-          this.contextState.getContextRecord(session.conversationId)!
-            .contextState,
-          this.buildContextAttachmentSnapshot(session),
-          {
-            maxTokens: budget.maxTokens,
-            systemPromptTokens: budget.systemPromptTokens,
-            autoCompactTokenLimit: budget.autoCompactTokenLimit,
-            predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
-            strategy: options.strategy,
-            integrityMode,
-            referenceContextItem,
-            remoteCompactProvider: codexRemoteCompactProvider,
-            signal: options.signal,
-          }
-        )
-      options.signal.throwIfAborted()
-      if (collapseCommit) {
-        this.contextState.markContextStateDirty(session.conversationId)
-        this.contextState.recordCursorTurnTransition(session.conversationId, {
-          phase: "context_preparing",
-          reason: "context_collapse_applied",
-          backend: route.backend,
-          backendModel: route.model,
-          model: options.model || session.model,
-          details: {
-            collapseId: collapseCommit.id,
-            archivedMessages: collapseCommit.sourceMessageCount,
-            projectedTokens: collapseCommit.projectedTokenCount,
-            strategy: options.strategy,
-          },
-        })
-      }
+      const projectedTokenOverride = this.estimateCodexProjectedPromptTokens(
+        session,
+        route,
+        budget,
+        {
+          model: options.model,
+          pendingToolUseIds: options.pendingToolUseIds,
+          strategy: options.strategy,
+          integrityMode,
+        }
+      )
       const plan = await this.codexContextAdapter.compactIfNeeded(
         this.contextState.getContextRecord(session.conversationId)!
           .contextState,
@@ -7813,6 +8130,7 @@ export class CursorConnectStreamService {
           systemPromptTokens: budget.systemPromptTokens,
           autoCompactTokenLimit: budget.autoCompactTokenLimit,
           predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
+          projectedTokenOverride,
           strategy: options.strategy,
           integrityMode,
           referenceContextItem,
@@ -7867,6 +8185,10 @@ export class CursorConnectStreamService {
         `Context compact applied: backend=${route.backend}, model=${options.model || route.model || session.model}, ` +
           `strategy=${options.strategy}, budget=${budget.maxTokens}, estimatedTokens=${plan.estimatedTokens}, ` +
           `compactionId=${plan.commit.id}`
+      )
+      this.resetCodexContextLedger(
+        session.conversationId,
+        `context compaction applied (${plan.commit.id})`
       )
       this.resetCodexContinuationAfterProjectionRewrite(
         route.backend,
@@ -7955,6 +8277,10 @@ export class CursorConnectStreamService {
       `Context compact applied: backend=${route.backend}, model=${options.model || route.model || session.model}, ` +
         `strategy=${options.strategy}, budget=${budget.maxTokens}, estimatedTokens=${plan.estimatedTokens}, ` +
         `compactionId=${plan.commit.id}`
+    )
+    this.resetCodexContextLedger(
+      session.conversationId,
+      `context compaction applied (${plan.commit.id})`
     )
     this.resetCodexContinuationAfterProjectionRewrite(
       route.backend,
@@ -8395,7 +8721,8 @@ export class CursorConnectStreamService {
       assistantRecordId,
       usage,
       this.contextState.getContextRecord(session.conversationId)!.contextState
-        .usageLedger
+        .usageLedger,
+      this.resolveAssistantUsageReportedContextTokens(session)
     )
   }
 
@@ -8450,6 +8777,7 @@ ${raw}
       projectContext: session.projectContext,
       codeChunks: session.codeChunks,
       cursorRules: session.cursorRules,
+      skillOptions: session.skillOptions,
       selectedCursorRulePaths: session.selectedCursorRulePaths,
       selectedCursorRuleNames: session.selectedCursorRuleNames,
       cursorCommands: session.cursorCommands,
@@ -8620,6 +8948,7 @@ ${raw}
         turnId: this.getCurrentParentTurnId(conversationId),
         kind: "cloud_code_protocol_recovery",
         deadline: Date.now() + 30 * 60 * 1000,
+        streamId: this.sessionStream.getCurrentStreamId(conversationId),
       }
     )
 
@@ -8714,10 +9043,15 @@ ${raw}
     const compacted: Array<{
       role: "user" | "assistant"
       content: MessageContent
+      messageId?: string
+      isMeta?: boolean
     }> = []
 
     for (const message of messages) {
       let nextContent = message.message.content
+      const nextMessageId =
+        message.type === "assistant" ? message.message.id : undefined
+      const nextIsMeta = message.type === "user" ? message.isMeta : undefined
 
       if (Array.isArray(message.message.content)) {
         const filtered = (
@@ -8750,7 +9084,13 @@ ${raw}
       }
 
       const previous = compacted[compacted.length - 1]
-      if (previous?.role === message.message.role) {
+      const sameAssistantMessage =
+        previous?.role === "assistant" &&
+        message.message.role === "assistant" &&
+        previous.messageId === nextMessageId
+      const sameUserMessage =
+        previous?.role === "user" && message.message.role === "user"
+      if (sameAssistantMessage || sameUserMessage) {
         previous.content = this.mergeMessageContents(
           previous.content,
           nextContent
@@ -8761,11 +9101,18 @@ ${raw}
       compacted.push({
         role: message.message.role,
         content: nextContent,
+        ...(nextMessageId ? { messageId: nextMessageId } : {}),
+        ...(nextIsMeta ? { isMeta: true } : {}),
       })
     }
 
     const normalized = this.normalizeHistoryForBackend(
-      compacted.map((c) => makeSessionMessage(c.role, c.content)),
+      compacted.map((c) =>
+        makeSessionMessage(c.role, c.content, {
+          messageId: c.messageId,
+          isMeta: c.isMeta,
+        })
+      ),
       `cloud code protocol recovery: ${toolUseId}`,
       {
         pendingToolUseIds,
@@ -8889,6 +9236,7 @@ ${raw}
     conversationId: string,
     model: string
   ): Buffer {
+    const tokenDetails = this.resolveCheckpointTokenDetails(session)
     return this.grpcService.createConversationCheckpointResponse(
       conversationId,
       model,
@@ -8896,10 +9244,8 @@ ${raw}
         messageBlobIds: this.contextState.getContextRecord(
           session.conversationId
         )!.messageBlobIds,
-        usedTokens:
-          this.contextState.getContextRecord(session.conversationId)!
-            .usedTokens || 0,
-        maxTokens: this.resolveCheckpointMaxTokens(session),
+        usedTokens: tokenDetails.usedTokens,
+        maxTokens: tokenDetails.maxTokens,
         workspaceUri: session.projectContext?.rootPath
           ? `file://${session.projectContext.rootPath}`
           : undefined,
@@ -9324,14 +9670,15 @@ ${raw}
     const completedCtx = this.contextState.getContextRecord(
       completedSession.conversationId
     )!
+    const tokenDetails = this.resolveCheckpointTokenDetails(completedSession)
 
     const checkpoint = this.grpcService.createConversationCheckpointResponse(
       completedSession.conversationId,
       completedSession.model,
       {
         messageBlobIds: completedCtx.messageBlobIds,
-        usedTokens: completedCtx.usedTokens || 0,
-        maxTokens: this.resolveCheckpointMaxTokens(completedSession),
+        usedTokens: tokenDetails.usedTokens,
+        maxTokens: tokenDetails.maxTokens,
         workspaceUri: completedSession.projectContext?.rootPath
           ? `file://${completedSession.projectContext.rootPath}`
           : undefined,
@@ -9500,6 +9847,22 @@ ${raw}
           this.logger.warn(message)
         )
         if (!event) continue
+
+        if (event.type === CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE) {
+          const rawItem = event.data.item
+          if (rawItem && typeof rawItem === "object") {
+            this.persistSplitSiblingAssistantBlock(
+              conversationId,
+              turnAssistantMessages,
+              {
+                type: CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
+                item: { ...rawItem },
+              },
+              currentMessageId
+            )
+          }
+          continue
+        }
 
         if (event.type === "message_start") {
           const route = this.modelRouter.resolveModel(session.model)
@@ -10443,14 +10806,15 @@ ${raw}
     const completedCtx = this.contextState.getContextRecord(
       completedSession.conversationId
     )!
+    const tokenDetails = this.resolveCheckpointTokenDetails(completedSession)
 
     const checkpoint = this.grpcService.createConversationCheckpointResponse(
       completedSession.conversationId,
       completedSession.model,
       {
         messageBlobIds: completedCtx.messageBlobIds,
-        usedTokens: completedCtx.usedTokens || 0,
-        maxTokens: this.resolveCheckpointMaxTokens(completedSession),
+        usedTokens: tokenDetails.usedTokens,
+        maxTokens: tokenDetails.maxTokens,
         workspaceUri: completedSession.projectContext?.rootPath
           ? `file://${completedSession.projectContext.rootPath}`
           : undefined,
@@ -17308,6 +17672,7 @@ ${raw}
           turnId: this.getCurrentParentTurnId(conversationId),
           kind: "deferred_tool:create_plan",
           deadline: Date.now() + 30 * 60 * 1000,
+          streamId: this.sessionStream.getCurrentStreamId(conversationId),
         }
       )
 
@@ -17692,6 +18057,43 @@ ${raw}
     return types.join("\u0000")
   }
 
+  private resolveRequestedSubagent(
+    requestedAgentType: string,
+    projectCwd: string
+  ): { ok: true; agent: SubagentDefinition } | { ok: false; error: string } {
+    const allSubagents = this.subagentRegistry.getAll(projectCwd)
+
+    if (requestedAgentType) {
+      const agent = this.subagentRegistry.findByType(
+        requestedAgentType,
+        projectCwd
+      )
+      if (agent) return { ok: true, agent }
+
+      const available = allSubagents
+        .map((candidate) => candidate.agentType)
+        .sort((left, right) => left.localeCompare(right))
+        .join(", ")
+      return {
+        ok: false,
+        error:
+          `[task error] unknown subagent_type '${requestedAgentType}'. ` +
+          `Available subagent_type values: ${available || "(none)"}.`,
+      }
+    }
+
+    const defaultAgent =
+      allSubagents.find((agent) => agent.agentType === "general-purpose") ||
+      allSubagents[0]
+    if (!defaultAgent) {
+      return {
+        ok: false,
+        error: "[task error] no sub-agent definitions are available",
+      }
+    }
+    return { ok: true, agent: defaultAgent }
+  }
+
   /**
    * Execute a sub-agent for the "task" tool.
    *
@@ -17753,26 +18155,33 @@ ${raw}
       return
     }
 
-    // Resolve the requested sub-agent definition. The model passes
-    // `subagent_type` to pick a specific agent. Unknown / missing types
-    // fall back to general-purpose, matching claude-code's behaviour.
+    // Resolve the requested sub-agent definition. Missing type defaults
+    // to general-purpose; an explicit unknown type is a protocol error.
     const requestedAgentType =
       this.pickFirstString(input, ["subagent_type", "subagentType", "type"]) ||
       ""
     const projectCwd = session.projectContext?.rootPath || process.cwd()
-    const allSubagents = this.subagentRegistry.getAll(projectCwd)
-    const agentDefinition: SubagentDefinition | undefined = requestedAgentType
-      ? this.subagentRegistry.findByType(requestedAgentType, projectCwd)
-      : undefined
-    const effectiveAgent: SubagentDefinition =
-      agentDefinition ||
-      allSubagents.find((agent) => agent.agentType === "general-purpose") ||
-      allSubagents[0]!
-    if (!agentDefinition && requestedAgentType) {
+    const resolvedAgent = this.resolveRequestedSubagent(
+      requestedAgentType,
+      projectCwd
+    )
+    if (!resolvedAgent.ok) {
       this.logger.warn(
-        `[SubAgent] Unknown subagent_type '${requestedAgentType}'; falling back to '${effectiveAgent.agentType}'.`
+        `[SubAgent] Rejecting unknown subagent_type '${requestedAgentType}'.`
       )
+      await this.emitInlineToolResult(
+        conversationId,
+        parentToolCallId,
+        resolvedAgent.error,
+        { status: "error", message: resolvedAgent.error },
+        undefined,
+        "inline_tool_result",
+        undefined,
+        options
+      )
+      return
     }
+    const effectiveAgent = resolvedAgent.agent
 
     // Honour `subagent_model_overrides[<agentType>] = disabled` from the
     // Cursor settings UI: the user opted this subagent type out of LLM-
@@ -18071,11 +18480,17 @@ ${raw}
         return
       }
 
-      const { fullText, toolCalls } = sseTurn.result()
+      const { fullText, toolCalls, rawResponseItems } = sseTurn.result()
       ctx.accumulatedText = fullText
 
       // Build assistant message for history
       const assistantContentParts: Array<Record<string, unknown>> = []
+      for (const rawItem of rawResponseItems) {
+        assistantContentParts.push({
+          type: CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
+          item: rawItem,
+        })
+      }
       if (fullText) {
         assistantContentParts.push({ type: "text", text: fullText })
         // ConversationStep accumulation: push the assistant text so the
@@ -18738,6 +19153,7 @@ ${raw}
   ): Promise<{
     fullText: string
     toolCalls: Array<{ id: string; name: string; inputJson: string }>
+    rawResponseItems: Record<string, unknown>[]
     error?: string
   }> {
     const session = this.sessionManager.getSession(conversationId)
@@ -18745,6 +19161,7 @@ ${raw}
       return {
         fullText: "",
         toolCalls: [],
+        rawResponseItems: [],
         error: "session not found",
       }
     }
@@ -19086,20 +19503,27 @@ ${raw}
       this.pickFirstString(input, ["subagent_type", "subagentType", "type"]) ||
       ""
     const projectCwd = session.projectContext?.rootPath || process.cwd()
-    const allSubagents = this.subagentRegistry.getAll(projectCwd)
-    const agentDefinition: SubagentDefinition | undefined = requestedAgentType
-      ? this.subagentRegistry.findByType(requestedAgentType, projectCwd)
-      : undefined
-    const effectiveAgent: SubagentDefinition =
-      agentDefinition ||
-      allSubagents.find((agent) => agent.agentType === "general-purpose") ||
-      allSubagents[0]!
-    if (!agentDefinition && requestedAgentType) {
+    const resolvedAgent = this.resolveRequestedSubagent(
+      requestedAgentType,
+      projectCwd
+    )
+    if (!resolvedAgent.ok) {
       this.logger.warn(
-        `[BackgroundSubAgent] Unknown subagent_type '${requestedAgentType}'; ` +
-          `falling back to '${effectiveAgent.agentType}'.`
+        `[BackgroundSubAgent] Rejecting unknown subagent_type '${requestedAgentType}'.`
       )
+      await this.emitInlineToolResult(
+        conversationId,
+        parentToolCallId,
+        resolvedAgent.error,
+        { status: "error", message: resolvedAgent.error },
+        undefined,
+        "inline_tool_result",
+        undefined,
+        options
+      )
+      return
     }
+    const effectiveAgent = resolvedAgent.agent
 
     // Honour `subagent_model_overrides[<agentType>] = disabled` from the
     // Cursor settings UI for the background spawn path too: same
@@ -19134,21 +19558,22 @@ ${raw}
     // useful result. Reject the combo up front with a structured error
     // pointing at the two valid alternatives instead of silently
     // spawning a crippled worker.
-    if (effectiveAgent.agentType === "bash") {
+    if (
+      effectiveAgent.agentType === "bash" ||
+      effectiveAgent.agentType === "bugbot"
+    ) {
       await this.emitInlineToolResult(
         conversationId,
         parentToolCallId,
-        "[task error] bash sub-agents cannot run in background mode " +
+        `[task error] ${effectiveAgent.agentType} sub-agents cannot run in background mode ` +
           "(run_in_background=true). Background workers have no BiDi " +
-          "stream for run_terminal_command and the bash agent's tool " +
-          "surface relies on it. Either drop run_in_background (use " +
-          "foreground bash for direct shell execution) or pick a " +
+          "stream for run_terminal_command and this agent's tool " +
+          "surface relies on it. Drop run_in_background or pick a " +
           "subagent_type whose tool surface is read-only / inline " +
           "(general-purpose, explore, browser).",
         {
           status: "error",
-          message:
-            "bash subagent cannot run with run_in_background=true (no shell surface in bg)",
+          message: `${effectiveAgent.agentType} subagent cannot run with run_in_background=true (no shell surface in bg)`,
         },
         undefined,
         "inline_tool_result",
@@ -23113,7 +23538,8 @@ ${raw}
     if (requestedSkillName) {
       const skill = this.cursorSkillsManager.findByName(
         session?.cursorRules,
-        requestedSkillName
+        requestedSkillName,
+        session?.skillOptions
       )
       if (!skill || !session) {
         const message = `Cursor skill not found: ${requestedSkillName}`
@@ -23123,7 +23549,28 @@ ${raw}
         }
       }
 
-      this.cursorSkillsManager.activate(session, skill.name, "fetch_rules")
+      if (!skill.content) {
+        const message = `Cursor skill "${skill.name}" is listed in SkillOptions, but this request did not provide an active CursorRule with instruction content.`
+        return {
+          content: `[fetch_rules error] ${message}`,
+          state: { status: "error", message },
+        }
+      }
+      const activated = this.cursorSkillsManager.activate(
+        session,
+        skill.name,
+        "fetch_rules"
+      )
+      if (activated) {
+        const route = this.modelRouter.resolveModel(session.model)
+        if (route.backend === "codex") {
+          this.codexService.clearConversationContinuationBaseline(
+            session.conversationId,
+            route.model || session.model,
+            `cursor skill activated (${skill.name})`
+          )
+        }
+      }
       input.skill_name = skill.name
       input.path = skill.fullPath
       input.content = skill.content
@@ -23165,6 +23612,7 @@ ${raw}
 
     const skillPolicy = this.cursorSkillsManager.resolvePolicy({
       rules: session?.cursorRules,
+      skillOptions: session?.skillOptions,
       selectedRulePaths: session?.selectedCursorRulePaths,
       selectedRuleNames: session?.selectedCursorRuleNames,
       activeSkillNames: session?.activeCursorSkillNames,
@@ -23231,6 +23679,9 @@ ${raw}
       when_to_use: skill.whenToUse,
       paths: skill.paths,
       path: skill.fullPath,
+      folder_path: skill.folderPath,
+      readme_file_path: skill.readmeFilePath,
+      package_type: skill.packageType,
     }))
     if (searchHits.length > 0) {
       input.search_hits = searchHits.map((hit) => ({
@@ -25735,7 +26186,12 @@ ${raw}
         conversationId,
         "deferred_tool",
         payload,
-        { turnId, kind: iqKind, deadline }
+        {
+          turnId,
+          kind: iqKind,
+          deadline,
+          streamId: this.sessionStream.getCurrentStreamId(conversationId),
+        }
       )
 
     const queryMessage = this.buildInteractionQueryForDeferredTool(
@@ -27237,27 +27693,49 @@ ${raw}
     promptTokens: number
     availableHistoryBudgetTokens: number
   } {
-    const protectedContextTokens = this.isCloudCodeBackend(route.backend)
-      ? this.tokenCounter.countMessages(
-          this.buildGoogleContextMessages(
-            session,
-            conversationId
-          ) as UnifiedMessage[]
-        )
-      : 0
-    const systemPrompt = this.isCloudCodeBackend(route.backend)
-      ? this.buildGoogleSystemPrompt(session)
-      : this.buildSystemPrompt(session, session.deferredToolCatalog, {
-          sessionMessageCount: this.contextState.getContextRecord(
-            session.conversationId
-          )!.messages.length,
-        })
+    const model = route.model || session.model
+    const codexPromptContext =
+      route.backend === "codex"
+        ? this.buildPromptContextFromSession(session)
+        : undefined
+    const codexContextEntries =
+      route.backend === "codex" && codexPromptContext
+        ? this.buildCodexContextEntries(codexPromptContext, {
+            model,
+            deferredCatalog: session.deferredToolCatalog,
+            sessionMessageCount: this.getSessionMessageCount(session),
+          })
+        : []
+    const protectedContextTokens =
+      route.backend === "codex"
+        ? this.estimateCodexContextLedgerTokens(
+            conversationId,
+            codexContextEntries
+          )
+        : this.isCloudCodeBackend(route.backend)
+          ? this.tokenCounter.countMessages(
+              this.buildGoogleContextMessages(
+                session,
+                conversationId
+              ) as UnifiedMessage[]
+            )
+          : 0
+    const systemPrompt =
+      route.backend === "codex"
+        ? this.buildCodexSystemPrompt(model)
+        : this.isCloudCodeBackend(route.backend)
+          ? this.buildGoogleSystemPrompt(session)
+          : this.buildSystemPrompt(session, session.deferredToolCatalog, {
+              sessionMessageCount: this.contextState.getContextRecord(
+                session.conversationId
+              )!.messages.length,
+            })
     const budget = this.resolveMessageBudget(route.backend, {
       session,
       protectedContextTokens,
       systemPrompt,
       toolDefinitions,
-      model: session.model,
+      model,
     })
     const availableHistoryBudgetTokens = Math.max(
       1,
@@ -27279,7 +27757,7 @@ ${raw}
         },
         {
           contextLabel: `tool continuation preflight: ${conversationId}`,
-          model: route.model,
+          model,
           pendingToolUseIds,
           strategy: "reactive",
           dryRun: true,
@@ -27299,10 +27777,20 @@ ${raw}
       }
       throw error
     }
+    const promptTokens =
+      route.backend === "codex"
+        ? this.tokenCounter.countMessages(
+            previewCodexContextLedgerProjection(
+              this.peekCodexContextLedger(conversationId),
+              promptMessages as CodexExecutionRequest["messages"],
+              codexContextEntries
+            ).messages as UnifiedMessage[]
+          )
+        : promptMessages.length
+          ? this.tokenCounter.countMessages(promptMessages as UnifiedMessage[])
+          : 0
     return {
-      promptTokens: promptMessages.length
-        ? this.tokenCounter.countMessages(promptMessages as UnifiedMessage[])
-        : 0,
+      promptTokens,
       availableHistoryBudgetTokens,
     }
   }
@@ -27555,9 +28043,7 @@ ${raw}
         session.conversationId
       )!.messageBlobIds,
       pendingToolCalls,
-      usedTokens: this.contextState.getContextRecord(session.conversationId)!
-        .usedTokens,
-      maxTokens: this.resolveCheckpointMaxTokens(session),
+      ...this.resolveCheckpointTokenDetails(session),
       workspaceUri: workspaceRootPath
         ? `file://${workspaceRootPath}`
         : undefined,
@@ -28172,7 +28658,7 @@ ${raw}
       conversationId,
       route.backend,
       [toolCallId],
-      { readyForContinuation: false }
+      { readyForContinuation: false, streamId }
     )
     this.startProviderWarmup(route, conversationId, "streaming-tool-dispatch", {
       pendingToolUseIds: [toolCallId],
@@ -28451,7 +28937,7 @@ ${raw}
       conversationId,
       route.backend,
       batchToolCallIds,
-      { readyForContinuation: true }
+      { readyForContinuation: true, streamId }
     )
 
     // Concurrent dispatch fan-out
@@ -29030,7 +29516,10 @@ ${raw}
             // Bind the stream to conversationId early so subsequent tool results can be matched.
             if (!conversationId && parsed.conversationId) {
               conversationId = parsed.conversationId
-              this.sessionManager.getOrCreateSession(conversationId, parsed)
+              this.sessionManager.getOrCreateSession(
+                conversationId,
+                this.sanitizeParsedRequestForSession(parsed)
+              )
               // Bind the BidiStreamController + outbound channel to
               // the real conversationId now that we know it.
               // handleChatMessage will look these up to spawn child
@@ -29400,7 +29889,10 @@ ${raw}
 
               // CRITICAL: Create session BEFORE sending KV messages
               // This ensures blobIds can be tracked in the session
-              this.sessionManager.getOrCreateSession(conversationId, parsed)
+              this.sessionManager.getOrCreateSession(
+                conversationId,
+                this.sanitizeParsedRequestForSession(parsed)
+              )
               // Bind sidecars on the user-message bind path too
               // (mirrors the control-first path above).
               registerSidecars(conversationId)
@@ -29552,6 +30044,12 @@ ${raw}
               this.sessionManager.clearRestartRecovery(conversationId!)
               this.logger.warn(
                 `Cleared stale restart recovery for ${conversationId} on a new user turn`
+              )
+            }
+            if (!parsed.isResumeAction && sessionBeforeRun) {
+              this.clearSupersededControlStateForNewUserTurn(
+                conversationId!,
+                streamId
               )
             }
             if (
@@ -30541,6 +31039,7 @@ ${raw}
     streamId?: string
   ): Promise<void> {
     // Get or create session with the provided conversationId
+    parsed = this.sanitizeParsedRequestForSession(parsed)
     let session = this.sessionManager.getOrCreateSession(conversationId, parsed)
     this.resetTopLevelAgentTurnState(session, conversationId)
 
@@ -31246,14 +31745,15 @@ ${raw}
       const completedCtx2 = this.contextState.getContextRecord(
         completedSession.conversationId
       )!
+      const tokenDetails = this.resolveCheckpointTokenDetails(completedSession)
 
       const checkpoint = this.grpcService.createConversationCheckpointResponse(
         conversationId,
         completedSession.model,
         {
           messageBlobIds: completedCtx2.messageBlobIds,
-          usedTokens: completedCtx2.usedTokens || 0,
-          maxTokens: this.resolveCheckpointMaxTokens(completedSession),
+          usedTokens: tokenDetails.usedTokens,
+          maxTokens: tokenDetails.maxTokens,
           workspaceUri: completedSession.projectContext?.rootPath
             ? `file://${completedSession.projectContext.rootPath}`
             : undefined,
@@ -31408,7 +31908,9 @@ ${raw}
         conversationId
       )
     if (settledBatchForFlush && settledBatchForFlush.toolCallIds.length > 0) {
-      this.flushBufferedToolResults(session, settledBatchForFlush.toolCallIds)
+      this.flushBufferedToolResults(session, settledBatchForFlush.toolCallIds, {
+        batchId: settledBatchForFlush.id,
+      })
     }
 
     let activeSession =
@@ -35417,13 +35919,24 @@ ${raw}
     return ledger
   }
 
+  private peekCodexContextLedger(
+    conversationId: string | undefined
+  ): CodexContextLedgerState | undefined {
+    const normalized = conversationId?.trim()
+    return normalized
+      ? this.codexContextLedgersByConversation.get(normalized)
+      : undefined
+  }
+
   private estimateCodexContextLedgerTokens(
     conversationId: string | undefined,
     entries: CodexContextEntry[]
   ): number {
-    const ledger = this.getCodexContextLedger(conversationId)
     return this.countCodexContextMessages(
-      previewCodexContextLedgerMessages(ledger, entries)
+      previewCodexContextLedgerMessages(
+        this.peekCodexContextLedger(conversationId),
+        entries
+      )
     )
   }
 
@@ -35449,10 +35962,32 @@ ${raw}
       historyMessages,
       entries
     )
+    if (projection.contextChanged) {
+      this.codexService.clearConversationContinuationBaseline(
+        conversationId,
+        undefined,
+        `codex context snapshot changed (${projection.changedKeys.join(",")})`
+      )
+    }
     return {
       messages: projection.messages,
       contextMessageCount: projection.contextMessages.length,
       addedContextMessageCount: projection.addedContextMessages.length,
+    }
+  }
+
+  private resetCodexContextLedger(
+    conversationId: string | undefined,
+    reason: string
+  ): void {
+    const normalized = conversationId?.trim()
+    if (!normalized) {
+      return
+    }
+    if (this.codexContextLedgersByConversation.delete(normalized)) {
+      this.logger.debug(
+        `Reset Codex context ledger for ${normalized}: ${reason}`
+      )
     }
   }
 

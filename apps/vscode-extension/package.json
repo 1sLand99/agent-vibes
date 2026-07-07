@@ -161,6 +161,11 @@
         "category": "Agent Vibes"
       },
       {
+        "command": "agentVibes.applyCursorBridgeEndpointPatch",
+        "title": "Apply Cursor Bridge Endpoint Patch",
+        "category": "Agent Vibes"
+      },
+      {
         "command": "agentVibes.applyCursorIdleKillerPatch",
         "title": "Apply Cursor Idle Extension Host Patch",
         "category": "Agent Vibes"
@@ -236,6 +241,21 @@
           "type": "number",
           "default": 2026,
           "description": "Proxy server port"
+        },
+        "agentVibes.trafficMode": {
+          "type": "string",
+          "default": "cursorPatch",
+          "enum": [
+            "cursorPatch",
+            "systemForwarding",
+            "manual"
+          ],
+          "enumDescriptions": [
+            "Patch Cursor to connect directly to the Agent Vibes bridge.",
+            "Use the legacy hosts and local port forwarding path.",
+            "Do not manage Cursor connection automatically."
+          ],
+          "description": "How Agent Vibes connects Cursor IDE traffic to the local bridge"
         },
         "agentVibes.healthCheckInterval": {
           "type": "number",

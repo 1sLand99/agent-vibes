@@ -6,10 +6,10 @@
  *   - Sub-agents run inside the bridge. Read-only file/search tools are
  *     bridge-local; shell/edit/delete remain restricted to agents whose
  *     resolved tool surface explicitly lists them.
- *   - The proto `SubagentType` oneof has 11 fixed cases (general-purpose
- *     maps to `unspecified`, explore to `explore`, bash to `bash`, etc.).
- *     Built-in agentTypes are chosen so they round-trip cleanly through
- *     the proto layer in `cursor-grpc.service.ts::buildSubagentTypeMessage`.
+ *   - The proto `SubagentType` oneof has fixed built-in cases plus a
+ *     `custom` case. General-purpose maps to `unspecified`; explore,
+ *     browser, and bash map to their concrete cases; named agents such
+ *     as bugbot round-trip through `custom`.
  *
  * The agent definitions intentionally keep `whenToUse` short and concrete
  * so the dynamic `task` tool prompt can list every available agent without
@@ -225,11 +225,79 @@ Output format:
 ${SHARED_GUIDELINES}`,
 }
 
+/** Bugbot review agent. Cursor's `/review-bugbot` skill launches this
+ * by name (`subagent_type: "bugbot"`) and expects the sub-agent, not the
+ * parent, to compute the repository diff. This is a named custom
+ * sub-agent in the proto layer rather than the separate StreamBugBot
+ * product endpoint.
+ */
+export const BUGBOT_SUBAGENT: BuiltInSubagentDefinition = {
+  agentType: "bugbot",
+  whenToUse:
+    "Code-review agent for Cursor /review-bugbot. Use only when the user " +
+    "asks to run Bugbot or /review-bugbot. It computes the requested local " +
+    "diff from the repository path and reports concrete bugs.",
+  tools: [
+    "run_terminal_command",
+    "read_file",
+    "list_directory",
+    "grep_search",
+    "glob_search",
+    "file_search",
+    "search_symbols",
+    "go_to_definition",
+    "read_lints",
+    "read_project",
+    "fetch_rules",
+    "fetch_pull_request",
+    "reflect",
+  ],
+  maxTurns: 40,
+  source: "built-in",
+  getSystemPrompt: () =>
+    `${SHARED_PREFIX}
+
+You are Bugbot, a focused code-review sub-agent. Review the requested
+repository changes for real defects that could affect correctness,
+security, data integrity, migrations, user-visible behavior, deployability,
+or maintainability at production scale.
+
+Input contract:
+- The parent prompt provides "Full Repository Path" and "Diff".
+- "Diff: branch changes" means compare the current branch against the
+  repository's default/base branch merge-base, including committed, staged,
+  and unstaged changes.
+- "Diff: uncommitted changes" means review staged and unstaged changes only.
+- "Diff: natural language" means inspect the described changed files directly.
+- "Base Branch" overrides default-base inference only when present.
+
+Workflow:
+1. Use run_terminal_command with cwd set to the repository path to inspect
+   git status, remotes, branches, merge-base, and diff. Use read-only git
+   commands such as status, branch, remote, rev-parse, merge-base, diff,
+   diff --stat, log, show, and ls-files.
+2. Read changed files with read_file / grep_search / search_symbols as needed.
+3. Do not edit files, delete files, create commits, switch branches, stash,
+   install dependencies, or run formatters.
+4. Report only findings you can tie to a concrete changed line, behavior, or
+   migration/deploy consequence. Skip style-only notes.
+
+Output format:
+- If there is no diff, say exactly that in one sentence.
+- Otherwise lead with "Bugbot found N findings" or "Bugbot found no bugs".
+- For findings, use a compact markdown table with columns:
+  Severity | Location | Finding.
+- Sort by severity, highest first. Locations must be file:line when known.
+
+${SHARED_GUIDELINES}`,
+}
+
 export function getBuiltInSubagents(): BuiltInSubagentDefinition[] {
   return [
     GENERAL_PURPOSE_SUBAGENT,
     EXPLORE_SUBAGENT,
     BROWSER_SUBAGENT,
+    BUGBOT_SUBAGENT,
     BASH_SUBAGENT,
   ]
 }

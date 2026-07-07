@@ -28,6 +28,7 @@
 import { Injectable, Logger } from "@nestjs/common"
 import * as crypto from "crypto"
 
+import { CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE } from "../../../context"
 import {
   resolveSubagentToolSurface,
   SUB_AGENT_SAFE_TOOL_NAMES,
@@ -147,6 +148,7 @@ export interface BackgroundWorkerHostDeps {
   ): Promise<{
     fullText: string
     toolCalls: Array<{ id: string; name: string; inputJson: string }>
+    rawResponseItems: Record<string, unknown>[]
     error?: string
   }>
   /** Build a ConversationStep wrapping an assistant text reply. Host
@@ -362,6 +364,12 @@ export class SubagentBackgroundWorker {
         // Record assistant text + tool_use blocks into the message
         // history exactly like the foreground worker does.
         const assistantContentParts: Array<Record<string, unknown>> = []
+        for (const rawItem of llmResult.rawResponseItems) {
+          assistantContentParts.push({
+            type: CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
+            item: rawItem,
+          })
+        }
         if (finalText) {
           assistantContentParts.push({ type: "text", text: finalText })
           this.transcriptStore.appendTranscript(agentId, {
@@ -531,9 +539,20 @@ export class SubagentBackgroundWorker {
               const synthText = synthesisResult.fullText.trim()
               if (synthText.length > 0) {
                 finalText = synthesisResult.fullText
+                const assistantContentParts: Array<Record<string, unknown>> = []
+                for (const rawItem of synthesisResult.rawResponseItems) {
+                  assistantContentParts.push({
+                    type: CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
+                    item: rawItem,
+                  })
+                }
+                assistantContentParts.push({
+                  type: "text",
+                  text: synthesisResult.fullText,
+                })
                 messages.push({
                   role: "assistant",
-                  content: synthesisResult.fullText,
+                  content: assistantContentParts,
                 })
                 this.transcriptStore.appendTranscript(agentId, {
                   ts: Date.now(),

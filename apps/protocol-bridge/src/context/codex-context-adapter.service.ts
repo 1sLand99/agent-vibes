@@ -12,11 +12,18 @@ import {
   ContextCompactionPlan,
   ContextCompactionService,
 } from "./context-compaction.service"
+import { repairOrphanedToolPairs } from "./orphan-tool-pair-repair"
 import {
+  isAttachmentRecord,
   isContextCollapseSummaryRecord,
+  isHookResultRecord,
   isMessageRecord,
-  stripInternalContextEvents,
 } from "./context-transcript-events"
+import {
+  buildTopicContinuityGuard,
+  composeCompactHookMessage,
+  extractLatestUserUtterance,
+} from "./context-continuity-guard"
 import { TokenCounterService } from "./token-counter.service"
 import { ToolIntegrityService } from "./tool-integrity.service"
 import {
@@ -50,6 +57,12 @@ export const CODEX_SUMMARIZATION_PROMPT = [
 
 export const CODEX_SUMMARY_PREFIX =
   "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:"
+
+export const CODEX_HISTORICAL_SUMMARY_NOTICE = [
+  "This is compressed historical context, not the current task directive.",
+  "The retained recent messages and any topic-continuity guard that follow this summary are authoritative for the current request and next action.",
+  "Do not resume a task from this summary unless the retained recent messages explicitly continue it.",
+].join(" ")
 
 const DEFAULT_CODEX_TRUNCATION_POLICY: CodexTruncationPolicy = {
   mode: "bytes",
@@ -87,6 +100,13 @@ export interface CodexRemoteCompactResult {
 export type CodexRemoteCompactProvider = (
   request: CodexRemoteCompactRequest
 ) => Promise<CodexRemoteCompactResult>
+
+export interface CodexProjectedMessagesResult {
+  messages: UnifiedMessage[]
+  hardFitApplied: boolean
+  beforeHardFitTokens: number
+  hardMaxTokens: number
+}
 
 @Injectable()
 export class CodexContextAdapterService {
@@ -144,6 +164,7 @@ export class CodexContextAdapterService {
       systemPromptTokens: number
       autoCompactTokenLimit?: number
       predictiveCompactTokenLimit?: number
+      projectedTokenOverride?: number
       strategy?: "auto" | "manual" | "reactive"
       integrityMode?: "strict-adjacent" | "global"
       referenceContextItem: CodexReferenceContextItem
@@ -172,23 +193,33 @@ export class CodexContextAdapterService {
         systemPromptTokens: options.systemPromptTokens,
         autoCompactTokenLimit: options.autoCompactTokenLimit,
         predictiveCompactTokenLimit: options.predictiveCompactTokenLimit,
+        projectedTokenOverride: options.projectedTokenOverride,
         strategy: options.strategy || "auto",
         integrityMode: options.integrityMode,
       }
     )
     if (!candidate) return undefined
 
-    const hookUserMessage =
+    const explicitHookUserMessage =
       options.hookUserMessage || (await options.hookProvider?.(candidate))
+    const continuityGuard = buildTopicContinuityGuard(
+      extractLatestUserUtterance(state)
+    )
+    const hookUserMessage = composeCompactHookMessage(
+      explicitHookUserMessage,
+      continuityGuard
+    )
     options.signal.throwIfAborted()
-    const sourceMessages = this.recordsToMessages([
+    const sourceRecords = [
       ...candidate.archivedRecords,
       ...candidate.retainedRecords,
-    ])
+    ]
+    const sourceMessages = this.recordsToMessages(sourceRecords)
     const compactMessages = this.projectCodexMessages(state, sourceMessages, {
       maxTokens: options.maxTokens,
       systemPromptTokens: options.systemPromptTokens,
       truncationPolicy: options.referenceContextItem.truncationPolicy,
+      replacementRecords: sourceRecords,
     })
     const compactResult = await options.remoteCompactProvider({
       messages: compactMessages,
@@ -283,14 +314,16 @@ export class CodexContextAdapterService {
     )
     if (!candidate) return undefined
 
-    const sourceMessages = this.recordsToMessages([
+    const sourceRecords = [
       ...candidate.archivedRecords,
       ...candidate.retainedRecords,
-    ])
+    ]
+    const sourceMessages = this.recordsToMessages(sourceRecords)
     const compactMessages = this.projectCodexMessages(state, sourceMessages, {
       maxTokens: options.maxTokens,
       systemPromptTokens: options.systemPromptTokens,
       truncationPolicy: options.referenceContextItem.truncationPolicy,
+      replacementRecords: sourceRecords,
     })
     const compactResult = await options.remoteCompactProvider({
       messages: compactMessages,
@@ -331,46 +364,128 @@ export class CodexContextAdapterService {
       systemPromptTokens: number
       pendingToolUseIds?: Iterable<string>
       truncationPolicy?: CodexTruncationPolicy
+      allowHardFit?: boolean
+      replacementRecords?: readonly ContextTranscriptRecord[]
     }
   ): UnifiedMessage[] {
+    return this.projectCodexMessagesWithMetadata(state, baseMessages, options)
+      .messages
+  }
+
+  projectCodexMessagesWithMetadata(
+    state: ContextConversationState,
+    baseMessages: UnifiedMessage[],
+    options: {
+      maxTokens: number
+      systemPromptTokens: number
+      pendingToolUseIds?: Iterable<string>
+      truncationPolicy?: CodexTruncationPolicy
+      allowHardFit?: boolean
+      replacementRecords?: readonly ContextTranscriptRecord[]
+    }
+  ): CodexProjectedMessagesResult {
     const codex = this.ensureState(state)
     const truncationPolicy = options.truncationPolicy || codex.truncationPolicy
     let messages = baseMessages
+    let protectedPrefixCount = 0
     const replacement = codex.replacementHistory
     if (replacement?.items?.length) {
       const replacementMessages = this.replacementHistoryToMessages(
         replacement.items
       )
       if (replacementMessages.length > 0) {
+        protectedPrefixCount = replacementMessages.length
         const postAnchor = this.recordsAfterReplacementAnchor(
-          state.records,
-          replacement.anchorRecordId
+          options.replacementRecords || state.records,
+          replacement.anchorRecordId,
+          state.records
         )
         messages = [
           ...replacementMessages,
-          ...this.recordsToMessages(postAnchor),
+          ...this.recordsToPostReplacementMessages(postAnchor),
         ]
       }
     }
 
-    messages = this.projectAppendOnlyLiveMetaMessages(
-      codex,
-      this.prepareMessagesForCodex(messages, truncationPolicy)
+    messages = repairOrphanedToolPairs(
+      this.projectAppendOnlyLiveMetaMessages(
+        codex,
+        this.prepareMessagesForCodex(messages, truncationPolicy)
+      ),
+      {
+        pendingToolUseIds: options.pendingToolUseIds,
+      }
     )
     const hardMaxTokens = Math.max(
       256,
       options.maxTokens - options.systemPromptTokens
     )
-    if (this.tokenCounter.countMessages(messages) <= hardMaxTokens) {
-      return messages
+    const beforeHardFitTokens = this.tokenCounter.countMessages(messages)
+    if (
+      beforeHardFitTokens <= hardMaxTokens ||
+      options.allowHardFit === false
+    ) {
+      return {
+        messages,
+        hardFitApplied: false,
+        beforeHardFitTokens,
+        hardMaxTokens,
+      }
     }
 
-    const retained = this.toolIntegrity.extractWithIntegrity(
-      messages,
+    const retained =
+      protectedPrefixCount > 0
+        ? this.extractWithProtectedPrefix(messages, hardMaxTokens, {
+            protectedPrefixCount,
+            pendingToolUseIds: options.pendingToolUseIds,
+          })
+        : repairOrphanedToolPairs(
+            this.toolIntegrity.extractWithIntegrity(messages, hardMaxTokens, {
+              mode: "global",
+            }),
+            {
+              pendingToolUseIds: options.pendingToolUseIds,
+            }
+          )
+    return {
+      messages: retained,
+      hardFitApplied: retained.length < messages.length,
+      beforeHardFitTokens,
       hardMaxTokens,
-      { mode: "global" }
+    }
+  }
+
+  private extractWithProtectedPrefix(
+    messages: UnifiedMessage[],
+    hardMaxTokens: number,
+    options: {
+      protectedPrefixCount: number
+      pendingToolUseIds?: Iterable<string>
+    }
+  ): UnifiedMessage[] {
+    const prefixCount = Math.max(
+      0,
+      Math.min(options.protectedPrefixCount, messages.length)
     )
-    return retained
+    const protectedPrefix = messages.slice(0, prefixCount)
+    const suffix = messages.slice(prefixCount)
+    const prefixTokens = this.tokenCounter.countMessages(protectedPrefix)
+    if (prefixTokens > hardMaxTokens) {
+      throw new Error(
+        `Codex replacement history exceeds context window (${prefixTokens} > ${hardMaxTokens})`
+      )
+    }
+    const suffixBudget = Math.max(0, hardMaxTokens - prefixTokens)
+    const retainedSuffix =
+      suffixBudget > 0 && suffix.length > 0
+        ? this.toolIntegrity.extractWithIntegrity(suffix, suffixBudget, {
+            mode: "global",
+          })
+        : []
+
+    return repairOrphanedToolPairs([...protectedPrefix, ...retainedSuffix], {
+      pendingToolUseIds: options.pendingToolUseIds,
+    })
   }
 
   prepareMessagesForCodex(
@@ -481,7 +596,13 @@ export class CodexContextAdapterService {
         .filter((text) => text.trim().length > 0)
         .join("\n\n")
         .trim() || "(no summary available)"
-    return `${CODEX_SUMMARY_PREFIX}\n${truncateCodexTextByBytes(body, 32_000)}`
+    const compacted = truncateCodexTextByBytes(body, 32_000)
+    return [
+      CODEX_SUMMARY_PREFIX,
+      CODEX_HISTORICAL_SUMMARY_NOTICE,
+      "",
+      compacted,
+    ].join("\n")
   }
 
   private replacementHistoryToMessages(
@@ -739,16 +860,33 @@ export class CodexContextAdapterService {
 
   private recordsAfterReplacementAnchor(
     records: readonly ContextTranscriptRecord[],
-    anchorRecordId: string | undefined
+    anchorRecordId: string | undefined,
+    fullRecords: readonly ContextTranscriptRecord[] = records
   ): ContextTranscriptRecord[] {
-    const sourceRecords =
-      stripInternalContextEvents(records).filter(isMessageRecord)
     if (!anchorRecordId) return []
-    const anchorIndex = sourceRecords.findIndex(
-      (record) => record.id === anchorRecordId
+    const anchorIndex = records.findIndex(
+      (record) => isMessageRecord(record) && record.id === anchorRecordId
     )
-    if (anchorIndex < 0) return []
-    return sourceRecords.slice(anchorIndex + 1)
+    if (anchorIndex >= 0) return records.slice(anchorIndex + 1)
+
+    const firstRecord = records[0]
+    const lastRecord = records[records.length - 1]
+    if (!firstRecord || !lastRecord) return []
+    const fullAnchorIndex = fullRecords.findIndex(
+      (record) => isMessageRecord(record) && record.id === anchorRecordId
+    )
+    const fullFirstIndex = fullRecords.findIndex(
+      (record) => record.id === firstRecord.id
+    )
+    const fullLastIndex = fullRecords.findIndex(
+      (record) => record.id === lastRecord.id
+    )
+    if (fullAnchorIndex < 0 || fullFirstIndex < 0 || fullLastIndex < 0) {
+      return []
+    }
+    if (fullAnchorIndex < fullFirstIndex) return [...records]
+    if (fullAnchorIndex >= fullLastIndex) return []
+    return []
   }
 
   private recordsToMessages(
@@ -762,7 +900,68 @@ export class CodexContextAdapterService {
       .map((record) => ({
         role: record.role,
         content: record.content,
+        ...(record.messageId ? { messageId: record.messageId } : {}),
+        ...(record.isMeta ? { isMeta: true } : {}),
       })) as UnifiedMessage[]
+  }
+
+  private recordsToPostReplacementMessages(
+    records: readonly ContextTranscriptRecord[]
+  ): UnifiedMessage[] {
+    const lastUserInputIndex = this.findLastUserInputIndex(records)
+    return records.flatMap((record, index) => {
+      if (isMessageRecord(record) || isContextCollapseSummaryRecord(record)) {
+        return [
+          {
+            role: record.role,
+            content: record.content,
+            ...(record.messageId ? { messageId: record.messageId } : {}),
+            ...(record.isMeta ? { isMeta: true } : {}),
+            recordId: record.id,
+          } as UnifiedMessage & { recordId: string },
+        ]
+      }
+      if (isAttachmentRecord(record)) {
+        return [
+          {
+            role: "user",
+            content: record.content,
+            source: "attachment",
+            isMeta: true,
+            recordId: record.id,
+            ...(record.attachmentMetadata?.kind
+              ? { attachmentKind: record.attachmentMetadata.kind }
+              : {}),
+          } as UnifiedMessage & { recordId: string },
+        ]
+      }
+      if (isHookResultRecord(record)) {
+        if (index < lastUserInputIndex) return []
+        return [
+          {
+            role: "user",
+            content: record.content,
+            source: "hook",
+            isMeta: true,
+            recordId: record.id,
+          } as UnifiedMessage & { recordId: string },
+        ]
+      }
+      return []
+    })
+  }
+
+  private findLastUserInputIndex(
+    records: readonly ContextTranscriptRecord[]
+  ): number {
+    for (let index = records.length - 1; index >= 0; index--) {
+      const record = records[index]
+      if (!record) continue
+      if (record.role !== "user") continue
+      if (record.kind && record.kind !== "message") continue
+      return index
+    }
+    return -1
   }
 
   private cloneReplacementItem(

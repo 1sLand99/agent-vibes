@@ -11,7 +11,8 @@
  * verbatim so the Cursor IDE can replay the model's reasoning. Filtering and
  * merging happen only when projecting `SessionMessage[]` onto an outbound
  * DTO, where backend-specific constraints kick in (Anthropic requires signed
- * thinking; Kiro/Codex/Google have no thinking slot at all).
+ * thinking; Codex maps thinking to native reasoning items; Kiro/Google have no
+ * thinking slot at all).
  *
  * # Pipeline (11 stages, mirroring cc messages.ts)
  *
@@ -47,6 +48,7 @@ import type {
   LooseMessageContent,
   UnifiedMessage,
 } from "../../context/types"
+import { CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE } from "../../context/types"
 import type { SessionMessage } from "../../protocol/cursor/session/session-lifecycle.service"
 
 /** Backends that may need thinking handling on the wire. */
@@ -666,8 +668,8 @@ export function sanitizeErrorToolResultContent(
  * Strip every thinking / redacted_thinking block from every assistant
  * message. Mirrors cc messages.ts:5501-5534. Used when signatures are no
  * longer valid (credential rotation, model fallback to a different family)
- * or for backends that don't accept thinking on the wire (Kiro, Codex,
- * Google, OpenAI-compat).
+ * or for backends that don't accept thinking on the wire (Kiro, Google,
+ * OpenAI-compat).
  *
  * If stripping leaves an assistant message empty we drop it; the trailing /
  * orphan / non-empty filters above clean up any structural fallout.
@@ -775,19 +777,88 @@ function pruneUnsignedThinkingBlocks(
   return changed ? result : [...messages]
 }
 
+function pruneEmptyCodexThinkingBlocks(
+  messages: ReadonlyArray<FlatMessage>
+): FlatMessage[] {
+  let changed = false
+  const result: FlatMessage[] = []
+  for (const msg of messages) {
+    if (msg.type !== "assistant") {
+      result.push(msg)
+      continue
+    }
+    const blocks = asBlocks(msg.content)
+    if (!blocks) {
+      result.push(msg)
+      continue
+    }
+    const filtered = blocks.filter((b) => {
+      if (b.type !== "thinking") {
+        return b.type !== "redacted_thinking"
+      }
+      const sig = (b as { signature?: unknown }).signature
+      const sigStr = typeof sig === "string" ? sig.trim() : ""
+      const thinking = (b as { thinking?: unknown }).thinking
+      const thinkingStr = typeof thinking === "string" ? thinking.trim() : ""
+      return sigStr.length > 0 || thinkingStr.length > 0
+    })
+    if (filtered.length === blocks.length) {
+      result.push(msg)
+      continue
+    }
+    changed = true
+    if (filtered.length === 0) continue
+    result.push({ ...msg, content: filtered })
+  }
+  return changed ? result : [...messages]
+}
+
+function stripCodexRawResponseItemBlocks(
+  messages: ReadonlyArray<FlatMessage>
+): FlatMessage[] {
+  let changed = false
+  const result: FlatMessage[] = []
+  for (const msg of messages) {
+    if (msg.type !== "assistant") {
+      result.push(msg)
+      continue
+    }
+    const blocks = asBlocks(msg.content)
+    if (!blocks) {
+      result.push(msg)
+      continue
+    }
+    const filtered = blocks.filter(
+      (b) => b.type !== CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE
+    )
+    if (filtered.length === blocks.length) {
+      result.push(msg)
+      continue
+    }
+    changed = true
+    if (filtered.length === 0) continue
+    result.push({ ...msg, content: filtered })
+  }
+  return changed ? result : [...messages]
+}
+
 function applyBackendThinkingRules(
   messages: ReadonlyArray<FlatMessage>,
   opts: NormalizeOptions
 ): FlatMessage[] {
   if (opts.forceStripSignatures) {
-    return stripSignatureBlocks(messages)
+    return stripCodexRawResponseItemBlocks(stripSignatureBlocks(messages))
   }
   if (opts.backend === "anthropic") {
-    return opts.stripThinking
+    const normalized = opts.stripThinking
       ? stripSignatureBlocks(messages)
       : pruneUnsignedThinkingBlocks(messages)
+    return stripCodexRawResponseItemBlocks(normalized)
   }
-  return stripSignatureBlocks(messages)
+  if (opts.backend === "codex") {
+    return pruneEmptyCodexThinkingBlocks(messages)
+  }
+  return stripCodexRawResponseItemBlocks(stripSignatureBlocks(messages))
 }
 
 // ---------------------------------------------------------------------------

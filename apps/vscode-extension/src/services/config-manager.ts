@@ -3,6 +3,8 @@ import * as path from "path"
 import * as vscode from "vscode"
 import { ensureDir, getDefaultDataDir } from "../utils/platform"
 
+export type CursorTrafficMode = "cursorPatch" | "systemForwarding" | "manual"
+
 /**
  * Normalize a raw Kiro `authMethod` value to one of the three canonical
  * methods the bridge understands. Mirrors the classification in
@@ -14,6 +16,24 @@ function normalizeKiroAuthMethod(value: string | undefined): string {
   if (raw === "api_key" || raw === "apikey") return "api_key"
   if (raw === "social") return "social"
   return "idc"
+}
+
+function normalizeCursorTrafficMode(value: unknown): CursorTrafficMode {
+  const raw = typeof value === "string" ? value.trim().toLowerCase() : ""
+
+  if (
+    raw === "systemforwarding" ||
+    raw === "forwarding" ||
+    raw === "legacyforwarding"
+  ) {
+    return "systemForwarding"
+  }
+
+  if (raw === "manual" || raw === "none" || raw === "off") {
+    return "manual"
+  }
+
+  return "cursorPatch"
 }
 
 /**
@@ -83,6 +103,12 @@ export class ConfigManager {
       vscode.workspace
         .getConfiguration("agentVibes")
         .get<boolean>("debugMode") ?? false
+    )
+  }
+
+  get trafficMode(): CursorTrafficMode {
+    return normalizeCursorTrafficMode(
+      vscode.workspace.getConfiguration("agentVibes").get("trafficMode")
     )
   }
 

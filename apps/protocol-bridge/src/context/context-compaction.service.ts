@@ -425,6 +425,7 @@ export class ContextCompactionService {
       systemPromptTokens: number
       autoCompactTokenLimit?: number
       predictiveCompactTokenLimit?: number
+      projectedTokenOverride?: number
       strategy?: ContextCompactionCommit["strategy"]
       integrityMode?: "strict-adjacent" | "global"
     }
@@ -462,10 +463,17 @@ export class ContextCompactionService {
       snapshot,
       attachmentTokenBudget
     )
-    const projectedTokens = this.countProjected(projected)
+    const measuredProjectedTokens = this.countProjected(projected)
+    const projectedTokens = Math.max(
+      measuredProjectedTokens,
+      options.projectedTokenOverride || 0
+    )
     if (projectedTokens <= effectiveMaxTokens) {
       this.logger.debug(
         `prepareCompactionCandidate: skipped (projected=${projectedTokens} <= effective=${effectiveMaxTokens}, ` +
+          (options.projectedTokenOverride
+            ? `localProjected=${measuredProjectedTokens}, override=${options.projectedTokenOverride}, `
+            : "") +
           `hardMax=${hardMaxTokens}, sysPrompt=${options.systemPromptTokens}, ` +
           `auto=${options.autoCompactTokenLimit ?? "(none)"}, pred=${options.predictiveCompactTokenLimit ?? "(none)"})`
       )

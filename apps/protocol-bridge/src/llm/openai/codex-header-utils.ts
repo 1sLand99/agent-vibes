@@ -1,3 +1,5 @@
+import { normalizeCodexPromptCacheKey } from "./codex-prompt-cache-key"
+
 export type CodexForwardHeaders = Record<string, string>
 
 /**
@@ -127,6 +129,32 @@ function ensureHeader(
   }
 }
 
+function ensureCodexIdentityHeader(
+  target: Record<string, string>,
+  source: CodexForwardHeaders | undefined,
+  key: string,
+  defaultValue: string,
+  aliases: string[] = []
+): void {
+  const sourceValue = getForwardHeader(source, key, ...aliases)
+  if (sourceValue) {
+    const normalizedSource = normalizeCodexHeaderIdentityValue(sourceValue)
+    if (normalizedSource) {
+      target[key] = normalizedSource
+    }
+    return
+  }
+
+  if (getExistingHeader(target, key, ...aliases)) {
+    return
+  }
+
+  const normalizedDefault = normalizeCodexHeaderIdentityValue(defaultValue)
+  if (normalizedDefault) {
+    target[key] = normalizedDefault
+  }
+}
+
 function ensureCompatibilityHeader(
   target: Record<string, string>,
   forwardHeaders: CodexForwardHeaders | undefined,
@@ -162,19 +190,25 @@ function resolveCodexIdentityHeaders(
   clientMetadata: CodexForwardHeaders | undefined,
   defaultConversationId: string
 ): { sessionId: string; threadId: string } {
-  const sessionId =
+  const sessionId = normalizeCodexHeaderIdentityValue(
     getForwardHeader(forwardHeaders, "session-id", "session_id") ||
-    getForwardHeader(clientMetadata, "session_id", "session-id") ||
-    defaultConversationId.trim()
-  const threadId =
+      getForwardHeader(clientMetadata, "session_id", "session-id") ||
+      defaultConversationId
+  )
+  const threadId = normalizeCodexHeaderIdentityValue(
     getForwardHeader(forwardHeaders, "thread-id", "thread_id") ||
-    getForwardHeader(clientMetadata, "thread_id", "thread-id") ||
-    sessionId
+      getForwardHeader(clientMetadata, "thread_id", "thread-id") ||
+      sessionId
+  )
 
   return {
     sessionId,
     threadId,
   }
+}
+
+function normalizeCodexHeaderIdentityValue(value: string): string {
+  return normalizeCodexPromptCacheKey(value)
 }
 
 function ensureCodexSessionHeaders(
@@ -362,7 +396,7 @@ export function buildCodexWebSocketHeaders(
     params.clientMetadata,
     "x-openai-subagent"
   )
-  ensureHeader(
+  ensureCodexIdentityHeader(
     headers,
     params.forwardHeaders,
     "x-client-request-id",

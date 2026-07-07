@@ -124,16 +124,6 @@ export function getCodexIncrementalInput(
     requestInput.length < baseline.length ||
     (!allowEmptyDelta && requestInput.length === baseline.length)
   ) {
-    const omittedResponseResult =
-      getCodexIncrementalInputWithOmittedResponseItems(
-        requestInput,
-        previousInput,
-        responseInput,
-        allowEmptyDelta
-      )
-    if (omittedResponseResult) {
-      return omittedResponseResult
-    }
     return {
       ok: false,
       reason: "input_not_extension",
@@ -149,16 +139,6 @@ export function getCodexIncrementalInput(
       stableCodexJsonStringify(requestInput[index]) !==
       stableCodexJsonStringify(baseline[index])
     ) {
-      const omittedResponseResult =
-        getCodexIncrementalInputWithOmittedResponseItems(
-          requestInput,
-          previousInput,
-          responseInput,
-          allowEmptyDelta
-        )
-      if (omittedResponseResult) {
-        return omittedResponseResult
-      }
       return {
         ok: false,
         reason: "input_not_extension",
@@ -175,95 +155,6 @@ export function getCodexIncrementalInput(
 
   return { ok: true, input: requestInput.slice(baseline.length) }
 }
-
-function getCodexIncrementalInputWithOmittedResponseItems(
-  requestInput: CodexInputItem[],
-  previousInput: CodexInputItem[],
-  responseInput: CodexInputItem[],
-  allowEmptyDelta: boolean
-): { ok: true; input: CodexInputItem[] } | undefined {
-  if (requestInput.length < previousInput.length) {
-    return undefined
-  }
-
-  for (let index = 0; index < previousInput.length; index++) {
-    if (
-      stableCodexJsonStringify(requestInput[index]) !==
-      stableCodexJsonStringify(previousInput[index])
-    ) {
-      return undefined
-    }
-  }
-
-  let requestIndex = previousInput.length
-  let responseIndex = 0
-  while (requestIndex < requestInput.length) {
-    const requestItem = requestInput[requestIndex]
-    const matchedResponseIndex = findMatchingResponseReplayItemIndex(
-      responseInput,
-      responseIndex,
-      requestItem
-    )
-    if (matchedResponseIndex >= 0) {
-      responseIndex = matchedResponseIndex + 1
-      requestIndex++
-      continue
-    }
-
-    if (isCodexResponseReplayItem(requestItem)) {
-      requestIndex++
-      continue
-    }
-
-    break
-  }
-
-  const incrementalInput = requestInput.slice(requestIndex)
-  if (!allowEmptyDelta && incrementalInput.length === 0) {
-    return undefined
-  }
-  return { ok: true, input: incrementalInput }
-}
-
-function findMatchingResponseReplayItemIndex(
-  responseInput: CodexInputItem[],
-  startIndex: number,
-  requestItem: CodexInputItem | undefined
-): number {
-  if (!requestItem) {
-    return -1
-  }
-  const requestKey = stableCodexJsonStringify(requestItem)
-  for (let index = startIndex; index < responseInput.length; index++) {
-    const responseItem = responseInput[index]
-    if (!isCodexResponseReplayItem(responseItem)) {
-      continue
-    }
-    if (stableCodexJsonStringify(responseItem) === requestKey) {
-      return index
-    }
-  }
-  return -1
-}
-
-function isCodexResponseReplayItem(item: CodexInputItem | undefined): boolean {
-  const type = getCodexInputItemType(item)
-  if (type === "message") {
-    return getCodexMessageRole(item) === "assistant"
-  }
-  return CODEX_RESPONSE_REPLAY_ITEM_TYPES.has(type)
-}
-
-const CODEX_RESPONSE_REPLAY_ITEM_TYPES = new Set([
-  "agent_message",
-  "reasoning",
-  "local_shell_call",
-  "function_call",
-  "custom_tool_call",
-  "tool_search_call",
-  "web_search_call",
-  "image_generation_call",
-])
 
 /**
  * Codex continuation state is compared against the semantic Responses API
@@ -376,14 +267,6 @@ function getCodexInputItemType(item: CodexInputItem | undefined): string {
       ? ((item as { type: string }).type || "").trim()
       : ""
   return type || "unknown"
-}
-
-function getCodexMessageRole(item: CodexInputItem | undefined): string {
-  if (!item || getCodexInputItemType(item) !== "message") {
-    return ""
-  }
-  const role = (item as { role?: unknown }).role
-  return typeof role === "string" ? role.trim() : ""
 }
 
 function getCodexInputItems(

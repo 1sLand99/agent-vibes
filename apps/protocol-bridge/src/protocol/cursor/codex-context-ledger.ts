@@ -27,6 +27,8 @@ export interface CodexContextLedgerProjection {
   messages: CodexExecutionRequest["messages"]
   contextMessages: CodexConversationMessage[]
   addedContextMessages: CodexConversationMessage[]
+  contextChanged: boolean
+  changedKeys: string[]
 }
 
 export function createCodexContextLedgerState(): CodexContextLedgerState {
@@ -42,15 +44,45 @@ export function previewCodexContextLedgerMessages(
   state: CodexContextLedgerState | undefined,
   entries: CodexContextEntry[]
 ): CodexConversationMessage[] {
-  const pending = buildPendingContextMessages(
-    state ?? createCodexContextLedgerState(),
-    normalizeEntries(entries),
-    0
+  return previewCodexContextLedgerProjection(state, [], entries).contextMessages
+}
+
+export function previewCodexContextLedgerProjection(
+  state: CodexContextLedgerState | undefined,
+  visibleMessages: CodexExecutionRequest["messages"],
+  entries: CodexContextEntry[]
+): CodexContextLedgerProjection {
+  const snapshot = state ?? createCodexContextLedgerState()
+  const normalizedEntries = normalizeEntries(entries)
+  const insertionIndex = snapshot.initialized
+    ? findCurrentTurnContextInsertionIndex(visibleMessages)
+    : 0
+  const pendingMessages = buildPendingContextMessages(
+    snapshot,
+    normalizedEntries,
+    insertionIndex
   )
-  return [
-    ...((state?.messages ?? []) as CodexConversationMessage[]),
-    ...pending,
-  ].map(({ role, content }) => ({ role, content }))
+  const contextMessages = buildCurrentContextMessages(
+    normalizedEntries,
+    insertionIndex
+  )
+
+  return {
+    messages: mergeContextMessagesIntoVisibleMessages(
+      contextMessages,
+      visibleMessages
+    ),
+    contextMessages: contextMessages.map(({ role, content }) => ({
+      role,
+      content,
+    })),
+    addedContextMessages: pendingMessages.map(({ role, content }) => ({
+      role,
+      content,
+    })),
+    contextChanged: pendingMessages.length > 0,
+    changedKeys: pendingMessages.map((message) => message.key),
+  }
 }
 
 export function projectCodexContextLedgerMessages(
@@ -69,7 +101,10 @@ export function projectCodexContextLedgerMessages(
   )
 
   if (!state.initialized || pendingMessages.length > 0) {
-    state.messages.push(...pendingMessages)
+    state.messages = buildCurrentContextMessages(
+      normalizedEntries,
+      insertionIndex
+    )
     state.initialized = true
     state.latestSignaturesByKey = Object.fromEntries(
       normalizedEntries.map((entry) => [entry.key, signContextEntry(entry)])
@@ -92,6 +127,8 @@ export function projectCodexContextLedgerMessages(
       role,
       content,
     })),
+    contextChanged: pendingMessages.length > 0,
+    changedKeys: pendingMessages.map((message) => message.key),
   }
 }
 
@@ -104,30 +141,38 @@ function buildPendingContextMessages(
     return entries.map((entry) => anchorContextEntry(entry, beforeVisibleIndex))
   }
 
-  const currentKeys = new Set(entries.map((entry) => entry.key))
   const pending: CodexContextLedgerAnchoredMessage[] = []
   for (const [key, signature] of Object.entries(state.latestSignaturesByKey)) {
-    if (currentKeys.has(key)) {
+    const current = entries.find((entry) => entry.key === key)
+    if (!current) {
+      pending.push({
+        key,
+        signature: `removed:${signature}`,
+        role: state.latestRolesByKey[key] ?? "developer",
+        content: "",
+        beforeVisibleIndex,
+      })
       continue
     }
-    pending.push({
-      key,
-      signature: `removed:${signature}`,
-      role: state.latestRolesByKey[key] ?? "developer",
-      content: renderRemovedContextEntry(key),
-      beforeVisibleIndex,
-    })
+    if (signContextEntry(current) !== signature) {
+      pending.push(anchorContextEntry(current, beforeVisibleIndex))
+    }
   }
 
   for (const entry of entries) {
-    const signature = signContextEntry(entry)
-    if (state.latestSignaturesByKey[entry.key] === signature) {
-      continue
+    if (!(entry.key in state.latestSignaturesByKey)) {
+      pending.push(anchorContextEntry(entry, beforeVisibleIndex))
     }
-    pending.push(anchorContextEntry(entry, beforeVisibleIndex))
   }
 
   return pending
+}
+
+function buildCurrentContextMessages(
+  entries: CodexContextEntry[],
+  beforeVisibleIndex: number
+): CodexContextLedgerAnchoredMessage[] {
+  return entries.map((entry) => anchorContextEntry(entry, beforeVisibleIndex))
 }
 
 function anchorContextEntry(
@@ -229,12 +274,4 @@ function signContextEntry(entry: CodexContextEntry): string {
     role: entry.role,
     content: entry.content,
   })
-}
-
-function renderRemovedContextEntry(key: string): string {
-  return [
-    "<context_update>",
-    `The previously supplied Cursor context section \`${key}\` is no longer present for the current turn.`,
-    "</context_update>",
-  ].join("\n")
 }

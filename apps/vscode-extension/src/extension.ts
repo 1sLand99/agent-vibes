@@ -5,11 +5,15 @@ import { t, tFmt } from "./i18n/messages-i18n"
 import { BridgeManager } from "./services/bridge-manager"
 import { CertManager } from "./services/cert-manager"
 import { ConfigManager } from "./services/config-manager"
+import { CursorPatchService } from "./services/cursor-patch"
 import { ExtensionUpdateService } from "./services/extension-update"
 import { NetworkManager } from "./services/network-manager"
 import { logger } from "./utils/logger"
 import { executePrivileged } from "./utils/terminal"
-import { StatusIndicator } from "./views/status-indicator"
+import {
+  StatusIndicator,
+  type CursorConnectionState,
+} from "./views/status-indicator"
 
 // Singleton references for cleanup
 let bridge: BridgeManager | null = null
@@ -32,15 +36,65 @@ export async function activate(
   network = new NetworkManager()
   network.setExtensionPath(context.extensionPath)
   network.setPort(config.port)
+  const cursorPatch = new CursorPatchService(logger)
   const cert = new CertManager(config)
   const updater = new ExtensionUpdateService(context)
 
   // Create UI
-  statusIndicator = new StatusIndicator(() => network!.isForwardingActive())
+  const getCursorConnectionState = (): CursorConnectionState => {
+    const bridgeEndpointPatch = cursorPatch.getBridgeEndpointPatchStatus(
+      config.port
+    )
+    if (bridgeEndpointPatch.applied) return "patched"
+    if (network?.isForwardingActive()) return "forwarding"
+    return "unwired"
+  }
+  statusIndicator = new StatusIndicator(getCursorConnectionState)
 
   let forwardingRepairPromptShown = false
+  let directPatchRestartPromptShown = false
+
+  const maybeApplyCursorDirectPatch = async (): Promise<void> => {
+    if (config.trafficMode !== "cursorPatch") return
+
+    const status = cursorPatch.getBridgeEndpointPatchStatus(config.port)
+    if (!status.fileExists || !status.canApply || status.applied) {
+      statusIndicator?.update(bridge?.state ?? "stopped")
+      return
+    }
+
+    const result = cursorPatch.applyBridgeEndpointPatch(config.port)
+    if (!result.success) {
+      logger.warn(
+        `Cursor direct connection patch could not be applied: ${result.errors.join("; ")}`
+      )
+      statusIndicator?.update(bridge?.state ?? "stopped")
+      return
+    }
+
+    logger.info("Cursor direct connection patch applied from traffic mode")
+    statusIndicator?.update(bridge?.state ?? "stopped")
+
+    if (result.restartRequired !== true) return
+    if (directPatchRestartPromptShown) return
+    directPatchRestartPromptShown = true
+    const action = await vscode.window.showInformationMessage(
+      t("patches.bridgeEndpointApplied"),
+      t("forwarding.action.quit"),
+      t("setup.action.later")
+    )
+    if (action === t("forwarding.action.quit")) {
+      await vscode.commands.executeCommand("workbench.action.quit")
+    }
+  }
+
   const maybePromptForForwardingRepair = async (): Promise<void> => {
+    if (config.trafficMode !== "systemForwarding") return
     if (forwardingRepairPromptShown || !bridge?.isRunning || !network) return
+    const bridgeEndpointPatch = cursorPatch.getBridgeEndpointPatchStatus(
+      config.port
+    )
+    if (bridgeEndpointPatch.applied) return
     if (!network.hasHostEntries() || network.isForwardingActive()) return
 
     forwardingRepairPromptShown = true
@@ -77,10 +131,25 @@ export async function activate(
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async (event) => {
       const portChanged = event.affectsConfiguration("agentVibes.port")
-      if (!portChanged) return
+      const trafficModeChanged = event.affectsConfiguration(
+        "agentVibes.trafficMode"
+      )
+      if (!portChanged && !trafficModeChanged) return
+
+      if (trafficModeChanged && !portChanged) {
+        await maybeApplyCursorDirectPatch()
+        statusIndicator?.update(bridge?.state ?? "stopped")
+        return
+      }
 
       const nextPort = config.port
-      if (nextPort === currentPort) return
+      if (nextPort === currentPort) {
+        if (trafficModeChanged) {
+          await maybeApplyCursorDirectPatch()
+          statusIndicator?.update(bridge?.state ?? "stopped")
+        }
+        return
+      }
 
       const previousPort = currentPort
       currentPort = nextPort
@@ -110,7 +179,15 @@ export async function activate(
         return
       }
 
-      if (forwardingActive && network) {
+      if (config.trafficMode === "cursorPatch") {
+        await maybeApplyCursorDirectPatch()
+      }
+
+      if (
+        config.trafficMode === "systemForwarding" &&
+        forwardingActive &&
+        network
+      ) {
         statusIndicator?.showBusy(
           t("bridge.reconfiguringBusy"),
           tFmt("bridge.reconfiguringTooltip", { port: nextPort })
@@ -125,6 +202,8 @@ export async function activate(
       }
     })
   )
+
+  void maybeApplyCursorDirectPatch()
 
   // Push disposables
   context.subscriptions.push({

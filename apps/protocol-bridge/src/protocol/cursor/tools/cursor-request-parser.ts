@@ -1,4 +1,4 @@
-import { fromBinary, toBinary } from "@bufbuild/protobuf"
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf"
 import { Logger } from "@nestjs/common"
 import * as zlib from "zlib"
 
@@ -25,6 +25,8 @@ import {
   UserMessage,
   UserMessageAction,
   UserMessageSchema,
+  type SkillOptions,
+  SkillOptionsSchema,
 } from "../../../gen/agent/v1_pb"
 import { parseModelRequest } from "../../../llm/shared/model-request"
 import { doesModelSupportThinking } from "../../../llm/shared/model-registry"
@@ -49,6 +51,33 @@ import { CursorProtocolTraceService } from "../cursor-protocol-trace.service"
 
 // GZIP 魔数
 const GZIP_MAGIC = Buffer.from([0x1f, 0x8b])
+
+function mergeSkillOptions(
+  ...options: Array<SkillOptions | undefined>
+): SkillOptions | undefined {
+  const descriptors = []
+  const seen = new Set<string>()
+  for (const option of options) {
+    for (const descriptor of option?.skillDescriptors || []) {
+      const key = [
+        descriptor.readmeFilePath || "",
+        descriptor.folderPath || "",
+        descriptor.name || "",
+      ]
+        .map((value) => value.trim().toLowerCase())
+        .find((value) => value.length > 0)
+      if (!key || seen.has(key)) {
+        continue
+      }
+      seen.add(key)
+      descriptors.push(descriptor)
+    }
+  }
+  if (descriptors.length === 0) {
+    return undefined
+  }
+  return create(SkillOptionsSchema, { skillDescriptors: descriptors })
+}
 
 // 已解析的 tool 结果
 export interface ParsedToolResult {
@@ -305,6 +334,7 @@ export interface ParsedCursorRequest {
 
   // Cursor 规则（保留协议原始结构，避免在解析阶段丢失元数据）
   cursorRules?: CursorRule[]
+  skillOptions?: SkillOptions
   selectedCursorRulePaths?: string[]
   selectedCursorRuleNames?: string[]
 
@@ -2068,6 +2098,15 @@ export class CursorRequestParser {
       buildBuiltInDisciplineRule(),
       ...filteredContextRules,
     ]
+    const skillOptions = mergeSkillOptions(
+      req.skillOptions,
+      requestContext?.skillOptions
+    )
+    if (skillOptions?.skillDescriptors.length) {
+      this.logger.debug(
+        `[DEBUG] SkillOptions.skill_descriptors: ${skillOptions.skillDescriptors.length} item(s)`
+      )
+    }
 
     // 提取 Cursor Commands (/ 命令)
     const cursorCommands: Array<{ name: string; content: string }> = []
@@ -2438,6 +2477,7 @@ export class CursorRequestParser {
             ? { rootPath, directories, files: [], workspaceFolders }
             : undefined,
           cursorRules,
+          skillOptions,
           selectedCursorRulePaths:
             selectedCursorRulePaths.size > 0
               ? Array.from(selectedCursorRulePaths)
@@ -2599,6 +2639,7 @@ export class CursorRequestParser {
             ? { rootPath, directories, files: [], workspaceFolders }
             : undefined,
           cursorRules,
+          skillOptions,
           selectedCursorRulePaths:
             selectedCursorRulePaths.size > 0
               ? Array.from(selectedCursorRulePaths)
@@ -2648,6 +2689,7 @@ export class CursorRequestParser {
             ? { rootPath, directories, files: [], workspaceFolders }
             : undefined,
           cursorRules,
+          skillOptions,
           selectedCursorRulePaths:
             selectedCursorRulePaths.size > 0
               ? Array.from(selectedCursorRulePaths)
@@ -2705,6 +2747,7 @@ export class CursorRequestParser {
         ? { rootPath, directories, files: [], workspaceFolders }
         : undefined,
       cursorRules,
+      skillOptions,
       selectedCursorRulePaths:
         selectedCursorRulePaths.size > 0
           ? Array.from(selectedCursorRulePaths)

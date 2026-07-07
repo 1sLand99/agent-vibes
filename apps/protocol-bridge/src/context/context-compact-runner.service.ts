@@ -10,6 +10,11 @@ import {
   ContextTranscriptRecord,
   extractText,
 } from "./types"
+import {
+  buildTopicContinuityGuard,
+  composeCompactHookMessage,
+  extractLatestUserUtterance,
+} from "./context-continuity-guard"
 
 export interface ContextCompactRunnerSummaryRequest {
   prompt: string
@@ -129,14 +134,12 @@ export class ContextCompactRunnerService {
       )
     }
 
-    const latestUserUtterance = this.extractLatestUserUtterance(state)
-    const continuityGuard = this.buildTopicContinuityGuard(latestUserUtterance)
-    const composedHookUserMessage = [
+    const latestUserUtterance = extractLatestUserUtterance(state)
+    const continuityGuard = buildTopicContinuityGuard(latestUserUtterance)
+    const composedHookUserMessage = composeCompactHookMessage(
       summaryResult.hookUserMessage || explicitHookUserMessage,
-      continuityGuard,
-    ]
-      .filter((value): value is string => Boolean(value && value.trim()))
-      .join("\n\n")
+      continuityGuard
+    )
 
     const plan = this.compaction.applyGeneratedSummaryCompaction(
       state,
@@ -144,7 +147,7 @@ export class ContextCompactRunnerService {
       candidate,
       {
         summary,
-        hookUserMessage: composedHookUserMessage || undefined,
+        hookUserMessage: composedHookUserMessage,
         meta: options.meta,
       }
     )
@@ -201,14 +204,12 @@ export class ContextCompactRunnerService {
       throw new Error("LLM compact runner returned an empty summary")
     }
 
-    const latestUserUtterance = this.extractLatestUserUtterance(state)
-    const continuityGuard = this.buildTopicContinuityGuard(latestUserUtterance)
-    const composedHookUserMessage = [
+    const latestUserUtterance = extractLatestUserUtterance(state)
+    const continuityGuard = buildTopicContinuityGuard(latestUserUtterance)
+    const composedHookUserMessage = composeCompactHookMessage(
       summaryResult.hookUserMessage || explicitHookUserMessage,
-      continuityGuard,
-    ]
-      .filter((value): value is string => Boolean(value && value.trim()))
-      .join("\n\n")
+      continuityGuard
+    )
 
     const plan = this.compaction.applyGeneratedSummaryCompaction(
       state,
@@ -216,7 +217,7 @@ export class ContextCompactRunnerService {
       candidate,
       {
         summary,
-        hookUserMessage: composedHookUserMessage || undefined,
+        hookUserMessage: composedHookUserMessage,
         meta: options.meta,
       }
     )
@@ -303,56 +304,6 @@ export class ContextCompactRunnerService {
       return summaryMatch[1].trim()
     }
     return raw.replace(/<analysis>[\s\S]*?<\/analysis>/gi, "").trim()
-  }
-
-  /**
-   * Pull the most recent user-authored text out of the live state so the
-   * post-compact guard can quote it back to the model. Walking from the tail
-   * keeps us aligned with whatever the user just typed even when older user
-   * turns had richer phrasing.
-   */
-  private extractLatestUserUtterance(
-    state: ContextConversationState
-  ): string | undefined {
-    const records = state.records
-    if (!records || records.length === 0) return undefined
-    for (let i = records.length - 1; i >= 0; i--) {
-      const record = records[i]
-      if (!record) continue
-      if (record.role !== "user") continue
-      if (record.kind && record.kind !== "message") continue
-      const text =
-        typeof record.content === "string"
-          ? record.content
-          : extractText(record.content)
-      const trimmed = text?.trim()
-      if (trimmed) {
-        return trimmed.length > 480 ? `${trimmed.slice(0, 480)}…` : trimmed
-      }
-    }
-    return undefined
-  }
-
-  /**
-   * Hard topic-continuity guard injected as a synthetic user message right
-   * after the summary. Without this guard, even a well-structured summary
-   * leaves room for the next thinking turn to drift back into older topics
-   * that share vocabulary with the current request — exactly the "thinking
-   * jumps to a previous task" failure mode the bridge has been hitting.
-   */
-  private buildTopicContinuityGuard(
-    latestUserUtterance: string | undefined
-  ): string | undefined {
-    if (!latestUserUtterance) return undefined
-    return [
-      "[context-compact] Topic continuity guard:",
-      "- The conversation above was just compacted. The summary captures the full prior history; do not re-derive or restate it.",
-      "- Resume work on the user's MOST RECENT request, quoted below. Do not pivot back to earlier tasks that were already answered or set aside, even if the summary mentions them.",
-      "- If the most recent request is unclear or already resolved, ask the user before starting new work — do not invent next steps from older threads.",
-      "",
-      "Most recent user request (verbatim):",
-      `"""${latestUserUtterance}"""`,
-    ].join("\n")
   }
 
   private renderRecord(record: ContextTranscriptRecord): string {

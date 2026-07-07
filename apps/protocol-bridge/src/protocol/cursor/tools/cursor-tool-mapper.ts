@@ -530,7 +530,8 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
           type: "string",
           description:
             "Pick from the available `subagent_type` values listed in " +
-            "this tool's description. Omit to fall back to 'general-purpose'.",
+            "this tool's description. Omit to use 'general-purpose'. " +
+            "If provided, it must match one listed value exactly.",
         },
         run_in_background: {
           type: "boolean",
@@ -544,10 +545,10 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
             "sub-agents only get inline tools (no shell, no file edits, " +
             "no run_terminal_command); they're best for parallel " +
             "research / web fetches / MCP work that doesn't need to " +
-            "block the user. Cannot be combined with " +
-            "`subagent_type='bash'` — the bash agent's whole tool " +
-            "surface is run_terminal_command, which is unavailable in " +
-            "background mode. Default false (foreground, blocks until " +
+            "block the user. Cannot be combined with shell-dependent " +
+            "agents such as `subagent_type='bash'` or " +
+            "`subagent_type='bugbot'`, because their tool surface relies " +
+            "on run_terminal_command. Default false (foreground, blocks until " +
             "the sub-agent finishes and returns its result inline).",
         },
       },
@@ -588,7 +589,8 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
           type: "string",
           description:
             "Pick from the available `subagent_type` values listed in " +
-            "this tool's description. Omit to fall back to 'general-purpose'.",
+            "this tool's description. Omit to use 'general-purpose'. " +
+            "If provided, it must match one listed value exactly.",
         },
         run_in_background: {
           type: "boolean",
@@ -602,10 +604,10 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
             "sub-agents only get inline tools (no shell, no file edits, " +
             "no run_terminal_command); they're best for parallel " +
             "research / web fetches / MCP work that doesn't need to " +
-            "block the user. Cannot be combined with " +
-            "`subagent_type='bash'` — the bash agent's whole tool " +
-            "surface is run_terminal_command, which is unavailable in " +
-            "background mode. Default false (foreground, blocks until " +
+            "block the user. Cannot be combined with shell-dependent " +
+            "agents such as `subagent_type='bash'` or " +
+            "`subagent_type='bugbot'`, because their tool surface relies " +
+            "on run_terminal_command. Default false (foreground, blocks until " +
             "the sub-agent finishes and returns its result inline).",
         },
       },
@@ -2756,8 +2758,7 @@ function addCodexToolDefinition(
  * Mirrors claude-code's getPrompt(agentDefinitions) — the model needs to
  * see which sub-agents are available, what each is good for, and what
  * tools each one can use, so it can pick a `subagent_type` that actually
- * matches the task instead of falling back to "general-purpose" with a
- * mismatched tool surface.
+ * matches the task instead of sending an invalid explicit type.
  *
  * The static description is preserved as the first paragraph so any
  * model that never reads past the first sentence still gets the original
@@ -2776,7 +2777,8 @@ function buildDynamicTaskToolDescription(
     staticDescription,
     "",
     "Available `subagent_type` values and what each one is good for. Pass " +
-      "`subagent_type` to choose; omit it to fall back to `general-purpose`.",
+      "`subagent_type` to choose; omit it to use `general-purpose`. If you " +
+      "pass `subagent_type`, it must match one listed value exactly.",
     "",
   ]
   for (const def of subagentDefinitions) {

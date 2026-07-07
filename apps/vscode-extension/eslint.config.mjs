@@ -48,5 +48,13 @@ export default tseslint.config(
       "no-useless-escape": "error",
       "prefer-const": "error",
     },
+  },
+  {
+    files: ["**/*.spec.ts"],
+    languageOptions: {
+      globals: {
+        ...globals.jest,
+      },
+    },
   }
 )

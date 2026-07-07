@@ -14,6 +14,10 @@
 
 import { Injectable, Logger } from "@nestjs/common"
 import * as crypto from "crypto"
+import {
+  buildDeterministicCodexPromptCacheKey,
+  normalizeCodexPromptCacheKey,
+} from "./codex-prompt-cache-key"
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -33,9 +37,6 @@ export class CodexCacheService {
 
   /** Default TTL: 1 hour */
   private readonly DEFAULT_TTL_MS = 60 * 60 * 1000
-
-  /** Codex Responses API rejects prompt_cache_key values longer than 64 chars. */
-  private readonly MAX_PROMPT_CACHE_KEY_LENGTH = 64
 
   /** Cleanup interval: 10 minutes */
   private cleanupTimer: ReturnType<typeof setInterval> | null = null
@@ -97,25 +98,7 @@ export class CodexCacheService {
   }
 
   private buildDeterministicCacheId(name: string): string {
-    const namespace = "6ba7b812-9dad-11d1-80b4-00c04fd430c8" // UUID v5 OID namespace
-
-    const hash = crypto
-      .createHash("sha1")
-      .update(Buffer.from(namespace.replace(/-/g, ""), "hex"))
-      .update(name)
-      .digest()
-
-    hash[6] = (hash[6]! & 0x0f) | 0x50
-    hash[8] = (hash[8]! & 0x3f) | 0x80
-
-    const hex = hash.toString("hex").slice(0, 32)
-    return [
-      hex.slice(0, 8),
-      hex.slice(8, 12),
-      hex.slice(12, 16),
-      hex.slice(16, 20),
-      hex.slice(20, 32),
-    ].join("-")
+    return buildDeterministicCodexPromptCacheKey(name)
   }
 
   /**
@@ -138,15 +121,7 @@ export class CodexCacheService {
   }
 
   private normalizePromptCacheKey(cacheId: string): string {
-    const trimmed = cacheId.trim()
-    if (!trimmed) return ""
-    if (trimmed.length <= this.MAX_PROMPT_CACHE_KEY_LENGTH) {
-      return trimmed
-    }
-
-    return this.buildDeterministicCacheId(
-      `cli-proxy-api:codex:prompt-cache-key:${trimmed}`
-    )
+    return normalizeCodexPromptCacheKey(cacheId)
   }
 
   /**

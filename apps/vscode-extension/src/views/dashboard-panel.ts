@@ -952,6 +952,7 @@ export class DashboardPanel {
     const allowedStrings = new Set([
       "language",
       "responseLanguage",
+      "trafficMode",
       "dataDir",
       "antigravityAccountsPath",
       "codexAccountsPath",
@@ -1010,7 +1011,9 @@ export class DashboardPanel {
         this.watchAccountFiles()
       }
 
-      if (key !== "language") {
+      if (key === "trafficMode") {
+        vscode.window.showInformationMessage(t("dash.trafficModeChanged"))
+      } else if (key !== "language") {
         vscode.window.showInformationMessage(
           str
             ? tFmt("dash.settingUpdated", { key })
@@ -1141,6 +1144,45 @@ export class DashboardPanel {
     )
     const idlePatchStatus =
       this.cursorPatchService.getIdleExtensionHostKillerStatus()
+    const bridgeEndpointPatchStatus =
+      this.cursorPatchService.getBridgeEndpointPatchStatus(this.config.port)
+    const bridgeEndpointPatchValue = !bridgeEndpointPatchStatus.fileExists
+      ? translateNotFound(locale, "Not found")
+      : bridgeEndpointPatchStatus.applied
+        ? translateOnOff(locale, "On")
+        : bridgeEndpointPatchStatus.requiresPortUpdate
+          ? locale === "zh"
+            ? "需更新"
+            : "Update needed"
+          : bridgeEndpointPatchStatus.canApply
+            ? translateOnOff(locale, "Off")
+            : locale === "zh"
+              ? "不可用"
+              : "Unavailable"
+    const bridgeEndpointPatchHint = !bridgeEndpointPatchStatus.fileExists
+      ? locale === "zh"
+        ? "未找到 Cursor workbench 文件。"
+        : "Cursor workbench file was not found."
+      : bridgeEndpointPatchStatus.applied
+        ? locale === "zh"
+          ? `Cursor 已直连 ${bridgeEndpointPatchStatus.endpointUrl}，无需 hosts 或本机端口转发。`
+          : `Cursor connects directly to ${bridgeEndpointPatchStatus.endpointUrl}; hosts and local port forwarding are not required.`
+        : bridgeEndpointPatchStatus.requiresPortUpdate
+          ? locale === "zh"
+            ? `当前补丁使用 ${bridgeEndpointPatchStatus.currentUrl || "旧地址"}，点击应用更新到 ${bridgeEndpointPatchStatus.endpointUrl}。`
+            : `Current patch uses ${bridgeEndpointPatchStatus.currentUrl || "an older endpoint"}; apply to update it to ${bridgeEndpointPatchStatus.endpointUrl}.`
+          : bridgeEndpointPatchStatus.canApply
+            ? locale === "zh"
+              ? `将 Cursor 请求写入 ${bridgeEndpointPatchStatus.endpointUrl}，不再需要 hosts 或本机端口转发。`
+              : `Routes Cursor requests to ${bridgeEndpointPatchStatus.endpointUrl} without hosts or local port forwarding.`
+            : locale === "zh"
+              ? "当前 Cursor 构建未匹配到可应用的接入地址。"
+              : "No matching endpoint location was found in this Cursor build."
+    const canApplyBridgeEndpointPatch =
+      bridgeEndpointPatchStatus.fileExists &&
+      bridgeEndpointPatchStatus.canApply &&
+      (!bridgeEndpointPatchStatus.applied ||
+        bridgeEndpointPatchStatus.requiresPortUpdate)
     const idlePatchValue = !idlePatchStatus.fileExists
       ? translateNotFound(locale, "Not found")
       : idlePatchStatus.applied
@@ -1204,6 +1246,12 @@ export class DashboardPanel {
       hasCertificates: this.config.hasCertificates(),
       totalAccounts,
       defaultProxyUrl: this.getDefaultProxyUrl(),
+      cursorBridgePatch: {
+        applied: bridgeEndpointPatchStatus.applied,
+        canApply: bridgeEndpointPatchStatus.canApply,
+        requiresPortUpdate: bridgeEndpointPatchStatus.requiresPortUpdate,
+        endpointUrl: bridgeEndpointPatchStatus.endpointUrl,
+      },
       setup: this.getOverviewPayload(channelAccountsData, locale),
       versions: this.versionInfo,
     }
@@ -1287,6 +1335,28 @@ export class DashboardPanel {
                 type: "number",
                 key: "port",
                 value: this.config.port,
+              },
+              {
+                label: st.groups.bridge.items.trafficMode.label,
+                desc: st.groups.bridge.items.trafficMode.desc,
+                type: "select",
+                key: "trafficMode",
+                value: this.config.trafficMode,
+                options:
+                  locale === "zh"
+                    ? [
+                        { value: "cursorPatch", label: "Cursor 直连补丁" },
+                        { value: "systemForwarding", label: "Legacy 转发" },
+                        { value: "manual", label: "手动管理" },
+                      ]
+                    : [
+                        { value: "cursorPatch", label: "Cursor Direct Patch" },
+                        {
+                          value: "systemForwarding",
+                          label: "Legacy Forwarding",
+                        },
+                        { value: "manual", label: "Manual" },
+                      ],
               },
               {
                 label: st.groups.bridge.items.healthCheckInterval.label,
@@ -1401,6 +1471,23 @@ export class DashboardPanel {
                 value: cursorBuildValue,
               },
               {
+                label: st.groups.patch.items.bridgeEndpoint.label,
+                desc: st.groups.patch.items.bridgeEndpoint.desc,
+                type: "actions",
+                value: bridgeEndpointPatchValue,
+                hint: bridgeEndpointPatchHint,
+                actions: [
+                  {
+                    label: bridgeEndpointPatchStatus.requiresPortUpdate
+                      ? st.patch.updateBridgeEndpoint
+                      : st.patch.applyBridgeEndpoint,
+                    command: CMD.APPLY_CURSOR_BRIDGE_ENDPOINT_PATCH,
+                    tone: "secondary",
+                    disabled: !canApplyBridgeEndpointPatch,
+                  },
+                ],
+              },
+              {
                 label: st.groups.patch.items.idleKiller.label,
                 desc: st.groups.patch.items.idleKiller.desc,
                 type: "actions",
@@ -1459,10 +1546,9 @@ export class DashboardPanel {
       0
     )
 
-    // Cursor traffic forwarding is intentionally excluded from the setup
-    // steps: the bridge can run purely as a relay (e.g. Claude Code CLI /
-    // API clients) without intercepting Cursor. Forwarding is controlled
-    // independently from the API tab's Cursor IDE Protocol toggle.
+    // Cursor IDE connection is intentionally excluded from the setup steps:
+    // the bridge can run purely as a relay for Claude Code CLI / API clients.
+    // Cursor's direct-connection patch is controlled from the API tab.
     const steps: DashboardOverviewStep[] = [
       {
         id: "certs",

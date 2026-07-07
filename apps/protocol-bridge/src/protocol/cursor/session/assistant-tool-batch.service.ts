@@ -28,6 +28,7 @@ import { SessionLifecycleService } from "./session-lifecycle.service"
 export interface AssistantToolBatch {
   id: string
   backend: BackendType
+  streamId?: string
   toolCallIds: string[]
   unsettledToolCallIds: string[]
   continuationClaimed?: boolean
@@ -43,6 +44,7 @@ interface AssistantToolBatchRecord {
 export class AssistantToolBatchService {
   private readonly logger = new Logger(AssistantToolBatchService.name)
   private readonly records = new Map<ConversationId, AssistantToolBatchRecord>()
+  private batchSequence = 0
 
   constructor(
     @Inject(forwardRef(() => SessionLifecycleService))
@@ -55,7 +57,7 @@ export class AssistantToolBatchService {
     conversationId: string,
     backend: BackendType,
     toolCallIds: string[],
-    options?: { readyForContinuation?: boolean }
+    options?: { readyForContinuation?: boolean; streamId?: string }
   ): void {
     const cid = ConversationId.of(conversationId)
     const record = this.ensureRecord(cid)
@@ -71,8 +73,9 @@ export class AssistantToolBatchService {
     }
 
     record.activeAssistantToolBatch = {
-      id: `assistant-batch-${Date.now()}`,
+      id: this.nextBatchId(),
       backend,
+      streamId: this.normalizeStreamId(options?.streamId),
       toolCallIds: [...normalizedToolCallIds],
       unsettledToolCallIds: [...normalizedToolCallIds],
       continuationClaimed: false,
@@ -85,7 +88,7 @@ export class AssistantToolBatchService {
     conversationId: string,
     backend: BackendType,
     toolCallIds: string[],
-    options?: { readyForContinuation?: boolean }
+    options?: { readyForContinuation?: boolean; streamId?: string }
   ): void {
     const cid = ConversationId.of(conversationId)
     const record = this.ensureRecord(cid)
@@ -96,7 +99,13 @@ export class AssistantToolBatchService {
     if (normalizedToolCallIds.length === 0) return
 
     const batch = record.activeAssistantToolBatch
-    if (!batch || batch.backend !== backend || batch.continuationClaimed) {
+    const streamId = this.normalizeStreamId(options?.streamId)
+    if (
+      !batch ||
+      batch.backend !== backend ||
+      batch.streamId !== streamId ||
+      batch.continuationClaimed
+    ) {
       this.startAssistantToolBatch(
         conversationId,
         backend,
@@ -202,6 +211,7 @@ export class AssistantToolBatchService {
     return {
       id: batch.id,
       backend: batch.backend,
+      streamId: batch.streamId,
       toolCallIds: [...batch.toolCallIds],
       unsettledToolCallIds: [...batch.unsettledToolCallIds],
       continuationClaimed: batch.continuationClaimed,
@@ -235,6 +245,7 @@ export class AssistantToolBatchService {
     record.activeAssistantToolBatch = batch
       ? {
           ...batch,
+          streamId: this.normalizeStreamId(batch.streamId),
           toolCallIds: [...batch.toolCallIds],
           unsettledToolCallIds: [...batch.unsettledToolCallIds],
         }
@@ -261,6 +272,31 @@ export class AssistantToolBatchService {
     const record = this.records.get(cid)
     if (!record) return
     record.activeAssistantToolBatch = undefined
+    this.touchSession(conversationId)
+  }
+
+  completeAssistantToolBatch(
+    conversationId: string,
+    batchId: string | undefined,
+    reason: string
+  ): boolean {
+    const cid = ConversationId.of(conversationId)
+    const record = this.records.get(cid)
+    const batch = record?.activeAssistantToolBatch
+    if (!record || !batch) return false
+    if (batchId && batch.id !== batchId) {
+      this.logger.debug(
+        `Ignoring stale assistant tool batch completion for ${conversationId}: ` +
+          `batch=${batchId}, active=${batch.id}, reason=${reason}`
+      )
+      return false
+    }
+    record.activeAssistantToolBatch = undefined
+    this.touchSession(conversationId)
+    this.logger.debug(
+      `Completed assistant tool batch ${batch.id} for ${conversationId}: ${reason}`
+    )
+    return true
   }
 
   /**
@@ -283,6 +319,16 @@ export class AssistantToolBatchService {
       this.records.set(cid, record)
     }
     return record
+  }
+
+  private nextBatchId(): string {
+    this.batchSequence += 1
+    return `assistant-batch-${Date.now()}-${this.batchSequence}`
+  }
+
+  private normalizeStreamId(streamId: string | undefined): string | undefined {
+    const normalized = typeof streamId === "string" ? streamId.trim() : ""
+    return normalized || undefined
   }
 
   private touchSession(conversationId: string): void {

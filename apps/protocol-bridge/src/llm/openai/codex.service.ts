@@ -1141,6 +1141,39 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
   }
 
+  /**
+   * Discard the previous_response_id baseline without closing the current
+   * upstream transport. Use this when the next turn's prompt surface changes
+   * while the current Codex response stream is still open.
+   */
+  clearConversationContinuationBaseline(
+    conversationId: string | undefined,
+    modelName?: string,
+    reason?: string
+  ): void {
+    const normalizedConversationId = conversationId?.trim()
+    if (!normalizedConversationId) {
+      return
+    }
+
+    const result = this.turnContexts.clearContinuationBaseline({
+      conversationId: normalizedConversationId,
+      modelName,
+      slotKeys: this.accounts.map((slot) => this.getSlotStickyKey(slot)),
+    })
+
+    const discarded = result.discardedPreviousResponseId
+      ? ` discarded_previous_response_id=${result.discardedPreviousResponseId}`
+      : ""
+    if (result.resetCount > 0 || reason) {
+      this.logger.debug(
+        `[Codex][TurnContext] Cleared continuation baseline for ${normalizedConversationId}` +
+          `${result.modelName ? ` model=${result.modelName}` : ""}` +
+          `${reason ? `: ${reason}` : ""}${discarded}`
+      )
+    }
+  }
+
   private hasConversationContinuationState(
     conversationId: string,
     slot?: CodexAccountSlot,
@@ -2236,11 +2269,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
     this.bindConversationToSlot(conversationId, requestSlot)
 
-    let codexRequest = buildCodexRequest(
-      { ...request, conversationId },
-      modelName
-    )
-    const cacheId = this.getCacheId({ ...request, conversationId }, requestSlot)
+    const compactRequest: CodexExecutionRequest = {
+      ...request,
+      conversationId,
+      inputToolIntegrity: "preserve",
+    }
+    let codexRequest = buildCodexRequest(compactRequest, modelName)
+    const cacheId = this.getCacheId(compactRequest, requestSlot)
     if (cacheId) {
       codexRequest = this.cacheService.injectCacheKey(
         codexRequest as Record<string, unknown>,
@@ -2251,6 +2286,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       this.turnContexts.getActiveContext(conversationId)
     const preparedCodexRequest = prepareCodexRequestForSend(codexRequest)
     const payload = buildCodexCompactRequestPayload(preparedCodexRequest)
+    this.logger.debug(
+      `[Codex][Compact Request] ${summarizeCodexRequestForLogs(payload)}`
+    )
     const url = this.buildUrl(requestSlot, "responses/compact")
     const headers = this.buildHeaders(requestSlot, token, false, {
       conversationId,
@@ -4357,6 +4395,17 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
                 requestStartedAt
               )
 
+              if (
+                payload?.type === "response.output_item.done" &&
+                payload.item &&
+                typeof payload.item === "object"
+              ) {
+                yield `event: codex_response_item\ndata: ${JSON.stringify({
+                  type: "codex_response_item",
+                  item: payload.item,
+                })}\n\n`
+              }
+
               const claudeEvents = translateCodexSseEvent(
                 trimmed,
                 state,
@@ -4404,6 +4453,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             payload,
             requestStartedAt
           )
+          if (
+            payload?.type === "response.output_item.done" &&
+            payload.item &&
+            typeof payload.item === "object"
+          ) {
+            yield `event: codex_response_item\ndata: ${JSON.stringify({
+              type: "codex_response_item",
+              item: payload.item,
+            })}\n\n`
+          }
           const claudeEvents = translateCodexSseEvent(
             buffer.trim(),
             state,
@@ -4820,12 +4879,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         )
 
         if (msg.type === "response.output_item.done") {
-          appendCodexResponseOutputItemToLedger(
-            itemsAdded,
-            (msg as Record<string, unknown>).item as
-              | Record<string, unknown>
-              | undefined
-          )
+          const item = (msg as Record<string, unknown>).item as
+            | Record<string, unknown>
+            | undefined
+          appendCodexResponseOutputItemToLedger(itemsAdded, item)
+          if (item && typeof item === "object") {
+            yield `event: codex_response_item\ndata: ${JSON.stringify({
+              type: "codex_response_item",
+              item,
+            })}\n\n`
+          }
         }
 
         if (msg.type === "response.completed") {

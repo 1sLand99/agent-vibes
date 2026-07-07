@@ -30,9 +30,17 @@ export function buildCodexCompactRequestPayload(
     | "text"
   >
 ): CodexCompactRequestPayload {
+  const input = Array.isArray(codexRequest.input) ? codexRequest.input : []
+  if (input.length === 0) {
+    throw new CodexApiError(
+      500,
+      "Codex compact request did not include input history."
+    )
+  }
+
   return {
     model: codexRequest.model,
-    input: codexRequest.input,
+    input: [...input, { type: "compaction_trigger" }],
     instructions: codexRequest.instructions,
     tools: codexRequest.tools || [],
     parallel_tool_calls: codexRequest.parallel_tool_calls !== false,

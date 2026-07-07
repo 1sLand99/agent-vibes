@@ -1,4 +1,9 @@
-import type { CodexInputItem } from "./codex-native-types"
+import type {
+  CodexCustomToolCall,
+  CodexFunctionCall,
+  CodexInputItem,
+  CodexInputMessage,
+} from "./codex-native-types"
 
 const CODEX_API_VISIBLE_INPUT_ITEM_TYPES = new Set([
   "additional_tools",
@@ -15,6 +20,7 @@ const CODEX_API_VISIBLE_INPUT_ITEM_TYPES = new Set([
   "web_search_call",
   "image_generation_call",
   "compaction",
+  "compaction_trigger",
   "context_compaction",
 ])
 
@@ -49,4 +55,54 @@ export function cloneCodexApiVisibleInputItem(
     return undefined
   }
   return { ...(value as Record<string, unknown>) } as CodexInputItem
+}
+
+export function codexResponseOutputItemToInputItem(
+  item: Record<string, unknown> | undefined
+): CodexInputItem | undefined {
+  if (!item) return undefined
+
+  if (item.type === "function_call") {
+    return {
+      ...item,
+      type: "function_call",
+      call_id: typeof item.call_id === "string" ? item.call_id : "",
+      name: typeof item.name === "string" ? item.name : "",
+      arguments:
+        typeof item.arguments === "string"
+          ? item.arguments
+          : JSON.stringify(item.arguments ?? {}),
+    } satisfies CodexFunctionCall
+  }
+
+  if (item.type === "custom_tool_call") {
+    return {
+      ...item,
+      type: "custom_tool_call",
+      call_id: typeof item.call_id === "string" ? item.call_id : "",
+      name: typeof item.name === "string" ? item.name : "",
+      input:
+        typeof item.input === "string"
+          ? item.input
+          : JSON.stringify(item.input ?? ""),
+    } satisfies CodexCustomToolCall
+  }
+
+  if (item.type === "message") {
+    const rawContent = item.content
+    const content = Array.isArray(rawContent)
+      ? (rawContent as Array<Record<string, unknown>>)
+      : typeof rawContent === "string"
+        ? [{ type: "output_text", text: rawContent }]
+        : []
+
+    return {
+      ...item,
+      type: "message",
+      role: typeof item.role === "string" ? item.role : "assistant",
+      content,
+    } satisfies CodexInputMessage
+  }
+
+  return cloneCodexApiVisibleInputItem(item)
 }

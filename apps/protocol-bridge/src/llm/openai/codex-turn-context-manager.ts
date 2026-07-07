@@ -48,6 +48,19 @@ export interface CodexResetContinuationResult {
   discardedActivePreviousResponseId: string | undefined
 }
 
+export interface CodexClearContinuationBaselineInput {
+  conversationId: string | undefined
+  modelName?: string
+  slotKeys?: string[]
+}
+
+export interface CodexClearContinuationBaselineResult {
+  conversationId: string | undefined
+  modelName: string | undefined
+  resetCount: number
+  discardedPreviousResponseId: string | undefined
+}
+
 export interface CodexTransportReconnectInput extends CodexTurnContextCacheScope {
   conversationId: string | undefined
 }
@@ -413,6 +426,73 @@ export class CodexTurnContextManager {
     const previousResponseId = resetCodexTurnContinuationState(context)
     this.sessions.touch(normalizedConversationId)
     return previousResponseId
+  }
+
+  clearContinuationBaseline(
+    input: CodexClearContinuationBaselineInput
+  ): CodexClearContinuationBaselineResult {
+    const conversationId = this.normalizeConversationId(input.conversationId)
+    const modelName = input.modelName?.trim() || undefined
+    if (!conversationId) {
+      return {
+        conversationId: undefined,
+        modelName,
+        resetCount: 0,
+        discardedPreviousResponseId: undefined,
+      }
+    }
+
+    let resetCount = 0
+    let discardedPreviousResponseId: string | undefined
+    const activeContext = this.sessions.getActive(conversationId)
+    if (activeContext) {
+      const hadContinuationBaseline =
+        !!activeContext.lastRequest || !!activeContext.lastResponse
+      discardedPreviousResponseId =
+        resetCodexTurnContinuationState(activeContext)
+      activeContext.connectionReused = false
+      this.sessions.touch(conversationId)
+      if (hadContinuationBaseline) {
+        resetCount++
+      }
+    }
+
+    if (modelName) {
+      for (const slotKey of input.slotKeys ?? []) {
+        const cacheKey = this.buildWsCacheKey({
+          slotKey,
+          modelName,
+          conversationId,
+        })
+        const cached = this.runtimeCache.getWs(cacheKey)
+        if (!cached) {
+          continue
+        }
+        const hadContinuationBaseline =
+          !!cached.lastRequest || !!cached.lastResponse
+        if (!hadContinuationBaseline) {
+          continue
+        }
+        discardedPreviousResponseId =
+          discardedPreviousResponseId || cached.lastResponse?.responseId
+        this.runtimeCache.setWs(cacheKey, {
+          ...cached,
+          lastRequest: undefined,
+          lastResponse: undefined,
+          updatedAt: this.now(),
+        })
+        resetCount++
+      }
+    }
+
+    this.runtimeCache.deleteWarmupPayload(conversationId)
+
+    return {
+      conversationId,
+      modelName,
+      resetCount,
+      discardedPreviousResponseId,
+    }
   }
 
   recordTransportReconnect(

@@ -54,6 +54,14 @@ const EN: Record<string, string> = {
   "patches.resetFailed": "Failed to reset Cursor patches: {detail}",
   "patches.resetSummary":
     "Reset {count} Cursor file(s). Fully restart Cursor to apply.",
+  "patches.bridgeEndpointFailed":
+    "Failed to apply Cursor bridge endpoint patch: {detail}",
+  "patches.bridgeEndpointApplied":
+    "Cursor will connect to Agent Vibes directly. Fully restart Cursor to apply.",
+  "patches.bridgeEndpointAlreadyApplied":
+    "Cursor already connects to Agent Vibes directly.",
+  "patches.bridgeEndpointRepaired":
+    "Cursor direct connection settings were repaired.",
   "patches.idleKillerFailed":
     "Failed to apply Cursor idle extension host patch: {detail}",
   "patches.idleKillerApplied":
@@ -127,6 +135,7 @@ const EN: Record<string, string> = {
   "dash.action.later": "Later",
   "dash.settingUpdated": "{key} updated. Restart bridge to apply.",
   "dash.settingReset": "{key} reset to default.",
+  "dash.trafficModeChanged": "Cursor connection mode updated.",
   "dash.token.invalid": "No valid refresh tokens found in the input.",
   "dash.token.added": "Added {count} account(s) to {channel}.",
   "dash.codex.invalidIndex": "Codex CLI: invalid account index {index}",
@@ -175,10 +184,12 @@ const EN: Record<string, string> = {
   "status.svc.starting": "Starting…",
   "status.svc.error": "Error",
   "status.svc.stopped": "Stopped",
+  "status.cursor.patched": "Patched",
+  "status.cursor.forwarding": "Forwarding",
   "status.cursor.wired": "Wired",
   "status.cursor.unwired": "Not wired",
   "status.tooltip.combined":
-    "Agent Vibes\nService: {service}\nCursor forwarding: {cursor}\n(click to open dashboard)",
+    "Agent Vibes\nService: {service}\nCursor: {cursor}\n(click to open dashboard)",
   "status.tooltip.busy": "Agent Vibes — {label}",
 }
 
@@ -227,6 +238,11 @@ const ZH: Record<string, string> = {
   "patches.resetFailed": "重置 Cursor 补丁失败：{detail}",
   "patches.resetSummary":
     "已还原 {count} 个 Cursor 文件。请完整重启 Cursor 以应用。",
+  "patches.bridgeEndpointFailed": "应用 Cursor 直连补丁失败：{detail}",
+  "patches.bridgeEndpointApplied":
+    "Cursor 将直接连接 Agent Vibes。请完整重启 Cursor 以应用。",
+  "patches.bridgeEndpointAlreadyApplied": "Cursor 已经直接连接 Agent Vibes。",
+  "patches.bridgeEndpointRepaired": "已修复 Cursor 直连设置。",
   "patches.idleKillerFailed": "应用 Cursor 空闲扩展宿主补丁失败：{detail}",
   "patches.idleKillerApplied":
     "已应用 Cursor 空闲扩展宿主补丁。请完整重启 Cursor 以应用。",
@@ -292,6 +308,7 @@ const ZH: Record<string, string> = {
   "dash.action.later": "稍后",
   "dash.settingUpdated": "{key} 已更新，请重启桥接以应用。",
   "dash.settingReset": "{key} 已恢复为默认值。",
+  "dash.trafficModeChanged": "Cursor 接入方式已更新。",
   "dash.token.invalid": "输入中未找到有效的 refresh token。",
   "dash.token.added": "已向 {channel} 添加 {count} 个账号。",
   "dash.codex.invalidIndex": "Codex CLI：无效的账号索引 {index}",
@@ -335,10 +352,12 @@ const ZH: Record<string, string> = {
   "status.svc.starting": "启动中…",
   "status.svc.error": "出现错误",
   "status.svc.stopped": "已停止",
+  "status.cursor.patched": "已直连",
+  "status.cursor.forwarding": "转发中",
   "status.cursor.wired": "已接入",
   "status.cursor.unwired": "未接入",
   "status.tooltip.combined":
-    "Agent Vibes\n服务：{service}\nCursor 转发：{cursor}\n（点击打开控制台）",
+    "Agent Vibes\n服务：{service}\nCursor：{cursor}\n（点击打开控制台）",
   "status.tooltip.busy": "Agent Vibes — {label}",
 }
 

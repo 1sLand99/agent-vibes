@@ -2587,9 +2587,8 @@
           disabled: !isRunning,
         })
 
-        // Cursor traffic forwarding is controlled from the API tab's Cursor
-        // IDE Protocol toggle, not from the Overview actions — start/stop
-        // here only manage the bridge process.
+        // Cursor IDE connection is controlled from the API tab's Cursor IDE
+        // Protocol row. Start/stop here only manage the bridge process.
 
         baseActions.push({
           label: L("action.clearCache"),
@@ -2713,11 +2712,15 @@
 
         // 5 status cards — user-facing info only
         const grid = document.getElementById("status-grid")
-        const trafficLabel = L("status.forwarding")
-        const trafficValue = s.forwarding
-          ? L("status.active")
-          : L("status.idle")
-        const trafficTone = s.forwarding ? "good" : "muted"
+        const cursorPatchStatus = s.cursorBridgePatch || {}
+        const cursorPatched = !!cursorPatchStatus.applied
+        const trafficLabel = L("status.cursor", "Cursor")
+        const trafficValue = cursorPatched
+          ? L("clients.status.patched", "Patched")
+          : s.forwarding
+            ? L("clients.status.forwarding", "Forwarding")
+            : L("status.idle")
+        const trafficTone = cursorPatched || s.forwarding ? "good" : "muted"
         const cards = [
           {
             label: L("status.health"),
@@ -4641,6 +4644,11 @@
 
         var s = claudeIntegrationState || {}
         var fwd = !!(lastStatusData && lastStatusData.forwarding)
+        var cursorPatch =
+          (lastStatusData && lastStatusData.cursorBridgePatch) || {}
+        var cursorPatched = !!cursorPatch.applied
+        var cursorPatchNeedsUpdate = !!cursorPatch.requiresPortUpdate
+        var cursorPatchCanApply = !!cursorPatch.canApply
         var bridgeRunning = !!(
           lastStatusData && lastStatusData.bridge === "Running"
         )
@@ -4789,38 +4797,50 @@
         })
 
         // ── Cursor IDE ──
-        // A single toggle replaces the old "Wired badge + Unwire button"
-        // pair. The toggle itself is the status indicator: green/on means
-        // wired, off means ready, disabled means the bridge isn't running.
+        // Default Cursor integration uses a managed Cursor patch so users do
+        // not need hosts edits, loopback aliases, or local port forwarding.
         var cursorActions = ""
-        if (!bridgeRunning && !fwd) {
-          // Bridge offline and not forwarding: enabling forwarding would
-          // point Cursor at a dead port, so the toggle stays disabled.
-          cursorActions += endpointToggle({
-            on: false,
-            label: L("clients.status.wire", "Wire"),
-            onClick: "",
-            state: { disabled: true },
-          })
-        } else if (fwd) {
-          // Forwarding is independent of the bridge process: keep it
-          // toggle-able even when the bridge is stopped so the user can
-          // always unwire Cursor instead of getting stuck.
+        if (cursorPatched) {
           cursorActions += endpointToggle({
             on: true,
             kind: "good",
-            label: L("clients.status.wired", "Wired"),
+            label: L("clients.status.patched", "Patched"),
+            onClick: "",
+            state: { disabled: true },
+          })
+        } else if (cursorPatchNeedsUpdate) {
+          cursorActions += endpointActionBtn(
+            L("clients.status.updatePatch", "Update Patch"),
+            "vscode.postMessage({type:'runCommand'," +
+              "command:'agentVibes.applyCursorBridgeEndpointPatch'})",
+            "primary",
+            { disabled: !cursorPatchCanApply }
+          )
+        } else {
+          cursorActions += endpointActionBtn(
+            L("clients.status.patch", "Patch Cursor"),
+            "vscode.postMessage({type:'runCommand'," +
+              "command:'agentVibes.applyCursorBridgeEndpointPatch'})",
+            "primary",
+            { disabled: !cursorPatchCanApply }
+          )
+        }
+        if (fwd) {
+          cursorActions += endpointToggle({
+            on: true,
+            kind: "good",
+            label: L("clients.status.forwarding", "Forwarding"),
             onClick:
               "vscode.postMessage({type:'runCommand'," +
               "command:'agentVibes.disableForwarding'})",
           })
-        } else {
+        }
+        if (!bridgeRunning && !cursorPatched) {
           cursorActions += endpointToggle({
             on: false,
-            label: L("clients.status.wire", "Wire"),
-            onClick:
-              "vscode.postMessage({type:'runCommand'," +
-              "command:'agentVibes.enableForwarding'})",
+            label: L("clients.status.offline", "Offline"),
+            onClick: "",
+            state: { disabled: true },
           })
         }
         cursorActions += copyBtn(bridgeUrl) + testBtn(bridgeUrl + "/health")
@@ -4828,7 +4848,7 @@
           name: L("endpoints.cursor.name", "Cursor IDE Protocol"),
           desc: L(
             "endpoints.cursor.desc",
-            "ConnectRPC drop-in for api*.cursor.sh — implements agent.v1.AgentService and aiserver.v1.AiService. Wiring edits /etc/hosts so Cursor IDE traffic lands here."
+            "ConnectRPC drop-in for Cursor IDE. Patch Cursor to connect here directly; hosts and local port forwarding are not required."
           ),
           url: bridgeUrl + "/{agent,aiserver}.v1.*",
           actions: cursorActions,

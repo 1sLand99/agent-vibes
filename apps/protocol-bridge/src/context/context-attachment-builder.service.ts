@@ -7,8 +7,10 @@ import type {
 } from "./types"
 
 export interface SessionTodoAttachmentLike {
+  id: string
   content: string
   status: string
+  dependencies: string[]
 }
 
 // Re-export for convenient import by downstream consumers.
@@ -396,7 +398,13 @@ export class ContextAttachmentBuilderService {
 
     const lines = snapshot.todos
       .slice(-20)
-      .map((todo) => `- [${todo.status}] ${todo.content}`)
+      .map((todo) => {
+        const deps =
+          todo.dependencies.length > 0
+            ? ` deps=${todo.dependencies.join(",")}`
+            : ""
+        return `- [${todo.status}] ${todo.id}${deps}: ${todo.content}`
+      })
       .join("\n")
 
     return this.buildAttachment("todos", "Todo State", lines)

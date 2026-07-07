@@ -1,5 +1,5 @@
 import { CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE } from "../../context"
-import { cloneCodexApiVisibleInputItem } from "./codex-response-items"
+import { codexResponseOutputItemToInputItem } from "./codex-response-items"
 import { sanitizeResponsesToolCallIntegrity } from "../shared/openai-tool-call-integrity"
 import { appendLanguageDirectiveToText } from "../shared/language-directive"
 import {
@@ -7,6 +7,7 @@ import {
   type CodexExecutionRequest,
   type CodexInputItem,
   type CodexRequest,
+  type CodexReasoningInputItem,
   type CodexSystemTextBlock,
   type CodexTool,
 } from "./codex-native-types"
@@ -30,6 +31,7 @@ type CodexProjectedToolCallType = "function" | "custom" | "tool_search"
 type CodexProjectableMessage = {
   role: "user" | "assistant" | "developer"
   content: unknown
+  messageId?: string
 }
 
 type CodexProjectableBlock = {
@@ -40,6 +42,8 @@ type CodexProjectableBlock = {
   input?: unknown
   tool_use_id?: string
   item?: unknown
+  thinking?: string
+  signature?: string
   image_url?: string | { url?: string; detail?: string }
   url?: string
   content?:
@@ -114,7 +118,11 @@ export function buildCodexInstructions(
 export function projectCodexInputItems(
   request: Pick<
     CodexExecutionRequest,
-    "contextMessages" | "messages" | "tools" | "pendingToolUseIds"
+    | "contextMessages"
+    | "messages"
+    | "tools"
+    | "pendingToolUseIds"
+    | "inputToolIntegrity"
   >,
   options: CodexNativeProjectionOptions = {}
 ): CodexInputItem[] {
@@ -124,6 +132,25 @@ export function projectCodexInputItems(
   const input: CodexInputItem[] = []
 
   const appendMessages = (messages: CodexProjectableMessage[]) => {
+    const assistantMessageIdsWithRawItems = new Set<string>()
+    for (const msg of messages) {
+      if (msg.role !== "assistant") {
+        continue
+      }
+      const messageId =
+        typeof msg.messageId === "string" ? msg.messageId.trim() : ""
+      if (!messageId || !Array.isArray(msg.content)) {
+        continue
+      }
+      if (
+        (msg.content as CodexProjectableBlock[]).some(
+          (block) => block.type === CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE
+        )
+      ) {
+        assistantMessageIdsWithRawItems.add(messageId)
+      }
+    }
+
     for (const msg of messages) {
       const role = msg.role
       const messageContent: Array<Record<string, unknown>> = []
@@ -165,7 +192,31 @@ export function projectCodexInputItems(
         continue
       }
 
-      for (const block of msg.content as CodexProjectableBlock[]) {
+      const blocks = msg.content as CodexProjectableBlock[]
+      const hasRawResponseItems =
+        role === "assistant" &&
+        blocks.some(
+          (block) => block.type === CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE
+        )
+      const messageId =
+        typeof msg.messageId === "string" ? msg.messageId.trim() : ""
+      if (
+        role === "assistant" &&
+        messageId &&
+        assistantMessageIdsWithRawItems.has(messageId) &&
+        !hasRawResponseItems
+      ) {
+        continue
+      }
+
+      for (const block of blocks) {
+        if (
+          hasRawResponseItems &&
+          block.type !== CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE
+        ) {
+          continue
+        }
+
         switch (block.type) {
           case "text":
             if (block.text) {
@@ -195,10 +246,25 @@ export function projectCodexInputItems(
             appendToolOutputItem(input, block, toolCallTypeById, options)
             break
 
+          case "thinking":
+            flushMessage()
+            {
+              const reasoningItem = projectReasoningItemFromThinkingBlock(block)
+              if (reasoningItem) {
+                input.push(reasoningItem)
+              }
+            }
+            break
+
           case CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE:
             flushMessage()
             {
-              const rawItem = cloneCodexApiVisibleInputItem(block.item)
+              const rawItem =
+                block.item && typeof block.item === "object"
+                  ? codexResponseOutputItemToInputItem(
+                      block.item as Record<string, unknown>
+                    )
+                  : undefined
               if (rawItem) {
                 input.push(rawItem)
               }
@@ -220,8 +286,28 @@ export function projectCodexInputItems(
   appendMessages((request.contextMessages || []) as CodexProjectableMessage[])
   appendMessages(request.messages as CodexProjectableMessage[])
 
+  if (request.inputToolIntegrity === "preserve") {
+    return input
+  }
+
   return sanitizeResponsesToolCallIntegrity(input, request.pendingToolUseIds)
     .items
+}
+
+function projectReasoningItemFromThinkingBlock(
+  block: CodexProjectableBlock
+): CodexReasoningInputItem | undefined {
+  const thinking = typeof block.thinking === "string" ? block.thinking : ""
+  const signature = typeof block.signature === "string" ? block.signature : ""
+  if (!thinking && !signature) {
+    return undefined
+  }
+
+  return {
+    type: "reasoning",
+    summary: thinking ? [{ type: "summary_text", text: thinking }] : [],
+    encrypted_content: signature || null,
+  }
 }
 
 export function projectCodexTools(

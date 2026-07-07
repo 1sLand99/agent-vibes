@@ -1,3 +1,4 @@
+import { normalizeCodexPromptCacheKey } from "../../llm/openai/codex-prompt-cache-key"
 import type {
   CodexConversationTool,
   CodexExecutionRequest,
@@ -213,13 +214,18 @@ export function buildCursorCodexClientMetadata(
   }
 
   const requestOrdinal = Math.max(1, Math.floor(input.requestOrdinal || 1))
-  const turnId = input.turnId?.trim() || `${conversationId}:${requestOrdinal}`
-  const windowId = input.windowId?.trim() || `${conversationId}:0`
+  const codexConversationId = normalizeCodexPromptCacheKey(conversationId)
+  const turnId = normalizeCodexPromptCacheKey(
+    input.turnId?.trim() || `${codexConversationId}:${requestOrdinal}`
+  )
+  const windowId = normalizeCodexPromptCacheKey(
+    input.windowId?.trim() || `${codexConversationId}:0`
+  )
   const installationId = input.installationId.trim()
   const turnMetadata: Record<string, unknown> = {
     installation_id: installationId,
-    session_id: conversationId,
-    thread_id: conversationId,
+    session_id: codexConversationId,
+    thread_id: codexConversationId,
     turn_id: turnId,
     window_id: windowId,
     request_kind: "turn",
@@ -235,8 +241,8 @@ export function buildCursorCodexClientMetadata(
   }
 
   return {
-    session_id: conversationId,
-    thread_id: conversationId,
+    session_id: codexConversationId,
+    thread_id: codexConversationId,
     turn_id: turnId,
     "x-codex-window-id": windowId,
     "x-codex-turn-metadata": JSON.stringify(turnMetadata),

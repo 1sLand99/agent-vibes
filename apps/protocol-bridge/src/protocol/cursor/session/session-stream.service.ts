@@ -573,6 +573,7 @@ export class SessionStreamService {
       turnId?: TurnId
       kind?: string
       deadline?: number
+      streamId?: string
     }
   ): { id: number; promise: Promise<any> } {
     const session = this.sessionLifecycle.getSession(conversationId)
@@ -599,6 +600,7 @@ export class SessionStreamService {
       turnId: options?.turnId,
       kind: options?.kind,
       deadline: options?.deadline,
+      streamId: options?.streamId,
       createdAt: Date.now(),
     })
     session.lastActivityAt = new Date()
@@ -612,6 +614,49 @@ export class SessionStreamService {
 
     this.sessionLifecycle.markSessionDirty(conversationId)
     return { id: queryId, promise }
+  }
+
+  interruptPendingInteractionQueries(
+    conversationId: string,
+    reason: string
+  ): number {
+    const session = this.sessionLifecycle.getSession(conversationId)
+    const stream = this.streamRecords.get(conversationId)
+    if (!session || !stream || stream.pendingInteractionQueries.size === 0) {
+      return 0
+    }
+
+    const wasPending =
+      this.sessionLifecycle.pendingToolCallCount(conversationId) > 0 ||
+      stream.pendingInteractionQueries.size > 0
+    const entries = Array.from(stream.pendingInteractionQueries.entries())
+    stream.pendingInteractionQueries.clear()
+
+    const interruptedAt = Date.now()
+    for (const [queryId, pending] of entries) {
+      pending.resolve({
+        approved: false,
+        resultCase: "interrupted",
+        rawResponse: {
+          reason,
+          queryId,
+          queryType: pending.queryType,
+          kind: pending.kind,
+          streamId: pending.streamId,
+          interruptedAt,
+        },
+      })
+    }
+
+    session.lastActivityAt = new Date()
+    this.sessionLifecycle.markSessionDirty(conversationId)
+    this.sessionLifecycle.notifyIfBecameIdleAfter(session, wasPending)
+    this.logger.warn(
+      `Interrupted ${entries.length} pending interaction quer${
+        entries.length === 1 ? "y" : "ies"
+      } for ${conversationId}: ${reason}`
+    )
+    return entries.length
   }
 
   resolveInteractionQuery(

@@ -16,7 +16,7 @@
  */
 
 import { Injectable, Logger } from "@nestjs/common"
-import type { CursorRule } from "../../../gen/agent/v1_pb"
+import type { CursorRule, SkillOptions } from "../../../gen/agent/v1_pb"
 import type { SessionRecord } from "../session/session-lifecycle.service"
 import { SessionLifecycleService } from "../session/session-lifecycle.service"
 import { renderCursorSkillsCatalog } from "./catalog"
@@ -38,12 +38,20 @@ import type {
 /** Service 接受的 Prompt 上下文子集；保持与 PromptContext 兼容。 */
 export interface CursorSkillsPromptContext {
   cursorRules?: CursorRule[]
+  skillOptions?: SkillOptions
   selectedCursorRulePaths?: string[]
   selectedCursorRuleNames?: string[]
   activeCursorSkillNames?: string[]
   projectContext?: { rootPath?: string }
   codeChunks?: Array<{ path: string }>
 }
+
+const DEFAULT_CURSOR_SKILL_ENVIRONMENTS = [
+  "cursor",
+  "vscode",
+  "agent",
+  "agent-vibes",
+]
 
 @Injectable()
 export class CursorSkillsManager {
@@ -93,8 +101,8 @@ export class CursorSkillsManager {
           conversationId,
           seenForSession
         )
-        this.logger.warn(
-          `Suppressed ${policy.suppressedSkills.length} inactive Cursor skill rule(s) for prompt: ` +
+        this.logger.debug(
+          `Omitted ${policy.suppressedSkills.length} inactive Cursor skill(s) from prompt: ` +
             policy.suppressedSkills.map((skill) => skill.name).join(", ") +
             "; use fetch_rules({ skill_name }) to load a skill before applying its workflow"
         )
@@ -170,16 +178,16 @@ export class CursorSkillsManager {
     )
   }
 
-  /** 在会话上激活某个 Skill（幂等）。 */
-  activate(session: SessionRecord, skillName: string, reason: string): void {
+  /** 在会话上激活某个 Skill（幂等）；返回本次是否新增激活态。 */
+  activate(session: SessionRecord, skillName: string, reason: string): boolean {
     const normalized = normalizeSkillName(skillName)
-    if (!normalized) return
+    if (!normalized) return false
     const activeNames = new Set(
       (session.activeCursorSkillNames || []).map((name) =>
         normalizeSkillName(name)
       )
     )
-    if (activeNames.has(normalized)) return
+    if (activeNames.has(normalized)) return false
     session.activeCursorSkillNames = [
       ...(session.activeCursorSkillNames || []),
       normalized,
@@ -188,6 +196,7 @@ export class CursorSkillsManager {
     this.logger.log(
       `Activated Cursor skill "${normalized}" for session ${session.conversationId}; reason=${reason}`
     )
+    return true
   }
 
   /** 显式卸载某个 Skill；无匹配则忽略。 */
@@ -238,7 +247,8 @@ export class CursorSkillsManager {
     if (!targetPath) return null
     const skill = findCursorSkillForInternalPath(
       session.cursorRules,
-      targetPath
+      targetPath,
+      session.skillOptions
     )
     if (!skill) return null
     if (this.isActive(session, skill.name)) return null
@@ -284,9 +294,10 @@ export class CursorSkillsManager {
   /** 按 name 在 rules 中精确查找 Skill。 */
   findByName(
     rules: CursorRule[] | undefined,
-    skillName: string
+    skillName: string,
+    skillOptions?: SkillOptions
   ): CursorSkillMetadata | null {
-    return findCursorSkillByName(rules, skillName)
+    return findCursorSkillByName(rules, skillName, skillOptions)
   }
 
   /** 按任务描述模糊检索 Skill。 */
@@ -305,11 +316,14 @@ export class CursorSkillsManager {
   ): CursorSkillPolicyInput {
     return {
       rules: context.cursorRules,
+      skillOptions: context.skillOptions,
       selectedRulePaths: context.selectedCursorRulePaths,
       selectedRuleNames: context.selectedCursorRuleNames,
       activeSkillNames: context.activeCursorSkillNames,
       projectRoot: context.projectContext?.rootPath,
       contextPaths: (context.codeChunks || []).map((chunk) => chunk.path),
+      environmentNames: DEFAULT_CURSOR_SKILL_ENVIRONMENTS,
+      scopePaths: this.buildScopePaths(context.projectContext?.rootPath),
     }
   }
 
@@ -325,12 +339,24 @@ export class CursorSkillsManager {
       : baseContextPaths
     return {
       rules: session.cursorRules,
+      skillOptions: session.skillOptions,
       selectedRulePaths: session.selectedCursorRulePaths,
       selectedRuleNames: session.selectedCursorRuleNames,
       activeSkillNames: session.activeCursorSkillNames,
       projectRoot: session.projectContext?.rootPath,
       contextPaths,
+      environmentNames: DEFAULT_CURSOR_SKILL_ENVIRONMENTS,
+      scopePaths: this.buildScopePaths(session.projectContext?.rootPath),
     }
+  }
+
+  private buildScopePaths(rootPath: string | undefined): string[] {
+    const normalizedRoot = rootPath?.trim()
+    if (!normalizedRoot) return []
+    const normalizedPath = normalizePathForMatch(normalizedRoot)
+    const segments = normalizedPath.split("/").filter(Boolean)
+    const leaf = segments[segments.length - 1]
+    return leaf ? [normalizedPath, leaf] : [normalizedPath]
   }
 }
 

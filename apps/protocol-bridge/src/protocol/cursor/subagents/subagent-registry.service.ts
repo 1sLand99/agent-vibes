@@ -52,8 +52,9 @@ export class SubagentRegistryService {
   }
 
   /** Look up a single sub-agent by its `agentType`. Returns undefined when
-   * the model passes a `subagent_type` that nobody declared — the caller
-   * should fall back to `general-purpose`. */
+   * the model passes a `subagent_type` that nobody declared. Callers should
+   * treat an explicit unknown type as a tool error; only an omitted type
+   * defaults to `general-purpose`. */
   findByType(
     agentType: string,
     projectCwd?: string

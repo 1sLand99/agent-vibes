@@ -125,6 +125,44 @@ export function getCursorWorkbenchPath(): string | null {
   return candidates[0] || null
 }
 
+/** Returns the Cursor global storage SQLite database path */
+export function getCursorGlobalStorageStateDbPath(): string | null {
+  let candidate: string | null = null
+
+  if (process.platform === "darwin") {
+    candidate = path.join(
+      os.homedir(),
+      "Library",
+      "Application Support",
+      "Cursor",
+      "User",
+      "globalStorage",
+      "state.vscdb"
+    )
+  } else if (process.platform === "linux") {
+    candidate = path.join(
+      os.homedir(),
+      ".config",
+      "Cursor",
+      "User",
+      "globalStorage",
+      "state.vscdb"
+    )
+  } else if (process.platform === "win32") {
+    const appData =
+      process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming")
+    candidate = path.join(
+      appData,
+      "Cursor",
+      "User",
+      "globalStorage",
+      "state.vscdb"
+    )
+  }
+
+  return candidate
+}
+
 /** Returns the Cursor app resource root that contains product.json and out/ */
 export function getCursorAppRootPath(): string | null {
   const workbenchPath = getCursorWorkbenchPath()

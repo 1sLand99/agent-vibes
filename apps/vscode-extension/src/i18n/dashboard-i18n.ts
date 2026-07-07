@@ -26,7 +26,7 @@ const UI_EN: Record<string, string> = {
   "endpoints.action.copy": "Copy",
   "endpoints.action.test": "Test",
   "endpoints.action.applyClaude": "Apply to Claude CLI",
-  "endpoints.action.applyCursor": "Wire Cursor (hosts)",
+  "endpoints.action.applyCursor": "Patch Cursor",
   "endpoints.toast.copied": "Copied",
   "endpoints.toast.testing": "Testing…",
   "endpoints.status.ready": "Ready",
@@ -40,7 +40,7 @@ const UI_EN: Record<string, string> = {
     "Drop-in replacement for api.anthropic.com. Used by Claude Code CLI and any Anthropic-compatible SDK.",
   "endpoints.cursor.name": "Cursor IDE Protocol",
   "endpoints.cursor.desc":
-    "Cursor IDE speaks Cursor protocol; wiring rewrites /etc/hosts so api*.cursor.sh requests land on this bridge.",
+    "Patch Cursor to connect to this bridge directly. Hosts and local port forwarding are not required.",
   "endpoints.health.name": "Health Check",
   "endpoints.health.desc":
     "Liveness probe — returns bridge runtime status as JSON.",
@@ -54,6 +54,11 @@ const UI_EN: Record<string, string> = {
   "clients.subtitle": "Wire your local AI clients to this bridge.",
   "clients.status.wired": "Wired",
   "clients.status.notWired": "Not wired",
+  "clients.status.patched": "Patched",
+  "clients.status.patch": "Patch Cursor",
+  "clients.status.updatePatch": "Update Patch",
+  "clients.status.forwarding": "Forwarding",
+  "clients.status.offline": "Offline",
   "clients.status.builtin": "Built-in",
   "clients.status.comingSoon": "Coming soon",
   "clients.action.wire": "Wire to Bridge",
@@ -68,7 +73,7 @@ const UI_EN: Record<string, string> = {
   "clients.claudeCode.desc":
     "Rewrites ~/.claude/settings.json env so the CLI calls this bridge instead of api.anthropic.com.",
   "clients.cursorIde.desc":
-    "Wiring rewrites /etc/hosts so Cursor's api*.cursor.sh requests hit this bridge. Requires admin privileges; independent from server start/stop.",
+    "Patch Cursor to connect to this bridge directly. Hosts and local port forwarding are not required.",
   "clients.cursorIde.endpoint": "Bridge endpoint",
   "clients.comingSoon.desc": "Integration is planned but not yet implemented.",
   "tab.accounts": "Accounts",
@@ -122,6 +127,7 @@ const UI_EN: Record<string, string> = {
   "action.clearCache": "Clear cache",
   "status.health": "Health",
   "status.ssl": "SSL",
+  "status.cursor": "Cursor",
   "status.forwarding": "Forwarding",
   "status.port": "Port",
   "status.accounts": "Accounts",
@@ -415,7 +421,7 @@ const UI_ZH: Record<string, string> = {
   "endpoints.action.copy": "复制",
   "endpoints.action.test": "测试",
   "endpoints.action.applyClaude": "写入 Claude CLI",
-  "endpoints.action.applyCursor": "接入 Cursor (hosts)",
+  "endpoints.action.applyCursor": "修补 Cursor",
   "endpoints.toast.copied": "已复制",
   "endpoints.toast.testing": "测试中…",
   "endpoints.status.ready": "就绪",
@@ -429,7 +435,7 @@ const UI_ZH: Record<string, string> = {
     "兼容 api.anthropic.com，可被 Claude Code CLI 及任意 Anthropic SDK 直接使用。",
   "endpoints.cursor.name": "Cursor IDE 协议",
   "endpoints.cursor.desc":
-    "Cursor IDE 走 Cursor 协议；接入会改写 /etc/hosts，让 api*.cursor.sh 落到本桥接。",
+    "让 Cursor 直接连接本 Bridge，不再依赖 hosts 或本机端口转发。",
   "endpoints.health.name": "健康检查",
   "endpoints.health.desc": "返回桥接运行状态的 JSON 探针。",
   "endpoints.openai.name": "OpenAI API",
@@ -442,6 +448,11 @@ const UI_ZH: Record<string, string> = {
   "clients.subtitle": "将本机 AI 客户端接入到本 Bridge。",
   "clients.status.wired": "已接入",
   "clients.status.notWired": "未接入",
+  "clients.status.patched": "已直连",
+  "clients.status.patch": "修补 Cursor",
+  "clients.status.updatePatch": "更新补丁",
+  "clients.status.forwarding": "转发中",
+  "clients.status.offline": "离线",
   "clients.status.builtin": "原生支持",
   "clients.status.comingSoon": "即将支持",
   "clients.action.wire": "接入 Bridge",
@@ -456,7 +467,7 @@ const UI_ZH: Record<string, string> = {
   "clients.claudeCode.desc":
     "改写 ~/.claude/settings.json 的 env，让 CLI 把请求发到本 Bridge，而不是 api.anthropic.com。",
   "clients.cursorIde.desc":
-    "接入会改写 /etc/hosts，把 Cursor 发往 api*.cursor.sh 的请求劫持到本 Bridge。需要管理员授权，与服务启停相互独立。",
+    "让 Cursor 直接连接本 Bridge，不再依赖 hosts 或本机端口转发。",
   "clients.cursorIde.endpoint": "Bridge 接入地址",
   "clients.comingSoon.desc": "已规划但尚未实现该客户端的接入。",
   "tab.accounts": "账号",
@@ -509,6 +520,7 @@ const UI_ZH: Record<string, string> = {
   "action.clearCache": "清除缓存",
   "status.health": "健康",
   "status.ssl": "SSL",
+  "status.cursor": "Cursor",
   "status.forwarding": "转发",
   "status.port": "端口",
   "status.accounts": "账号",
@@ -948,6 +960,7 @@ type GeneralSettingsItems = {
 type BridgeSettingsItems = {
   autoStart: SettingsItemCopy
   port: SettingsItemCopy
+  trafficMode: SettingsItemCopy
   healthCheckInterval: SettingsItemCopy
 }
 
@@ -969,6 +982,7 @@ type StorageSettingsItems = {
 type PatchSettingsItems = {
   cursorAppRoot: SettingsItemCopy
   cursorBuild: SettingsItemCopy
+  bridgeEndpoint: SettingsItemCopy
   idleKiller: SettingsItemCopy
   resetPatches: SettingsItemCopy
   fixChecksums: SettingsItemCopy
@@ -988,6 +1002,8 @@ type SettingsCopy = {
   }
   patch: {
     resetAll: string
+    applyBridgeEndpoint: string
+    updateBridgeEndpoint: string
     applyIdleKiller: string
     fixChecksumsLabel: string
     fixChecksumsDesc: string
@@ -1039,6 +1055,10 @@ const SETTINGS_EN: SettingsCopy = {
         port: {
           label: "Port",
           desc: "HTTPS port the bridge listens on (requires restart)",
+        },
+        trafficMode: {
+          label: "Cursor Connection",
+          desc: "Default Cursor connection path for account, models, and agent requests. Direct patch does not require hosts or local port forwarding.",
         },
         healthCheckInterval: {
           label: "Health Check Interval",
@@ -1106,6 +1126,10 @@ const SETTINGS_EN: SettingsCopy = {
           label: "Cursor Build",
           desc: "Detected Cursor build identity used to scope patch baselines across upgrades.",
         },
+        bridgeEndpoint: {
+          label: "Cursor Direct Connection",
+          desc: "Patch Cursor to connect to this Agent Vibes bridge without hosts or local port forwarding.",
+        },
         idleKiller: {
           label: "Idle Extension Host Killer",
           desc: "Disable Cursor's idle extension-host killer to keep long agent sessions alive.",
@@ -1123,6 +1147,8 @@ const SETTINGS_EN: SettingsCopy = {
   },
   patch: {
     resetAll: "Reset All",
+    applyBridgeEndpoint: "Apply",
+    updateBridgeEndpoint: "Update",
     applyIdleKiller: "Apply",
     fixChecksumsLabel: "Fix Checksums Next",
     fixChecksumsDesc:
@@ -1176,6 +1202,10 @@ const SETTINGS_ZH: SettingsCopy = {
         port: {
           label: "端口",
           desc: "桥接监听的 HTTPS 端口（修改后需重启）",
+        },
+        trafficMode: {
+          label: "Cursor 接入方式",
+          desc: "账号、模型和 Agent 请求的默认 Cursor 接入路径。直连补丁不需要 hosts 或本机端口转发。",
         },
         healthCheckInterval: {
           label: "健康检查间隔",
@@ -1243,6 +1273,10 @@ const SETTINGS_ZH: SettingsCopy = {
           label: "Cursor 构建信息",
           desc: "检测到的 Cursor 构建标识，用于跨版本补丁基线",
         },
+        bridgeEndpoint: {
+          label: "Cursor 直连接入",
+          desc: "让 Cursor 直接连接本机 Agent Vibes 桥接，不再依赖 hosts 或本机端口转发。",
+        },
         idleKiller: {
           label: "空闲扩展宿主保护",
           desc: "禁用 Cursor 空闲扩展宿主停止逻辑，保持长会话可用。",
@@ -1260,6 +1294,8 @@ const SETTINGS_ZH: SettingsCopy = {
   },
   patch: {
     resetAll: "全部重置",
+    applyBridgeEndpoint: "应用",
+    updateBridgeEndpoint: "更新",
     applyIdleKiller: "应用",
     fixChecksumsLabel: "Fix Checksums Next",
     fixChecksumsDesc:

@@ -17,9 +17,15 @@ export { CompactWarningHookService } from "./compact-warning-hook.service"
 export { PostCompactCleanupService } from "./post-compact-cleanup.service"
 export {
   CodexContextAdapterService,
+  CODEX_HISTORICAL_SUMMARY_NOTICE,
   CODEX_SUMMARIZATION_PROMPT,
   CODEX_SUMMARY_PREFIX,
 } from "./codex-context-adapter.service"
+export {
+  buildTopicContinuityGuard,
+  composeCompactHookMessage,
+  extractLatestUserUtterance,
+} from "./context-continuity-guard"
 export type {
   CodexCompactReferenceInput,
   CodexRemoteCompactProvider,

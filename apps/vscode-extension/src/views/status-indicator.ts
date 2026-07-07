@@ -6,20 +6,21 @@ import { t, tFmt } from "../i18n/messages-i18n"
 const LOADING_COLOR = "#34d399"
 const FORWARDING_POLL_INTERVAL_MS = 4000
 
+export type CursorConnectionState = "patched" | "forwarding" | "unwired"
+
 /**
  * Bottom status bar indicator.
  *
- * Service (bridge) and Cursor traffic forwarding are independent concerns,
- * so the item renders two segments side by side: a service dot reflecting the
- * bridge process state, and a Cursor plug reflecting whether Cursor traffic
- * forwarding is wired. Forwarding can be toggled without the bridge and vice
- * versa, so neither segment is derived from the other.
+ * Service (bridge) and Cursor traffic wiring are independent concerns.
+ * Cursor wiring can be a direct patch or legacy forwarding, so the status bar
+ * asks the caller for the current connection state instead of assuming the
+ * forwarding backend is the only source of truth.
  */
 export class StatusIndicator {
   private item: vscode.StatusBarItem
   private state: ServerState = "stopped"
-  private forwardingActive = false
-  private forwardingPollTimer: ReturnType<typeof setInterval> | null = null
+  private cursorConnection: CursorConnectionState = "unwired"
+  private connectionPollTimer: ReturnType<typeof setInterval> | null = null
   private transientStatus: {
     text: string
     tooltip: string
@@ -28,37 +29,39 @@ export class StatusIndicator {
   } | null = null
 
   /**
-   * @param isForwardingActive Cheap local probe (no subprocess) for the
-   *   current Cursor forwarding state. Polled on an interval so the segment
-   *   tracks sudo-driven enable/disable that happens outside this process.
+   * @param getCursorConnectionState Cheap local probe for the current Cursor
+   *   connection state. Polled on an interval so the segment tracks patch and
+   *   forwarding changes that happen outside this process.
    */
-  constructor(private readonly isForwardingActive?: () => boolean) {
+  constructor(
+    private readonly getCursorConnectionState?: () => CursorConnectionState
+  ) {
     this.item = vscode.window.createStatusBarItem(
       vscode.StatusBarAlignment.Right,
       100
     )
     this.item.command = "agentVibes.openDashboard"
-    this.refreshForwarding()
+    this.refreshCursorConnection()
     this.update("stopped")
     this.item.show()
-    this.startForwardingPoll()
+    this.startConnectionPoll()
   }
 
-  private refreshForwarding(): boolean {
-    if (!this.isForwardingActive) return false
+  private refreshCursorConnection(): CursorConnectionState {
+    if (!this.getCursorConnectionState) return "unwired"
     try {
-      this.forwardingActive = this.isForwardingActive()
+      this.cursorConnection = this.getCursorConnectionState()
     } catch {
-      this.forwardingActive = false
+      this.cursorConnection = "unwired"
     }
-    return this.forwardingActive
+    return this.cursorConnection
   }
 
-  private startForwardingPoll(): void {
-    if (this.forwardingPollTimer || !this.isForwardingActive) return
-    this.forwardingPollTimer = setInterval(() => {
-      const previous = this.forwardingActive
-      const next = this.refreshForwarding()
+  private startConnectionPoll(): void {
+    if (this.connectionPollTimer || !this.getCursorConnectionState) return
+    this.connectionPollTimer = setInterval(() => {
+      const previous = this.cursorConnection
+      const next = this.refreshCursorConnection()
       if (next !== previous && !this.transientStatus) {
         this.render()
       }
@@ -101,9 +104,15 @@ export class StatusIndicator {
   }
 
   private cursorLabel(): string {
-    return this.forwardingActive
-      ? t("status.cursor.wired")
-      : t("status.cursor.unwired")
+    switch (this.cursorConnection) {
+      case "patched":
+        return t("status.cursor.patched")
+      case "forwarding":
+        return t("status.cursor.forwarding")
+      case "unwired":
+      default:
+        return t("status.cursor.unwired")
+    }
   }
 
   private render(): void {
@@ -133,9 +142,8 @@ export class StatusIndicator {
 
   update(state: ServerState): void {
     this.state = state
-    // Bridge state changes are a good moment to re-sync forwarding too — a
-    // restart can race with a forwarding toggle.
-    this.refreshForwarding()
+    // Bridge state changes are a good moment to re-sync connection state too.
+    this.refreshCursorConnection()
     this.render()
   }
 
@@ -155,9 +163,9 @@ export class StatusIndicator {
   }
 
   dispose(): void {
-    if (this.forwardingPollTimer) {
-      clearInterval(this.forwardingPollTimer)
-      this.forwardingPollTimer = null
+    if (this.connectionPollTimer) {
+      clearInterval(this.connectionPollTimer)
+      this.connectionPollTimer = null
     }
     this.item.dispose()
   }
