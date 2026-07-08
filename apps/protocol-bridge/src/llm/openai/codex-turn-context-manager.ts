@@ -580,9 +580,8 @@ export class CodexTurnContextManager {
     if (activeContext) {
       discardedActivePreviousResponseId =
         resetCodexTurnContinuationState(activeContext)
-      this.sessions.touch(conversationId)
       this.closeWsSession(activeContext.wsSessionId)
-      activeContext.connectionReused = false
+      this.sessions.clearActive(conversationId)
       resetCount++
     }
 

@@ -111,6 +111,8 @@ export {
   findLastCompactBoundaryIndex,
   getActiveCompactCommitFromTranscript,
   getRecordsAfterCompactBoundary,
+  resolveCompactSummaryReplacementAnchor,
+  resolveContextReplacementAnchor,
   isAttachmentRecord,
   isCompactBoundaryRecord,
   isCompactSummaryRecord,

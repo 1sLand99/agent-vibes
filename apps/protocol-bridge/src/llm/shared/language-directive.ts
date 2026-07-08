@@ -217,6 +217,16 @@ export function buildLanguageDirective(
     : GENERIC_DIRECTIVE
 }
 
+export function buildStableLanguageDirective(
+  options: { skip?: boolean } = {}
+): string {
+  if (options.skip) {
+    return ""
+  }
+  const forced = (process.env[FORCED_LANGUAGE_ENV] ?? "").trim()
+  return forced ? buildForcedDirective(forced) : GENERIC_DIRECTIVE
+}
+
 /**
  * A terse, last-position language anchor for backends that fold the system
  * prompt into user content (Kiro): there the full directive ends up buried

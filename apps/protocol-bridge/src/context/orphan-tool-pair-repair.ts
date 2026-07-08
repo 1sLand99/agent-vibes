@@ -9,12 +9,11 @@ import {
 } from "./types"
 
 /**
- * Send-time repair of tool_use ↔ tool_result pairs that were split across a
- * compaction boundary (or lost when a budget-overflow round archived one half
- * of the pair). Pure transform over the projected message list — the stored
- * transcript records are never mutated (Cursor re-sends the original
- * transcript and `replaceMessages` reconcile would overwrite any record
- * rewrite by id), so this MUST run on every projection.
+ * Defensive send-time repair for legacy compacted states or external
+ * truncation paths that already contain split tool_use ↔ tool_result pairs.
+ * New compaction candidates must choose a tool-safe durable boundary before
+ * records are installed; this transform is kept as a migration guard over the
+ * projected message list.
  *
  * Two symmetric orphan kinds are repaired:
  *

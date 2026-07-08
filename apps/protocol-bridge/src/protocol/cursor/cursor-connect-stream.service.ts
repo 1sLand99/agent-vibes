@@ -100,7 +100,7 @@ import {
   detectModelFamily,
   resolveCodexRequestCapabilities,
 } from "../../llm/shared/model-registry"
-import { buildLanguageDirective } from "../../llm/shared/language-directive"
+import { buildStableLanguageDirective } from "../../llm/shared/language-directive"
 import {
   BackendType,
   ModelRouteResult,
@@ -132,6 +132,7 @@ import { BidiStreamController } from "./bidi/bidi-stream-controller"
 import {
   assembleCursorCodexExecutionRequest,
   buildCursorCodexClientMetadata,
+  buildCursorCodexCompactionMetadata,
   resolveCursorCodexTurnId,
   resolveCursorCodexServiceTier,
   shouldRequestCursorCodexThinkingSummary,
@@ -2899,7 +2900,13 @@ export class CursorConnectStreamService {
                     clientMetadata: this.buildCodexClientMetadata(
                       session,
                       conversationId,
-                      { requestKind: "compaction" }
+                      {
+                        requestKind: "compaction",
+                        compaction: buildCursorCodexCompactionMetadata({
+                          strategy: "manual",
+                          injectionMode: "pre_turn",
+                        }),
+                      }
                     ),
                     serviceTier: this.resolveRequestedCodexServiceTier(
                       session.requestedModelParameters
@@ -4852,7 +4859,10 @@ export class CursorConnectStreamService {
   private buildCodexClientMetadata(
     session: SessionRecord | undefined,
     conversationId?: string,
-    options?: { requestKind?: "turn" | "compaction" }
+    options?: {
+      requestKind?: "turn" | "compaction"
+      compaction?: ReturnType<typeof buildCursorCodexCompactionMetadata>
+    }
   ): Record<string, string> | undefined {
     const normalizedConversationId = conversationId?.trim()
     if (!normalizedConversationId) {
@@ -4897,6 +4907,8 @@ export class CursorConnectStreamService {
       requestKind: options?.requestKind,
       installationId: this.codexInstallationId,
       workspaceRootPath: session?.projectContext?.rootPath,
+      turnStartedAtUnixMs: Date.now(),
+      compaction: options?.compaction,
     })
   }
 
@@ -8915,7 +8927,13 @@ export class CursorConnectStreamService {
                 clientMetadata: this.buildCodexClientMetadata(
                   session,
                   session.conversationId,
-                  { requestKind: "compaction" }
+                  {
+                    requestKind: "compaction",
+                    compaction: buildCursorCodexCompactionMetadata({
+                      strategy: options.strategy,
+                      injectionMode: options.injectionMode,
+                    }),
+                  }
                 ),
                 serviceTier: this.resolveRequestedCodexServiceTier(
                   session.requestedModelParameters
@@ -9178,7 +9196,14 @@ export class CursorConnectStreamService {
               clientMetadata: this.buildCodexClientMetadata(
                 session,
                 session.conversationId,
-                { requestKind: "compaction" }
+                {
+                  requestKind: "compaction",
+                  compaction: buildCursorCodexCompactionMetadata({
+                    strategy: options.strategy,
+                    injectionMode:
+                      options.strategy === "reactive" ? "mid_turn" : "pre_turn",
+                  }),
+                }
               ),
               serviceTier: this.resolveRequestedCodexServiceTier(
                 session.requestedModelParameters
@@ -37212,10 +37237,7 @@ ${raw}
       entries.push({ key, role, content: trimmed })
     }
 
-    const languageDirective = buildLanguageDirective(
-      context.newMessage ? [{ role: "user", content: context.newMessage }] : []
-    )
-    pushEntry("language_directive", "developer", languageDirective)
+    pushEntry("language_directive", "developer", buildStableLanguageDirective())
     pushEntry("custom_system_prompt", "developer", context.customSystemPrompt)
     pushEntry("tool_usage", "developer", this.buildCodexToolUsageSection())
 

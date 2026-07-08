@@ -758,25 +758,16 @@ export class ContextCompactionService {
       sourceMessages,
       targetRecentTokens
     )
-    // Integrity-safe point. In long autonomous runs an async / long-running
-    // tool's tool_use and tool_result can span the whole window; then there is
-    // no orphan-free suffix that also fits budget, so this collapses to
-    // archiving (nearly) everything (it advances PAST the budget point). Detect
-    // that and instead keep the budget-sized recent window, repairing the
-    // orphaned tool_results (whose tool_use is archived into the boundary) into
-    // text so the window stays protocol-valid. This preserves recent context
-    // across compaction (cc compact_partial semantics) rather than nuking it.
+    // Integrity-safe point. Compaction owns the durable transcript boundary,
+    // so the retained suffix must already be protocol-valid; send-time repair
+    // remains only a migration guard for older compacted states.
     const integrityTruncationIndex =
       this.toolIntegrity.findBudgetSafeTruncationPointWithIntegrity(
         sourceMessages,
         targetRecentTokens,
         { mode: integrityMode }
       )
-    const repairOrphanedRetainedResults =
-      integrityTruncationIndex > budgetTruncationIndex
-    const truncationIndex = repairOrphanedRetainedResults
-      ? budgetTruncationIndex
-      : integrityTruncationIndex
+    const truncationIndex = integrityTruncationIndex
     if (truncationIndex <= 0 || truncationIndex > sourceRecords.length) {
       this.logger.debug(
         `prepareCandidateForBudget: truncationIndex out of range ` +
@@ -793,20 +784,6 @@ export class ContextCompactionService {
     const retainedRecords = sourceRecords
       .slice(truncationIndex)
       .filter(isMessageRecord)
-    if (repairOrphanedRetainedResults) {
-      // The retained window can hold tool_results whose tool_use is archived
-      // (async/long-running pairs spanning the window). We do NOT rewrite the
-      // stored records here — replaceMessages reconcile overwrites them by id
-      // from Cursor's re-sent transcript, which would undo any rewrite. The
-      // orphaned tool_results are instead repaired into text at send time in
-      // sanitizeProjectedMessages, which runs every projection and is immune
-      // to that overwrite.
-      this.logger.debug(
-        `prepareCandidateForBudget: integrity cut would over-archive ` +
-          `(integrityIdx=${integrityTruncationIndex} > budgetIdx=${budgetTruncationIndex}); ` +
-          `kept budget recent window; orphaned tool_results repaired at send`
-      )
-    }
     if (archivedRecords.length === 0) {
       this.logger.debug(
         `prepareCandidateForBudget: empty side after split ` +
@@ -1088,14 +1065,10 @@ export class ContextCompactionService {
         ? { attachmentKind: message.attachmentKind }
         : {}),
     })) as UnifiedMessage[]
-    // Repair tool_result blocks orphaned by partial compaction (their
-    // tool_use was archived behind the boundary) AND tool_use blocks whose
-    // matching tool_result was archived/lost (which would otherwise reach
-    // the Kiro translator and be closed with a misleading status:"error"
-    // "context truncation" placeholder). Done here, at send time, rather
-    // than on stored records — replaceMessages reconcile overwrites stored
-    // records by id from Cursor's re-sent transcript, so a record rewrite
-    // would not survive; this projection transform runs every send. The
+    // Migration/defense guard for legacy compacted states or external
+    // truncation paths that already contain split tool pairs. New compaction
+    // candidates choose a tool-safe durable boundary before records are
+    // installed, so this must not be the normal repair path. The
     // pendingToolUseIds set protects genuinely in-flight tool_uses from
     // being synthesised over.
     return repairOrphanedToolPairs(unified, {

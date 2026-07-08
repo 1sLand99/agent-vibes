@@ -56,6 +56,7 @@ import {
   createCompactSummaryRecord,
   deriveCompactionHistoryFromTranscript,
   getActiveCompactCommitFromTranscript,
+  resolveCompactSummaryReplacementAnchor,
   isContextCollapseSummaryRecord,
   isMessageRecord,
   isSnipBoundaryRecord,
@@ -4594,17 +4595,10 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     const activeCommit = getActiveCompactCommitFromTranscript(state.records)
     if (!activeCommit) return
 
-    const summaryRecordIndex = state.records.findIndex(
-      (record) =>
-        record.kind === "compact_summary" &&
-        record.compactMetadata?.commit?.id === activeCommit.id
+    const replacementAnchor = resolveCompactSummaryReplacementAnchor(
+      state.records,
+      activeCommit.id
     )
-    const summaryRecordId =
-      (summaryRecordIndex >= 0
-        ? state.records[summaryRecordIndex]?.id
-        : undefined) || `compact_summary_${activeCommit.id}`
-    const anchorRecordCount =
-      summaryRecordIndex >= 0 ? summaryRecordIndex + 1 : state.records.length
 
     const normalizeHistory = (
       history: CodexReplacementHistory | undefined
@@ -4642,8 +4636,8 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       }
       const normalized: CodexReplacementHistory = {
         ...history,
-        anchorRecordId: summaryRecordId,
-        anchorRecordCount,
+        anchorRecordId: replacementAnchor.anchorRecordId,
+        anchorRecordCount: replacementAnchor.anchorRecordCount,
         items,
         summary,
       }
@@ -4708,7 +4702,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       )
       this.logger.warn(
         `Repaired Codex replacement history for compaction ${activeCommit.id}: ` +
-          `anchor=${summaryRecordId}, droppedItems=${droppedItems}`
+          `anchor=${replacementAnchor.anchorRecordId}, droppedItems=${droppedItems}`
       )
     }
   }

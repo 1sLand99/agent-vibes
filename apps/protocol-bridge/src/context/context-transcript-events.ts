@@ -75,6 +75,31 @@ export function createCompactSummaryRecord(
   }
 }
 
+export interface ContextReplacementAnchor {
+  anchorRecordId: string
+  anchorRecordCount: number
+}
+
+export function resolveContextReplacementAnchor(
+  records: readonly ContextTranscriptRecord[],
+  anchorRecordId: string
+): ContextReplacementAnchor {
+  const anchorIndex = records.findIndex(
+    (record) => record.id === anchorRecordId
+  )
+  return {
+    anchorRecordId,
+    anchorRecordCount: anchorIndex >= 0 ? anchorIndex + 1 : records.length,
+  }
+}
+
+export function resolveCompactSummaryReplacementAnchor(
+  records: readonly ContextTranscriptRecord[],
+  commitId: string
+): ContextReplacementAnchor {
+  return resolveContextReplacementAnchor(records, `compact_summary_${commitId}`)
+}
+
 export function createContextCollapseSummaryRecord(
   commit: ContextCollapseCommit,
   createdAt: number = Date.now()

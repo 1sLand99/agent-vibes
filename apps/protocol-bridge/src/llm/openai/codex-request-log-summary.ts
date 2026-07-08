@@ -34,6 +34,28 @@ function getObjectField(
     : null
 }
 
+function getStringFromCodexTurnMetadata(
+  clientMetadata: Record<string, unknown> | null,
+  key: string
+): string {
+  if (!clientMetadata) {
+    return ""
+  }
+
+  const raw = getStringField(clientMetadata, "x-codex-turn-metadata").trim()
+  if (!raw) {
+    return ""
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    const value = parsed[key]
+    return typeof value === "string" ? value.trim() : ""
+  } catch {
+    return ""
+  }
+}
+
 export function buildCodexHttpRequestLogLine(
   options: CodexHttpRequestLogLineOptions
 ): string {
@@ -85,9 +107,10 @@ export function summarizeCodexRequestForLogs(
   const windowId = clientMetadata
     ? getStringField(clientMetadata, "x-codex-window-id").trim()
     : ""
-  const requestKind = clientMetadata
-    ? getStringField(clientMetadata, "request_kind").trim()
-    : ""
+  const requestKind =
+    (clientMetadata
+      ? getStringField(clientMetadata, "request_kind").trim()
+      : "") || getStringFromCodexTurnMetadata(clientMetadata, "request_kind")
 
   return (
     `type=${getStringField(codexRequest, "type") || "none"} ` +

@@ -1,8 +1,13 @@
-import { normalizeCodexPromptCacheKey } from "../../llm/openai/codex-prompt-cache-key"
 import type {
   CodexConversationTool,
   CodexExecutionRequest,
 } from "../../llm/openai/codex-native-types"
+import {
+  buildCodexClientMetadata,
+  buildCodexCompactionMetadata,
+  type CodexResponsesRequestKind,
+  type CodexTurnCompactionMetadata,
+} from "../../llm/openai/codex-turn-metadata"
 
 export interface CursorCodexThinkingSummaryInput {
   backend: string
@@ -32,9 +37,11 @@ export interface CursorCodexClientMetadataInput {
   requestOrdinal?: number
   turnId?: string
   windowId?: string
-  requestKind?: "turn" | "compaction"
+  requestKind?: CodexResponsesRequestKind
   installationId: string
   workspaceRootPath?: string
+  turnStartedAtUnixMs?: number
+  compaction?: CodexTurnCompactionMetadata
 }
 
 export interface CursorCodexTurnIdInput {
@@ -206,48 +213,15 @@ export function assembleCursorCodexExecutionRequest(
   return request
 }
 
+export function buildCursorCodexCompactionMetadata(input: {
+  strategy?: "auto" | "manual" | "reactive"
+  injectionMode?: "pre_turn" | "mid_turn"
+}): CodexTurnCompactionMetadata {
+  return buildCodexCompactionMetadata(input)
+}
+
 export function buildCursorCodexClientMetadata(
   input: CursorCodexClientMetadataInput
 ): Record<string, string> | undefined {
-  const conversationId = input.conversationId?.trim()
-  if (!conversationId) {
-    return undefined
-  }
-
-  const requestOrdinal = Math.max(1, Math.floor(input.requestOrdinal || 1))
-  const codexConversationId = normalizeCodexPromptCacheKey(conversationId)
-  const turnId = normalizeCodexPromptCacheKey(
-    input.turnId?.trim() || `${codexConversationId}:${requestOrdinal}`
-  )
-  const windowId = normalizeCodexPromptCacheKey(
-    input.windowId?.trim() || `${codexConversationId}:0`
-  )
-  const requestKind = input.requestKind === "compaction" ? "compaction" : "turn"
-  const installationId = input.installationId.trim()
-  const turnMetadata: Record<string, unknown> = {
-    installation_id: installationId,
-    session_id: codexConversationId,
-    thread_id: codexConversationId,
-    turn_id: turnId,
-    window_id: windowId,
-    request_kind: requestKind,
-    thread_source: "user",
-    sandbox: "none",
-  }
-
-  const rootPath = input.workspaceRootPath?.trim()
-  if (rootPath) {
-    turnMetadata.workspaces = {
-      [rootPath]: {},
-    }
-  }
-
-  return {
-    session_id: codexConversationId,
-    thread_id: codexConversationId,
-    turn_id: turnId,
-    "x-codex-window-id": windowId,
-    "x-codex-turn-metadata": JSON.stringify(turnMetadata),
-    "x-codex-installation-id": installationId,
-  }
+  return buildCodexClientMetadata(input)
 }

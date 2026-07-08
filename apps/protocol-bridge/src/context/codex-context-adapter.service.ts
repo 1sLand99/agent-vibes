@@ -14,11 +14,13 @@ import {
 } from "./context-compaction.service"
 import { repairOrphanedToolPairs } from "./orphan-tool-pair-repair"
 import {
+  deriveCompactionHistoryFromTranscript,
   isAttachmentRecord,
   isCompactSummaryRecord,
   isContextCollapseSummaryRecord,
   isHookResultRecord,
   isMessageRecord,
+  resolveContextReplacementAnchor,
 } from "./context-transcript-events"
 import {
   buildTopicContinuityGuard,
@@ -162,7 +164,6 @@ export class CodexContextAdapterService {
       createdAt?: number
       injectionMode: "pre_turn" | "mid_turn"
       anchorRecordId?: string
-      anchorRecordCount: number
       summary: string
       items: CodexReplacementHistoryItem[]
     }
@@ -174,6 +175,10 @@ export class CodexContextAdapterService {
       input.conversationId,
       createdAt
     )
+    const anchor = resolveContextReplacementAnchor(
+      state.records,
+      input.anchorRecordId || `compact_summary_${input.compactionId}`
+    )
     const windowNumber = currentWindow.windowNumber + 1
     const windowId = this.buildWindowId(input.conversationId, windowNumber)
     const replacementHistory: CodexReplacementHistory = {
@@ -184,10 +189,22 @@ export class CodexContextAdapterService {
       firstWindowId: currentWindow.firstWindowId,
       previousWindowId: currentWindow.windowId,
       windowId,
-      anchorRecordId: input.anchorRecordId,
-      anchorRecordCount: Math.max(0, Math.floor(input.anchorRecordCount)),
+      anchorRecordId: anchor.anchorRecordId,
+      anchorRecordCount: anchor.anchorRecordCount,
       summary: input.summary,
       items: input.items.map((item) => this.cloneReplacementItem(item)),
+    }
+    let installedOnCompactCommit = false
+    for (const record of state.records) {
+      const commit = record.compactMetadata?.commit
+      if (commit?.id !== input.compactionId) continue
+      commit.codexReplacementHistory = replacementHistory
+      installedOnCompactCommit = true
+    }
+    if (installedOnCompactCommit) {
+      state.compactionHistory = deriveCompactionHistoryFromTranscript(
+        state.records
+      )
     }
     codex.activeWindow = {
       windowNumber,
@@ -325,14 +342,12 @@ export class CodexContextAdapterService {
         meta: options.meta,
       }
     )
-    plan.commit.codexReplacementHistory = this.installReplacementHistoryWindow(
+    const codexReplacementHistory = this.installReplacementHistoryWindow(
       state,
       {
         conversationId: options.referenceContextItem.conversationId,
         compactionId: plan.commit.id,
         injectionMode: options.injectionMode,
-        anchorRecordId: `compact_summary_${plan.commit.id}`,
-        anchorRecordCount: state.records.length,
         summary,
         items: replacementHistory,
       }
@@ -354,8 +369,8 @@ export class CodexContextAdapterService {
 
     this.logger.log(
       `Codex compact applied commit=${plan.commit.id} mode=${options.injectionMode} ` +
-        `window=${plan.commit.codexReplacementHistory.windowId} ` +
-        `previousWindow=${plan.commit.codexReplacementHistory.previousWindowId || "none"} ` +
+        `window=${codexReplacementHistory.windowId} ` +
+        `previousWindow=${codexReplacementHistory.previousWindowId || "none"} ` +
         `replacementItems=${replacementHistory.length} ` +
         `remoteRawItems=${remoteReplacement.rawItemCount} ` +
         `remoteFilteredItems=${remoteReplacement.filteredItemCount} ` +
@@ -443,7 +458,6 @@ export class CodexContextAdapterService {
         compactionId: commit.id,
         injectionMode: "pre_turn",
         anchorRecordId: commit.summaryRecordId,
-        anchorRecordCount: state.records.length,
         summary,
         items: replacementHistory,
       }
