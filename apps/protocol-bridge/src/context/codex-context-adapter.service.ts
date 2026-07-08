@@ -63,9 +63,12 @@ export const CODEX_SUMMARY_PREFIX =
 
 export const CODEX_HISTORICAL_SUMMARY_NOTICE = [
   "This is compressed historical context, not the current task directive.",
-  "The retained recent messages and any topic-continuity guard that follow this summary are authoritative for the current request and next action.",
-  "Do not resume a task from this summary unless the retained recent messages explicitly continue it.",
+  "Any later messages and topic-continuity guard that follow this summary are authoritative for the current request and next action.",
+  "Do not resume a task from this summary unless later messages explicitly continue it.",
 ].join(" ")
+
+const CODEX_EMPTY_REMOTE_COMPACTION_SUMMARY =
+  "Remote compaction returned no textual summary after filtering synthetic context. Continue from the compacted context and any later messages."
 
 const DEFAULT_CODEX_TRUNCATION_POLICY: CodexTruncationPolicy = {
   mode: "bytes",
@@ -305,22 +308,13 @@ export class CodexContextAdapterService {
       signal: options.signal,
     })
     options.signal.throwIfAborted()
-    const replacementHistory = this.processRemoteReplacementHistory(
+    const remoteReplacement = this.buildRemoteReplacementHistory(
       compactResult.replacementHistory,
       options.injectionMode,
       options.referenceContextItem
     )
-    if (replacementHistory.length === 0) {
-      throw new Error(
-        `Codex compact returned empty replacement history ` +
-          `conversation=${options.meta?.conversationId || options.referenceContextItem.conversationId || "(unknown)"} ` +
-          `archived=${candidate.archivedRecords.length} retained=${candidate.retainedRecords.length} ` +
-          `rawItems=${compactResult.replacementHistory.length} ` +
-          `rawTypes=${this.summarizeReplacementHistoryItems(compactResult.replacementHistory)}`
-      )
-    }
-
-    const summary = this.buildReplacementSummary(replacementHistory)
+    const replacementHistory = remoteReplacement.items
+    const summary = remoteReplacement.summary
     const plan = this.compaction.applyGeneratedSummaryCompaction(
       state,
       snapshot,
@@ -362,7 +356,10 @@ export class CodexContextAdapterService {
       `Codex compact applied commit=${plan.commit.id} mode=${options.injectionMode} ` +
         `window=${plan.commit.codexReplacementHistory.windowId} ` +
         `previousWindow=${plan.commit.codexReplacementHistory.previousWindowId || "none"} ` +
-        `replacementItems=${replacementHistory.length}`
+        `replacementItems=${replacementHistory.length} ` +
+        `remoteRawItems=${remoteReplacement.rawItemCount} ` +
+        `remoteFilteredItems=${remoteReplacement.filteredItemCount} ` +
+        `remoteDiscardedItems=${remoteReplacement.discardedItemCount}`
     )
     return plan
   }
@@ -427,22 +424,13 @@ export class CodexContextAdapterService {
       signal: options.signal,
     })
     options.signal.throwIfAborted()
-    const replacementHistory = this.processRemoteReplacementHistory(
+    const remoteReplacement = this.buildRemoteReplacementHistory(
       compactResult.replacementHistory,
       "pre_turn",
       options.referenceContextItem
     )
-    if (replacementHistory.length === 0) {
-      throw new Error(
-        `Codex collapse returned empty replacement history ` +
-          `conversation=${options.referenceContextItem.conversationId || "(unknown)"} ` +
-          `archived=${candidate.archivedRecords.length} retained=${candidate.retainedRecords.length} ` +
-          `rawItems=${compactResult.replacementHistory.length} ` +
-          `rawTypes=${this.summarizeReplacementHistoryItems(compactResult.replacementHistory)}`
-      )
-    }
-
-    const summary = this.buildReplacementSummary(replacementHistory)
+    const replacementHistory = remoteReplacement.items
+    const summary = remoteReplacement.summary
     const commit = this.contextCollapse.applyGeneratedCollapse(
       state,
       candidate,
@@ -464,7 +452,10 @@ export class CodexContextAdapterService {
       `Codex context collapse applied commit=${commit.id} ` +
         `window=${codexReplacementHistory.windowId} ` +
         `previousWindow=${codexReplacementHistory.previousWindowId || "none"} ` +
-        `replacementItems=${replacementHistory.length}`
+        `replacementItems=${replacementHistory.length} ` +
+        `remoteRawItems=${remoteReplacement.rawItemCount} ` +
+        `remoteFilteredItems=${remoteReplacement.filteredItemCount} ` +
+        `remoteDiscardedItems=${remoteReplacement.discardedItemCount}`
     )
     return commit
   }
@@ -713,13 +704,65 @@ export class CodexContextAdapterService {
     const filtered = items.filter((item) =>
       this.shouldKeepRemoteHistoryItem(item)
     )
+    if (filtered.length !== items.length) {
+      this.logger.debug(
+        `Filtered Codex replacement history items: ${items.length}->${filtered.length}`
+      )
+    }
     return filtered
+  }
+
+  private buildRemoteReplacementHistory(
+    items: CodexReplacementHistoryItem[],
+    injectionMode: "pre_turn" | "mid_turn",
+    referenceContextItem: CodexReferenceContextItem
+  ): {
+    summary: string
+    items: CodexReplacementHistoryItem[]
+    rawItemCount: number
+    filteredItemCount: number
+    discardedItemCount: number
+  } {
+    const filtered = this.processRemoteReplacementHistory(
+      items,
+      injectionMode,
+      referenceContextItem
+    )
+    const rawCompactionItems = filtered.filter((item) =>
+      this.isRawCompactionItem(item)
+    )
+    if (rawCompactionItems.length > 0) {
+      const summary = this.buildReplacementSummary(
+        filtered.filter((item) => !this.isRawCompactionItem(item)),
+        "Remote compacted history is attached as a Codex compaction item. Continue from the compacted context and any later messages."
+      )
+      return {
+        summary,
+        items: [
+          this.cloneReplacementItem(
+            rawCompactionItems[rawCompactionItems.length - 1]!
+          ),
+        ],
+        rawItemCount: items.length,
+        filteredItemCount: filtered.length,
+        discardedItemCount: Math.max(0, items.length - 1),
+      }
+    }
+
+    const summary = this.buildReplacementSummary(filtered)
+    return {
+      summary,
+      items: [this.buildSyntheticCompactionSummaryItem(summary)],
+      rawItemCount: items.length,
+      filteredItemCount: filtered.length,
+      discardedItemCount: Math.max(0, items.length - 1),
+    }
   }
 
   private shouldKeepRemoteHistoryItem(
     item: CodexReplacementHistoryItem
   ): boolean {
-    if (item.type === "compaction" || item.type === "context_compaction") {
+    if (this.isRawCompactionItem(item)) {
       return true
     }
     if (item.type === "compaction_trigger") return false
@@ -740,7 +783,9 @@ export class CodexContextAdapterService {
     const trimmed = text.trimStart()
     return (
       this.isCodexReferenceContextText(trimmed) ||
-      /^(?:\[Context (?:attachment|summary|collapse|attachment removed)|\[Result of an earlier tool call|\[tool_result stored\])/i.test(
+      trimmed.startsWith(CODEX_SUMMARY_PREFIX) ||
+      trimmed.startsWith("This is compressed historical context") ||
+      /^(?:\[Context (?:attachment|summary|collapse|boundary|attachment removed)|\[Result of an earlier tool call|\[tool_result stored\])/i.test(
         trimmed
       ) ||
       /^# AGENTS\.md instructions\b/i.test(trimmed) ||
@@ -748,19 +793,28 @@ export class CodexContextAdapterService {
       /^<turn_aborted>/i.test(trimmed) ||
       /^Grep completed:\s*pattern=/i.test(trimmed) ||
       /\bDocumentId:\s*tool_result:/i.test(trimmed) ||
-      /\/\.agent-vibes\/tool-results\//i.test(trimmed)
+      /\/\.agent-vibes\/tool-results\//i.test(trimmed) ||
+      /\n(?:Session Memory|Investigation Memory|Recent File Snapshots|Tracked File Changes)\b/i.test(
+        trimmed
+      )
     )
   }
 
   private buildReplacementSummary(
-    items: CodexReplacementHistoryItem[]
+    items: CodexReplacementHistoryItem[],
+    fallbackBody: string = CODEX_EMPTY_REMOTE_COMPACTION_SUMMARY
   ): string {
-    const body =
-      items
-        .map((item) => this.extractReplacementSummaryText(item))
-        .filter((text) => text.trim().length > 0)
-        .join("\n\n")
-        .trim() || "(no summary available)"
+    const seen = new Set<string>()
+    const parts: string[] = []
+    for (const item of items) {
+      const text = this.extractReplacementSummaryText(item).trim()
+      if (!text) continue
+      const key = text.replace(/\s+/g, " ").trim()
+      if (!key || seen.has(key)) continue
+      seen.add(key)
+      parts.push(text)
+    }
+    const body = parts.join("\n\n").trim() || fallbackBody
     const compacted = truncateCodexTextByBytes(body, 32_000)
     return [
       CODEX_SUMMARY_PREFIX,
@@ -792,11 +846,21 @@ export class CodexContextAdapterService {
       .join(",")
   }
 
+  private buildSyntheticCompactionSummaryItem(
+    summary: string
+  ): CodexReplacementHistoryItem {
+    return {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: summary }],
+    }
+  }
+
   private replacementHistoryToMessages(
     items: CodexReplacementHistoryItem[]
   ): UnifiedMessage[] {
     return items.flatMap((item) => {
-      if (item.type === "compaction" || item.type === "context_compaction") {
+      if (this.isRawCompactionItem(item)) {
         const rawBlock: CodexRawResponseItemBlock = {
           type: CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
           item: this.cloneReplacementItem(item),
@@ -816,10 +880,14 @@ export class CodexContextAdapterService {
     })
   }
 
+  private isRawCompactionItem(item: CodexReplacementHistoryItem): boolean {
+    return item.type === "compaction" || item.type === "context_compaction"
+  }
+
   private extractReplacementSummaryText(
     item: CodexReplacementHistoryItem
   ): string {
-    if (item.type === "compaction" || item.type === "context_compaction") {
+    if (this.isRawCompactionItem(item)) {
       return ""
     }
     const text = this.extractResponseItemText(item).trim()

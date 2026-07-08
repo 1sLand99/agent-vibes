@@ -65,9 +65,12 @@ import {
   // ConversationStateStructure
   ConversationStateStructureSchema,
   ConversationStepSchema,
-  ConversationSummaryArchiveSchema,
   ConversationSummarySchema,
   ConversationTokenDetailsSchema,
+  PromptContextNodeSchema,
+  PromptContextUsageTreeSchema,
+  PromptTokenBreakdownCategorySchema,
+  PromptTokenBreakdownSnapshotSchema,
   CreatePlanArgsSchema,
   CreatePlanErrorSchema,
   CreatePlanResultSchema,
@@ -438,6 +441,32 @@ function safeString(value: unknown, defaultValue: string = ""): string {
 type ToolCallOneOf = ToolCall["tool"]
 type InteractionUpdateOneOf = InteractionUpdate["message"]
 type InteractionQueryOneOf = InteractionQuery["query"]
+
+interface ConversationCheckpointTokenCategory {
+  id: string
+  label: string
+  estimatedTokens: number
+  characterCount?: number
+}
+
+interface ConversationCheckpointContextNode {
+  id: string
+  parentId?: string
+  kind: string
+  label: string
+  categoryId: string
+  estimatedTokens: number
+  characterCount: number
+  contentAvailable: boolean
+  inlineContent?: string
+}
+
+interface ConversationCheckpointTokenDetails {
+  usedTokens: number
+  maxTokens: number
+  categories?: ConversationCheckpointTokenCategory[]
+  nodes?: ConversationCheckpointContextNode[]
+}
 
 function resolveThinkingStyleForModel(model?: string): ThinkingStyle {
   const normalized = (model || "").trim().toLowerCase()
@@ -1075,6 +1104,138 @@ interface ToolCompletionExtraData {
 @Injectable()
 export class CursorGrpcService {
   private readonly logger = new Logger(CursorGrpcService.name)
+
+  private buildConversationTokenDetails(
+    details?: ConversationCheckpointTokenDetails
+  ) {
+    const usedTokens = safeUint32(details?.usedTokens, 0)
+    const maxTokens = safeUint32(details?.maxTokens, 200_000)
+    const categories = this.normalizeCheckpointTokenCategories(
+      details?.categories,
+      usedTokens
+    )
+    const nodes = this.normalizeCheckpointContextNodes(
+      details?.nodes,
+      categories,
+      usedTokens
+    )
+
+    return create(ConversationTokenDetailsSchema, {
+      usedTokens,
+      maxTokens,
+      breakdown: create(PromptTokenBreakdownSnapshotSchema, {
+        totalUsedTokens: usedTokens,
+        maxTokens,
+        categories: categories.map((category) =>
+          create(PromptTokenBreakdownCategorySchema, {
+            id: category.id,
+            label: category.label,
+            estimatedTokens: category.estimatedTokens,
+            ...(category.characterCount !== undefined
+              ? { characterCount: category.characterCount }
+              : {}),
+          })
+        ),
+      }),
+      promptContextUsageTree: create(PromptContextUsageTreeSchema, {
+        schemaVersion: 1,
+        nodes: nodes.map((node) =>
+          create(PromptContextNodeSchema, {
+            id: node.id,
+            ...(node.parentId ? { parentId: node.parentId } : {}),
+            kind: node.kind,
+            label: node.label,
+            categoryId: node.categoryId,
+            estimatedTokens: node.estimatedTokens,
+            characterCount: node.characterCount,
+            contentAvailable: node.contentAvailable,
+            ...(node.inlineContent
+              ? { inlineContent: node.inlineContent }
+              : {}),
+          })
+        ),
+      }),
+    })
+  }
+
+  private normalizeCheckpointTokenCategories(
+    categories: ConversationCheckpointTokenCategory[] | undefined,
+    usedTokens: number
+  ): ConversationCheckpointTokenCategory[] {
+    const normalized = (categories || [])
+      .map((category) => ({
+        id: category.id.trim(),
+        label: category.label.trim(),
+        estimatedTokens: safeUint32(category.estimatedTokens, 0),
+        characterCount:
+          category.characterCount === undefined
+            ? undefined
+            : safeUint32(category.characterCount, 0),
+      }))
+      .filter(
+        (category) =>
+          category.id.length > 0 &&
+          category.label.length > 0 &&
+          category.estimatedTokens > 0
+      )
+
+    if (normalized.length > 0) {
+      return normalized
+    }
+
+    return [
+      {
+        id: "context",
+        label: "Context",
+        estimatedTokens: usedTokens,
+      },
+    ]
+  }
+
+  private normalizeCheckpointContextNodes(
+    nodes: ConversationCheckpointContextNode[] | undefined,
+    categories: ConversationCheckpointTokenCategory[],
+    usedTokens: number
+  ): ConversationCheckpointContextNode[] {
+    const validCategoryIds = new Set(categories.map((category) => category.id))
+    const normalized = (nodes || [])
+      .map((node) => ({
+        id: node.id.trim(),
+        parentId: node.parentId?.trim() || undefined,
+        kind: node.kind.trim(),
+        label: node.label.trim(),
+        categoryId: node.categoryId.trim(),
+        estimatedTokens: safeUint32(node.estimatedTokens, 0),
+        characterCount: safeUint32(node.characterCount, 0),
+        contentAvailable: node.contentAvailable === true,
+        inlineContent: node.inlineContent?.trim() || undefined,
+      }))
+      .filter(
+        (node) =>
+          node.id.length > 0 &&
+          node.kind.length > 0 &&
+          node.label.length > 0 &&
+          validCategoryIds.has(node.categoryId) &&
+          node.estimatedTokens > 0
+      )
+
+    if (normalized.length > 0) {
+      return normalized
+    }
+
+    return [
+      {
+        id: "context",
+        kind: "context",
+        label: "Context",
+        categoryId: "context",
+        estimatedTokens: usedTokens,
+        characterCount: 0,
+        contentAvailable: false,
+      },
+    ]
+  }
+
   private readonly execDispatchableFamilies: ReadonlySet<ToolFamily> = new Set([
     "read_mcp_resource",
     "list_mcp_resources",
@@ -8538,8 +8699,7 @@ export class CursorGrpcService {
     checkpoint: {
       pendingToolCalls?: Array<{ id: string; name: string; input: unknown }>
       messageBlobIds?: string[]
-      usedTokens?: number
-      maxTokens?: number
+      tokenDetails?: ConversationCheckpointTokenDetails
       workspaceUri?: string
       readPaths?: string[]
       fileStates?: Record<
@@ -8557,31 +8717,14 @@ export class CursorGrpcService {
         updatedAt: number
         dependencies: string[]
       }>
-      /**
-       * Active conversation-level summary (the most recent committed
-       * boundary). Optional; when absent the IDE falls back to its
-       * own no-summary rendering. Surfaces as
-       * `ConversationStateStructure.summary` (bytes — a serialized
-       * `ConversationSummary{summary}`) and as
-       * `ConversationStateStructure.summary_archive` for legacy
-       * single-archive readers.
-       */
+      /** Active conversation-level summary for `ConversationStateStructure.summary`. */
       activeSummary?: string
-      /**
-       * Full bridge-side compaction history (oldest → newest). Used to
-       * compute the active summary text and as a legacy fallback when
-       * callers have not materialized `summaryArchiveBlobIds`.
-       */
+      /** Full bridge-side compaction history (oldest -> newest). */
       compactionHistory?: Array<{
         summary: string
         archivedMessageCount: number
       }>
-      /**
-       * Blob ids for serialized `ConversationSummaryArchive` records.
-       * Newer Cursor clients hydrate `summary_archives` through the
-       * blob store, so the state structure must carry ids, not inline
-       * archive protobuf bytes.
-       */
+      /** Blob ids for serialized `ConversationSummaryArchive` records. */
       summaryArchiveBlobIds?: string[]
     }
   ): Buffer {
@@ -8619,30 +8762,11 @@ export class CursorGrpcService {
       new TextEncoder().encode(t)
     )
 
-    // Newer Cursor clients hydrate `summary_archives` by treating each
-    // bytes value as a blob id, then loading a serialized
-    // ConversationSummaryArchive from the blob store. Prefer the
-    // caller-materialized ids; keep inline archive bytes only as a legacy
-    // fallback for older bridge call sites.
     const compactionHistory = checkpoint.compactionHistory || []
-    const legacyInlineSummaryArchives = compactionHistory.map((entry) => {
-      const archive = create(ConversationSummaryArchiveSchema, {
-        summary: entry.summary,
-        windowTail: Math.max(0, Math.floor(entry.archivedMessageCount || 0)),
-        summarizedMessages: [],
-        summaryMessage: new Uint8Array(),
-      })
-      return toBinary(ConversationSummaryArchiveSchema, archive)
-    })
-    const summaryArchiveBlobIds = (checkpoint.summaryArchiveBlobIds || [])
+    const summaryArchivesBytes = (checkpoint.summaryArchiveBlobIds || [])
       .map((blobId) => blobId.trim())
       .filter((blobId) => blobId.length > 0)
-    const summaryArchivesBytes =
-      summaryArchiveBlobIds.length > 0
-        ? summaryArchiveBlobIds.map((blobId) =>
-            new TextEncoder().encode(blobId)
-          )
-        : legacyInlineSummaryArchives
+      .map((blobId) => new TextEncoder().encode(blobId))
 
     // 构建 summary (optional bytes) — 当前 active summary。Cursor 把它
     // 渲染在 chat 顶部"已压缩 X 条消息"的 banner 上。bridge 没有显式的
@@ -8660,19 +8784,10 @@ export class CursorGrpcService {
         )
       : undefined
 
-    // 同步填 summary_archive (legacy single-archive 字段) ——
-    // 一些旧版 IDE 客户端只读这一个字段，新版读 summary_archives 数组。
-    // 双填保证向后兼容。
-    const latestArchiveBytes =
-      summaryArchivesBytes[summaryArchivesBytes.length - 1] || undefined
-
     // 构建 ConversationStateStructure 并正确填充字段
     const stateStructure = create(ConversationStateStructureSchema, {
       // Token 统计
-      tokenDetails: create(ConversationTokenDetailsSchema, {
-        usedTokens: checkpoint.usedTokens || 0,
-        maxTokens: checkpoint.maxTokens || 200000,
-      }),
+      tokenDetails: this.buildConversationTokenDetails(checkpoint.tokenDetails),
       // 待处理工具调用 ID
       pendingToolCalls: (checkpoint.pendingToolCalls || []).map((tc) => tc.id),
       // 已读路径
@@ -8693,10 +8808,7 @@ export class CursorGrpcService {
       selfSummaryCount: checkpoint.selfSummaryCount || 0,
       // summary (active conversation summary, optional bytes)
       ...(summaryBytes ? { summary: summaryBytes } : {}),
-      // summary_archive (latest archive only — legacy single-archive
-      // field for older IDE clients; new clients read summary_archives)
-      ...(latestArchiveBytes ? { summaryArchive: latestArchiveBytes } : {}),
-      // summary_archives (full compaction trail, oldest → newest)
+      // summary_archives (blob ids for full compaction trail, oldest -> newest)
       summaryArchives: summaryArchivesBytes,
       // todos (serialized as bytes[])
       todos: (checkpoint.todos || []).map((todo) => {

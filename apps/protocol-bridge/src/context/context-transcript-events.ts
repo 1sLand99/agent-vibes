@@ -175,7 +175,7 @@ export function renderCompactBoundary(commit: ContextCompactionCommit): string {
   return (
     `[Context boundary ${commit.id}]\n` +
     `Earlier conversation content was compacted into the summary that follows. ` +
-    `Use it as working context and continue from the retained messages.`
+    `Use it as working context and continue from any messages that follow.`
   )
 }
 

@@ -457,6 +457,13 @@ async function assertSafeToRestartBridge(port, caCertPath) {
       )
       return
     }
+    if (result.statusCode === 404) {
+      console.warn(
+        "[restart:bridge] Running bridge does not expose /api/context/runtime; " +
+          "restarting it to install the current bridge protocol."
+      )
+      return
+    }
     throw new Error(
       `Cannot verify bridge runtime activity before restart (${errorText}); refusing to interrupt unknown Cursor Agent state.`
     )

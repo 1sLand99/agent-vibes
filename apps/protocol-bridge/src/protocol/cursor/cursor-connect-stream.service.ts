@@ -42,6 +42,7 @@ import {
   type ContextProjectionAttachment,
   detectPromptTooLong,
   extractText,
+  normalizeContent,
   formatSubAgentMemoryEntry,
   isMessageRecord,
   type ContentBlock,
@@ -1142,6 +1143,35 @@ export function resolveSessionCleanupBackends(input: {
   }
 
   return Array.from(cleanupBackends)
+}
+
+type CheckpointTranscriptRecord =
+  ContextStateRecord["contextState"]["records"][number]
+
+interface CheckpointTokenCategory {
+  id: string
+  label: string
+  estimatedTokens: number
+  characterCount?: number
+}
+
+interface CheckpointContextNode {
+  id: string
+  parentId?: string
+  kind: string
+  label: string
+  categoryId: string
+  estimatedTokens: number
+  characterCount: number
+  contentAvailable: boolean
+  inlineContent?: string
+}
+
+interface CheckpointTokenDetails {
+  usedTokens: number
+  maxTokens: number
+  categories: CheckpointTokenCategory[]
+  nodes: CheckpointContextNode[]
 }
 
 /**
@@ -5090,15 +5120,577 @@ export class CursorConnectStreamService {
     return 200_000
   }
 
-  private resolveCheckpointTokenDetails(session: SessionRecord): {
-    usedTokens: number
-    maxTokens: number
-  } {
+  private resolveCheckpointTokenDetails(
+    session: SessionRecord
+  ): CheckpointTokenDetails {
     const maxTokens = this.resolveCheckpointMaxTokens(session)
+    const usedTokens = this.resolveCheckpointUsedTokens(session)
+    const breakdown = this.buildCheckpointTokenBreakdown(session, usedTokens)
     return {
-      usedTokens: this.resolveCheckpointUsedTokens(session),
+      usedTokens,
       maxTokens,
+      categories: breakdown.categories,
+      nodes: breakdown.nodes,
     }
+  }
+
+  private buildCheckpointTokenBreakdown(
+    session: SessionRecord,
+    usedTokens: number
+  ): { categories: CheckpointTokenCategory[]; nodes: CheckpointContextNode[] } {
+    const ctx = this.contextState.getContextRecord(session.conversationId)
+    const buckets = new Map<string, CheckpointContextNode>()
+    const seenAttachmentKinds = new Set<ContextProjectionAttachment["kind"]>()
+
+    const addLeaf = (
+      categoryId: string,
+      kind: string,
+      label: string,
+      estimatedTokens: number,
+      characterCount: number,
+      mergeKey?: string,
+      inlineContent?: string
+    ) => {
+      const tokens = this.normalizeNonNegativeInteger(estimatedTokens) ?? 0
+      if (tokens <= 0) return
+      const key = mergeKey || `${categoryId}:${kind}:${label}`
+      const existing = buckets.get(key)
+      if (existing) {
+        existing.estimatedTokens += tokens
+        existing.characterCount += Math.max(0, characterCount)
+        return
+      }
+      buckets.set(key, {
+        id: this.makeCheckpointContextNodeId(key, buckets.size),
+        kind,
+        label,
+        categoryId,
+        estimatedTokens: tokens,
+        characterCount: Math.max(0, characterCount),
+        contentAvailable: inlineContent !== undefined,
+        inlineContent,
+      })
+    }
+
+    if (ctx) {
+      const representedCompactionIds = new Set<string>()
+      for (const record of ctx.contextState.records) {
+        const category = this.classifyCheckpointRecordCategory(record)
+        const text = this.stringifyCheckpointContent(record.content)
+        const tokens = this.estimateCheckpointRecordTokens(record)
+        const label = this.describeCheckpointRecord(record)
+        if (record.attachmentMetadata?.kind) {
+          seenAttachmentKinds.add(record.attachmentMetadata.kind)
+        }
+        const compactionId = record.compactMetadata?.commit?.id
+        if (compactionId) {
+          representedCompactionIds.add(compactionId)
+        }
+        addLeaf(
+          category.categoryId,
+          category.kind,
+          label,
+          tokens,
+          text.length,
+          `${category.categoryId}:${category.kind}:${label}`
+        )
+      }
+
+      for (const commit of ctx.contextState.compactionHistory) {
+        if (representedCompactionIds.has(commit.id)) continue
+        const summaryText = commit.summary || ""
+        addLeaf(
+          "summaries",
+          "summary",
+          `Compaction summary ${commit.epoch ?? ""}`.trim(),
+          commit.summaryTokenCount || this.tokenCounter.countText(summaryText),
+          summaryText.length,
+          `summaries:compaction:${commit.id}`
+        )
+      }
+
+      for (const message of ctx.contextState.codexContext?.metaMessageLedger
+        ?.messages || []) {
+        if (message.attachmentKind) {
+          seenAttachmentKinds.add(message.attachmentKind)
+        }
+        const category = this.classifyCheckpointMetaMessageCategory(
+          message.source,
+          message.attachmentKind
+        )
+        const text = this.stringifyCheckpointContent(message.content)
+        addLeaf(
+          category.categoryId,
+          category.kind,
+          this.describeCheckpointMetaMessage(
+            message.source,
+            message.attachmentKind
+          ),
+          this.estimateCheckpointContentTokens(message.role, message.content),
+          text.length,
+          `${category.categoryId}:${category.kind}:${message.key}`
+        )
+      }
+
+      if (!seenAttachmentKinds.has("read_paths") && ctx.readPaths.size > 0) {
+        const text = Array.from(ctx.readPaths).join("\n")
+        addLeaf(
+          "files",
+          "read_paths",
+          "Read paths",
+          this.tokenCounter.countText(text),
+          text.length,
+          "files:read_paths"
+        )
+      }
+
+      if (!seenAttachmentKinds.has("file_states") && ctx.fileStates.size > 0) {
+        const text = Array.from(ctx.fileStates.entries())
+          .map(
+            ([filePath, state]) => `${filePath}\n${state.afterContent || ""}`
+          )
+          .join("\n\n")
+        addLeaf(
+          "files",
+          "file_states",
+          "File states",
+          this.tokenCounter.countText(text),
+          text.length,
+          "files:file_states"
+        )
+      }
+
+      if (!seenAttachmentKinds.has("todos") && ctx.todos.length > 0) {
+        const text = ctx.todos
+          .map((todo) => `${todo.status}: ${todo.content}`)
+          .join("\n")
+        addLeaf(
+          "todos",
+          "todos",
+          "Todos",
+          this.tokenCounter.countText(text),
+          text.length,
+          "todos:session"
+        )
+      }
+
+      if (
+        !seenAttachmentKinds.has("session_memory") &&
+        ctx.contextState.sessionMemory.length > 0
+      ) {
+        const text = safeJsonStringify(ctx.contextState.sessionMemory, {
+          maxDepth: 4,
+          maxArrayItems: 100,
+          maxObjectKeys: 50,
+          maxStringLength: 16_384,
+        })
+        addLeaf(
+          "memory",
+          "session_memory",
+          "Session memory",
+          this.tokenCounter.countText(text),
+          text.length,
+          "memory:session"
+        )
+      }
+
+      if (
+        !seenAttachmentKinds.has("investigation_memory") &&
+        ctx.contextState.investigationMemory.length > 0
+      ) {
+        const text = safeJsonStringify(ctx.contextState.investigationMemory, {
+          maxDepth: 4,
+          maxArrayItems: 100,
+          maxObjectKeys: 50,
+          maxStringLength: 16_384,
+        })
+        addLeaf(
+          "memory",
+          "investigation_memory",
+          "Investigation memory",
+          this.tokenCounter.countText(text),
+          text.length,
+          "memory:investigation"
+        )
+      }
+    }
+
+    const leaves = this.reconcileCheckpointContextLeaves(
+      Array.from(buckets.values()),
+      usedTokens
+    )
+    return this.buildCheckpointContextTree(leaves, usedTokens)
+  }
+
+  private classifyCheckpointRecordCategory(
+    record: CheckpointTranscriptRecord
+  ): { categoryId: string; kind: string } {
+    if (record.kind === "attachment") {
+      return this.classifyCheckpointAttachmentCategory(
+        record.attachmentMetadata?.kind
+      )
+    }
+    if (
+      record.kind === "compact_boundary" ||
+      record.kind === "compact_summary" ||
+      record.kind === "context_collapse_summary" ||
+      record.kind === "snip_boundary" ||
+      record.kind === "microcompact_boundary"
+    ) {
+      return { categoryId: "summaries", kind: record.kind }
+    }
+    if (record.kind === "hook_result") {
+      return { categoryId: "hooks", kind: "hook" }
+    }
+    if (
+      this.checkpointContentContainsBlockType(record.content, "tool_result")
+    ) {
+      return { categoryId: "tool_results", kind: "tool_result" }
+    }
+    return { categoryId: "conversation", kind: record.role }
+  }
+
+  private classifyCheckpointMetaMessageCategory(
+    source: ContextMessageSource | undefined,
+    attachmentKind: ContextProjectionAttachment["kind"] | undefined
+  ): { categoryId: string; kind: string } {
+    if (source === "attachment") {
+      return this.classifyCheckpointAttachmentCategory(attachmentKind)
+    }
+    if (
+      source === "summary" ||
+      source === "boundary" ||
+      source === "context_collapse" ||
+      source === "snip" ||
+      source === "microcompact"
+    ) {
+      return { categoryId: "summaries", kind: source }
+    }
+    if (source === "hook") {
+      return { categoryId: "hooks", kind: "hook" }
+    }
+    if (source === "protected_context") {
+      return { categoryId: "protected_context", kind: "protected_context" }
+    }
+    return { categoryId: "other", kind: source || "context" }
+  }
+
+  private classifyCheckpointAttachmentCategory(
+    attachmentKind: ContextProjectionAttachment["kind"] | undefined
+  ): { categoryId: string; kind: string } {
+    switch (attachmentKind) {
+      case "read_paths":
+      case "file_states":
+      case "file_snapshots":
+        return { categoryId: "files", kind: attachmentKind }
+      case "todos":
+        return { categoryId: "todos", kind: "todos" }
+      case "sub_agent":
+        return { categoryId: "sub_agents", kind: "sub_agent" }
+      case "session_memory":
+      case "investigation_memory":
+        return { categoryId: "memory", kind: attachmentKind }
+      default:
+        return { categoryId: "other", kind: attachmentKind || "attachment" }
+    }
+  }
+
+  private describeCheckpointRecord(record: CheckpointTranscriptRecord): string {
+    if (record.kind === "attachment" && record.attachmentMetadata?.label) {
+      return record.attachmentMetadata.label
+    }
+    if (record.kind === "compact_summary") return "Compaction summary"
+    if (record.kind === "context_collapse_summary") return "Context collapse"
+    if (record.kind === "compact_boundary") return "Compaction boundary"
+    if (record.kind === "snip_boundary") return "Snipped context"
+    if (record.kind === "microcompact_boundary") return "Microcompact"
+    if (record.kind === "hook_result") return "Hook output"
+    if (
+      this.checkpointContentContainsBlockType(record.content, "tool_result")
+    ) {
+      return "Tool results"
+    }
+    return record.role === "assistant" ? "Assistant messages" : "User messages"
+  }
+
+  private describeCheckpointMetaMessage(
+    source: ContextMessageSource | undefined,
+    attachmentKind: ContextProjectionAttachment["kind"] | undefined
+  ): string {
+    switch (attachmentKind) {
+      case "read_paths":
+        return "Read paths"
+      case "file_states":
+        return "File states"
+      case "file_snapshots":
+        return "File snapshots"
+      case "todos":
+        return "Todos"
+      case "sub_agent":
+        return "Sub-agent context"
+      case "session_memory":
+        return "Session memory"
+      case "investigation_memory":
+        return "Investigation memory"
+      default:
+        break
+    }
+    switch (source) {
+      case "summary":
+        return "Summary"
+      case "boundary":
+        return "Compaction boundary"
+      case "context_collapse":
+        return "Context collapse"
+      case "snip":
+        return "Snipped context"
+      case "microcompact":
+        return "Microcompact"
+      case "hook":
+        return "Hook output"
+      case "protected_context":
+        return "Protected context"
+      default:
+        return "Other context"
+    }
+  }
+
+  private estimateCheckpointRecordTokens(
+    record: CheckpointTranscriptRecord
+  ): number {
+    const attachmentTokens = this.normalizeNonNegativeInteger(
+      record.attachmentMetadata?.tokenCount
+    )
+    if (attachmentTokens !== undefined && attachmentTokens > 0) {
+      return attachmentTokens
+    }
+    const summaryTokens = this.normalizeNonNegativeInteger(
+      record.compactMetadata?.commit?.summaryTokenCount
+    )
+    if (summaryTokens !== undefined && summaryTokens > 0) {
+      return summaryTokens
+    }
+    return this.estimateCheckpointContentTokens(record.role, record.content)
+  }
+
+  private estimateCheckpointContentTokens(
+    role: "user" | "assistant",
+    content: LooseMessageContent
+  ): number {
+    return this.tokenCounter.countMessage({
+      role,
+      content: content as UnifiedMessage["content"],
+    } as UnifiedMessage)
+  }
+
+  private checkpointContentContainsBlockType(
+    content: LooseMessageContent,
+    blockType: string
+  ): boolean {
+    return normalizeContent(content).some((block) => block.type === blockType)
+  }
+
+  private stringifyCheckpointContent(content: LooseMessageContent): string {
+    const text = extractText(content).trim()
+    if (text.length > 0) return text
+    if (typeof content === "string") return content
+    return safeJsonStringify(content, {
+      maxDepth: 4,
+      maxArrayItems: 100,
+      maxObjectKeys: 50,
+      maxStringLength: 16_384,
+    })
+  }
+
+  private reconcileCheckpointContextLeaves(
+    leaves: CheckpointContextNode[],
+    usedTokens: number
+  ): CheckpointContextNode[] {
+    const target = this.normalizeNonNegativeInteger(usedTokens) ?? 0
+    const positiveLeaves = leaves.filter((leaf) => leaf.estimatedTokens > 0)
+    if (target <= 0) return []
+    if (positiveLeaves.length === 0) {
+      return [
+        {
+          id: "other-context",
+          kind: "other",
+          label: "Other context",
+          categoryId: "other",
+          estimatedTokens: target,
+          characterCount: 0,
+          contentAvailable: false,
+        },
+      ]
+    }
+
+    const total = positiveLeaves.reduce(
+      (sum, leaf) => sum + leaf.estimatedTokens,
+      0
+    )
+    if (total < target) {
+      return [
+        ...positiveLeaves,
+        {
+          id: "other-context",
+          kind: "other",
+          label: "Other context",
+          categoryId: "other",
+          estimatedTokens: target - total,
+          characterCount: 0,
+          contentAvailable: false,
+        },
+      ]
+    }
+    if (total === target) return positiveLeaves
+
+    const scale = target / total
+    const scaled = positiveLeaves.map((leaf) => ({
+      ...leaf,
+      estimatedTokens: Math.max(1, Math.floor(leaf.estimatedTokens * scale)),
+    }))
+    let delta =
+      target - scaled.reduce((sum, leaf) => sum + leaf.estimatedTokens, 0)
+    if (delta !== 0) {
+      const sorted = [...scaled].sort(
+        (a, b) => b.estimatedTokens - a.estimatedTokens
+      )
+      for (const leaf of sorted) {
+        if (delta === 0) break
+        if (delta > 0) {
+          leaf.estimatedTokens += delta
+          delta = 0
+          break
+        }
+        const reduction = Math.min(leaf.estimatedTokens - 1, Math.abs(delta))
+        if (reduction <= 0) continue
+        leaf.estimatedTokens -= reduction
+        delta += reduction
+      }
+    }
+    return scaled.filter((leaf) => leaf.estimatedTokens > 0)
+  }
+
+  private buildCheckpointContextTree(
+    leaves: CheckpointContextNode[],
+    usedTokens: number
+  ): { categories: CheckpointTokenCategory[]; nodes: CheckpointContextNode[] } {
+    if (leaves.length === 0) {
+      return {
+        categories: [
+          {
+            id: "context",
+            label: "Context",
+            estimatedTokens: usedTokens,
+          },
+        ],
+        nodes: [
+          {
+            id: "context",
+            kind: "context",
+            label: "Context",
+            categoryId: "context",
+            estimatedTokens: usedTokens,
+            characterCount: 0,
+            contentAvailable: false,
+          },
+        ],
+      }
+    }
+
+    const categoriesById = new Map<string, CheckpointTokenCategory>()
+    for (const leaf of leaves) {
+      const existing = categoriesById.get(leaf.categoryId)
+      if (existing) {
+        existing.estimatedTokens += leaf.estimatedTokens
+        existing.characterCount =
+          (existing.characterCount || 0) + leaf.characterCount
+      } else {
+        categoriesById.set(leaf.categoryId, {
+          id: leaf.categoryId,
+          label: this.getCheckpointCategoryLabel(leaf.categoryId),
+          estimatedTokens: leaf.estimatedTokens,
+          characterCount: leaf.characterCount,
+        })
+      }
+    }
+
+    const categories = Array.from(categoriesById.values()).sort(
+      (a, b) =>
+        this.getCheckpointCategoryOrder(a.id) -
+        this.getCheckpointCategoryOrder(b.id)
+    )
+    const rootNodes = categories.map((category) => ({
+      id: `${category.id}-root`,
+      kind: category.id,
+      label: category.label,
+      categoryId: category.id,
+      estimatedTokens: category.estimatedTokens,
+      characterCount: category.characterCount || 0,
+      contentAvailable: false,
+    }))
+    const categoryIds = new Set(categories.map((category) => category.id))
+    const childNodes = leaves
+      .filter((leaf) => categoryIds.has(leaf.categoryId))
+      .map((leaf) => ({
+        ...leaf,
+        parentId: `${leaf.categoryId}-root`,
+      }))
+
+    return { categories, nodes: [...rootNodes, ...childNodes] }
+  }
+
+  private getCheckpointCategoryLabel(categoryId: string): string {
+    switch (categoryId) {
+      case "conversation":
+        return "Conversation"
+      case "tool_results":
+        return "Tool Results"
+      case "files":
+        return "Files"
+      case "summaries":
+        return "Summaries"
+      case "memory":
+        return "Memory"
+      case "todos":
+        return "Todos"
+      case "sub_agents":
+        return "Sub-agents"
+      case "hooks":
+        return "Hooks"
+      case "protected_context":
+        return "Protected Context"
+      case "other":
+        return "Other Context"
+      default:
+        return "Context"
+    }
+  }
+
+  private getCheckpointCategoryOrder(categoryId: string): number {
+    const order = [
+      "conversation",
+      "tool_results",
+      "files",
+      "summaries",
+      "memory",
+      "todos",
+      "sub_agents",
+      "hooks",
+      "protected_context",
+      "other",
+      "context",
+    ]
+    const index = order.indexOf(categoryId)
+    return index >= 0 ? index : order.length
+  }
+
+  private makeCheckpointContextNodeId(seed: string, fallback: number): string {
+    const normalized = seed
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 80)
+    return normalized || `context-node-${fallback}`
   }
 
   private resolveCheckpointUsedTokens(session: SessionRecord): number {
@@ -9789,8 +10381,7 @@ ${raw}
         messageBlobIds: this.contextState.getContextRecord(
           session.conversationId
         )!.messageBlobIds,
-        usedTokens: tokenDetails.usedTokens,
-        maxTokens: tokenDetails.maxTokens,
+        tokenDetails,
         workspaceUri: session.projectContext?.rootPath
           ? `file://${session.projectContext.rootPath}`
           : undefined,
@@ -28325,7 +28916,7 @@ ${raw}
           contextLabel: `tool continuation preflight: ${conversationId}`,
           model,
           pendingToolUseIds,
-          strategy: "reactive",
+          strategy: "auto",
           dryRun: true,
         }
       )
@@ -28595,7 +29186,7 @@ ${raw}
     session: SessionRecord,
     checkpointModel: string,
     workspaceRootPath: string | undefined
-  ): Buffer {
+  ): { checkpoint: Buffer; blobMessages: Buffer[] } {
     const pendingToolCalls = this.sessionManager
       .listPendingToolCalls(session.conversationId)
       .map((toolCall) => ({
@@ -28603,13 +29194,14 @@ ${raw}
         name: toolCall.toolName,
         input: toolCall.toolInput,
       }))
+    const summaryArchiveBlobs = this.materializeSummaryArchiveBlobs(session)
 
     const checkpointData = {
       messageBlobIds: this.contextState.getContextRecord(
         session.conversationId
       )!.messageBlobIds,
       pendingToolCalls,
-      ...this.resolveCheckpointTokenDetails(session),
+      tokenDetails: this.resolveCheckpointTokenDetails(session),
       workspaceUri: workspaceRootPath
         ? `file://${workspaceRootPath}`
         : undefined,
@@ -28622,13 +29214,17 @@ ${raw}
       turns: this.contextState.getContextRecord(session.conversationId)!.turns,
       todos: this.contextState.getContextRecord(session.conversationId)!.todos,
       compactionHistory: this.extractCompactionHistoryForCheckpoint(session),
+      summaryArchiveBlobIds: summaryArchiveBlobs.summaryArchiveBlobIds,
     }
 
-    return this.grpcService.createConversationCheckpointResponse(
-      conversationId,
-      checkpointModel,
-      checkpointData
-    )
+    return {
+      checkpoint: this.grpcService.createConversationCheckpointResponse(
+        conversationId,
+        checkpointModel,
+        checkpointData
+      ),
+      blobMessages: summaryArchiveBlobs.blobMessages,
+    }
   }
 
   /**
@@ -29229,15 +29825,16 @@ ${raw}
     this.startProviderWarmup(route, conversationId, "streaming-tool-dispatch", {
       pendingToolUseIds: [toolCallId],
     })
-    this.emit(
+    const checkpoint = this.createPendingToolCheckpointResponse(
       conversationId,
-      this.createPendingToolCheckpointResponse(
-        conversationId,
-        registeredSession,
-        checkpointModel,
-        workspaceRootPath
-      )
+      registeredSession,
+      checkpointModel,
+      workspaceRootPath
     )
+    for (const blobMessage of checkpoint.blobMessages) {
+      this.emit(conversationId, blobMessage)
+    }
+    this.emit(conversationId, checkpoint.checkpoint)
     const outcome = await this.executePreparedToolInvocation(
       conversationId,
       registeredSession,
@@ -29467,15 +30064,16 @@ ${raw}
       (tool) => !earlyDispatchedToolIds.has(tool.activeToolCall.id)
     )
     if (hasNonEarlyDispatch) {
-      this.emit(
+      const checkpoint = this.createPendingToolCheckpointResponse(
         conversationId,
-        this.createPendingToolCheckpointResponse(
-          conversationId,
-          registeredSession,
-          checkpointModel,
-          workspaceRootPath
-        )
+        registeredSession,
+        checkpointModel,
+        workspaceRootPath
       )
+      for (const blobMessage of checkpoint.blobMessages) {
+        this.emit(conversationId, blobMessage)
+      }
+      this.emit(conversationId, checkpoint.checkpoint)
     }
     // Split-siblings (thinking + text + tool_use) already landed in
     // (this.contextState.getContextRecord(session.conversationId)!).messages during processAssistantTurnStream; we do not
@@ -32383,14 +32981,15 @@ ${raw}
         completedSession.conversationId
       )!
       const tokenDetails = this.resolveCheckpointTokenDetails(completedSession)
+      const summaryArchiveBlobs =
+        this.materializeSummaryArchiveBlobs(completedSession)
 
       const checkpoint = this.grpcService.createConversationCheckpointResponse(
         conversationId,
         completedSession.model,
         {
           messageBlobIds: completedCtx2.messageBlobIds,
-          usedTokens: tokenDetails.usedTokens,
-          maxTokens: tokenDetails.maxTokens,
+          tokenDetails,
           workspaceUri: completedSession.projectContext?.rootPath
             ? `file://${completedSession.projectContext.rootPath}`
             : undefined,
@@ -32400,8 +32999,12 @@ ${raw}
           todos: completedCtx2.todos,
           compactionHistory:
             this.extractCompactionHistoryForCheckpoint(completedSession),
+          summaryArchiveBlobIds: summaryArchiveBlobs.summaryArchiveBlobIds,
         }
       )
+      for (const blobMessage of summaryArchiveBlobs.blobMessages) {
+        this.emit(conversationId, blobMessage)
+      }
       this.emit(conversationId, checkpoint)
       this.logger.log(
         "Sent conversationCheckpointUpdate (post-tool continuation error)"
@@ -32834,7 +33437,7 @@ ${raw}
               contextLabel: `${continuationLabel}: ${conversationId}`,
               model: streamRoute.model,
               pendingToolUseIds: remainingPendingToolUseIds,
-              strategy: "reactive",
+              strategy: hints?.budgetOverride ? "reactive" : "auto",
             }
           ) as CreateMessageDto["messages"],
       })
@@ -32870,7 +33473,7 @@ ${raw}
               contextLabel: `${continuationLabel}: ${conversationId}`,
               model: streamRoute.model,
               pendingToolUseIds: remainingPendingToolUseIds,
-              strategy: "reactive",
+              strategy: hints?.budgetOverride ? "reactive" : "auto",
             }
           ) as CodexExecutionRequest["messages"],
       })
@@ -32953,7 +33556,7 @@ ${raw}
               model: streamRoute.model,
               pendingToolUseIds: remainingPendingToolUseIds,
               toolDefinitions: continuationTools,
-              strategy: "reactive",
+              strategy: hints?.budgetOverride ? "reactive" : "auto",
             }
           )
         },

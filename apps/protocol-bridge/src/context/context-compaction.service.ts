@@ -113,28 +113,14 @@ export class ContextCompactionService {
   private readonly SUMMARY_TOKEN_BUDGET = 20_000
   private readonly ATTACHMENT_TOKEN_BUDGET = 2200
   /**
-   * Fraction of the pressure budget that a compaction retains as the recent
-   * window. The pressure budget is the *trigger* (compact when projected
-   * exceeds it); retaining right up to it would leave the post-compaction
-   * projection sitting at the trigger again, so the very next tool result
-   * re-fires compaction — thrashing that regenerates the LLM summary every few
-   * K of growth and compounds summary loss (summary-of-summary).
-   *
-   * 0.8 proved insufficient: it leaves only ~20% headroom, and a single
-   * autonomous turn's tool-result burst (cc budgets ~15K, large reads spike
-   * 20K+) refills it almost immediately. A live log showed two compactions
-   * 50s apart (+33K archived in between) — exactly this thrash, which is what
-   * compounds and flattens the summary across epochs. Claude Code avoids this
-   * structurally: it fires at ~93% then does a FULL compaction that drops to a
-   * SMALL post-compaction size, so it rarely re-compacts. The bridge keeps a
-   * large recent window verbatim, so it must instead leave a turn-burst-proof
-   * headroom: 0.6 keeps ~40% of the budget free (e.g. ~65K of a ~162K budget)
-   * so a normal turn cannot re-cross the trigger, making compaction rare (and
-   * therefore re-summarization, and therefore flattening, rare) like cc. It
-   * still retains a generous verbatim window (~0.6 of the budget, far more
-   * than cc keeps).
+   * Full compaction must reset active model context to a small replacement
+   * window. Codex keeps at most ~20K of user messages beside the summary, and
+   * Claude Code full auto-compact keeps no large suffix at all. Retaining a
+   * percentage of a 272K window leaves 100K+ live history after compaction,
+   * which defeats the context-window boundary and causes stale-topic drift.
    */
-  private readonly COMPACTION_RETENTION_RATIO = 0.6
+  private readonly POST_COMPACT_TARGET_TOKENS = 40_000
+  private readonly POST_COMPACT_TARGET_RATIO = 0.35
   private readonly INVESTIGATION_MEMORY_ATTACHMENT_BONUS = 320
   private readonly SNIP_MIN_REMOVED_RECORDS = 2
   /**
@@ -438,22 +424,6 @@ export class ContextCompactionService {
       hardMaxTokens,
       options
     )
-    // Decouple the trigger budget from the retention budget (Option A).
-    //
-    // effectiveMaxTokens uses min(auto, predictive) so compaction can FIRE
-    // early (predictive's only intended job). But the retention window must
-    // NOT shrink just because the predictive threshold is low: predictive is
-    // designed purely to trigger sooner, not to discard more history. When
-    // both share effectiveMaxTokens, a low predictive limit (e.g. 134K vs
-    // auto 161K) silently pulls the retained recent window down with it,
-    // over-archiving ~17K of history that the auto budget would have kept.
-    //
-    // retentionMaxTokens therefore uses the auto-only budget (predictive
-    // excluded). The skip/trigger decision below stays on effectiveMaxTokens.
-    const retentionMaxTokens = this.resolvePressureBudget(hardMaxTokens, {
-      autoCompactTokenLimit: options.autoCompactTokenLimit,
-      systemPromptTokens: options.systemPromptTokens,
-    })
     const attachmentTokenBudget = this.resolveAttachmentBudget(
       hardMaxTokens,
       (snapshot.investigationSummaries?.length ?? 0) > 0
@@ -485,8 +455,7 @@ export class ContextCompactionService {
       effectiveMaxTokens,
       attachmentTokenBudget,
       options.strategy || "auto",
-      options.integrityMode,
-      retentionMaxTokens
+      options.integrityMode
     )
     if (!candidate) {
       this.logger.debug(
@@ -737,12 +706,7 @@ export class ContextCompactionService {
     effectiveMaxTokens: number,
     attachmentTokenBudget: number,
     strategy: ContextCompactionCommit["strategy"],
-    integrityMode?: "strict-adjacent" | "global",
-    // Auto-only budget for the retention window (Option A). Defaults to
-    // effectiveMaxTokens so existing callers (directional compaction) keep
-    // their current behaviour; the auto-compact path passes the larger
-    // auto-only budget so a low predictive trigger does not shrink retention.
-    retentionMaxTokens: number = effectiveMaxTokens
+    integrityMode?: "strict-adjacent" | "global"
   ): ContextCompactionCandidate | null {
     const commitId = randomUUID()
     const activeSlice = getRecordsAfterCompactBoundary(state.records)
@@ -774,19 +738,12 @@ export class ContextCompactionService {
       this.estimateBoundaryTokens(commitId) +
       this.estimateSummaryEnvelopeTokens(commitId) +
       attachmentTokens
-    // Retain to a fraction BELOW the pressure budget (the trigger) so the
-    // post-compaction projection has growth headroom and compaction does not
-    // immediately re-fire on the next tool result. Only the retention target
-    // is reduced; the trigger (skip decision in prepareCompactionCandidate)
-    // still uses the full effectiveMaxTokens.
-    //
-    // Option A: the retention window is sized off retentionMaxTokens (the
-    // auto-only budget), NOT effectiveMaxTokens (which may be pulled down by a
-    // low predictive trigger). This keeps the verbatim recent window stable
-    // regardless of how early predictive fired compaction.
-    const retentionBudget = Math.floor(
-      retentionMaxTokens * this.COMPACTION_RETENTION_RATIO
-    )
+    // Full auto compaction should leave a small active window, not a suffix
+    // proportional to the model's full context window. The budget below is
+    // the total post-compaction target before subtracting boundary, summary
+    // reserve, and live attachments.
+    const retentionBudget =
+      this.resolvePostCompactRetentionBudget(effectiveMaxTokens)
     const targetRecentTokens = Math.max(
       0,
       retentionBudget - envelopeTokens - summaryBudgetCap
@@ -820,7 +777,7 @@ export class ContextCompactionService {
     const truncationIndex = repairOrphanedRetainedResults
       ? budgetTruncationIndex
       : integrityTruncationIndex
-    if (truncationIndex <= 0 || truncationIndex >= sourceRecords.length) {
+    if (truncationIndex <= 0 || truncationIndex > sourceRecords.length) {
       this.logger.debug(
         `prepareCandidateForBudget: truncationIndex out of range ` +
           `(idx=${truncationIndex}, budgetIdx=${budgetTruncationIndex}, ` +
@@ -850,7 +807,7 @@ export class ContextCompactionService {
           `kept budget recent window; orphaned tool_results repaired at send`
       )
     }
-    if (archivedRecords.length === 0 || retainedRecords.length === 0) {
+    if (archivedRecords.length === 0) {
       this.logger.debug(
         `prepareCandidateForBudget: empty side after split ` +
           `(archived=${archivedRecords.length}, retained=${retainedRecords.length})`
@@ -1277,6 +1234,18 @@ export class ContextCompactionService {
     return pressureLimits.length > 0
       ? Math.min(...pressureLimits)
       : hardMaxTokens
+  }
+
+  private resolvePostCompactRetentionBudget(
+    effectiveMaxTokens: number
+  ): number {
+    const scaledTarget = Math.floor(
+      effectiveMaxTokens * this.POST_COMPACT_TARGET_RATIO
+    )
+    return Math.max(
+      this.MIN_REQUEST_BUDGET,
+      Math.min(this.POST_COMPACT_TARGET_TOKENS, scaledTarget)
+    )
   }
 
   private shouldCompact(

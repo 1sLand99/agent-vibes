@@ -30,6 +30,7 @@ export interface CodexRequestCapabilities {
   useResponsesLite: boolean
   supportsReasoningSummaries: boolean
   supportsOriginalImageDetail: boolean
+  supportsImages: boolean
   supportedServiceTiers?: readonly string[]
   contextTokenLimit?: number
   contextTokenLimitForMaxMode?: number
@@ -104,6 +105,7 @@ function createCodexRequestCapabilities(
     useResponsesLite: false,
     supportsReasoningSummaries: true,
     supportsOriginalImageDetail: true,
+    supportsImages: true,
     supportedServiceTiers: [],
     ...overrides,
     truncationPolicy: overrides.truncationPolicy
@@ -584,7 +586,7 @@ const CODEX_MODELS: Record<
       ["low", "medium", "high", "xhigh"],
       "medium"
     ),
-    codex: createCodexRequestCapabilities(),
+    codex: createCodexRequestCapabilities({ supportsImages: false }),
   },
   "gpt-5.5": {
     cloudCodeId: "gpt-5.5",
@@ -1331,6 +1333,7 @@ const DEFAULT_VISIBLE_CODEX_CURSOR_MODEL_IDS = new Set([
   "gpt-5.4",
   "gpt-5.4-mini",
   "gpt-5.3-codex",
+  "gpt-5.3-codex-spark",
   "gpt-5.2",
 ])
 
@@ -1344,6 +1347,7 @@ function withCodexCursorDisplayCapabilities(
 
   return {
     ...model,
+    supportsImages: capabilities.supportsImages,
     contextTokenLimit:
       capabilities.contextTokenLimit ?? model.contextTokenLimit,
     contextTokenLimitForMaxMode:

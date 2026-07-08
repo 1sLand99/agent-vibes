@@ -1,6 +1,14 @@
-import { ContextConversationState, extractText } from "./types"
+import {
+  ContextConversationState,
+  extractText,
+  isToolResultBlock,
+  normalizeContent,
+  type LooseMessageContent,
+} from "./types"
 
 const DEFAULT_MAX_QUOTED_USER_CHARS = 480
+const CODEX_SUMMARY_PREFIX_START =
+  "Another language model started to solve this problem"
 
 /**
  * Pull the latest real user-authored message from the live transcript.
@@ -24,11 +32,39 @@ export function extractLatestUserUtterance(
         : extractText(record.content)
     const trimmed = text?.trim()
     if (!trimmed) continue
+    if (containsToolResult(record.content)) continue
+    if (isSyntheticUserContextText(trimmed)) continue
     return trimmed.length > maxChars
       ? `${trimmed.slice(0, maxChars)}...`
       : trimmed
   }
   return undefined
+}
+
+function containsToolResult(content: LooseMessageContent): boolean {
+  if (typeof content === "string") return false
+  try {
+    return normalizeContent(content).some(isToolResultBlock)
+  } catch {
+    return false
+  }
+}
+
+function isSyntheticUserContextText(text: string): boolean {
+  const normalized = text.trimStart()
+  return (
+    normalized.startsWith("Current Codex turn context:") ||
+    normalized.startsWith(CODEX_SUMMARY_PREFIX_START) ||
+    normalized.startsWith("This is compressed historical context") ||
+    /^(?:\[Context (?:attachment|summary|collapse|boundary|attachment removed)|\[Result of an earlier tool call|\[tool_result stored\])/i.test(
+      normalized
+    ) ||
+    /^# AGENTS\.md instructions\b/i.test(normalized) ||
+    /^<environment_context>/i.test(normalized) ||
+    /^<turn_aborted>/i.test(normalized) ||
+    /\bDocumentId:\s*tool_result:/i.test(normalized) ||
+    /\/\.agent-vibes\/tool-results\//i.test(normalized)
+  )
 }
 
 /**

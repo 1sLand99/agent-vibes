@@ -16,6 +16,7 @@ const CODEX_UNKNOWN_MODEL_CAPABILITIES: CodexRequestCapabilities = {
   useResponsesLite: false,
   supportsReasoningSummaries: false,
   supportsOriginalImageDetail: false,
+  supportsImages: true,
   supportedServiceTiers: [],
 }
 
@@ -55,6 +56,7 @@ export function buildCodexRequest(
   const projection = projectCodexNativeRequest(request, modelName, {
     supportsOriginalImageDetail:
       effectiveCapabilities.supportsOriginalImageDetail === true,
+    supportsImages: effectiveCapabilities.supportsImages === true,
   })
 
   const reasoning = resolveReasoningForRequest(

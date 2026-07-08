@@ -254,8 +254,8 @@ export class ContextCompactRunnerService {
       .join("\n\n")
 
     return [
-      "You are summarizing the EARLIER portion of an ongoing conversation. The MOST RECENT messages are preserved verbatim immediately AFTER this summary and remain the authoritative record of the current task — this summary only supplies the earlier context they build on.",
-      "Capture the earlier technical details, code patterns, and architectural decisions thoroughly. Do NOT treat the end of this segment as the current state of the work: the preserved recent messages that follow, not this summary, define what is happening now and what comes next.",
+      "You are summarizing the EARLIER portion of an ongoing conversation. Any preserved messages after this summary remain the authoritative record of the current task; when no recent messages are preserved, the summary plus the latest user request defines the continuation.",
+      "Capture the earlier technical details, code patterns, and architectural decisions thoroughly. Do NOT treat stale earlier tasks as current work: preserved recent messages, or the latest user request when no recent messages are preserved, define what is happening now and what comes next.",
       "",
       "Before writing the summary, wrap your reasoning in <analysis> tags. In your analysis:",
       "1. Walk every message chronologically. For each section identify the user's explicit requests, the assistant's approach, key decisions, technical concepts and code patterns, file names, full code snippets, function signatures, file edits, errors and how they were fixed, and any user feedback that redirected the work.",

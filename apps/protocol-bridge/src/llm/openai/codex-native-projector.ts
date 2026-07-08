@@ -24,6 +24,7 @@ export interface CodexNativeProjection {
 
 export interface CodexNativeProjectionOptions {
   supportsOriginalImageDetail?: boolean
+  supportsImages?: boolean
 }
 
 type CodexProjectedToolCallType = "function" | "custom" | "tool_search"
@@ -73,6 +74,8 @@ const UNSUPPORTED_LOW_DETAIL_PLACEHOLDER =
   "image content omitted because detail 'low' is not supported; use 'high', 'original', or 'auto'"
 const IMAGE_PROCESSING_ERROR_PLACEHOLDER =
   "image content omitted because it could not be processed"
+const UNSUPPORTED_IMAGE_MODEL_PLACEHOLDER =
+  "image content omitted because the selected model does not support image inputs"
 const DEFAULT_IMAGE_DETAIL = "high"
 
 const TOOL_SCHEMA_DOC_KEYS = new Set([
@@ -565,6 +568,9 @@ function projectImageContent(
   const imageUrl = resolveImageUrl(block)
   if (!imageUrl) {
     return undefined
+  }
+  if (options.supportsImages === false) {
+    return { type: "input_text", text: UNSUPPORTED_IMAGE_MODEL_PLACEHOLDER }
   }
   if (isRemoteImageUrl(imageUrl)) {
     return { type: "input_text", text: REMOTE_IMAGE_URL_PLACEHOLDER }
