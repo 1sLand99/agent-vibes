@@ -6,6 +6,7 @@ import { BridgeManager } from "./services/bridge-manager"
 import { CertManager } from "./services/cert-manager"
 import { ConfigManager } from "./services/config-manager"
 import { CursorPatchService } from "./services/cursor-patch"
+import { CursorPatchManagerService } from "./services/cursor-patch-manager"
 import { ExtensionUpdateService } from "./services/extension-update"
 import { NetworkManager } from "./services/network-manager"
 import { logger } from "./utils/logger"
@@ -37,6 +38,7 @@ export async function activate(
   network.setExtensionPath(context.extensionPath)
   network.setPort(config.port)
   const cursorPatch = new CursorPatchService(logger)
+  const cursorPatchManager = new CursorPatchManagerService()
   const cert = new CertManager(config)
   const updater = new ExtensionUpdateService(context)
 
@@ -45,7 +47,10 @@ export async function activate(
     const bridgeEndpointPatch = cursorPatch.getBridgeEndpointPatchStatus(
       config.port
     )
-    if (bridgeEndpointPatch.applied) return "patched"
+    if (bridgeEndpointPatch.applied) {
+      cursorPatchManager.ensureBridgeEndpointPatchTracked(bridgeEndpointPatch)
+      return "patched"
+    }
     if (network?.isForwardingActive()) return "forwarding"
     return "unwired"
   }
@@ -58,7 +63,12 @@ export async function activate(
     if (config.trafficMode !== "cursorPatch") return
 
     const status = cursorPatch.getBridgeEndpointPatchStatus(config.port)
-    if (!status.fileExists || !status.canApply || status.applied) {
+    if (!status.fileExists || !status.canApply) {
+      statusIndicator?.update(bridge?.state ?? "stopped")
+      return
+    }
+    if (status.applied && !status.requiresPortUpdate) {
+      cursorPatchManager.ensureBridgeEndpointPatchTracked(status)
       statusIndicator?.update(bridge?.state ?? "stopped")
       return
     }
@@ -71,6 +81,12 @@ export async function activate(
       statusIndicator?.update(bridge?.state ?? "stopped")
       return
     }
+
+    const patchedStatus = cursorPatch.getBridgeEndpointPatchStatus(
+      config.port,
+      { force: true }
+    )
+    cursorPatchManager.recordBridgeEndpointPatchSuccess(patchedStatus)
 
     logger.info("Cursor direct connection patch applied from traffic mode")
     statusIndicator?.update(bridge?.state ?? "stopped")

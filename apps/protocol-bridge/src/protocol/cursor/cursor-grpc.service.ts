@@ -64,6 +64,7 @@ import {
   ComputerUseToolCallSchema,
   // ConversationStateStructure
   ConversationStateStructureSchema,
+  type ConversationStep,
   ConversationStepSchema,
   ConversationSummarySchema,
   ConversationTokenDetailsSchema,
@@ -135,10 +136,19 @@ import {
   GlobToolResultSchema,
   GlobToolSuccessSchema,
   GrepArgsSchema,
+  GrepContentMatchSchema,
+  GrepContentResultSchema,
+  GrepCountResultSchema,
   GrepErrorSchema,
+  GrepFileCountSchema,
+  GrepFileMatchSchema,
+  GrepFilesResultSchema,
   GrepResultSchema,
   GrepSuccessSchema,
   GrepToolCallSchema,
+  type GrepUnionResult,
+  GrepUnionResultSchema,
+  HookAdditionalContextSchema,
   HeartbeatUpdateSchema,
   type InteractionQuery,
   InteractionQuerySchema,
@@ -2292,6 +2302,227 @@ export class CursorGrpcService {
     })
   }
 
+  normalizeConversationStepForEncoding(value: unknown): ConversationStep {
+    return create(
+      ConversationStepSchema,
+      this.normalizeConversationStepShape(value) as never
+    )
+  }
+
+  private normalizeConversationStepShape(value: unknown): unknown {
+    if (!value || typeof value !== "object" || value instanceof Uint8Array) {
+      return value
+    }
+
+    const record = value as Record<string, unknown>
+    const message = record.message
+    if (!message || typeof message !== "object") {
+      return value
+    }
+
+    const oneOf = message as { case?: unknown; value?: unknown }
+    if (oneOf.case !== "toolCall") {
+      return value
+    }
+
+    return {
+      ...record,
+      message: {
+        case: "toolCall" as const,
+        value: this.normalizeToolCallForEncoding(oneOf.value),
+      },
+    }
+  }
+
+  private normalizeToolCallForEncoding(value: unknown): ToolCall {
+    if (!value || typeof value !== "object") {
+      return create(ToolCallSchema, {})
+    }
+
+    const record = value as Record<string, unknown>
+    const tool = record.tool
+    if (!tool || typeof tool !== "object") {
+      return create(ToolCallSchema, value as never)
+    }
+
+    const oneOf = tool as { case?: unknown; value?: unknown }
+    if (oneOf.case === "grepToolCall") {
+      return create(ToolCallSchema, {
+        ...this.normalizeToolCallMetadata(record),
+        tool: {
+          case: "grepToolCall" as const,
+          value: this.normalizeGrepToolCallForEncoding(oneOf.value),
+        },
+      })
+    }
+
+    if (oneOf.case === "taskToolCall") {
+      return create(ToolCallSchema, {
+        ...this.normalizeToolCallMetadata(record),
+        tool: {
+          case: "taskToolCall" as const,
+          value: this.normalizeTaskToolCallForEncoding(oneOf.value),
+        },
+      })
+    }
+
+    return create(ToolCallSchema, value as never)
+  }
+
+  private normalizeToolCallMetadata(record: Record<string, unknown>) {
+    return {
+      hookAdditionalContexts: this.normalizeHookAdditionalContexts(
+        record.hookAdditionalContexts ?? record.hook_additional_contexts
+      ),
+      toolCallId:
+        safeString(record.toolCallId ?? record.tool_call_id).trim() ||
+        undefined,
+      startedAtMs: this.normalizeOptionalBigInt(
+        record.startedAtMs ?? record.started_at_ms
+      ),
+      completedAtMs: this.normalizeOptionalBigInt(
+        record.completedAtMs ?? record.completed_at_ms
+      ),
+    }
+  }
+
+  private normalizeHookAdditionalContexts(value: unknown) {
+    return this.toRecordArray(value).map((entry) =>
+      create(HookAdditionalContextSchema, {
+        hookEventName: safeString(entry.hookEventName ?? entry.hook_event_name),
+        content: safeString(entry.content),
+      })
+    )
+  }
+
+  private normalizeGrepToolCallForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(GrepToolCallSchema, {})
+    }
+
+    const record = value as Record<string, unknown>
+    const result = record.result
+    const resultRecord =
+      result && typeof result === "object"
+        ? (result as Record<string, unknown>)
+        : undefined
+    const resultOneOf = resultRecord?.result
+    const normalizedResult =
+      resultOneOf &&
+      typeof resultOneOf === "object" &&
+      (resultOneOf as { case?: unknown }).case === "success"
+        ? create(GrepResultSchema, {
+            result: {
+              case: "success" as const,
+              value: this.normalizeGrepSuccessForEncoding(
+                (resultOneOf as { value?: unknown }).value
+              ),
+            },
+          })
+        : result
+          ? create(GrepResultSchema, result as never)
+          : undefined
+
+    return create(GrepToolCallSchema, {
+      args: record.args
+        ? create(GrepArgsSchema, record.args as never)
+        : undefined,
+      result: normalizedResult,
+    })
+  }
+
+  private normalizeGrepSuccessForEncoding(value: unknown) {
+    const record =
+      value && typeof value === "object"
+        ? (value as Record<string, unknown>)
+        : {}
+    const workspaceResults = this.normalizeGrepWorkspaceResults(
+      record.workspaceResults ?? record.workspace_results
+    )
+    const activeEditorResult = this.normalizeGrepUnionResult(
+      record.activeEditorResult ?? record.active_editor_result
+    )
+
+    return create(GrepSuccessSchema, {
+      pattern: safeString(record.pattern),
+      path: safeString(record.path),
+      outputMode: safeString(record.outputMode ?? record.output_mode),
+      workspaceResults,
+      activeEditorResult,
+    })
+  }
+
+  private normalizeTaskToolCallForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(TaskToolCallSchema, {})
+    }
+
+    const record = value as Record<string, unknown>
+    const result = record.result
+    const resultRecord =
+      result && typeof result === "object"
+        ? (result as Record<string, unknown>)
+        : undefined
+    const resultOneOf = resultRecord?.result
+    const normalizedResult =
+      resultOneOf &&
+      typeof resultOneOf === "object" &&
+      (resultOneOf as { case?: unknown }).case === "success"
+        ? create(TaskResultSchema, {
+            result: {
+              case: "success" as const,
+              value: this.normalizeTaskSuccessForEncoding(
+                (resultOneOf as { value?: unknown }).value
+              ),
+            },
+          })
+        : result
+          ? create(TaskResultSchema, result as never)
+          : undefined
+
+    return create(TaskToolCallSchema, {
+      args: record.args
+        ? create(TaskArgsSchema, record.args as never)
+        : undefined,
+      result: normalizedResult,
+    })
+  }
+
+  private normalizeTaskSuccessForEncoding(value: unknown) {
+    const record =
+      value && typeof value === "object"
+        ? (value as Record<string, unknown>)
+        : {}
+
+    return create(TaskSuccessSchema, {
+      conversationSteps: this.normalizeTaskConversationSteps(
+        record.conversationSteps ?? record.conversation_steps
+      ),
+      agentId:
+        safeString(record.agentId ?? record.agent_id).trim() || undefined,
+      isBackground: this.parseBooleanFlag(
+        record.isBackground ?? record.is_background
+      ),
+      durationMs: this.normalizeOptionalBigInt(
+        record.durationMs ?? record.duration_ms
+      ),
+      resultSuffix:
+        safeString(record.resultSuffix ?? record.result_suffix).trim() ||
+        undefined,
+      backgroundReason: this.parseOptionalNonNegativeInt(
+        record.backgroundReason ?? record.background_reason
+      ),
+      transcriptPath:
+        safeString(record.transcriptPath ?? record.transcript_path).trim() ||
+        undefined,
+    })
+  }
+
+  private normalizeTaskConversationSteps(value: unknown): ConversationStep[] {
+    if (!Array.isArray(value)) return []
+    return value.map((step) => this.normalizeConversationStepForEncoding(step))
+  }
+
   // ─── ExecServerMessage (Agent tool call dispatch) ────────────
 
   /**
@@ -3382,78 +3613,191 @@ export class CursorGrpcService {
     )
   }
 
-  private normalizeGrepUnionResult(value: unknown):
-    | {
-        result: {
-          case: "count" | "files" | "content"
-          value: Record<string, unknown>
-        }
-      }
-    | undefined {
+  private normalizeGrepUnionResult(
+    value: unknown
+  ): GrepUnionResult | undefined {
     if (!value || typeof value !== "object") return undefined
 
     const record = value as Record<string, unknown>
     const oneOf = record.result
     if (oneOf && typeof oneOf === "object") {
       const result = oneOf as { case?: unknown; value?: unknown }
-      if (
-        (result.case === "count" ||
-          result.case === "files" ||
-          result.case === "content") &&
-        result.value &&
-        typeof result.value === "object"
-      ) {
-        return {
+      if (result.case === "count") {
+        return create(GrepUnionResultSchema, {
           result: {
-            case: result.case,
-            value: result.value as Record<string, unknown>,
+            case: "count",
+            value: this.normalizeGrepCountResult(result.value),
           },
-        }
+        })
+      }
+      if (result.case === "files") {
+        return create(GrepUnionResultSchema, {
+          result: {
+            case: "files",
+            value: this.normalizeGrepFilesResult(result.value),
+          },
+        })
+      }
+      if (result.case === "content") {
+        return create(GrepUnionResultSchema, {
+          result: {
+            case: "content",
+            value: this.normalizeGrepContentResult(result.value),
+          },
+        })
       }
     }
 
     const directCount = record.count
     if (directCount && typeof directCount === "object") {
-      return {
+      return create(GrepUnionResultSchema, {
         result: {
           case: "count",
-          value: directCount as Record<string, unknown>,
+          value: this.normalizeGrepCountResult(directCount),
         },
-      }
+      })
     }
 
     const directFiles = record.files
     if (directFiles && typeof directFiles === "object") {
-      return {
+      return create(GrepUnionResultSchema, {
         result: {
           case: "files",
-          value: directFiles as Record<string, unknown>,
+          value: this.normalizeGrepFilesResult(directFiles),
         },
-      }
+      })
     }
 
     const directContent = record.content
     if (directContent && typeof directContent === "object") {
-      return {
+      return create(GrepUnionResultSchema, {
         result: {
           case: "content",
-          value: directContent as Record<string, unknown>,
+          value: this.normalizeGrepContentResult(directContent),
         },
-      }
+      })
     }
 
     return undefined
   }
 
-  private normalizeGrepWorkspaceResults(value: unknown): Record<
-    string,
-    {
-      result: {
-        case: "count" | "files" | "content"
-        value: Record<string, unknown>
-      }
-    }
-  > {
+  private normalizeGrepCountResult(value: unknown) {
+    const record =
+      value && typeof value === "object"
+        ? (value as Record<string, unknown>)
+        : {}
+    return create(GrepCountResultSchema, {
+      counts: this.toRecordArray(record.counts).map((entry) =>
+        create(GrepFileCountSchema, {
+          file: safeString(entry.file),
+          count: this.parseOptionalNonNegativeInt(entry.count) ?? 0,
+        })
+      ),
+      totalFiles:
+        this.parseOptionalNonNegativeInt(
+          record.totalFiles ?? record.total_files
+        ) ?? 0,
+      totalMatches:
+        this.parseOptionalNonNegativeInt(
+          record.totalMatches ?? record.total_matches
+        ) ?? 0,
+      clientTruncated: this.parseBooleanFlag(
+        record.clientTruncated ?? record.client_truncated
+      ),
+      ripgrepTruncated: this.parseBooleanFlag(
+        record.ripgrepTruncated ?? record.ripgrep_truncated
+      ),
+      headLimitApplied: this.parseOptionalNonNegativeInt(
+        record.headLimitApplied ?? record.head_limit_applied
+      ),
+      offsetApplied: this.parseOptionalNonNegativeInt(
+        record.offsetApplied ?? record.offset_applied
+      ),
+    })
+  }
+
+  private normalizeGrepFilesResult(value: unknown) {
+    const record =
+      value && typeof value === "object"
+        ? (value as Record<string, unknown>)
+        : {}
+    const files = Array.isArray(record.files)
+      ? record.files.map((entry) => safeString(entry)).filter(Boolean)
+      : []
+    return create(GrepFilesResultSchema, {
+      files,
+      totalFiles:
+        this.parseOptionalNonNegativeInt(
+          record.totalFiles ?? record.total_files
+        ) ?? files.length,
+      clientTruncated: this.parseBooleanFlag(
+        record.clientTruncated ?? record.client_truncated
+      ),
+      ripgrepTruncated: this.parseBooleanFlag(
+        record.ripgrepTruncated ?? record.ripgrep_truncated
+      ),
+      headLimitApplied: this.parseOptionalNonNegativeInt(
+        record.headLimitApplied ?? record.head_limit_applied
+      ),
+      offsetApplied: this.parseOptionalNonNegativeInt(
+        record.offsetApplied ?? record.offset_applied
+      ),
+    })
+  }
+
+  private normalizeGrepContentResult(value: unknown) {
+    const record =
+      value && typeof value === "object"
+        ? (value as Record<string, unknown>)
+        : {}
+    const matches = this.toRecordArray(record.matches).map((fileMatch) =>
+      create(GrepFileMatchSchema, {
+        file: safeString(fileMatch.file),
+        matches: this.toRecordArray(fileMatch.matches).map((match) =>
+          create(GrepContentMatchSchema, {
+            lineNumber:
+              this.parseOptionalNonNegativeInt(
+                match.lineNumber ?? match.line_number
+              ) ?? 0,
+            content: safeString(match.content),
+            contentTruncated: this.parseBooleanFlag(
+              match.contentTruncated ?? match.content_truncated
+            ),
+            isContextLine: this.parseBooleanFlag(
+              match.isContextLine ?? match.is_context_line
+            ),
+          })
+        ),
+      })
+    )
+    return create(GrepContentResultSchema, {
+      matches,
+      totalLines:
+        this.parseOptionalNonNegativeInt(
+          record.totalLines ?? record.total_lines
+        ) ?? 0,
+      totalMatchedLines:
+        this.parseOptionalNonNegativeInt(
+          record.totalMatchedLines ?? record.total_matched_lines
+        ) ?? 0,
+      clientTruncated: this.parseBooleanFlag(
+        record.clientTruncated ?? record.client_truncated
+      ),
+      ripgrepTruncated: this.parseBooleanFlag(
+        record.ripgrepTruncated ?? record.ripgrep_truncated
+      ),
+      headLimitApplied: this.parseOptionalNonNegativeInt(
+        record.headLimitApplied ?? record.head_limit_applied
+      ),
+      offsetApplied: this.parseOptionalNonNegativeInt(
+        record.offsetApplied ?? record.offset_applied
+      ),
+    })
+  }
+
+  private normalizeGrepWorkspaceResults(
+    value: unknown
+  ): Record<string, GrepUnionResult> {
     if (!value) return {}
 
     const entries: Array<[string, unknown]> = []
@@ -3469,15 +3813,7 @@ export class CursorGrpcService {
       )
     }
 
-    const normalized: Record<
-      string,
-      {
-        result: {
-          case: "count" | "files" | "content"
-          value: Record<string, unknown>
-        }
-      }
-    > = {}
+    const normalized: Record<string, GrepUnionResult> = {}
 
     for (const [key, item] of entries) {
       const normalizedKey = key.trim()
@@ -8387,15 +8723,11 @@ export class CursorGrpcService {
 
     if (family === "task") {
       const taskSuccessExtra = extraData?.taskSuccess
-      const conversationSteps = Array.isArray(
-        taskSuccessExtra?.conversationSteps
+      const conversationSteps = this.normalizeTaskConversationSteps(
+        taskSuccessExtra?.conversationSteps ??
+          args.conversation_steps ??
+          args.conversationSteps
       )
-        ? taskSuccessExtra.conversationSteps
-        : Array.isArray(args.conversation_steps)
-          ? args.conversation_steps
-          : Array.isArray(args.conversationSteps)
-            ? args.conversationSteps
-            : []
       const isBackground =
         taskSuccessExtra?.isBackground ??
         !!(args.is_background ?? args.isBackground)

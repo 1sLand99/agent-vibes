@@ -268,6 +268,11 @@ export function registerCommands(
             vscode.ConfigurationTarget.Global
           )
 
+        const status = cursorPatch.getBridgeEndpointPatchStatus(config.port, {
+          force: true,
+        })
+        cursorPatchManager.recordBridgeEndpointPatchSuccess(status)
+
         let message =
           result.restartRequired === true
             ? t("patches.bridgeEndpointApplied")

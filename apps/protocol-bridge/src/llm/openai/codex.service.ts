@@ -4084,9 +4084,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           }
         }
 
-        // 网关瞬时错误（502 / 503 / 504）：常见于 "upstream connect error" 或
-        // "reset reason: connection termination" —— 上游边缘代理把 TCP 连接掐
-        // 断，并不代表账号不可用。立即 markAccountCooldown 会让单账号场景
+        // 网关/上游瞬时错误（500 / 502 / 503 / 504）：常见于 server overloaded、
+        // "upstream connect error" 或 "reset reason: connection termination"。
+        // 这类错误不代表账号不可用。立即 markAccountCooldown 会让单账号场景
         // 1 分钟内完全失活、整个 turn 直接 fail（参见 bridge 日志中
         // delete_file -> PostToolContinuation 的 503 中断）。
         // 策略：第一次失败时先在同一 slot 上短暂 backoff 后重试一次；

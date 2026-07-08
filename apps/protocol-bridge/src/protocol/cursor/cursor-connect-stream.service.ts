@@ -9881,15 +9881,15 @@ export class CursorConnectStreamService {
     const raw = errorMessage.trim().slice(0, 4000)
 
     return (
-      `⚠️ Backend request failed
+      `Model request failed
 
 ` +
-      `backend=${backendLabel}
+      `Provider: ${backendLabel}
 ` +
-      `model=${backendModel}
+      `Model: ${backendModel}
 
 ` +
-      `Raw error:
+      `Error:
 ` +
       `\`\`\`text
 ${raw}
@@ -10470,9 +10470,11 @@ ${raw}
       blobMessages.push(userBlob.buffer)
 
       const stepBlobIds = turn.steps.map((step) => {
+        const normalizedStep =
+          this.grpcService.normalizeConversationStepForEncoding(step)
         const stepBlob = this.createProtocolBlobSetMessage(
           ConversationStepSchema,
-          step
+          normalizedStep
         )
         blobMessages.push(stepBlob.buffer)
         return stepBlob.blobId
@@ -32962,53 +32964,20 @@ ${raw}
       return true
     }
 
-    // Send checkpoint before turn_ended (required for rollback consistency).
-    // Matches the pattern in handleChatMessage, emitAgentFinalTextResponse,
-    // and handleToolResultContinuation to ensure all turn-ending paths
-    // produce a valid conversationCheckpointUpdate.
     const session = this.sessionManager.getSession(conversationId)
     if (session) {
-      const completedTurn = this.recordCompletedTurnIfNeeded(
+      await this.emitAgentFinalTextResponse(
         session,
-        true,
-        `post-tool continuation error: ${conversationId}`
+        this.buildBackendErrorMessage(
+          backend,
+          context.backendModel,
+          errorMessage
+        )
       )
-      for (const blobMessage of completedTurn.blobMessages) {
-        this.emit(conversationId, blobMessage)
-      }
-      const completedSession = completedTurn.session
-      const completedCtx2 = this.contextState.getContextRecord(
-        completedSession.conversationId
-      )!
-      const tokenDetails = this.resolveCheckpointTokenDetails(completedSession)
-      const summaryArchiveBlobs =
-        this.materializeSummaryArchiveBlobs(completedSession)
-
-      const checkpoint = this.grpcService.createConversationCheckpointResponse(
-        conversationId,
-        completedSession.model,
-        {
-          messageBlobIds: completedCtx2.messageBlobIds,
-          tokenDetails,
-          workspaceUri: completedSession.projectContext?.rootPath
-            ? `file://${completedSession.projectContext.rootPath}`
-            : undefined,
-          readPaths: Array.from(completedCtx2.readPaths),
-          fileStates: Object.fromEntries(completedCtx2.fileStates),
-          turns: completedCtx2.turns,
-          todos: completedCtx2.todos,
-          compactionHistory:
-            this.extractCompactionHistoryForCheckpoint(completedSession),
-          summaryArchiveBlobIds: summaryArchiveBlobs.summaryArchiveBlobIds,
-        }
-      )
-      for (const blobMessage of summaryArchiveBlobs.blobMessages) {
-        this.emit(conversationId, blobMessage)
-      }
-      this.emit(conversationId, checkpoint)
       this.logger.log(
-        "Sent conversationCheckpointUpdate (post-tool continuation error)"
+        "Sent visible backend error response (post-tool continuation error)"
       )
+      return false
     }
 
     const heartbeat = this.grpcService.createServerHeartbeatResponse()

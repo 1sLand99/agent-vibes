@@ -1178,19 +1178,35 @@ export class DashboardPanel {
       this.cursorPatchService.getIdleExtensionHostKillerStatus()
     const bridgeEndpointPatchStatus =
       this.cursorPatchService.getBridgeEndpointPatchStatus(this.config.port)
+    const bridgeEndpointLifecycle =
+      this.cursorPatchManager.getBridgeEndpointLifecycleState(
+        bridgeEndpointPatchStatus
+      )
+    const bridgeEndpointUpdateStale =
+      bridgeEndpointLifecycle.state === "stale_after_cursor_update"
+    const bridgeEndpointUpdateUnsupported =
+      bridgeEndpointLifecycle.state === "unsupported_cursor_update"
     const bridgeEndpointPatchValue = !bridgeEndpointPatchStatus.fileExists
       ? translateNotFound(locale, "Not found")
       : bridgeEndpointPatchStatus.applied
         ? translateOnOff(locale, "On")
-        : bridgeEndpointPatchStatus.requiresPortUpdate
+        : bridgeEndpointUpdateStale
           ? locale === "zh"
-            ? "需更新"
-            : "Update needed"
-          : bridgeEndpointPatchStatus.canApply
-            ? translateOnOff(locale, "Off")
-            : locale === "zh"
-              ? "不可用"
-              : "Unavailable"
+            ? "更新后失效"
+            : "Stale after update"
+          : bridgeEndpointUpdateUnsupported
+            ? locale === "zh"
+              ? "版本不兼容"
+              : "Unsupported build"
+            : bridgeEndpointPatchStatus.requiresPortUpdate
+              ? locale === "zh"
+                ? "需更新"
+                : "Update needed"
+              : bridgeEndpointPatchStatus.canApply
+                ? translateOnOff(locale, "Off")
+                : locale === "zh"
+                  ? "不可用"
+                  : "Unavailable"
     const bridgeEndpointCoverage = bridgeEndpointPatchStatus.coverage
     const bridgeEndpointCoverageHint =
       locale === "zh"
@@ -1204,17 +1220,25 @@ export class DashboardPanel {
         ? locale === "zh"
           ? `Cursor 已直连 ${bridgeEndpointPatchStatus.endpointUrl}，无需 hosts 或本机端口转发。`
           : `Cursor connects directly to ${bridgeEndpointPatchStatus.endpointUrl}; hosts and local port forwarding are not required.`
-        : bridgeEndpointPatchStatus.requiresPortUpdate
+        : bridgeEndpointUpdateStale
           ? locale === "zh"
-            ? `当前补丁使用 ${bridgeEndpointPatchStatus.currentUrl || "旧地址"}，点击应用更新到 ${bridgeEndpointPatchStatus.endpointUrl}。`
-            : `Current patch uses ${bridgeEndpointPatchStatus.currentUrl || "an older endpoint"}; apply to update it to ${bridgeEndpointPatchStatus.endpointUrl}.`
-          : bridgeEndpointPatchStatus.canApply
+            ? `检测到 Cursor 已从 ${bridgeEndpointLifecycle.lastInstallVersion || "旧版本"} 更新到 ${bridgeEndpointLifecycle.currentInstallVersion || "当前版本"}，直连补丁需要重新应用。`
+            : `Cursor changed from ${bridgeEndpointLifecycle.lastInstallVersion || "an earlier build"} to ${bridgeEndpointLifecycle.currentInstallVersion || "the current build"}; re-apply the direct connection patch.`
+          : bridgeEndpointUpdateUnsupported
             ? locale === "zh"
-              ? `将 Cursor 请求写入 ${bridgeEndpointPatchStatus.endpointUrl}，不再需要 hosts 或本机端口转发。`
-              : `Routes Cursor requests to ${bridgeEndpointPatchStatus.endpointUrl} without hosts or local port forwarding.`
-            : locale === "zh"
-              ? "当前 Cursor 构建未匹配到可应用的接入地址。"
-              : "No matching endpoint location was found in this Cursor build."
+              ? `检测到 Cursor 已更新，但当前构建未匹配到安全的直连补丁位置。请等待兼容更新，或临时使用其它接入方式。`
+              : `Cursor was updated, but this build does not expose a safe direct patch target. Wait for compatibility support or temporarily use another connection mode.`
+            : bridgeEndpointPatchStatus.requiresPortUpdate
+              ? locale === "zh"
+                ? `当前补丁使用 ${bridgeEndpointPatchStatus.currentUrl || "旧地址"}，点击应用更新到 ${bridgeEndpointPatchStatus.endpointUrl}。`
+                : `Current patch uses ${bridgeEndpointPatchStatus.currentUrl || "an older endpoint"}; apply to update it to ${bridgeEndpointPatchStatus.endpointUrl}.`
+              : bridgeEndpointPatchStatus.canApply
+                ? locale === "zh"
+                  ? `将 Cursor 请求写入 ${bridgeEndpointPatchStatus.endpointUrl}，不再需要 hosts 或本机端口转发。`
+                  : `Routes Cursor requests to ${bridgeEndpointPatchStatus.endpointUrl} without hosts or local port forwarding.`
+                : locale === "zh"
+                  ? "当前 Cursor 构建未匹配到可应用的接入地址。"
+                  : "No matching endpoint location was found in this Cursor build."
     const bridgeEndpointPatchHint =
       bridgeEndpointPatchStatus.fileExists &&
       bridgeEndpointPatchStatus.coverage.workbenchFiles > 0
@@ -1222,9 +1246,9 @@ export class DashboardPanel {
         : bridgeEndpointPatchBaseHint
     const canApplyBridgeEndpointPatch =
       bridgeEndpointPatchStatus.fileExists &&
-      bridgeEndpointPatchStatus.canApply &&
-      (!bridgeEndpointPatchStatus.applied ||
-        bridgeEndpointPatchStatus.requiresPortUpdate)
+      (bridgeEndpointLifecycle.canReapply ||
+        (bridgeEndpointPatchStatus.canApply &&
+          !bridgeEndpointPatchStatus.applied))
     const idlePatchValue = !idlePatchStatus.fileExists
       ? translateNotFound(locale, "Not found")
       : idlePatchStatus.applied
@@ -1294,6 +1318,7 @@ export class DashboardPanel {
         requiresPortUpdate: bridgeEndpointPatchStatus.requiresPortUpdate,
         endpointUrl: bridgeEndpointPatchStatus.endpointUrl,
         coverage: bridgeEndpointPatchStatus.coverage,
+        lifecycle: bridgeEndpointLifecycle,
       },
       setup: this.getOverviewPayload(channelAccountsData, locale),
       versions: this.versionInfo,

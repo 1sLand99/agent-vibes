@@ -22,7 +22,12 @@ export function isCodexRateLimitRetryStatus(statusCode: number): boolean {
 }
 
 export function isCodexGatewayTransientStatus(statusCode: number): boolean {
-  return statusCode === 502 || statusCode === 503 || statusCode === 504
+  return (
+    statusCode === 500 ||
+    statusCode === 502 ||
+    statusCode === 503 ||
+    statusCode === 504
+  )
 }
 
 export function shouldRefreshCodexTokenForStatus(
