@@ -1,3 +1,5 @@
+import { createHash } from "crypto"
+import { CONTEXT_MICROCOMPACT_CLEARED_MARKER } from "../../context/context-microcompact-marker"
 import type { CodexInputItem } from "./codex-native-types"
 import { isCodexApiVisibleInputItem } from "./codex-response-items"
 
@@ -25,6 +27,16 @@ export interface CodexInputMismatch {
   mismatchIndex?: number
   baselineType?: string
   requestType?: string
+  baselineDetail?: CodexInputMismatchItemDetail
+  requestDetail?: CodexInputMismatchItemDetail
+}
+
+export interface CodexInputMismatchItemDetail {
+  type: string
+  role?: string
+  signature: string
+  jsonLength: number
+  preview?: string
 }
 
 export interface CodexContinuationState {
@@ -136,8 +148,10 @@ export function getCodexIncrementalInput(
 
   for (let index = 0; index < baseline.length; index++) {
     if (
-      stableCodexJsonStringify(requestInput[index]) !==
-      stableCodexJsonStringify(baseline[index])
+      !codexInputItemsEquivalentForContinuation(
+        baseline[index],
+        requestInput[index]
+      )
     ) {
       return {
         ok: false,
@@ -148,6 +162,8 @@ export function getCodexIncrementalInput(
           mismatchIndex: index,
           baselineType: getCodexInputItemType(baseline[index]),
           requestType: getCodexInputItemType(requestInput[index]),
+          baselineDetail: summarizeCodexInputMismatchItem(baseline[index]),
+          requestDetail: summarizeCodexInputMismatchItem(requestInput[index]),
         },
       }
     }
@@ -261,12 +277,171 @@ function diffCodexStaticRequestKeys(
   return changed
 }
 
+function codexInputItemsEquivalentForContinuation(
+  baseline: CodexInputItem | undefined,
+  request: CodexInputItem | undefined
+): boolean {
+  if (
+    stableCodexJsonStringify(request) === stableCodexJsonStringify(baseline)
+  ) {
+    return true
+  }
+  return areMicrocompactedToolOutputsEquivalent(baseline, request)
+}
+
+function areMicrocompactedToolOutputsEquivalent(
+  baseline: CodexInputItem | undefined,
+  request: CodexInputItem | undefined
+): boolean {
+  if (!baseline || !request) return false
+  const baselineRecord = baseline as Record<string, unknown>
+  const requestRecord = request as Record<string, unknown>
+  const baselineType =
+    typeof baselineRecord.type === "string" ? baselineRecord.type : ""
+  const requestType =
+    typeof requestRecord.type === "string" ? requestRecord.type : ""
+  if (baselineType !== requestType) return false
+  if (
+    baselineType !== "function_call_output" &&
+    baselineType !== "custom_tool_call_output"
+  ) {
+    return false
+  }
+
+  const baselineCallId =
+    typeof baselineRecord.call_id === "string" ? baselineRecord.call_id : ""
+  const requestCallId =
+    typeof requestRecord.call_id === "string" ? requestRecord.call_id : ""
+  if (baselineCallId !== requestCallId) return false
+
+  return (
+    isMicrocompactClearedOutput(baselineRecord.output) ||
+    isMicrocompactClearedOutput(requestRecord.output)
+  )
+}
+
+function isMicrocompactClearedOutput(output: unknown): boolean {
+  if (output === CONTEXT_MICROCOMPACT_CLEARED_MARKER) {
+    return true
+  }
+  if (!Array.isArray(output)) {
+    return false
+  }
+  return output.some((part) => {
+    if (!part || typeof part !== "object") return false
+    return (
+      (part as Record<string, unknown>).text ===
+      CONTEXT_MICROCOMPACT_CLEARED_MARKER
+    )
+  })
+}
+
 function getCodexInputItemType(item: CodexInputItem | undefined): string {
   const type =
     item && typeof (item as { type?: unknown }).type === "string"
       ? ((item as { type: string }).type || "").trim()
       : ""
   return type || "unknown"
+}
+
+function summarizeCodexInputMismatchItem(
+  item: CodexInputItem | undefined
+): CodexInputMismatchItemDetail | undefined {
+  if (!item) return undefined
+  const json = stableCodexJsonStringify(item)
+  const detail: CodexInputMismatchItemDetail = {
+    type: getCodexInputItemType(item),
+    signature: createHash("sha256").update(json).digest("hex").slice(0, 16),
+    jsonLength: json.length,
+  }
+  const role = getCodexInputItemRole(item)
+  if (role) {
+    detail.role = role
+  }
+  const preview = previewCodexInputItem(item)
+  if (preview) {
+    detail.preview = preview
+  }
+  return detail
+}
+
+function getCodexInputItemRole(item: CodexInputItem): string | undefined {
+  const role = (item as Record<string, unknown>).role
+  return typeof role === "string" && role.trim() ? role.trim() : undefined
+}
+
+function previewCodexInputItem(item: CodexInputItem): string | undefined {
+  const type = getCodexInputItemType(item)
+  if (type === "message") {
+    return previewCodexTextParts(
+      (item as { content?: unknown }).content,
+      "message"
+    )
+  }
+  if (type === "function_call" || type === "custom_tool_call") {
+    const name = (item as { name?: unknown }).name
+    const callId = (item as { call_id?: unknown }).call_id
+    return truncateCodexMismatchPreview(
+      [
+        typeof name === "string" && name.trim() ? `name=${name.trim()}` : "",
+        typeof callId === "string" && callId.trim()
+          ? `call_id=${callId.trim()}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join(" ")
+    )
+  }
+  if (type === "function_call_output" || type === "custom_tool_call_output") {
+    const callId = (item as { call_id?: unknown }).call_id
+    const outputPreview = previewCodexTextParts(
+      (item as { output?: unknown }).output,
+      "output"
+    )
+    return truncateCodexMismatchPreview(
+      [
+        typeof callId === "string" && callId.trim()
+          ? `call_id=${callId.trim()}`
+          : "",
+        outputPreview || "",
+      ]
+        .filter(Boolean)
+        .join(" ")
+    )
+  }
+  return undefined
+}
+
+function previewCodexTextParts(
+  value: unknown,
+  label: string
+): string | undefined {
+  if (typeof value === "string") {
+    return truncateCodexMismatchPreview(value)
+  }
+  if (!Array.isArray(value)) {
+    return undefined
+  }
+  const texts: string[] = []
+  for (const part of value) {
+    if (!part || typeof part !== "object") {
+      continue
+    }
+    const text = (part as Record<string, unknown>).text
+    if (typeof text === "string" && text.trim()) {
+      texts.push(text)
+    }
+  }
+  const preview = truncateCodexMismatchPreview(texts.join(" "))
+  return preview || `${label}_parts=${value.length}`
+}
+
+function truncateCodexMismatchPreview(text: string): string | undefined {
+  const normalized = text.replace(/\s+/g, " ").trim()
+  if (!normalized) {
+    return undefined
+  }
+  return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized
 }
 
 function getCodexInputItems(

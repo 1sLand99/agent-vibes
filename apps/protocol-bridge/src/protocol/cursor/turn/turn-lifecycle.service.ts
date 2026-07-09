@@ -499,6 +499,15 @@ export class TurnLifecycle {
   }
 
   /**
+   * True while a turn is still registered in the supervisor. Callers that keep
+   * lightweight TurnHandle references use this to avoid parenting new work under
+   * a turn that has already unwound after cancellation.
+   */
+  hasTurn(turnId: TurnId): boolean {
+    return this.turns.has(turnId)
+  }
+
+  /**
    * The deepest active turn under a BiDi attachment — the leaf of
    * the parent → child chain. Resolves to:
    *   - an active foreground sub-agent if one is running

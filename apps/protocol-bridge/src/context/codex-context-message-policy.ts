@@ -9,6 +9,7 @@ function isMovableCodexMetaMessage(message: UnifiedMessage): boolean {
   return (
     message.role === "user" &&
     message.isMeta === true &&
+    message.source !== "attachment" &&
     !messageContainsToolResult(message)
   )
 }

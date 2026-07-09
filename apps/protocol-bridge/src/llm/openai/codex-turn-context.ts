@@ -54,9 +54,7 @@ export function reuseCodexActiveTurnContext(
   if (context.turnKey !== turnKey) {
     context.turnKey = turnKey
     context.turnState = undefined
-    context.lastRequest = undefined
-    context.lastResponse = undefined
-    context.connectionReused = false
+    context.connectionReused = true
   }
   return context
 }
@@ -71,9 +69,9 @@ export function createCodexTurnContext(
       wsSessionId: cached.wsSessionId,
       turnKey: options.turnKey,
       turnState: turnKeyMatches ? cached.turnState : undefined,
-      lastResponse: turnKeyMatches ? cached.lastResponse : undefined,
-      lastRequest: turnKeyMatches ? cached.lastRequest : undefined,
-      connectionReused: turnKeyMatches,
+      lastResponse: cached.lastResponse,
+      lastRequest: cached.lastRequest,
+      connectionReused: true,
     }
   }
 

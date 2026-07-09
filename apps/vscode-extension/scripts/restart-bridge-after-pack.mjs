@@ -441,6 +441,15 @@ function formatBusyRuntimeSession(session) {
   ].join(" ")
 }
 
+function hasInterruptibleRuntimeWork(session) {
+  return (
+    Number(session.activeBackendStreams) > 0 ||
+    Number(session.pendingToolCalls) > 0 ||
+    Number(session.pendingInteractionQueries) > 0 ||
+    Number(session.deferredControlContinuations) > 0
+  )
+}
+
 async function assertSafeToRestartBridge(port, caCertPath) {
   const result = await requestBridgeJson(
     port,
@@ -471,16 +480,22 @@ async function assertSafeToRestartBridge(port, caCertPath) {
 
   const snapshot = result.value || {}
   const sessions = Array.isArray(snapshot.sessions) ? snapshot.sessions : []
-  const busySessions = sessions.filter((session) => session?.busy === true)
+  const busySessions = sessions.filter(
+    (session) => session?.busy === true && hasInterruptibleRuntimeWork(session)
+  )
 
-  if (
-    snapshot.canRestartWithoutInterruptingRuns !== true ||
-    busySessions.length > 0
-  ) {
+  if (busySessions.length > 0) {
     const details = busySessions.map(formatBusyRuntimeSession).join("; ")
     throw new Error(
       `Refusing to restart bridge because ${busySessions.length} active Cursor Agent session(s) would be interrupted.` +
         (details ? ` ${details}` : "")
+    )
+  }
+
+  if (snapshot.canRestartWithoutInterruptingRuns !== true) {
+    console.warn(
+      "[restart:bridge] Runtime reported active session(s), but none have " +
+        "backend streams, pending tool calls, interaction queries, or deferred continuations; restarting is safe."
     )
   }
 

@@ -358,7 +358,10 @@ export function mergeUserMessages(a: FlatUser, b: FlatUser): FlatUser {
 
 function mergeAdjacentUserMessages(
   messages: ReadonlyArray<FlatMessage>,
-  opts?: { preserveMetaBoundaries?: boolean }
+  opts?: {
+    preserveMetaBoundaries?: boolean
+    preserveAnyMetaBoundary?: boolean
+  }
 ): FlatMessage[] {
   const out: FlatMessage[] = []
   for (const msg of messages) {
@@ -366,7 +369,9 @@ function mergeAdjacentUserMessages(
     if (msg.type === "user" && prev?.type === "user") {
       if (
         opts?.preserveMetaBoundaries &&
-        Boolean(prev.isMeta) !== Boolean(msg.isMeta)
+        (Boolean(prev.isMeta) !== Boolean(msg.isMeta) ||
+          (opts.preserveAnyMetaBoundary &&
+            (prev.isMeta === true || msg.isMeta === true)))
       ) {
         out.push(msg)
         continue
@@ -882,12 +887,15 @@ export function normalizeMessagesForAPI(
   opts: NormalizeOptions
 ): UnifiedMessage[] {
   if (!Array.isArray(messages) || messages.length === 0) return []
+  const preserveCodexMetaBoundaries = opts.backend === "codex"
 
   let pipeline: FlatMessage[] = lift(messages)
   pipeline = reorderAttachmentsForAPI(pipeline)
   pipeline = mergeAssistantMessagesById(pipeline)
   pipeline = mergeAdjacentUserMessages(pipeline, {
-    preserveMetaBoundaries: opts.backend === "google",
+    preserveMetaBoundaries:
+      opts.backend === "google" || preserveCodexMetaBoundaries,
+    preserveAnyMetaBoundary: preserveCodexMetaBoundaries,
   })
   pipeline = relocateToolReferenceSiblings(pipeline)
   pipeline = filterOrphanedThinkingOnlyMessages(pipeline)
@@ -904,7 +912,9 @@ export function normalizeMessagesForAPI(
   // we don't have the snip / chair_sermon gates that change the merge
   // semantics there.
   pipeline = mergeAdjacentUserMessages(pipeline, {
-    preserveMetaBoundaries: opts.backend === "google",
+    preserveMetaBoundaries:
+      opts.backend === "google" || preserveCodexMetaBoundaries,
+    preserveAnyMetaBoundary: preserveCodexMetaBoundaries,
   })
 
   return project(pipeline)
@@ -939,6 +949,7 @@ export function normalizeFlatMessagesForAPI(
   opts: NormalizeOptions
 ): UnifiedMessage[] {
   if (messages.length === 0) return []
+  const preserveCodexMetaBoundaries = opts.backend === "codex"
   let pipeline: FlatMessage[] = messages.map((msg) =>
     msg.role === "assistant"
       ? ({
@@ -969,7 +980,9 @@ export function normalizeFlatMessagesForAPI(
   pipeline = reorderAttachmentsForAPI(pipeline)
   pipeline = mergeAssistantMessagesById(pipeline)
   pipeline = mergeAdjacentUserMessages(pipeline, {
-    preserveMetaBoundaries: opts.backend === "google",
+    preserveMetaBoundaries:
+      opts.backend === "google" || preserveCodexMetaBoundaries,
+    preserveAnyMetaBoundary: preserveCodexMetaBoundaries,
   })
   pipeline = relocateToolReferenceSiblings(pipeline)
   pipeline = filterOrphanedThinkingOnlyMessages(pipeline)
@@ -980,7 +993,9 @@ export function normalizeFlatMessagesForAPI(
   pipeline = hoistInUserMessages(pipeline)
   pipeline = applyBackendThinkingRules(pipeline, opts)
   pipeline = mergeAdjacentUserMessages(pipeline, {
-    preserveMetaBoundaries: opts.backend === "google",
+    preserveMetaBoundaries:
+      opts.backend === "google" || preserveCodexMetaBoundaries,
+    preserveAnyMetaBoundary: preserveCodexMetaBoundaries,
   })
   return project(pipeline)
 }

@@ -85,6 +85,7 @@ function createLevelThinkingCapability(
 
 const CODEX_PRIORITY_SERVICE_TIERS = ["priority"] as const
 const CODEX_STANDARD_CONTEXT_TOKEN_LIMIT = 272_000
+const CODEX_SPARK_CONTEXT_TOKEN_LIMIT = 120_000
 const CODEX_MAX_CONTEXT_TOKEN_LIMIT = 1_000_000
 const CODEX_TRUNCATION_POLICY_TOKENS_10K = {
   mode: "tokens",
@@ -586,7 +587,12 @@ const CODEX_MODELS: Record<
       ["low", "medium", "high", "xhigh"],
       "medium"
     ),
-    codex: createCodexRequestCapabilities({ supportsImages: false }),
+    codex: createCodexRequestCapabilities({
+      supportsImages: false,
+      contextTokenLimit: CODEX_SPARK_CONTEXT_TOKEN_LIMIT,
+      contextTokenLimitForMaxMode: CODEX_SPARK_CONTEXT_TOKEN_LIMIT,
+      truncationPolicy: CODEX_TRUNCATION_POLICY_TOKENS_10K,
+    }),
   },
   "gpt-5.5": {
     cloudCodeId: "gpt-5.5",

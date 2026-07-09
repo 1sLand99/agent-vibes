@@ -10,6 +10,7 @@ import {
 } from "./context-attachment-builder.service"
 import { ContextProjectionService } from "./context-projection.service"
 import { ContextTelemetryService } from "./context-telemetry.service"
+import { CONTEXT_MICROCOMPACT_CLEARED_MARKER } from "./context-microcompact-marker"
 import {
   createCompactBoundaryRecord,
   createCompactSummaryRecord,
@@ -83,12 +84,18 @@ export interface ContextSnipCompactionResult {
   estimatedTokens: number
 }
 
+export interface ContextMicroCompactionResult {
+  changed: boolean
+  clearedToolResults: number
+}
+
 export interface ContextCompactionResult {
   messages: UnifiedMessage[]
   projectedMessages: ProjectedContextMessage[]
   estimatedTokens: number
   wasCompacted: boolean
   snipCompaction?: ContextSnipCompactionResult
+  microCompaction?: ContextMicroCompactionResult
 }
 
 @Injectable()
@@ -134,7 +141,7 @@ export class ContextCompactionService {
   private readonly MICROCOMPACT_KEEP_RECENT_RESULTS = 12
   private readonly MICROCOMPACT_MIN_RESULT_TOKENS = 400
   private readonly MICROCOMPACT_CLEARED_MARKER =
-    "[Old tool result content cleared]"
+    CONTEXT_MICROCOMPACT_CLEARED_MARKER
   private static readonly MICROCOMPACTABLE_TOOLS = new Set<string>([
     "read_file",
     "read_files",
@@ -176,6 +183,7 @@ export class ContextCompactionService {
       pendingToolUseIds?: Iterable<string>
       strategy?: ContextCompactionCommit["strategy"]
       dryRun?: boolean
+      codexAppendOnlyAttachments?: boolean
     }
   ): ContextCompactionResult {
     const hardMaxTokens = Math.max(
@@ -200,10 +208,12 @@ export class ContextCompactionService {
     let projected = this.buildProjectedMessages(
       workingState,
       snapshot,
-      attachmentTokenBudget
+      attachmentTokenBudget,
+      options
     )
     const estimated = this.countProjected(projected)
     let snipCompaction: ContextSnipCompactionResult | undefined
+    let microCompaction: ContextMicroCompactionResult | undefined
 
     if (this.shouldCompact(estimated, hardMaxTokens, targetMaxTokens)) {
       // Diagnostics: count snip boundaries and the union of removed ids so
@@ -270,7 +280,11 @@ export class ContextCompactionService {
     if (this.shouldCompact(estimated, hardMaxTokens, targetMaxTokens)) {
       const microcompacted = this.microcompactProjectedToolResults(projected)
       if (microcompacted) {
-        projected = microcompacted
+        projected = microcompacted.projectedMessages
+        microCompaction = {
+          changed: true,
+          clearedToolResults: microcompacted.clearedToolResults,
+        }
       }
     }
 
@@ -316,6 +330,7 @@ export class ContextCompactionService {
       estimatedTokens: messageTokens,
       wasCompacted: false,
       snipCompaction,
+      microCompaction,
     }
   }
 
@@ -414,6 +429,7 @@ export class ContextCompactionService {
       projectedTokenOverride?: number
       strategy?: ContextCompactionCommit["strategy"]
       integrityMode?: "strict-adjacent" | "global"
+      codexAppendOnlyAttachments?: boolean
     }
   ): ContextCompactionCandidate | null {
     const hardMaxTokens = Math.max(
@@ -431,7 +447,8 @@ export class ContextCompactionService {
     const projected = this.buildProjectedMessages(
       state,
       snapshot,
-      attachmentTokenBudget
+      attachmentTokenBudget,
+      options
     )
     const measuredProjectedTokens = this.countProjected(projected)
     const projectedTokens = Math.max(
@@ -1008,11 +1025,15 @@ export class ContextCompactionService {
   private buildProjectedMessages(
     state: ContextConversationState,
     snapshot: ContextAttachmentSnapshot,
-    attachmentTokenBudget: number
+    attachmentTokenBudget: number,
+    options?: {
+      codexAppendOnlyAttachments?: boolean
+    }
   ): ProjectedContextMessage[] {
     return this.projection.project(state, {
       attachmentSnapshot: this.buildProjectionSnapshot(state, snapshot),
       attachmentTokenBudget,
+      codexAppendOnlyAttachments: options?.codexAppendOnlyAttachments,
     })
   }
 
@@ -1086,7 +1107,12 @@ export class ContextCompactionService {
    */
   private microcompactProjectedToolResults(
     projected: ProjectedContextMessage[]
-  ): ProjectedContextMessage[] | undefined {
+  ):
+    | {
+        projectedMessages: ProjectedContextMessage[]
+        clearedToolResults: number
+      }
+    | undefined {
     const toolNameById = new Map<string, string>()
     for (const message of projected) {
       if (message.role !== "assistant" || !Array.isArray(message.content)) {
@@ -1145,21 +1171,27 @@ export class ContextCompactionService {
         .map((hit) => `${hit.messageIndex}:${hit.blockIndex}`)
     )
 
-    return projected.map((message, messageIndex) => {
-      if (!Array.isArray(message.content)) return message
-      let touched = false
-      const content = message.content.map((block, blockIndex) => {
-        if (!toClear.has(`${messageIndex}:${blockIndex}`)) return block
-        touched = true
-        return {
-          ...(block as object),
-          content: this.MICROCOMPACT_CLEARED_MARKER,
-        }
-      })
-      return touched
-        ? { ...message, content: content as ProjectedContextMessage["content"] }
-        : message
-    })
+    return {
+      projectedMessages: projected.map((message, messageIndex) => {
+        if (!Array.isArray(message.content)) return message
+        let touched = false
+        const content = message.content.map((block, blockIndex) => {
+          if (!toClear.has(`${messageIndex}:${blockIndex}`)) return block
+          touched = true
+          return {
+            ...(block as object),
+            content: this.MICROCOMPACT_CLEARED_MARKER,
+          }
+        })
+        return touched
+          ? {
+              ...message,
+              content: content as ProjectedContextMessage["content"],
+            }
+          : message
+      }),
+      clearedToolResults: toClear.size,
+    }
   }
 
   private toolResultBlockText(content: unknown): string {

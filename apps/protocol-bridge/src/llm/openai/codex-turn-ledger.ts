@@ -3,6 +3,7 @@ import {
   prepareCodexContinuationRequest,
   type CodexContinuationDecision,
   type CodexContinuationState,
+  type CodexInputMismatchItemDetail,
   type CodexLastResponseSnapshot,
 } from "./codex-incremental"
 import { codexResponseOutputItemToInputItem } from "./codex-response-items"
@@ -10,7 +11,7 @@ import type { CodexInputItem } from "./codex-native-types"
 
 export type CodexTurnLedgerState = CodexContinuationState
 export type CodexTurnLedgerResponse = CodexLastResponseSnapshot
-export type { CodexContinuationDecision }
+export type { CodexContinuationDecision, CodexInputMismatchItemDetail }
 
 export function prepareCodexTurnLedgerRequest(
   request: Record<string, unknown>,

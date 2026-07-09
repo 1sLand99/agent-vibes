@@ -88,6 +88,7 @@ export class ContextManagerService {
       pendingToolUseIds?: Iterable<string>
       strategy?: "auto" | "manual" | "reactive"
       dryRun?: boolean
+      codexAppendOnlyAttachments?: boolean
     }
   ): ContextCompactionResult {
     return this.compaction.ensureWithinBudget(state, snapshot, options)
@@ -105,6 +106,7 @@ export class ContextManagerService {
       pendingToolUseIds?: Iterable<string>
       strategy?: "auto" | "manual" | "reactive"
       dryRun?: boolean
+      codexAppendOnlyAttachments?: boolean
     }
   ): ContextCompactionResult {
     return this.buildBackendMessages(
@@ -195,6 +197,7 @@ export class ContextManagerService {
       integrityMode?: "strict-adjacent" | "global"
       pendingToolUseIds?: Iterable<string>
       dryRun?: boolean
+      codexAppendOnlyAttachments?: boolean
     },
     request: ReactiveRecoveryRequest,
     recoveryKey: string
@@ -256,11 +259,13 @@ export class ContextManagerService {
       integrityMode: previousOptions.integrityMode,
       pendingToolUseIds: previousOptions.pendingToolUseIds,
       strategy: "reactive",
+      codexAppendOnlyAttachments: previousOptions.codexAppendOnlyAttachments,
     })
 
     if (
       !result.wasCompacted &&
       !result.snipCompaction?.changed &&
+      !result.microCompaction?.changed &&
       result.estimatedTokens >= previousOptions.maxTokens
     ) {
       this.telemetry.recordEvent({

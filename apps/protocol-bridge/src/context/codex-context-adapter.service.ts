@@ -69,6 +69,8 @@ export const CODEX_HISTORICAL_SUMMARY_NOTICE = [
 
 const CODEX_EMPTY_REMOTE_COMPACTION_SUMMARY =
   "Remote compaction returned no textual summary after filtering synthetic context. Continue from the compacted context and any later messages."
+const CODEX_SYNTHETIC_COMPACTION_SUMMARY_ITEM_FLAG =
+  "agent_vibes_synthetic_compaction_summary"
 
 const DEFAULT_CODEX_TRUNCATION_POLICY: CodexTruncationPolicy = {
   mode: "bytes",
@@ -869,8 +871,15 @@ export class CodexContextAdapterService {
     return {
       type: "message",
       role: "user",
+      [CODEX_SYNTHETIC_COMPACTION_SUMMARY_ITEM_FLAG]: true,
       content: [{ type: "input_text", text: summary }],
     }
+  }
+
+  private isBridgeSyntheticCompactionSummaryItem(
+    item: CodexReplacementHistoryItem
+  ): boolean {
+    return item[CODEX_SYNTHETIC_COMPACTION_SUMMARY_ITEM_FLAG] === true
   }
 
   private replacementHistoryToMessages(
@@ -892,8 +901,23 @@ export class CodexContextAdapterService {
       const role = item.role === "assistant" ? "assistant" : "user"
       const text = this.extractResponseItemText(item).trim()
       if (!text) return []
-      if (this.isSyntheticCodexHistoryText(text)) return []
-      return [{ role, content: text } satisfies UnifiedMessage]
+      const isBridgeSyntheticCompactionSummary =
+        this.isBridgeSyntheticCompactionSummaryItem(item)
+      if (
+        !isBridgeSyntheticCompactionSummary &&
+        this.isSyntheticCodexHistoryText(text)
+      ) {
+        return []
+      }
+      return [
+        {
+          role,
+          content: text,
+          ...(isBridgeSyntheticCompactionSummary
+            ? { isMeta: true, source: "summary" as const }
+            : {}),
+        } satisfies UnifiedMessage,
+      ]
     })
   }
 

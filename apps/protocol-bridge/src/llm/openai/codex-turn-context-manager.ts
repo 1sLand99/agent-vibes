@@ -6,6 +6,7 @@ import {
   buildCodexTurnWsSessionId,
   codexTurnContextToCachedWsEntry,
   createCodexTurnContext,
+  reuseCodexActiveTurnContext,
   type CodexTurnContext,
 } from "./codex-turn-context"
 import {
@@ -221,9 +222,12 @@ export class CodexTurnContextManager {
     })
     let cached = this.runtimeCache.getWs(cacheKey)
     if (cached && cached.turnKey !== turnKey) {
-      this.runtimeCache.deleteWs(cacheKey)
-      this.closeWsSession(cached.wsSessionId)
-      cached = undefined
+      cached = {
+        ...cached,
+        turnKey,
+        turnState: undefined,
+      }
+      this.runtimeCache.setWs(cacheKey, cached)
     }
     const sessionId =
       cached?.wsSessionId ||
@@ -308,8 +312,7 @@ export class CodexTurnContextManager {
         return existing
       }
 
-      this.closeWsSession(existing.wsSessionId)
-      this.sessions.clearActive(conversationId)
+      return reuseCodexActiveTurnContext(existing, input.turnKey)
     }
 
     const cacheKey = this.buildWsCacheKey({
@@ -321,19 +324,10 @@ export class CodexTurnContextManager {
       slotKey: input.slotKey,
       modelName: input.modelName,
     })
-    let takenCache = this.runtimeCache.takeConversationWsWithGlobalFallback(
+    const takenCache = this.runtimeCache.takeConversationWsWithGlobalFallback(
       cacheKey,
       globalCacheKey
     )
-    if (takenCache && takenCache.entry.turnKey !== input.turnKey) {
-      // A WebSocket session id is immutable inside CodexWebSocketService. A
-      // connection opened by startup/model-picker warmup has no Codex turn key,
-      // so promoting it into a keyed ModelClientSession would replay sticky
-      // routing on the wrong logical turn. Match Codex CLI by starting a fresh
-      // turn-scoped session whenever the turn key changes.
-      this.closeWsSession(takenCache.entry.wsSessionId)
-      takenCache = undefined
-    }
     const context = createCodexTurnContext({
       conversationId,
       turnKey: input.turnKey,
@@ -457,7 +451,8 @@ export class CodexTurnContextManager {
       }
     }
 
-    if (modelName) {
+    const hasExactCacheScope = !!modelName && (input.slotKeys?.length ?? 0) > 0
+    if (hasExactCacheScope) {
       for (const slotKey of input.slotKeys ?? []) {
         const cacheKey = this.buildWsCacheKey({
           slotKey,
@@ -483,6 +478,13 @@ export class CodexTurnContextManager {
         })
         resetCount++
       }
+    } else {
+      const cleared = this.runtimeCache.clearWsBaselinesByConversationHash(
+        hashCodexIdentityPart(conversationId)
+      )
+      discardedPreviousResponseId =
+        discardedPreviousResponseId || cleared.discardedPreviousResponseId
+      resetCount += cleared.clearedCount
     }
 
     this.runtimeCache.deleteWarmupPayload(conversationId)
@@ -586,7 +588,8 @@ export class CodexTurnContextManager {
     }
 
     const modelName = input.modelName?.trim() || undefined
-    if (modelName) {
+    const hasExactCacheScope = !!modelName && (input.slotKeys?.length ?? 0) > 0
+    if (hasExactCacheScope) {
       for (const slotKey of input.slotKeys ?? []) {
         const cached = this.runtimeCache.deleteWs(
           this.buildWsCacheKey({
@@ -599,6 +602,13 @@ export class CodexTurnContextManager {
           continue
         }
         this.closeWsSession(cached.wsSessionId)
+        resetCount++
+      }
+    } else {
+      for (const entry of this.runtimeCache.takeWsEntriesByConversationHash(
+        hashCodexIdentityPart(conversationId)
+      )) {
+        this.closeWsSession(entry.wsSessionId)
         resetCount++
       }
     }

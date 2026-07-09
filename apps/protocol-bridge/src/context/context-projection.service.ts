@@ -19,6 +19,7 @@ import {
   renderContextCollapseSummary,
 } from "./context-transcript-events"
 import { ContextCollapseService } from "./context-collapse.service"
+import { projectCodexAppendOnlyAttachments } from "./codex-append-only-attachments"
 import { stripSubAgentUiOnlyPayload } from "./subagent-ui-payload"
 import {
   ContextCompactionCommit,
@@ -39,6 +40,7 @@ export class ContextProjectionService {
     options?: {
       attachmentSnapshot?: ContextAttachmentSnapshot
       attachmentTokenBudget?: number
+      codexAppendOnlyAttachments?: boolean
       recordsOverride?: readonly ContextTranscriptRecord[]
     }
   ): ProjectedContextMessage[] {
@@ -77,6 +79,21 @@ export class ContextProjectionService {
             maxTokens: options.attachmentTokenBudget,
           })
         : []
+
+    if (options?.codexAppendOnlyAttachments && hasPostCompactAttachments) {
+      return projected
+    }
+
+    if (options?.codexAppendOnlyAttachments) {
+      return projectCodexAppendOnlyAttachments(
+        state,
+        projected,
+        liveAttachments,
+        {
+          commitId: activeCommit?.id,
+        }
+      )
+    }
 
     return [
       ...projected,

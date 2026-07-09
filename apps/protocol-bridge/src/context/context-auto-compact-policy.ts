@@ -21,11 +21,6 @@ const MEDIUM_CONTEXT_AUTOCOMPACT_BUFFER_TOKENS = 30_000
 const LARGE_CONTEXT_AUTOCOMPACT_BUFFER_TOKENS = 50_000
 const TOOL_RESULT_TURN_GROWTH_ESTIMATE_TOKENS = 15_000
 
-function normalizeServiceTier(value?: string): string | undefined {
-  const normalized = value?.trim().toLowerCase()
-  return normalized || undefined
-}
-
 function normalizePositiveInteger(value: unknown): number | undefined {
   if (typeof value !== "number") return undefined
   if (!Number.isFinite(value) || value <= 0) return undefined
@@ -49,9 +44,6 @@ export function resolveAutoCompactTokenLimit(
   }
 
   if (input.backend === "codex") {
-    if (normalizeServiceTier(input.requestedServiceTier) !== "priority") {
-      return undefined
-    }
     return Math.floor(maxTokens * 0.9)
   }
 

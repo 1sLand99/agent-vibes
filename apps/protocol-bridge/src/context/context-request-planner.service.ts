@@ -72,6 +72,7 @@ export interface ContextProjectionOptions {
   pendingToolUseIds?: Iterable<string>
   strategy?: "auto" | "manual" | "reactive"
   dryRun?: boolean
+  codexAppendOnlyAttachments?: boolean
 }
 
 export type ContextProjectionBudget = Pick<
@@ -235,6 +236,7 @@ export class ContextRequestPlannerService {
       pendingToolUseIds: options?.pendingToolUseIds,
       strategy: options?.strategy || "auto",
       dryRun: options?.dryRun,
+      codexAppendOnlyAttachments: options?.codexAppendOnlyAttachments,
     }
   }
 

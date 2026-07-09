@@ -1,4 +1,4 @@
-import { create, toBinary } from "@bufbuild/protobuf"
+import { create, type JsonObject, toBinary } from "@bufbuild/protobuf"
 import { Injectable, Logger } from "@nestjs/common"
 import * as crypto from "crypto"
 import type { KvServerMessage as KvStorageMessage } from "./kv-storage.service"
@@ -181,6 +181,7 @@ import {
   McpAuthResultSchema,
   McpAuthSuccessSchema,
   McpAuthToolCallSchema,
+  McpImageContentSchema,
   McpPermissionDeniedSchema,
   McpRejectedSchema,
   McpStateExecArgsSchema,
@@ -399,6 +400,8 @@ import {
   WebSearchArgsSchema,
   WebSearchErrorSchema,
   WebSearchRejectedSchema,
+  type WebSearchReference,
+  WebSearchReferenceSchema,
   type WebSearchResult,
   WebSearchResultSchema,
   WebSearchSuccessSchema,
@@ -2366,6 +2369,26 @@ export class CursorGrpcService {
       })
     }
 
+    if (oneOf.case === "mcpToolCall") {
+      return create(ToolCallSchema, {
+        ...this.normalizeToolCallMetadata(record),
+        tool: {
+          case: "mcpToolCall" as const,
+          value: this.normalizeMcpToolCallForEncoding(oneOf.value),
+        },
+      })
+    }
+
+    if (oneOf.case === "shellToolCall") {
+      return create(ToolCallSchema, {
+        ...this.normalizeToolCallMetadata(record),
+        tool: {
+          case: "shellToolCall" as const,
+          value: this.normalizeShellToolCallForEncoding(oneOf.value),
+        },
+      })
+    }
+
     return create(ToolCallSchema, value as never)
   }
 
@@ -2521,6 +2544,397 @@ export class CursorGrpcService {
   private normalizeTaskConversationSteps(value: unknown): ConversationStep[] {
     if (!Array.isArray(value)) return []
     return value.map((step) => this.normalizeConversationStepForEncoding(step))
+  }
+
+  private normalizeMcpToolCallForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(McpToolCallSchema, {})
+    }
+
+    const record = value as Record<string, unknown>
+    const description = safeString(record.description).trim()
+
+    return create(McpToolCallSchema, {
+      args: this.normalizeMcpArgsForEncoding(record.args),
+      result: this.normalizeMcpToolResultForEncoding(record.result),
+      ...(description ? { description } : {}),
+    })
+  }
+
+  private normalizeMcpArgsForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return undefined
+    }
+
+    const record = value as Record<string, unknown>
+    return create(McpArgsSchema, {
+      name: safeString(record.name),
+      args: this.normalizeProtoValueMap(record.args),
+      toolCallId: safeString(record.toolCallId ?? record.tool_call_id),
+      providerIdentifier: safeString(
+        record.providerIdentifier ?? record.provider_identifier
+      ),
+      toolName: safeString(record.toolName ?? record.tool_name),
+      smartModeApprovalOnly: this.parseBooleanFlag(
+        record.smartModeApprovalOnly ?? record.smart_mode_approval_only
+      ),
+      skipApproval: this.parseBooleanFlag(
+        record.skipApproval ?? record.skip_approval
+      ),
+    })
+  }
+
+  private normalizeMcpToolResultForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return undefined
+    }
+
+    const record = value as Record<string, unknown>
+    const result = record.result
+    if (!result || typeof result !== "object") {
+      return create(McpToolResultSchema, record as never)
+    }
+
+    const oneOf = result as { case?: unknown; value?: unknown }
+    switch (oneOf.case) {
+      case "success":
+        return create(McpToolResultSchema, {
+          result: {
+            case: "success" as const,
+            value: this.normalizeMcpSuccessForEncoding(oneOf.value),
+          },
+        })
+      case "error":
+        return create(McpToolResultSchema, {
+          result: {
+            case: "error" as const,
+            value: create(McpToolErrorSchema, oneOf.value as never),
+          },
+        })
+      case "rejected":
+        return create(McpToolResultSchema, {
+          result: {
+            case: "rejected" as const,
+            value: create(McpRejectedSchema, oneOf.value as never),
+          },
+        })
+      case "permissionDenied":
+        return create(McpToolResultSchema, {
+          result: {
+            case: "permissionDenied" as const,
+            value: create(McpPermissionDeniedSchema, oneOf.value as never),
+          },
+        })
+      default:
+        return create(McpToolResultSchema, record as never)
+    }
+  }
+
+  private normalizeMcpSuccessForEncoding(value: unknown) {
+    const record =
+      value && typeof value === "object"
+        ? (value as Record<string, unknown>)
+        : {}
+    const content = Array.isArray(record.content) ? record.content : []
+    const structuredContent =
+      this.isJsonObject(record.structuredContent) ??
+      this.isJsonObject(record.structured_content)
+
+    return create(McpSuccessSchema, {
+      content: content.map((item) =>
+        this.normalizeMcpContentItemForEncoding(item)
+      ),
+      isError: this.parseBooleanFlag(record.isError ?? record.is_error),
+      structuredContent,
+    })
+  }
+
+  private normalizeMcpContentItemForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(McpToolResultContentItemSchema, {})
+    }
+
+    const record = value as Record<string, unknown>
+    const content = record.content
+    if (!content || typeof content !== "object") {
+      return create(McpToolResultContentItemSchema, record as never)
+    }
+
+    const oneOf = content as { case?: unknown; value?: unknown }
+    if (oneOf.case === "text") {
+      const textRecord =
+        oneOf.value && typeof oneOf.value === "object"
+          ? (oneOf.value as Record<string, unknown>)
+          : {}
+      const outputLocation = this.normalizeOutputLocation(
+        textRecord.outputLocation ?? textRecord.output_location
+      )
+      return create(McpToolResultContentItemSchema, {
+        content: {
+          case: "text" as const,
+          value: create(McpTextContentSchema, {
+            text: safeString(textRecord.text),
+            ...(outputLocation ? { outputLocation } : {}),
+          }),
+        },
+      })
+    }
+
+    if (oneOf.case === "image") {
+      const imageRecord =
+        oneOf.value && typeof oneOf.value === "object"
+          ? (oneOf.value as Record<string, unknown>)
+          : {}
+      const data = imageRecord.data
+      return create(McpToolResultContentItemSchema, {
+        content: {
+          case: "image" as const,
+          value: create(McpImageContentSchema, {
+            data: data instanceof Uint8Array ? data : new Uint8Array(),
+            mimeType: safeString(imageRecord.mimeType ?? imageRecord.mime_type),
+          }),
+        },
+      })
+    }
+
+    return create(McpToolResultContentItemSchema, record as never)
+  }
+
+  private normalizeShellToolCallForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(ShellToolCallSchema, {})
+    }
+
+    const record = value as Record<string, unknown>
+    const description = safeString(record.description).trim()
+    return create(ShellToolCallSchema, {
+      args: this.normalizeShellArgsForEncoding(record.args),
+      ...(description ? { description } : {}),
+      result:
+        record.result && typeof record.result === "object"
+          ? create(ShellResultSchema, record.result as never)
+          : undefined,
+    })
+  }
+
+  private normalizeShellArgsForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(ShellArgsSchema, {})
+    }
+
+    const record = value as Record<string, unknown>
+    const requestedSandboxPolicy =
+      record.requestedSandboxPolicy &&
+      typeof record.requestedSandboxPolicy === "object"
+        ? (record.requestedSandboxPolicy as Record<string, unknown>)
+        : record.requested_sandbox_policy &&
+            typeof record.requested_sandbox_policy === "object"
+          ? (record.requested_sandbox_policy as Record<string, unknown>)
+          : undefined
+    const requestedSandboxType = this.parseOptionalNonNegativeInt(
+      requestedSandboxPolicy?.type
+    )
+
+    return create(ShellArgsSchema, {
+      command: safeString(record.command),
+      workingDirectory: safeString(
+        record.workingDirectory ?? record.working_directory
+      ),
+      timeout: normalizeShellTimeoutMs(record.timeout),
+      toolCallId: safeString(record.toolCallId ?? record.tool_call_id),
+      simpleCommands: this.toStringArray(
+        record.simpleCommands ?? record.simple_commands
+      ),
+      hasInputRedirect: this.parseBooleanFlag(
+        record.hasInputRedirect ?? record.has_input_redirect
+      ),
+      hasOutputRedirect: this.parseBooleanFlag(
+        record.hasOutputRedirect ?? record.has_output_redirect
+      ),
+      parsingResult: this.normalizeShellParsingResultForEncoding(
+        record.parsingResult ?? record.parsing_result
+      ),
+      requestedSandboxPolicy:
+        requestedSandboxType !== undefined
+          ? create(SandboxPolicySchema, {
+              type: requestedSandboxType as SandboxPolicy_Type,
+            })
+          : undefined,
+      fileOutputThresholdBytes: this.normalizeOptionalBigInt(
+        record.fileOutputThresholdBytes ?? record.file_output_threshold_bytes
+      ),
+      isBackground: this.parseBooleanFlag(
+        record.isBackground ?? record.is_background
+      ),
+      skipApproval: this.parseBooleanFlag(
+        record.skipApproval ?? record.skip_approval
+      ),
+      timeoutBehavior:
+        this.normalizeTimeoutBehavior(
+          record.timeoutBehavior ?? record.timeout_behavior
+        ) ?? TimeoutBehavior.UNSPECIFIED,
+      hardTimeout: this.parseOptionalNonNegativeInt(
+        record.hardTimeout ?? record.hard_timeout
+      ),
+      description: safeString(record.description).trim() || undefined,
+      classifierResult: this.normalizeShellClassifierResult(
+        record.classifierResult ?? record.classifier_result
+      ),
+      closeStdin: this.parseBooleanFlag(
+        record.closeStdin ?? record.close_stdin
+      ),
+    })
+  }
+
+  private normalizeShellParsingResultForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return undefined
+    }
+
+    const record = value as Record<string, unknown>
+    const rawCommands = record.executableCommands ?? record.executable_commands
+    const executableCommands = Array.isArray(rawCommands)
+      ? rawCommands
+          .map((entry) => {
+            if (!entry || typeof entry !== "object") return undefined
+            const command = entry as Record<string, unknown>
+            const rawArgs = command.args
+            const args = Array.isArray(rawArgs)
+              ? rawArgs
+                  .map((arg) => {
+                    if (!arg || typeof arg !== "object") return undefined
+                    const argRecord = arg as Record<string, unknown>
+                    return create(
+                      ShellCommandParsingResult_ExecutableCommandArgSchema,
+                      {
+                        type: safeString(argRecord.type),
+                        value: safeString(argRecord.value),
+                      }
+                    )
+                  })
+                  .filter((arg): arg is NonNullable<typeof arg> => !!arg)
+              : []
+            return create(ShellCommandParsingResult_ExecutableCommandSchema, {
+              name: safeString(command.name),
+              args,
+              fullText: safeString(command.fullText ?? command.full_text),
+            })
+          })
+          .filter((entry): entry is NonNullable<typeof entry> => !!entry)
+      : []
+
+    const allRedirectsAreDevNull =
+      record.allRedirectsAreDevNull ?? record.all_redirects_are_dev_null
+    return create(ShellCommandParsingResultSchema, {
+      parsingFailed: this.parseBooleanFlag(
+        record.parsingFailed ?? record.parsing_failed,
+        executableCommands.length === 0
+      ),
+      executableCommands,
+      hasRedirects: this.parseBooleanFlag(
+        record.hasRedirects ?? record.has_redirects
+      ),
+      hasCommandSubstitution: this.parseBooleanFlag(
+        record.hasCommandSubstitution ?? record.has_command_substitution
+      ),
+      allRedirectsAreDevNull:
+        allRedirectsAreDevNull === undefined
+          ? undefined
+          : this.parseBooleanFlag(allRedirectsAreDevNull),
+    })
+  }
+
+  private normalizeProtoValueMap(input: unknown): Record<string, Value> {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      return {}
+    }
+
+    const out: Record<string, Value> = {}
+    for (const [key, value] of Object.entries(
+      input as Record<string, unknown>
+    )) {
+      out[key] = this.normalizeProtoValue(value)
+    }
+    return out
+  }
+
+  private normalizeProtoValue(input: unknown): Value {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      return this.toProtoValue(input)
+    }
+
+    const record = input as Record<string, unknown>
+    const kind = record.kind
+    if (!kind || typeof kind !== "object") {
+      return this.toProtoValue(input)
+    }
+
+    const oneOf = kind as { case?: unknown; value?: unknown }
+    switch (oneOf.case) {
+      case "nullValue":
+        return create(ValueSchema, {
+          kind: { case: "nullValue" as const, value: NullValue.NULL_VALUE },
+        })
+      case "numberValue":
+        return create(ValueSchema, {
+          kind: {
+            case: "numberValue" as const,
+            value:
+              typeof oneOf.value === "number" && Number.isFinite(oneOf.value)
+                ? oneOf.value
+                : 0,
+          },
+        })
+      case "stringValue":
+        return create(ValueSchema, {
+          kind: {
+            case: "stringValue" as const,
+            value: safeString(oneOf.value),
+          },
+        })
+      case "boolValue":
+        return create(ValueSchema, {
+          kind: { case: "boolValue" as const, value: oneOf.value === true },
+        })
+      case "listValue": {
+        const listRecord =
+          oneOf.value && typeof oneOf.value === "object"
+            ? (oneOf.value as Record<string, unknown>)
+            : {}
+        const values = Array.isArray(listRecord.values) ? listRecord.values : []
+        return create(ValueSchema, {
+          kind: {
+            case: "listValue" as const,
+            value: create(ListValueSchema, {
+              values: values.map((item) => this.normalizeProtoValue(item)),
+            }),
+          },
+        })
+      }
+      case "structValue": {
+        const structRecord =
+          oneOf.value && typeof oneOf.value === "object"
+            ? (oneOf.value as Record<string, unknown>)
+            : {}
+        return create(ValueSchema, {
+          kind: {
+            case: "structValue" as const,
+            value: create(StructSchema, {
+              fields: this.normalizeProtoValueMap(structRecord.fields),
+            }),
+          },
+        })
+      }
+      default:
+        return this.toProtoValue(input)
+    }
+  }
+
+  private isJsonObject(value: unknown): JsonObject | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return undefined
+    }
+    return value as JsonObject
   }
 
   // ─── ExecServerMessage (Agent tool call dispatch) ────────────
@@ -3221,12 +3635,20 @@ export class CursorGrpcService {
     return "success"
   }
 
-  private parseWebSearchReferences(result: string): Array<{
+  private createWebSearchReference(input: {
     title: string
     url: string
     chunk: string
-  }> {
-    const references: Array<{ title: string; url: string; chunk: string }> = []
+  }): WebSearchReference {
+    return create(WebSearchReferenceSchema, {
+      title: input.title,
+      url: input.url,
+      chunk: input.chunk,
+    })
+  }
+
+  private parseWebSearchReferences(result: string): WebSearchReference[] {
+    const references: WebSearchReference[] = []
     const seenUrls = new Set<string>()
     const markdownLinkPattern = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g
 
@@ -3241,11 +3663,13 @@ export class CursorGrpcService {
         .slice(Math.max(0, idx - 100), Math.min(result.length, idx + 220))
         .replace(/\s+/g, " ")
         .trim()
-      references.push({
-        title: title || url,
-        url,
-        chunk,
-      })
+      references.push(
+        this.createWebSearchReference({
+          title: title || url,
+          url,
+          chunk,
+        })
+      )
       if (references.length >= 20) break
     }
 
@@ -3281,11 +3705,13 @@ export class CursorGrpcService {
 
       if (!url || seenUrls.has(url)) continue
       seenUrls.add(url)
-      references.push({
-        title: title || url,
-        url,
-        chunk: sourceLine,
-      })
+      references.push(
+        this.createWebSearchReference({
+          title: title || url,
+          url,
+          chunk: sourceLine,
+        })
+      )
       if (references.length >= 20) break
     }
 
@@ -3309,11 +3735,13 @@ export class CursorGrpcService {
         .replace(/\s+/g, " ")
         .trim()
       seenUrls.add(url)
-      references.push({
-        title,
-        url,
-        chunk,
-      })
+      references.push(
+        this.createWebSearchReference({
+          title,
+          url,
+          chunk,
+        })
+      )
       if (references.length >= 20) break
     }
 
@@ -3323,11 +3751,7 @@ export class CursorGrpcService {
   private buildWebSearchFallbackReferences(
     searchTerm: string,
     result: string
-  ): Array<{
-    title: string
-    url: string
-    chunk: string
-  }> {
+  ): WebSearchReference[] {
     const normalizedTerm = searchTerm.trim()
     if (!normalizedTerm) return []
 
@@ -3335,11 +3759,11 @@ export class CursorGrpcService {
     const fallbackUrl = `https://www.google.com/search?q=${encodeURIComponent(normalizedTerm)}`
 
     return [
-      {
+      this.createWebSearchReference({
         title: normalizedTerm,
         url: fallbackUrl,
         chunk: snippet || `Search query: ${normalizedTerm}`,
-      },
+      }),
     ]
   }
 
@@ -3829,18 +4253,19 @@ export class CursorGrpcService {
   private normalizeExaSearchReferences(
     args: Record<string, unknown>,
     result: string
-  ): Array<{
-    title: string
-    url: string
-    text: string
-    publishedDate: string
-  }> {
-    const structured = this.toRecordArray(args.references).map((entry) => ({
-      title: safeString(entry.title),
-      url: safeString(entry.url),
-      text: safeString(entry.text || entry.chunk),
-      publishedDate: safeString(entry.publishedDate || entry.published_date),
-    }))
+  ): WebSearchReference[] {
+    const structured = this.toRecordArray(args.references).map((entry) =>
+      this.createWebSearchReference({
+        title: safeString(entry.title),
+        url: safeString(entry.url),
+        chunk: safeString(
+          entry.text ||
+            entry.chunk ||
+            entry.publishedDate ||
+            entry.published_date
+        ),
+      })
+    )
     const filteredStructured = structured.filter(
       (entry) => entry.url.length > 0
     )
@@ -3848,14 +4273,7 @@ export class CursorGrpcService {
       return filteredStructured.slice(0, 20)
     }
 
-    return this.parseWebSearchReferences(result)
-      .map((reference) => ({
-        title: reference.title,
-        url: reference.url,
-        text: reference.chunk,
-        publishedDate: "",
-      }))
-      .slice(0, 20)
+    return this.parseWebSearchReferences(result).slice(0, 20)
   }
 
   private parseExaFetchContentsFromText(result: string): Array<{

@@ -147,6 +147,8 @@ import {
   type CodexContextEntry,
   type CodexContextLedgerState,
 } from "./codex-context-ledger"
+import { shouldResetCodexContinuationAfterProjection } from "./codex-continuation-reset-policy"
+import { buildCodexContextRewriteKey } from "./codex-context-rewrite-key"
 import { CursorGrpcService } from "./cursor-grpc.service"
 import { KnowledgeBaseService } from "./knowledge-base.service"
 import { KvStorageService } from "./kv-storage.service"
@@ -1214,6 +1216,7 @@ export class CursorConnectStreamService {
   //     through the streamWithHeartbeat generator at all.
   private readonly TRANSPORT_KEEPALIVE_TICK_MS = 500
   private readonly TRANSPORT_SILENCE_KEEPALIVE_MS = 1000
+  private readonly SUBAGENT_SHELL_HARD_TIMEOUT_MS = 60_000
   /**
    * Per-conversation timestamp (ms epoch) of the most recent IDE-bound
    * frame written through `emit()`. Read by the wall-clock keepalive
@@ -5890,6 +5893,24 @@ export class CursorConnectStreamService {
     }
   }
 
+  private buildContextAttachmentSnapshotSignature(
+    snapshot: ContextAttachmentSnapshot
+  ): string {
+    return crypto
+      .createHash("sha256")
+      .update(
+        safeJsonStringify(snapshot, {
+          maxDepth: 12,
+          maxArrayItems: 10_000,
+          maxObjectKeys: 10_000,
+          maxStringLength: 1_000_000,
+          includeHashes: true,
+        })
+      )
+      .digest("hex")
+      .slice(0, 16)
+  }
+
   private extractUsageSnapshot(
     event: SseEvent
   ): ContextUsageSnapshot | undefined {
@@ -6021,7 +6042,6 @@ export class CursorConnectStreamService {
       const activeTurn =
         activeTurnSignal != null && activeTurnSignal.aborted !== true
       const busy =
-        activeTurn ||
         activeBackendStreams > 0 ||
         pendingToolCalls > 0 ||
         pendingInteractionQueries > 0 ||
@@ -8493,11 +8513,16 @@ export class CursorConnectStreamService {
     // full safety argument.  Build the secondary keys first so a
     // cache hit can short-circuit before any of the side-effecting
     // pipeline runs.
+    const attachmentSnapshot = this.buildContextAttachmentSnapshot(session)
+    const attachmentSnapshotSignature =
+      backend === "codex"
+        ? this.buildContextAttachmentSnapshotSignature(attachmentSnapshot)
+        : ""
     const budgetSignature = `${budget.maxTokens}|${budget.systemPromptTokens}|${budget.autoCompactTokenLimit ?? ""}|${budget.predictiveCompactTokenLimit ?? ""}`
     const pendingToolUseIdsKey = options?.pendingToolUseIds?.length
       ? [...options.pendingToolUseIds].sort().join("|")
       : ""
-    const optionsSignature = `${options?.model ?? ""}|${options?.strategy ?? "auto"}|${options?.dryRun ? "1" : "0"}|${pendingToolUseIdsKey}`
+    const optionsSignature = `${options?.model ?? ""}|${options?.strategy ?? "auto"}|${options?.dryRun ? "1" : "0"}|${pendingToolUseIdsKey}|${attachmentSnapshotSignature}`
     const cached = this.truncateOutputCache
     if (
       cached &&
@@ -8545,13 +8570,14 @@ export class CursorConnectStreamService {
     }
     const primary = this.contextRequestPlanner.projectState(
       this.contextState.getContextRecord(session.conversationId)!.contextState,
-      this.buildContextAttachmentSnapshot(session),
+      attachmentSnapshot,
       budget,
       {
         pendingToolUseIds: options?.pendingToolUseIds,
         integrityMode,
         strategy: options?.strategy || "auto",
         dryRun: options?.dryRun,
+        codexAppendOnlyAttachments: backend === "codex",
       }
     )
     this.resetCodexContinuationAfterProjectionRewrite(
@@ -8651,7 +8677,8 @@ export class CursorConnectStreamService {
     // rounds keeps the cache contract narrow and obvious: a hit
     // means "the planner made no changes last time, and would make
     // no changes this time."
-    const noCompactionFired = !primary.snipCompaction?.changed
+    const noCompactionFired =
+      !primary.snipCompaction?.changed && !primary.microCompaction?.changed
     if (noCompactionFired) {
       this.truncateOutputCache = {
         sessionRef: session,
@@ -8725,6 +8752,7 @@ export class CursorConnectStreamService {
           integrityMode: options.integrityMode || "global",
           strategy: options.strategy || "auto",
           dryRun: true,
+          codexAppendOnlyAttachments: true,
         }
       )
       const codexProjection =
@@ -9697,11 +9725,7 @@ export class CursorConnectStreamService {
       return
     }
 
-    const projectionRewritten =
-      result.wasCompacted ||
-      result.snipCompaction?.changed === true ||
-      result.messages.length < result.projectedMessages.length
-    if (!projectionRewritten) {
+    if (!shouldResetCodexContinuationAfterProjection(result)) {
       return
     }
 
@@ -9746,20 +9770,7 @@ export class CursorConnectStreamService {
     const context =
       this.contextState.getContextRecord(conversationId)?.contextState
         .codexContext
-    if (!context) {
-      return undefined
-    }
-    const replacement = context.activeWindow?.replacementHistory
-    return safeJsonStringify({
-      historyVersion: context.historyVersion || 0,
-      activeWindowId: context.activeWindow?.windowId || "",
-      activeCompactionId: context.activeWindow?.compactionId || "",
-      replacementCompactionId: replacement?.compactionId || "",
-      replacementAnchorRecordId: replacement?.anchorRecordId || "",
-      replacementItemCount: replacement?.items?.length || 0,
-      truncationMode: context.truncationPolicy?.mode || "",
-      truncationLimit: context.truncationPolicy?.limit || 0,
-    })
+    return buildCodexContextRewriteKey(context)
   }
 
   private resetCodexStateAfterCompaction(
@@ -19741,6 +19752,14 @@ ${raw}
         let toolResultContent: string
         let toolResultStatus: "success" | "error" = "success"
         let toolCompletedExtraData: ToolCompletedExtraData | undefined
+        const bridgeInlineStartedAt = this.isSubAgentBridgeInlineTool(tc.name)
+          ? Date.now()
+          : 0
+        if (bridgeInlineStartedAt > 0) {
+          this.logger.log(
+            `[SubAgent] Bridge-inline tool started: ${tc.name} (${tc.id})`
+          )
+        }
         const bridgeInlineResult = await this.executeSubAgentBridgeInlineTool(
           conversationId,
           tc.name,
@@ -19748,8 +19767,14 @@ ${raw}
           ctx.allowedWorkspaceRoots
         )
         if (bridgeInlineResult) {
+          const durationMs =
+            bridgeInlineStartedAt > 0
+              ? Date.now() - bridgeInlineStartedAt
+              : undefined
           this.logger.log(
-            `[SubAgent] Bridge-inline tool: ${tc.name} (${tc.id})`
+            `[SubAgent] Bridge-inline tool: ${tc.name} (${tc.id}) ` +
+              `completed status=${bridgeInlineResult.state.status}` +
+              (durationMs == null ? "" : ` duration_ms=${durationMs}`)
           )
           toolResultContent = bridgeInlineResult.content
           if (bridgeInlineResult.state.status === "error") {
@@ -23014,6 +23039,23 @@ ${raw}
     )
   }
 
+  private isSubAgentBridgeInlineTool(toolName: string): boolean {
+    switch (toolName) {
+      case "grep_search":
+      case "read_file":
+      case "read_file_v2":
+      case "list_directory":
+      case "list_dir":
+      case "list_mcp_resources":
+      case "read_mcp_resource":
+      case "run_terminal_command":
+      case "run_terminal_command_v2":
+        return true
+      default:
+        return false
+    }
+  }
+
   private async executeSubAgentBridgeInlineTool(
     conversationId: string,
     toolName: string,
@@ -23590,7 +23632,7 @@ ${raw}
       }
     }
 
-    const HARD_TIMEOUT_MS = 60_000
+    const hardTimeoutMs = this.SUBAGENT_SHELL_HARD_TIMEOUT_MS
     const MAX_STREAM_BYTES = 256 * 1024 // 256 KB per stream
     const startedAtMs = Date.now()
 
@@ -23608,6 +23650,7 @@ ${raw}
     const outcome = await new Promise<SpawnOutcome>((resolve) => {
       const child = spawn("bash", ["-c", command], {
         cwd: target.absPath,
+        detached: process.platform !== "win32",
         env: process.env,
         stdio: ["ignore", "pipe", "pipe"],
       })
@@ -23619,16 +23662,29 @@ ${raw}
       let timedOut = false
       let settled = false
 
-      const timer = setTimeout(() => {
+      const killTimedOutProcessTree = () => {
         timedOut = true
         try {
-          child.kill("SIGKILL")
+          if (process.platform !== "win32" && child.pid) {
+            process.kill(-child.pid, "SIGKILL")
+          } else {
+            child.kill("SIGKILL")
+          }
         } catch {
-          // best-effort kill; if the kill itself throws there's not
-          // much we can do — the resolve below still fires off the
-          // child's `close` event.
+          try {
+            child.kill("SIGKILL")
+          } catch {
+            // best-effort kill; settle below still returns a timeout.
+          }
         }
-      }, HARD_TIMEOUT_MS)
+        child.stdout?.destroy()
+        child.stderr?.destroy()
+        child.unref()
+      }
+      const timer = setTimeout(() => {
+        killTimedOutProcessTree()
+        settle({ signal: "SIGKILL" })
+      }, hardTimeoutMs)
 
       const settle = (partial: Partial<SpawnOutcome>) => {
         if (settled) return
@@ -23710,7 +23766,7 @@ ${raw}
     }
 
     if (outcome.timedOut) {
-      const message = `command timed out after ${HARD_TIMEOUT_MS}ms`
+      const message = `command timed out after ${hardTimeoutMs}ms`
       return {
         content:
           `[run_terminal_command error] ${message}\n` +
@@ -31758,11 +31814,99 @@ ${raw}
    * sites that mirror state into the turn-keyed stores so that no
    * turn key is recorded when no turn is active.
    */
-  private getCurrentParentTurnId(conversationId: string): TurnId | undefined {
+  private isParentTurnHandleActive(handle: TurnHandle): boolean {
+    return !handle.signal.aborted && this.turnSupervisor.hasTurn(handle.turnId)
+  }
+
+  private discardParentTurnHandle(
+    conversationId: string,
+    handle: TurnHandle
+  ): void {
+    const stack = this.parentTurnStackByConversation.get(conversationId)
+    if (!stack) return
+    const idx = stack.lastIndexOf(handle)
+    if (idx >= 0) stack.splice(idx, 1)
+    if (stack.length === 0) {
+      this.parentTurnStackByConversation.delete(conversationId)
+    }
+  }
+
+  private getCurrentParentTurnHandle(
+    conversationId: string
+  ): TurnHandle | undefined {
     const stack = this.parentTurnStackByConversation.get(conversationId)
     if (!stack || stack.length === 0) return undefined
-    const top = stack[stack.length - 1]
-    return top?.turnId
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1]
+      if (top && this.isParentTurnHandleActive(top)) return top
+      stack.pop()
+      if (top) {
+        this.logger.debug(
+          `[turn-integrity] pruned inactive parent turn ${top.turnId} ` +
+            `conversation=${conversationId}`
+        )
+      }
+    }
+    this.parentTurnStackByConversation.delete(conversationId)
+    return undefined
+  }
+
+  private getCurrentParentTurnId(conversationId: string): TurnId | undefined {
+    return this.getCurrentParentTurnHandle(conversationId)?.turnId
+  }
+
+  private abortStaleSubAgentSpawn(
+    conversationId: string,
+    subagentName: string,
+    parentTurnId: TurnId | undefined,
+    reason: "parent_aborted" | "parent_missing"
+  ): never {
+    this.logger.warn(
+      `[turn-integrity] skipping sub-agent spawn from inactive parent ` +
+        `conversation=${conversationId} subagent=${subagentName} ` +
+        `parentTurnId=${parentTurnId ?? "(none)"} reason=${reason}`
+    )
+    throw new UpstreamRequestAbortedError(
+      "new user turn arrived; sub-agent spawn skipped"
+    )
+  }
+
+  private resolveSubAgentParentTurnId(
+    conversationId: string,
+    bidiId: BidiId,
+    subagentName: string,
+    contextHandle: TurnHandle | undefined
+  ): TurnId | undefined {
+    if (
+      contextHandle &&
+      String(contextHandle.conversationId) === conversationId
+    ) {
+      if (this.isParentTurnHandleActive(contextHandle)) {
+        return contextHandle.turnId
+      }
+      this.discardParentTurnHandle(conversationId, contextHandle)
+      this.abortStaleSubAgentSpawn(
+        conversationId,
+        subagentName,
+        contextHandle.turnId,
+        contextHandle.signal.aborted ? "parent_aborted" : "parent_missing"
+      )
+    }
+
+    const stackHadEntries =
+      (this.parentTurnStackByConversation.get(conversationId)?.length ?? 0) > 0
+    const parentHandle = this.getCurrentParentTurnHandle(conversationId)
+    if (parentHandle) return parentHandle.turnId
+    if (stackHadEntries) {
+      this.abortStaleSubAgentSpawn(
+        conversationId,
+        subagentName,
+        undefined,
+        "parent_missing"
+      )
+    }
+
+    return this.turnSupervisor.getUmbrellaForBidi(bidiId)
   }
 
   /**
@@ -32160,9 +32304,12 @@ ${raw}
     // Prefer the active chat ParentTurn (so the sub-agent inherits
     // its abort scope); fall back to the BiDi umbrella so the
     // sub-agent always has a parent to cascade-cancel from.
-    const parentTurnId =
-      this.getCurrentParentTurnId(conversationId) ??
-      this.turnSupervisor.getUmbrellaForBidi(bidiId)
+    const parentTurnId = this.resolveSubAgentParentTurnId(
+      conversationId,
+      bidiId,
+      subagentName,
+      ctxHandle
+    )
 
     let resolveRunner!: (r: TurnTerminalResult) => void
     const runnerSettle = new Promise<TurnTerminalResult>((resolve) => {

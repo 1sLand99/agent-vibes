@@ -99,6 +99,7 @@ export type {
   ContextTelemetryEvent,
   ContextTelemetryEventDetail,
 } from "./context-telemetry.service"
+export { CONTEXT_MICROCOMPACT_CLEARED_MARKER } from "./context-microcompact-marker"
 export {
   createCompactBoundaryRecord,
   createCompactSummaryRecord,

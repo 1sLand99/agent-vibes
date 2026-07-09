@@ -148,6 +148,50 @@ export class CodexRuntimeCacheStore {
     return deleted
   }
 
+  clearWsBaselinesByConversationHash(conversationIdHash: string): {
+    clearedCount: number
+    discardedPreviousResponseId: string | undefined
+  } {
+    const normalizedHash = conversationIdHash.trim()
+    if (!normalizedHash) {
+      return {
+        clearedCount: 0,
+        discardedPreviousResponseId: undefined,
+      }
+    }
+
+    this.prune()
+    const suffix = `:conversation:${normalizedHash}`
+    let clearedCount = 0
+    let discardedPreviousResponseId: string | undefined
+    for (const [key, entry] of this.cachedWsSessions) {
+      if (!key.endsWith(suffix)) {
+        continue
+      }
+
+      const hadContinuationBaseline =
+        !!entry.lastRequest || !!entry.lastResponse
+      if (!hadContinuationBaseline) {
+        continue
+      }
+
+      discardedPreviousResponseId =
+        discardedPreviousResponseId || entry.lastResponse?.responseId
+      this.cachedWsSessions.set(key, {
+        ...entry,
+        lastRequest: undefined,
+        lastResponse: undefined,
+        updatedAt: this.now(),
+      })
+      clearedCount++
+    }
+
+    return {
+      clearedCount,
+      discardedPreviousResponseId,
+    }
+  }
+
   takeWsEntriesByConversationHash(
     conversationIdHash: string
   ): CodexCachedWsEntry[] {

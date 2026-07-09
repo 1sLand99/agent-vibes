@@ -2,6 +2,7 @@ import type { CodexInputItem } from "./codex-native-types"
 import {
   prepareCodexTurnLedgerRequest,
   type CodexContinuationDecision,
+  type CodexInputMismatchItemDetail,
   type CodexTurnLedgerResponse,
 } from "./codex-turn-ledger"
 
@@ -52,7 +53,15 @@ export function buildCodexContinuationDecisionLogLine(
           (typeof decision.inputMismatch.mismatchIndex === "number"
             ? ` mismatch_index=${decision.inputMismatch.mismatchIndex}` +
               ` baseline_type=${decision.inputMismatch.baselineType || "unknown"}` +
-              ` request_type=${decision.inputMismatch.requestType || "unknown"}`
+              ` request_type=${decision.inputMismatch.requestType || "unknown"}` +
+              formatCodexInputMismatchDetail(
+                "baseline",
+                decision.inputMismatch.baselineDetail
+              ) +
+              formatCodexInputMismatchDetail(
+                "request",
+                decision.inputMismatch.requestDetail
+              )
             : "")
     return (
       `[Codex][TurnContext] Incremental request unavailable: ${decision.reason}${detail}; ` +
@@ -97,4 +106,24 @@ export function hasCodexTurnContinuationState(
   state: CodexTurnContinuationState | null | undefined
 ): boolean {
   return !!state?.lastResponse?.responseId
+}
+
+function formatCodexInputMismatchDetail(
+  label: "baseline" | "request",
+  detail: CodexInputMismatchItemDetail | undefined
+): string {
+  if (!detail) {
+    return ""
+  }
+  const parts = [
+    `${label}_sig=${detail.signature}`,
+    `${label}_json_len=${detail.jsonLength}`,
+  ]
+  if (detail.role) {
+    parts.push(`${label}_role=${detail.role}`)
+  }
+  if (detail.preview) {
+    parts.push(`${label}_preview=${JSON.stringify(detail.preview)}`)
+  }
+  return ` ${parts.join(" ")}`
 }

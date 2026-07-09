@@ -415,6 +415,28 @@ export interface CodexMetaMessageLedgerState {
   latestKindsByKey: Record<string, ContextProjectionAttachment["kind"]>
 }
 
+export interface CodexAppendOnlyAttachmentLedgerEntry {
+  kind: ContextProjectionAttachment["kind"]
+  label: string
+  signature: string
+  beforeVisibleIndex: number
+  role: "user"
+  content: LooseMessageContent
+  source: "attachment"
+  isMeta: true
+  attachmentKind: ContextProjectionAttachment["kind"]
+  commitId?: string
+  createdAt: number
+}
+
+export interface CodexAppendOnlyAttachmentLedgerState {
+  version: number
+  entries: CodexAppendOnlyAttachmentLedgerEntry[]
+  latestSignaturesByKind: Partial<
+    Record<ContextProjectionAttachment["kind"], string>
+  >
+}
+
 export const CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE = "codex_response_item"
 
 export interface CodexRawResponseItemBlock {
@@ -452,6 +474,7 @@ export interface CodexContextState {
   tokenInfo?: CodexContextTokenInfo
   referenceContextItem?: CodexReferenceContextItem
   metaMessageLedger?: CodexMetaMessageLedgerState
+  appendOnlyAttachmentLedger?: CodexAppendOnlyAttachmentLedgerState
   activeWindow?: CodexContextWindowState
   truncationPolicy: CodexTruncationPolicy
 }
