@@ -267,6 +267,11 @@
           "default": false,
           "description": "Enable debug logging"
         },
+        "agentVibes.proxyApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional global PROXY_API_KEY for bridge API authentication. If empty, the bridge inherits PROXY_API_KEY from the environment (requires restart)"
+        },
         "agentVibes.thinkingBudgetAuto": {
           "type": "boolean",
           "default": true,

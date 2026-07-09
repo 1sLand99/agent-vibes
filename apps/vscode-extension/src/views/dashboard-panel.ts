@@ -1,10 +1,9 @@
-import { X509Certificate } from "crypto"
+import { randomBytes, X509Certificate } from "crypto"
 import * as fs from "fs"
-import * as net from "net"
+import * as os from "os"
 import * as path from "path"
-import * as tls from "tls"
 import * as vscode from "vscode"
-import { CMD, CURSOR_DOMAINS } from "../constants"
+import { CMD } from "../constants"
 import {
   type DashboardLocale,
   formatUi,
@@ -394,10 +393,6 @@ export class DashboardPanel {
         void this.sendKiroQuotaStatus()
         break
 
-      case "getContextTelemetry":
-        void this.sendContextTelemetry()
-        break
-
       case "getUsageSummary":
         void this.sendUsageSummary()
         break
@@ -446,6 +441,10 @@ export class DashboardPanel {
         void this.handleClaudeIntegrationDisconnect()
         break
 
+      case "generateProxyApiKey":
+        void this.handleGenerateProxyApiKey()
+        break
+
       case "importKiroToken":
         if (msg.raw) {
           this.handleImportKiroToken(msg.raw)
@@ -476,6 +475,23 @@ export class DashboardPanel {
     }
   }
 
+  private async handleGenerateProxyApiKey(): Promise<void> {
+    const value = `av_${randomBytes(32).toString("base64url")}`
+    const config = vscode.workspace.getConfiguration("agentVibes")
+    await config.update("proxyApiKey", value, vscode.ConfigurationTarget.Global)
+    await vscode.env.clipboard.writeText(value)
+
+    const action = await vscode.window.showInformationMessage(
+      t("dash.proxyApiKey.generated"),
+      t("dash.action.restart"),
+      t("dash.action.later")
+    )
+    if (action === t("dash.action.restart")) {
+      await this.bridge.restart()
+    }
+    this.sendAllData()
+  }
+
   /**
    * Probe an exposed bridge endpoint with a `/health` GET and surface
    * the result as a toast. Called from the API tab's Test buttons.
@@ -499,6 +515,10 @@ export class DashboardPanel {
       const headers: Record<string, string> = {
         accept: "application/json,text/plain;q=0.8,*/*;q=0.5",
         "user-agent": "agent-vibes-extension-probe/1",
+      }
+      const apiKey = this.resolveBridgeApiKey()
+      if (apiKey) {
+        headers.authorization = `Bearer ${apiKey}`
       }
 
       // Trust the mkcert CA the bridge uses for HTTPS, but don't fail
@@ -800,40 +820,6 @@ export class DashboardPanel {
     }
   }
 
-  /**
-   * Fetch the context-management telemetry counter snapshot from the
-   * bridge and forward it to the webview Diagnostics tab.  When the
-   * bridge is not running we send `null` so the UI can render a clear
-   * "telemetry unavailable" hint instead of stale numbers.
-   */
-  private async sendContextTelemetry(): Promise<void> {
-    if (this.bridge.state !== "running") {
-      this.panel.webview.postMessage({
-        type: "contextTelemetryUpdate",
-        data: null,
-      })
-      return
-    }
-    try {
-      const data = await this.callBridgeApi<Record<string, unknown>>(
-        "/api/context/telemetry",
-        "GET"
-      )
-      this.panel.webview.postMessage({
-        type: "contextTelemetryUpdate",
-        data,
-      })
-    } catch (err) {
-      logger.debug(
-        `Context telemetry fetch failed: ${err instanceof Error ? err.message : String(err)}`
-      )
-      this.panel.webview.postMessage({
-        type: "contextTelemetryUpdate",
-        data: null,
-      })
-    }
-  }
-
   private async sendUsageSummary(): Promise<void> {
     if (this.bridge.state !== "running") {
       this.panel.webview.postMessage({
@@ -967,6 +953,7 @@ export class DashboardPanel {
       "language",
       "responseLanguage",
       "trafficMode",
+      "proxyApiKey",
       "dataDir",
       "antigravityAccountsPath",
       "codexAccountsPath",
@@ -1025,7 +1012,18 @@ export class DashboardPanel {
         this.watchAccountFiles()
       }
 
-      if (key === "trafficMode") {
+      if (key === "proxyApiKey") {
+        const action = await vscode.window.showInformationMessage(
+          str
+            ? tFmt("dash.settingUpdated", { key: "PROXY_API_KEY" })
+            : tFmt("dash.settingReset", { key: "PROXY_API_KEY" }),
+          t("dash.action.restart"),
+          t("dash.action.later")
+        )
+        if (action === t("dash.action.restart")) {
+          await this.bridge.restart()
+        }
+      } else if (key === "trafficMode") {
         vscode.window.showInformationMessage(t("dash.trafficModeChanged"))
       } else if (key !== "language") {
         vscode.window.showInformationMessage(
@@ -1303,6 +1301,11 @@ export class DashboardPanel {
       0
     )
 
+    const envProxyApiKey = process.env.PROXY_API_KEY?.trim() || ""
+    const envFileProxyApiKey = this.resolveProxyApiKeyFromEnvFiles()
+    const effectiveProxyApiKey =
+      this.config.proxyApiKey || envProxyApiKey || envFileProxyApiKey
+
     const statusData = {
       locale,
       uiPack,
@@ -1312,6 +1315,16 @@ export class DashboardPanel {
       hasCertificates: this.config.hasCertificates(),
       totalAccounts,
       defaultProxyUrl: this.getDefaultProxyUrl(),
+      proxyApiKey: {
+        source: this.config.proxyApiKey
+          ? "settings"
+          : envProxyApiKey || envFileProxyApiKey
+            ? "env"
+            : "none",
+        value: effectiveProxyApiKey,
+        configured: Boolean(this.config.proxyApiKey),
+        envConfigured: Boolean(envProxyApiKey || envFileProxyApiKey),
+      },
       cursorBridgePatch: {
         applied: bridgeEndpointPatchStatus.applied,
         canApply: bridgeEndpointPatchStatus.canApply,
@@ -1518,6 +1531,18 @@ export class DashboardPanel {
                 value: agentCfg.get<string>("kiroAccountsPath") || "",
                 placeholder: this.config.kiroAccountsPath,
               },
+              {
+                label: st.groups.storage.items.sessionData.label,
+                desc: st.groups.storage.items.sessionData.desc,
+                type: "actions",
+                actions: [
+                  {
+                    label: st.groups.storage.items.sessionData.label,
+                    command: CMD.CLEAR_CACHE,
+                    tone: "secondary",
+                  },
+                ],
+              },
             ],
           },
           {
@@ -1705,9 +1730,6 @@ export class DashboardPanel {
    * Run a single diagnostic test and stream results to the webview.
    */
   private runDiagnosticTest(testId: string): void {
-    const { execSync } =
-      require("child_process") as typeof import("child_process")
-
     const emit = (line: string) => {
       this.panel.webview.postMessage({
         type: "testResult",
@@ -1723,178 +1745,60 @@ export class DashboardPanel {
 
     try {
       switch (testId) {
-        // ── 1. Proxy Bypass ──
-        case "proxy": {
-          if (process.platform === "darwin") {
-            try {
-              // 1) Check if any system proxy is enabled via scutil
-              const scutil = execSync("scutil --proxy", {
-                encoding: "utf-8",
-                timeout: 3000,
-                stdio: "pipe",
-              })
-              const httpEnabled = /\bHTTPEnable\s*:\s*1\b/.test(scutil)
-              const httpsEnabled = /\bHTTPSEnable\s*:\s*1\b/.test(scutil)
-              const socksEnabled = /\bSOCKSEnable\s*:\s*1\b/.test(scutil)
-              if (!httpEnabled && !httpsEnabled && !socksEnabled) {
-                emit("System proxy: not enabled (HTTP/HTTPS/SOCKS all off)")
-                emit("✓ No proxy to bypass")
-                done("pass")
-                break
-              }
-              // Extract proxy URLs from scutil output
-              const httpHost =
-                scutil.match(/\bHTTPProxy\s*:\s*(\S+)/)?.[1] || ""
-              const httpPort = scutil.match(/\bHTTPPort\s*:\s*(\d+)/)?.[1] || ""
-              const httpsHost =
-                scutil.match(/\bHTTPSProxy\s*:\s*(\S+)/)?.[1] || ""
-              const httpsPort =
-                scutil.match(/\bHTTPSPort\s*:\s*(\d+)/)?.[1] || ""
-              const socksHost =
-                scutil.match(/\bSOCKSProxy\s*:\s*(\S+)/)?.[1] || ""
-              const socksPort =
-                scutil.match(/\bSOCKSPort\s*:\s*(\d+)/)?.[1] || ""
-              if (httpEnabled) emit(`HTTP proxy:  ${httpHost}:${httpPort}`)
-              if (httpsEnabled) emit(`HTTPS proxy: ${httpsHost}:${httpsPort}`)
-              if (socksEnabled) emit(`SOCKS proxy: ${socksHost}:${socksPort}`)
-
-              // 2) Read bypass domains via networksetup (matches setup-forwarding.js)
-              const svcList = execSync("networksetup -listallnetworkservices", {
-                encoding: "utf-8",
-                timeout: 3000,
-                stdio: "pipe",
-              })
-              const services = svcList
-                .split("\n")
-                .filter(
-                  (l: string) =>
-                    l.trim() &&
-                    !l.startsWith("An asterisk") &&
-                    !l.startsWith("*")
-                )
-              const svc = services[0]
-              if (!svc) {
-                emit("No active network service found")
-                done("warn")
-                break
-              }
-              emit(`Network service: ${svc}`)
-              const bypassRaw = execSync(
-                `networksetup -getproxybypassdomains "${svc}"`,
-                { encoding: "utf-8", timeout: 3000, stdio: "pipe" }
-              )
-              const bypassList = bypassRaw
-                .split("\n")
-                .map((l: string) => l.trim())
-                .filter((l: string) => l && !/^There aren't any/.test(l))
-
-              const checkEntries = [
-                ...CURSOR_DOMAINS.map((d) => d),
-                ...CURSOR_DOMAINS.map((d) => `*.${d}`),
-                "127.0.0.2",
-              ]
-              const missingEntries: string[] = []
-              for (const entry of checkEntries) {
-                if (!bypassList.includes(entry)) {
-                  missingEntries.push(entry)
-                }
-              }
-              if (missingEntries.length === 0) {
-                emit(`✓ All ${checkEntries.length} bypass entries present`)
-              } else {
-                emit(`Bypass entries: ${bypassList.length}`)
-                for (const entry of missingEntries) {
-                  emit(`  ${entry}: ✗ MISSING`)
-                }
-              }
-              done(missingEntries.length === 0 ? "pass" : "warn")
-            } catch (err) {
-              emit(
-                `Could not read proxy config: ${err instanceof Error ? err.message : String(err)}`
-              )
-              done("warn")
-            }
-          } else if (process.platform === "win32") {
-            try {
-              const reg = execSync(
-                'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyEnable',
-                { encoding: "utf-8", timeout: 3000, stdio: "pipe" }
-              )
-              if (!reg.includes("0x1")) {
-                emit("System proxy: disabled")
-                emit("✓ No proxy to bypass")
-                done("pass")
-                break
-              }
-              emit("System proxy: enabled")
-              const bypassRaw = execSync(
-                'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyOverride',
-                { encoding: "utf-8", timeout: 3000, stdio: "pipe" }
-              )
-              const match = bypassRaw.match(/ProxyOverride\s+REG_SZ\s+(.+)/)
-              const bypassList = match?.[1]
-                ? match[1]
-                    .split(";")
-                    .map((e: string) => e.trim())
-                    .filter(Boolean)
-                : []
-              emit(`Bypass entries: ${bypassList.length}`)
-
-              const checkEntries = [...CURSOR_DOMAINS, "127.0.0.2"]
-              let missing = 0
-              for (const entry of checkEntries) {
-                const found =
-                  bypassList.includes(entry) ||
-                  bypassList.some((b: string) => b === "*.cursor.sh")
-                if (!found) {
-                  emit(`  ${entry}: ✗ NOT bypassed`)
-                  missing++
-                }
-              }
-              if (missing === 0) emit("✓ All bypass entries present")
-              done(missing === 0 ? "pass" : "warn")
-            } catch {
-              emit("Could not read proxy config")
-              done("warn")
-            }
-          } else {
-            try {
-              const mode = execSync(
-                "gsettings get org.gnome.system.proxy mode",
-                { encoding: "utf-8", timeout: 3000, stdio: "pipe" }
-              ).trim()
-              if (mode !== "'manual'") {
-                emit(`Proxy mode: ${mode} (not manual)`)
-                emit("✓ No proxy to bypass")
-                done("pass")
-                break
-              }
-              emit("Proxy mode: manual")
-              const ignore = execSync(
-                "gsettings get org.gnome.system.proxy ignore-hosts",
-                { encoding: "utf-8", timeout: 3000, stdio: "pipe" }
-              ).trim()
-              const checkEntries = [...CURSOR_DOMAINS, "127.0.0.2"]
-              let missing = 0
-              for (const entry of checkEntries) {
-                const found =
-                  ignore.includes(entry) || ignore.includes("*.cursor.sh")
-                if (!found) {
-                  emit(`  ${entry}: ✗ NOT bypassed`)
-                  missing++
-                }
-              }
-              if (missing === 0) emit("✓ All bypass entries present")
-              done(missing === 0 ? "pass" : "warn")
-            } catch {
-              emit("gsettings not available, skipping")
-              done("pass")
-            }
+        // ── Cursor Direct Connection Patch ──
+        case "patchEndpoint": {
+          const status = this.cursorPatchService.getBridgeEndpointPatchStatus(
+            this.config.port,
+            { force: true }
+          )
+          emit(`Target endpoint: ${status.endpointUrl}`)
+          if (status.filePath) {
+            emit(`Workbench: ${status.filePath}`)
           }
+          emit(
+            `Local endpoints: ${status.coverage.matchingLocalEndpoints}/${status.coverage.localEndpoints}`
+          )
+          emit(
+            status.coverage.credentialsGuard
+              ? "✓ Runtime credentials covered"
+              : "✗ Runtime credentials not covered"
+          )
+          emit(
+            status.coverage.persistentGuard
+              ? "✓ Saved credentials covered"
+              : "✗ Saved credentials not covered"
+          )
+          emit(`Pending account/model endpoints: ${status.coverage.apiTargets}`)
+          emit(`Pending agent chat endpoints: ${status.coverage.agentTargets}`)
+
+          if (!status.fileExists) {
+            emit("✗ Cursor workbench file was not found")
+            done("fail")
+            break
+          }
+          if (status.applied) {
+            emit("✓ Cursor direct connection patch is active")
+            done("pass")
+            break
+          }
+          if (status.requiresPortUpdate) {
+            emit(
+              `Patch uses ${status.currentUrl || "an older endpoint"}; update to ${status.endpointUrl}`
+            )
+            done("warn")
+            break
+          }
+          if (status.canApply) {
+            emit("Patch is available but not applied")
+            done("warn")
+            break
+          }
+          emit("✗ Cursor direct connection patch cannot be applied")
+          done("fail")
           break
         }
 
-        // ── 2. SSL Certificates ──
+        // ── SSL Certificates ──
         case "ssl": {
           const serverCert = this.config.serverCertPath
           const serverKey = this.config.serverKeyPath
@@ -1932,23 +1836,27 @@ export class DashboardPanel {
             emit(`Valid to: ${x509.validTo}`)
             emit(`SAN: ${x509.subjectAltName || "(none)"}`)
 
-            const requiredNames = [
-              "localhost",
-              "api2.cursor.sh",
-              "api2geo.cursor.sh",
-              "api2direct.cursor.sh",
-              "api5.cursor.sh",
-              "127.0.0.2",
+            const san = x509.subjectAltName || ""
+            const requiredSans = [
+              { name: "localhost", patterns: ["DNS:localhost"] },
+              { name: "127.0.0.1", patterns: ["IP Address:127.0.0.1"] },
+              {
+                name: "::1",
+                patterns: ["IP Address:::1", "IP Address:0:0:0:0:0:0:0:1"],
+              },
             ]
-            const missingNames = requiredNames.filter(
-              (name) => !(x509.subjectAltName || "").includes(name)
-            )
+            const missingNames = requiredSans
+              .filter(
+                (entry) =>
+                  !entry.patterns.some((pattern) => san.includes(pattern))
+              )
+              .map((entry) => entry.name)
 
             if (missingNames.length === 0) {
-              emit("✓ Certificate SAN covers required Cursor domains")
+              emit("✓ Certificate SAN covers local bridge endpoints")
               done("pass")
             } else {
-              emit("✗ Certificate SAN is missing required names:")
+              emit("✗ Certificate SAN is missing required local endpoints:")
               for (const name of missingNames) {
                 emit(`  ${name}`)
               }
@@ -1963,7 +1871,7 @@ export class DashboardPanel {
           break
         }
 
-        // ── 3. Bridge Health (HTTPS) ──
+        // ── Bridge Health (HTTPS) ──
         case "bridge": {
           const port = this.config.port
           const caPath = this.config.caCertPath
@@ -2008,176 +1916,36 @@ export class DashboardPanel {
           return // async
         }
 
-        // ── 4. End-to-End Cursor TLS ──
-        case "h2": {
-          const targetHost = "api2.cursor.sh"
-          const caPath = this.config.caCertPath
-          emit(`TLS connect → ${targetHost}:443`)
-
-          let ca: Buffer
-          try {
-            ca = fs.readFileSync(caPath)
-          } catch (err) {
-            emit(
-              `✗ Failed to read CA certificate: ${err instanceof Error ? err.message : String(err)}`
-            )
+        // ── Idle Extension Host Killer Patch ──
+        case "idleKiller": {
+          const status =
+            this.cursorPatchService.getIdleExtensionHostKillerStatus({
+              force: true,
+            })
+          if (status.filePath) {
+            emit(`Workbench: ${status.filePath}`)
+          }
+          if (!status.fileExists) {
+            emit("✗ Cursor workbench file was not found")
             done("fail")
             break
           }
-
-          const socket = tls.connect({
-            host: targetHost,
-            port: 443,
-            servername: targetHost,
-            ca,
-            rejectUnauthorized: true,
-            ALPNProtocols: ["h2", "http/1.1"],
-            timeout: 5000,
-          })
-
-          socket.once("secureConnect", () => {
-            const peer = socket.getPeerCertificate(true)
-            emit(
-              `Remote address: ${socket.remoteAddress || "(unknown)"}:${socket.remotePort || ""}`
-            )
-            emit(`Authorized: ${socket.authorized ? "yes" : "no"}`)
-            if (!socket.authorized && socket.authorizationError) {
-              emit(`Authorization error: ${socket.authorizationError}`)
-            }
-            emit(`ALPN: ${socket.alpnProtocol || "(none)"}`)
-            emit(`Certificate subject: ${JSON.stringify(peer.subject || {})}`)
-            emit(`Certificate issuer: ${JSON.stringify(peer.issuer || {})}`)
-            emit(`Certificate SAN: ${peer.subjectaltname || "(none)"}`)
-
-            const san = peer.subjectaltname || ""
-            const remote = socket.remoteAddress || ""
-            const loopback =
-              remote === "127.0.0.2" ||
-              remote === "127.0.0.1" ||
-              remote === "::1"
-            const sanMatches = san.includes(`DNS:${targetHost}`)
-
-            if (!sanMatches) {
-              emit(`✗ Presented certificate does not cover ${targetHost}`)
-              socket.end()
-              done("fail")
-              return
-            }
-
-            if (!loopback) {
-              emit(
-                "✗ Connection did not terminate on local forwarding IP (possible TUN/global proxy interception)"
-              )
-              socket.end()
-              done("fail")
-              return
-            }
-
-            emit("✓ End-to-end TLS looks correct for Cursor domain")
-            socket.end()
+          if (status.applied) {
+            emit("✓ Idle extension-host killer patch is active")
             done("pass")
-          })
-
-          socket.once("timeout", () => {
-            emit("✗ TLS connection timed out")
-            socket.destroy()
-            done("fail")
-          })
-
-          socket.once("error", (err: Error & { code?: string }) => {
-            emit(`✗ TLS error: ${err.message}`)
-            if (err.code) {
-              emit(`Error code: ${err.code}`)
-            }
-            socket.destroy()
-            done("fail")
-          })
-          return // async
-        }
-
-        // ── 5. Traffic Forwarding ──
-        case "forwarding": {
-          const forwarding = this.network.getForwardingStatus()
-          emit(
-            forwarding.hasHosts
-              ? "✓ /etc/hosts entries found"
-              : "✗ /etc/hosts entries missing"
-          )
-
-          if (forwarding.hasLoopbackAlias !== null) {
-            emit(
-              forwarding.hasLoopbackAlias
-                ? "✓ Loopback alias (127.0.0.2) active"
-                : "✗ Loopback alias missing"
-            )
+            break
           }
-
-          emit(
-            forwarding.backendConfigured
-              ? `✓ ${forwarding.backendStatusLabel} active`
-              : `✗ ${forwarding.backendStatusLabel} missing`
-          )
-
-          // End-to-end: try connecting 127.0.0.2:443
-          emit("Testing 127.0.0.2:443 → 127.0.0.1:" + this.config.port + "...")
-          const sock = new net.Socket()
-          sock.setTimeout(2000)
-          sock.once("connect", () => {
-            emit("✓ End-to-end forwarding OK")
-            sock.destroy()
-            done(forwarding.active ? "pass" : "warn")
-          })
-          sock.once("timeout", () => {
-            emit("✗ 127.0.0.2:443 timed out")
-            sock.destroy()
-            done(
-              forwarding.hasHosts || forwarding.backendConfigured
-                ? "warn"
-                : "fail"
-            )
-          })
-          sock.once("error", (err: Error) => {
-            emit(`✗ 127.0.0.2:443: ${err.message}`)
-            sock.destroy()
-            done(
-              forwarding.hasHosts || forwarding.backendConfigured
-                ? "warn"
-                : "fail"
-            )
-          })
-          sock.connect(443, "127.0.0.2")
-          return // async
-        }
-
-        // ── 6. DNS Resolution ──
-        case "dns": {
-          const domains = [...CURSOR_DOMAINS]
-          emit("Checking /etc/hosts for Cursor domain entries...")
-          let allFound = true
-          try {
-            const hostsPath =
-              process.platform === "win32"
-                ? "C:\\Windows\\System32\\drivers\\etc\\hosts"
-                : "/etc/hosts"
-            const hosts = fs.readFileSync(hostsPath, "utf-8")
-            for (const domain of domains) {
-              const found = hosts.includes(domain)
-              emit(
-                `  ${domain}: ${found ? "✓ mapped to 127.0.0.2" : "✗ not found"}`
-              )
-              if (!found) allFound = false
-            }
-          } catch (err) {
-            emit(
-              `Could not read hosts file: ${err instanceof Error ? err.message : String(err)}`
-            )
-            allFound = false
+          if (status.canApply) {
+            emit("Patch is available but not applied")
+            done("warn")
+            break
           }
-          done(allFound ? "pass" : "warn")
+          emit("✗ Idle extension-host killer patch cannot be applied")
+          done("fail")
           break
         }
 
-        // ── 7. Backend Accounts ──
+        // ── Backend Accounts ──
         case "accounts": {
           const channels: AccountChannel[] = [
             "antigravity",
@@ -2679,8 +2447,85 @@ export class DashboardPanel {
   }
 
   private resolveBridgeApiKey(): string | undefined {
-    const fromEnv = process.env.PROXY_API_KEY?.trim()
-    return fromEnv || undefined
+    return (
+      this.config.proxyApiKey ||
+      process.env.PROXY_API_KEY?.trim() ||
+      this.resolveProxyApiKeyFromEnvFiles() ||
+      undefined
+    )
+  }
+
+  private resolveProxyApiKeyFromEnvFiles(): string {
+    for (const envPath of this.getBridgeEnvFileCandidates()) {
+      if (!fs.existsSync(envPath)) continue
+      const value = this.readProxyApiKeyFromEnvFile(envPath)
+      if (value) return value
+    }
+    return ""
+  }
+
+  private getBridgeEnvFileCandidates(): string[] {
+    const codexHome =
+      process.env.CODEX_HOME || path.join(os.homedir(), ".codex")
+    const workspaceCandidates = (
+      vscode.workspace.workspaceFolders ?? []
+    ).flatMap((folder) =>
+      this.getBridgeEnvFileCandidatesForRoot(folder.uri.fsPath)
+    )
+    const candidates = [
+      ...workspaceCandidates,
+      ...this.getBridgeEnvFileCandidatesForRoot(process.cwd()),
+      path.resolve(
+        this.extensionUri.fsPath,
+        "..",
+        "protocol-bridge",
+        ".env.local"
+      ),
+      path.resolve(this.extensionUri.fsPath, "..", "protocol-bridge", ".env"),
+      path.resolve(this.extensionUri.fsPath, "bridge", ".env.local"),
+      path.resolve(this.extensionUri.fsPath, "bridge", ".env"),
+      path.join(codexHome, ".env.local"),
+      path.join(codexHome, ".env"),
+    ]
+    return Array.from(new Set(candidates))
+  }
+
+  private getBridgeEnvFileCandidatesForRoot(root: string): string[] {
+    return [
+      path.resolve(root, "apps/protocol-bridge/.env.local"),
+      path.resolve(root, "apps/protocol-bridge/.env"),
+      path.resolve(root, ".env.local"),
+      path.resolve(root, ".env"),
+    ]
+  }
+
+  private readProxyApiKeyFromEnvFile(envPath: string): string {
+    const raw = fs.readFileSync(envPath, "utf-8")
+    for (const line of raw.split(/\r?\n/)) {
+      const match = /^\s*(?:export\s+)?PROXY_API_KEY\s*=\s*(.*)$/.exec(line)
+      if (!match) continue
+      return this.parseEnvValue(match[1] ?? "").trim()
+    }
+    return ""
+  }
+
+  private parseEnvValue(rawValue: string): string {
+    const value = rawValue.trim()
+    const quote = value[0]
+    if ((quote === '"' || quote === "'") && value.length >= 2) {
+      const endIndex = value.indexOf(quote, 1)
+      const inner = value.slice(1, endIndex === -1 ? undefined : endIndex)
+      if (quote === '"') {
+        return inner
+          .replace(/\\n/g, "\n")
+          .replace(/\\r/g, "\r")
+          .replace(/\\t/g, "\t")
+          .replace(/\\"/g, '"')
+          .replace(/\\\\/g, "\\")
+      }
+      return inner
+    }
+    return value.replace(/\s+#.*$/, "").trim()
   }
 
   private resolveBridgeCaCertPath(): string | undefined {
@@ -2785,6 +2630,14 @@ export class DashboardPanel {
     const caCert = this.config.caCertPath
     const caData = fs.existsSync(caCert) ? fs.readFileSync(caCert) : undefined
     const payload = body ? JSON.stringify(body) : ""
+    const headers: Record<string, string | number> = {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(payload),
+    }
+    const apiKey = this.resolveBridgeApiKey()
+    if (apiKey) {
+      headers.authorization = `Bearer ${apiKey}`
+    }
 
     return new Promise<T | null>((resolve, reject) => {
       const options: import("https").RequestOptions = {
@@ -2795,10 +2648,7 @@ export class DashboardPanel {
         ca: caData,
         rejectUnauthorized: !!caData,
         timeout: 30_000,
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-        },
+        headers,
       }
       const req = https.request(options, (res) => {
         let responseBody = ""

@@ -132,6 +132,10 @@ export class BridgeManager extends EventEmitter {
         env.AGENT_VIBES_FORCED_LANGUAGE = this.config.responseLanguage
       }
 
+      if (this.config.proxyApiKey) {
+        env.PROXY_API_KEY = this.config.proxyApiKey
+      }
+
       // Stability first: Kiro warmup sends one request per account on every
       // bridge start. On account pools this can trigger 429 cooldowns and a
       // memory spike before the first real turn.

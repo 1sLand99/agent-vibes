@@ -2291,8 +2291,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         cacheId
       ) as CodexRequest
     }
-    const compactTurnContext =
-      this.turnContexts.getActiveContext(conversationId)
+    const compactTurnKey = this.getCodexTurnKey(codexRequest)
+    const compactTurnContext = this.getOrCreateTurnContext(
+      conversationId,
+      requestSlot,
+      modelName,
+      compactTurnKey
+    )
     const preparedCodexRequest = prepareCodexRequestForSend(codexRequest)
     const payload = buildCodexCompactRequestPayload(preparedCodexRequest)
     this.logger.debug(

@@ -1188,6 +1188,10 @@ export class CursorConnectStreamService {
     string,
     CodexContextLedgerState
   >()
+  private readonly codexContextRewriteKeyByConversation = new Map<
+    string,
+    string
+  >()
   private lastHeartbeatLog = 0
   private readonly HEARTBEAT_LOG_INTERVAL = 60000 // Log heartbeat once per minute
   // Backend-yield-driven keepalive: how long streamWithHeartbeat waits on
@@ -5221,29 +5225,6 @@ export class CursorConnectStreamService {
         )
       }
 
-      for (const message of ctx.contextState.codexContext?.metaMessageLedger
-        ?.messages || []) {
-        if (message.attachmentKind) {
-          seenAttachmentKinds.add(message.attachmentKind)
-        }
-        const category = this.classifyCheckpointMetaMessageCategory(
-          message.source,
-          message.attachmentKind
-        )
-        const text = this.stringifyCheckpointContent(message.content)
-        addLeaf(
-          category.categoryId,
-          category.kind,
-          this.describeCheckpointMetaMessage(
-            message.source,
-            message.attachmentKind
-          ),
-          this.estimateCheckpointContentTokens(message.role, message.content),
-          text.length,
-          `${category.categoryId}:${category.kind}:${message.key}`
-        )
-      }
-
       if (!seenAttachmentKinds.has("read_paths") && ctx.readPaths.size > 0) {
         const text = Array.from(ctx.readPaths).join("\n")
         addLeaf(
@@ -5362,31 +5343,6 @@ export class CursorConnectStreamService {
     return { categoryId: "conversation", kind: record.role }
   }
 
-  private classifyCheckpointMetaMessageCategory(
-    source: ContextMessageSource | undefined,
-    attachmentKind: ContextProjectionAttachment["kind"] | undefined
-  ): { categoryId: string; kind: string } {
-    if (source === "attachment") {
-      return this.classifyCheckpointAttachmentCategory(attachmentKind)
-    }
-    if (
-      source === "summary" ||
-      source === "boundary" ||
-      source === "context_collapse" ||
-      source === "snip" ||
-      source === "microcompact"
-    ) {
-      return { categoryId: "summaries", kind: source }
-    }
-    if (source === "hook") {
-      return { categoryId: "hooks", kind: "hook" }
-    }
-    if (source === "protected_context") {
-      return { categoryId: "protected_context", kind: "protected_context" }
-    }
-    return { categoryId: "other", kind: source || "context" }
-  }
-
   private classifyCheckpointAttachmentCategory(
     attachmentKind: ContextProjectionAttachment["kind"] | undefined
   ): { categoryId: string; kind: string } {
@@ -5423,48 +5379,6 @@ export class CursorConnectStreamService {
       return "Tool results"
     }
     return record.role === "assistant" ? "Assistant messages" : "User messages"
-  }
-
-  private describeCheckpointMetaMessage(
-    source: ContextMessageSource | undefined,
-    attachmentKind: ContextProjectionAttachment["kind"] | undefined
-  ): string {
-    switch (attachmentKind) {
-      case "read_paths":
-        return "Read paths"
-      case "file_states":
-        return "File states"
-      case "file_snapshots":
-        return "File snapshots"
-      case "todos":
-        return "Todos"
-      case "sub_agent":
-        return "Sub-agent context"
-      case "session_memory":
-        return "Session memory"
-      case "investigation_memory":
-        return "Investigation memory"
-      default:
-        break
-    }
-    switch (source) {
-      case "summary":
-        return "Summary"
-      case "boundary":
-        return "Compaction boundary"
-      case "context_collapse":
-        return "Context collapse"
-      case "snip":
-        return "Snipped context"
-      case "microcompact":
-        return "Microcompact"
-      case "hook":
-        return "Hook output"
-      case "protected_context":
-        return "Protected context"
-      default:
-        return "Other context"
-    }
   }
 
   private estimateCheckpointRecordTokens(
@@ -8671,6 +8585,13 @@ export class CursorConnectStreamService {
           )
         : undefined
     const projectedForBackend = codexProjection?.messages || primary.messages
+    if (backend === "codex" && codexProjection && !options?.dryRun) {
+      this.resetCodexContinuationAfterContextStateRewrite(
+        session.conversationId,
+        options?.model || session.model,
+        contextLabel
+      )
+    }
     if (
       backend === "codex" &&
       codexProjection?.hardFitApplied &&
@@ -9789,6 +9710,56 @@ export class CursorConnectStreamService {
       modelName,
       `context projection rewritten (${contextLabel})`
     )
+  }
+
+  private resetCodexContinuationAfterContextStateRewrite(
+    conversationId: string | undefined,
+    modelName: string | undefined,
+    contextLabel: string
+  ): void {
+    const normalized = conversationId?.trim()
+    if (!normalized) {
+      return
+    }
+    const key = this.buildCodexContextRewriteKey(normalized)
+    if (!key) {
+      this.codexContextRewriteKeyByConversation.delete(normalized)
+      return
+    }
+
+    const previous = this.codexContextRewriteKeyByConversation.get(normalized)
+    this.codexContextRewriteKeyByConversation.set(normalized, key)
+    if (!previous || previous === key) {
+      return
+    }
+
+    this.codexService.clearConversationContinuationBaseline(
+      normalized,
+      modelName,
+      `codex context history rewritten (${contextLabel})`
+    )
+  }
+
+  private buildCodexContextRewriteKey(
+    conversationId: string
+  ): string | undefined {
+    const context =
+      this.contextState.getContextRecord(conversationId)?.contextState
+        .codexContext
+    if (!context) {
+      return undefined
+    }
+    const replacement = context.activeWindow?.replacementHistory
+    return safeJsonStringify({
+      historyVersion: context.historyVersion || 0,
+      activeWindowId: context.activeWindow?.windowId || "",
+      activeCompactionId: context.activeWindow?.compactionId || "",
+      replacementCompactionId: replacement?.compactionId || "",
+      replacementAnchorRecordId: replacement?.anchorRecordId || "",
+      replacementItemCount: replacement?.items?.length || 0,
+      truncationMode: context.truncationPolicy?.mode || "",
+      truncationLimit: context.truncationPolicy?.limit || 0,
+    })
   }
 
   private resetCodexStateAfterCompaction(
@@ -37415,6 +37386,7 @@ ${raw}
     if (!normalized) {
       return
     }
+    this.codexContextRewriteKeyByConversation.delete(normalized)
     if (this.codexContextLedgersByConversation.delete(normalized)) {
       this.logger.debug(
         `Reset Codex context ledger for ${normalized}: ${reason}`

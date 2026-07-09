@@ -48,7 +48,8 @@ const UI_EN: Record<string, string> = {
   "endpoints.openai.desc":
     "Drop-in replacement for api.openai.com. Used by the OpenAI SDK and any OpenAI-compatible client (chat/completions, completions, models).",
   "endpoints.google.name": "Google API",
-  "endpoints.gemini.desc": "Google Gemini API compatibility — planned.",
+  "endpoints.gemini.desc":
+    "Drop-in for generativelanguage.googleapis.com. Used by Gemini CLI / google-genai SDK.",
   "tab.clients": "Clients",
   "clients.title": "Client integrations",
   "clients.subtitle": "Wire your local AI clients to this bridge.",
@@ -95,7 +96,6 @@ const UI_EN: Record<string, string> = {
   "section.topAccounts": "Top Accounts",
   "section.recentActivity": "Recent Activity",
   "section.diagnostics": "Diagnostics",
-  "section.contextTelemetry": "Context Telemetry",
   "section.bridgeLog": "Bridge Log",
   "meta.extension": "Extension",
   "meta.cursor": "Cursor",
@@ -106,14 +106,6 @@ const UI_EN: Record<string, string> = {
   refreshing: "Refreshing…",
   runAll: "Run All",
   run: "Run",
-  "contextTelemetry.refresh": "Refresh",
-  "contextTelemetry.hint":
-    "Cumulative counters since bridge start. Resets on bridge restart.",
-  "contextTelemetry.loading": "Loading telemetry…",
-  "contextTelemetry.unavailable":
-    "Telemetry unavailable. Start the bridge to see counters.",
-  "contextTelemetry.empty": "No context-management events recorded yet.",
-  "contextTelemetry.fetchedAt": "Updated at {timestamp}",
   "dlg.cancel": "Cancel",
   "dlg.add": "Add",
   "dlg.save": "Save",
@@ -124,7 +116,7 @@ const UI_EN: Record<string, string> = {
   "action.restart": "Restart",
   "action.enableForwarding": "Enable forwarding",
   "action.disableForwarding": "Disable forwarding",
-  "action.clearCache": "Reset sessions",
+  "action.clearCache": "Clear session data",
   "status.health": "Health",
   "status.ssl": "SSL",
   "status.cursor": "Cursor",
@@ -344,23 +336,17 @@ const UI_EN: Record<string, string> = {
   "analytics.recent.out": "Out",
   "analytics.recent.search": "Search",
   "analytics.noBackendUsage": "No backend usage recorded yet",
-  "test.proxy.name": "Proxy Bypass",
-  "test.proxy.desc":
-    "Check system proxy bypass entries for Cursor domains (does not validate TUN/global proxy interception)",
+  "test.patchEndpoint.name": "Cursor Direct Connection",
+  "test.patchEndpoint.desc":
+    "Verify the Cursor direct connection patch status and endpoint coverage",
   "test.ssl.name": "SSL Certificates",
   "test.ssl.desc":
-    "Validate local certificate files and SAN coverage for Cursor domains",
+    "Validate local certificate files and SAN coverage for the local bridge",
   "test.bridge.name": "Bridge Health",
   "test.bridge.desc": "HTTPS health check against the local bridge",
-  "test.h2.name": "End-to-End Cursor TLS",
-  "test.h2.desc":
-    "Verify api2.cursor.sh resolves correctly and presents a valid certificate end-to-end",
-  "test.forwarding.name": "Traffic Forwarding",
-  "test.forwarding.desc":
-    "Verify hosts mapping and the active platform forwarding backend",
-  "test.dns.name": "DNS Resolution",
-  "test.dns.desc":
-    "Resolve Cursor domains via /etc/hosts to the managed local IP",
+  "test.idleKiller.name": "Idle Extension Host Killer",
+  "test.idleKiller.desc":
+    "Verify Cursor's idle extension-host killer patch status",
   "test.accounts.name": "Backend Accounts",
   "test.accounts.desc": "Check at least one account is configured",
   "model.gemini": "Gemini Pro 3.1 High",
@@ -442,7 +428,8 @@ const UI_ZH: Record<string, string> = {
   "endpoints.openai.desc":
     "兼容 api.openai.com，可被 OpenAI SDK 及任意 OpenAI 兼容客户端直接使用（chat/completions、completions、models）。",
   "endpoints.google.name": "Google API",
-  "endpoints.gemini.desc": "Google Gemini API 兼容 — 计划中。",
+  "endpoints.gemini.desc":
+    "兼容 generativelanguage.googleapis.com，可被 Gemini CLI / google-genai SDK 使用。",
   "tab.clients": "客户端",
   "clients.title": "客户端接入",
   "clients.subtitle": "将本机 AI 客户端接入到本 Bridge。",
@@ -489,7 +476,6 @@ const UI_ZH: Record<string, string> = {
   "section.topAccounts": "常用账号",
   "section.recentActivity": "最近活动",
   "section.diagnostics": "诊断",
-  "section.contextTelemetry": "上下文遥测",
   "section.bridgeLog": "桥接日志",
   "meta.extension": "扩展",
   "meta.cursor": "Cursor",
@@ -500,13 +486,6 @@ const UI_ZH: Record<string, string> = {
   refreshing: "刷新中…",
   runAll: "全部运行",
   run: "运行",
-  "contextTelemetry.refresh": "刷新",
-  "contextTelemetry.hint":
-    "桥接进程启动以来累计的上下文管理事件计数。重启桥接后清零。",
-  "contextTelemetry.loading": "正在加载遥测数据…",
-  "contextTelemetry.unavailable": "遥测不可用，请先启动桥接。",
-  "contextTelemetry.empty": "暂未记录任何上下文管理事件。",
-  "contextTelemetry.fetchedAt": "更新于 {timestamp}",
   "dlg.cancel": "取消",
   "dlg.add": "添加",
   "dlg.save": "保存",
@@ -517,7 +496,7 @@ const UI_ZH: Record<string, string> = {
   "action.restart": "重启",
   "action.enableForwarding": "启用转发",
   "action.disableForwarding": "关闭转发",
-  "action.clearCache": "重置会话",
+  "action.clearCache": "清理会话数据",
   "status.health": "健康",
   "status.ssl": "SSL",
   "status.cursor": "Cursor",
@@ -730,19 +709,14 @@ const UI_ZH: Record<string, string> = {
   "analytics.recent.out": "输出",
   "analytics.recent.search": "搜索",
   "analytics.noBackendUsage": "尚无后端用量记录",
-  "test.proxy.name": "代理绕过",
-  "test.proxy.desc":
-    "检查系统代理绕过列表是否包含 Cursor 域名（不验证 TUN/全局代理拦截）",
+  "test.patchEndpoint.name": "Cursor 直连接入",
+  "test.patchEndpoint.desc": "检查 Cursor 直连补丁状态与端点覆盖情况",
   "test.ssl.name": "SSL 证书",
-  "test.ssl.desc": "校验本地证书文件与 Cursor 域名的 SAN 覆盖",
+  "test.ssl.desc": "校验本地证书文件与本机桥接端点的 SAN 覆盖",
   "test.bridge.name": "桥接健康",
   "test.bridge.desc": "对本地桥接执行 HTTPS 健康检查",
-  "test.h2.name": "端到端 Cursor TLS",
-  "test.h2.desc": "验证 api2.cursor.sh 解析与端到端证书是否有效",
-  "test.forwarding.name": "流量转发",
-  "test.forwarding.desc": "验证 hosts 与当前平台的转发后端",
-  "test.dns.name": "DNS 解析",
-  "test.dns.desc": "通过 /etc/hosts 将 Cursor 域名解析到管理的本地 IP",
+  "test.idleKiller.name": "空闲扩展宿主保护",
+  "test.idleKiller.desc": "检查 Cursor 空闲扩展宿主保护补丁状态",
   "test.accounts.name": "后端账号",
   "test.accounts.desc": "检查是否至少配置了一个账号",
   "model.gemini": "Gemini Pro 3.1 High",
@@ -977,6 +951,7 @@ type StorageSettingsItems = {
   openaiCompatAccountsPath: SettingsItemCopy
   claudeApiAccountsPath: SettingsItemCopy
   kiroAccountsPath: SettingsItemCopy
+  sessionData: SettingsItemCopy
 }
 
 type PatchSettingsItems = {
@@ -1111,6 +1086,10 @@ const SETTINGS_EN: SettingsCopy = {
         kiroAccountsPath: {
           label: "Kiro Accounts File",
           desc: "Custom path for kiro-accounts.json",
+        },
+        sessionData: {
+          label: "Clear Session Data",
+          desc: "Delete saved bridge session state and cached conversations from the data directory.",
         },
       },
     },
@@ -1258,6 +1237,10 @@ const SETTINGS_ZH: SettingsCopy = {
         kiroAccountsPath: {
           label: "Kiro 账号文件",
           desc: "kiro-accounts.json 的自定义路径",
+        },
+        sessionData: {
+          label: "清理会话数据",
+          desc: "删除数据目录中保存的桥接会话状态和缓存对话。",
         },
       },
     },

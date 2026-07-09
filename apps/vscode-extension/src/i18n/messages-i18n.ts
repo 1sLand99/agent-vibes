@@ -133,6 +133,8 @@ const EN: Record<string, string> = {
   "dash.debugMode.disabled": "disabled",
   "dash.action.restart": "Restart",
   "dash.action.later": "Later",
+  "dash.proxyApiKey.generated":
+    "PROXY_API_KEY generated, saved, and copied. Restart bridge to apply.",
   "dash.settingUpdated": "{key} updated. Restart bridge to apply.",
   "dash.settingReset": "{key} reset to default.",
   "dash.trafficModeChanged": "Cursor connection mode updated.",
@@ -308,6 +310,8 @@ const ZH: Record<string, string> = {
   "dash.debugMode.disabled": "关闭",
   "dash.action.restart": "重启",
   "dash.action.later": "稍后",
+  "dash.proxyApiKey.generated":
+    "PROXY_API_KEY 已生成、保存并复制，请重启桥接以应用。",
   "dash.settingUpdated": "{key} 已更新，请重启桥接以应用。",
   "dash.settingReset": "{key} 已恢复为默认值。",
   "dash.trafficModeChanged": "Cursor 接入方式已更新。",

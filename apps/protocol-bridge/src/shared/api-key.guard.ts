@@ -5,13 +5,13 @@ import {
   UnauthorizedException,
 } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
-import { Request } from "express"
-
 interface RequestWithHeaders {
   headers: {
     "x-api-key"?: string
+    "x-goog-api-key"?: string
     authorization?: string
   }
+  query?: Record<string, unknown>
 }
 
 @Injectable()
@@ -30,6 +30,16 @@ export class ApiKeyGuard implements CanActivate {
     // Check x-api-key header (Anthropic style)
     const xApiKey = request.headers["x-api-key"]
     if (xApiKey && xApiKey === expectedKey) {
+      return true
+    }
+
+    // Check x-goog-api-key header / key query param (Google SDK style)
+    const googleApiKey = request.headers["x-goog-api-key"]
+    if (googleApiKey && googleApiKey === expectedKey) {
+      return true
+    }
+    const queryKey = request.query?.key
+    if (typeof queryKey === "string" && queryKey === expectedKey) {
       return true
     }
 

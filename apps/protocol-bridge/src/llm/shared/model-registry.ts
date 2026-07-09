@@ -119,7 +119,7 @@ function createCodexCatalogCapabilities(
 ): CodexRequestCapabilities {
   return createCodexRequestCapabilities({
     contextTokenLimit: CODEX_STANDARD_CONTEXT_TOKEN_LIMIT,
-    contextTokenLimitForMaxMode: CODEX_STANDARD_CONTEXT_TOKEN_LIMIT,
+    contextTokenLimitForMaxMode: CODEX_MAX_CONTEXT_TOKEN_LIMIT,
     truncationPolicy: CODEX_TRUNCATION_POLICY_TOKENS_10K,
     ...overrides,
   })

@@ -6,6 +6,7 @@ import {
   HttpCode,
   HttpException,
   Post,
+  Query,
   Res,
   UseGuards,
 } from "@nestjs/common"
@@ -19,6 +20,10 @@ import {
 import type { FastifyReply } from "fastify"
 import { looksLikeRealCcCliRequest } from "../../llm/anthropic/oauth-cloaking"
 import { ApiKeyGuard } from "../../shared/api-key.guard"
+import {
+  bridgeModelsToGoogleModels,
+  isGoogleModelsListRequest,
+} from "../google/google-models"
 import {
   type AnthropicErrorEnvelope,
   renderAnthropicError,
@@ -249,7 +254,14 @@ export class MessagesController {
 
   @Get("models")
   @ApiOperation({ summary: "List available models (Anthropic-compatible)" })
-  listAnthropicModels() {
-    return this.messagesService.listModels()
+  listAnthropicModels(
+    @Headers("x-goog-api-key") googleApiKey?: string,
+    @Query("key") queryKey?: string
+  ) {
+    const models = this.messagesService.listModels()
+    if (isGoogleModelsListRequest(googleApiKey, queryKey)) {
+      return bridgeModelsToGoogleModels(models)
+    }
+    return models
   }
 }

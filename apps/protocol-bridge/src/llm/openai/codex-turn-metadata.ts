@@ -197,11 +197,7 @@ export function captureCodexTurnState(
   turnState: string | undefined
 ): boolean {
   const normalizedTurnState = turnState?.trim()
-  if (
-    !carrier ||
-    !normalizedTurnState ||
-    carrier.turnState === normalizedTurnState
-  ) {
+  if (!carrier || !normalizedTurnState || carrier.turnState) {
     return false
   }
   carrier.turnState = normalizedTurnState

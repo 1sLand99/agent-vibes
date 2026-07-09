@@ -1082,6 +1082,13 @@
         font-size: var(--text-base);
         font-weight: 600;
       }
+      .setting-label-status {
+        margin-left: var(--sp-2);
+        font-size: var(--text-sm);
+        color: var(--fg-2);
+        font-family: var(--vscode-editor-font-family, monospace);
+        white-space: nowrap;
+      }
       .setting-desc {
         font-size: var(--text-sm);
         color: var(--fg-2);
@@ -1641,30 +1648,6 @@
             </button>
           </div>
           <div class="test-list" id="tests-root"></div>
-        </div>
-        <div class="section">
-          <div class="section-head">
-            <span class="section-title" data-i18n="section.contextTelemetry"
-              >Context Telemetry</span
-            >
-            <button
-              type="button"
-              class="btn"
-              onclick="refreshContextTelemetry()"
-              data-i18n="contextTelemetry.refresh"
-            >
-              Refresh
-            </button>
-          </div>
-          <div
-            class="context-telemetry-hint muted"
-            id="context-telemetry-hint"
-            data-i18n="contextTelemetry.hint"
-          >
-            Cumulative counters since the bridge process started. Values reset
-            on bridge restart.
-          </div>
-          <div id="context-telemetry-root" class="test-list"></div>
         </div>
       </div>
 
@@ -2275,8 +2258,6 @@
         if (m.type === "claudeIntegrationUpdate")
           handleClaudeIntegrationUpdate(m.data)
         if (m.type === "kiroQuotaUpdate") handleKiroQuotaUpdate(m.data)
-        if (m.type === "contextTelemetryUpdate")
-          handleContextTelemetryUpdate(m.data)
       })
 
       window.addEventListener("resize", function () {
@@ -2589,12 +2570,6 @@
 
         // Cursor IDE connection is controlled from the API tab's Cursor IDE
         // Protocol row. Start/stop here only manage the bridge process.
-
-        baseActions.push({
-          label: L("action.clearCache"),
-          command: "agentVibes.clearCache",
-          tone: "secondary",
-        })
 
         if (
           pendingDisplayCommand &&
@@ -3802,10 +3777,18 @@
             ch += '<div class="settings-group-desc">' + esc(g.desc) + "</div>"
           for (var si = 0; si < g.items.length; si++) {
             var item = g.items[si]
+            var isActionItem = item.type === "actions"
             ch += '<div class="setting-item">'
             ch += '<div class="setting-top">'
             ch +=
-              '<div><div class="setting-label">' + esc(item.label) + "</div>"
+              '<div><div class="setting-label">' + esc(item.label)
+            if (isActionItem && item.value !== undefined) {
+              ch +=
+                '<span class="setting-label-status">' +
+                esc(item.value) +
+                "</span>"
+            }
+            ch += "</div>"
             if (item.desc)
               ch += '<div class="setting-desc">' + esc(item.desc) + "</div>"
             ch += "</div>"
@@ -3935,10 +3918,7 @@
                 '">' +
                 esc(item.value) +
                 "</span>"
-            } else if (item.type === "actions") {
-              if (item.value !== undefined) {
-                ch += '<span class="setting-val">' + esc(item.value) + "</span>"
-              }
+            } else if (isActionItem) {
               ch += '<div class="setting-actions">'
               if (item.actions) {
                 for (var ai = 0; ai < item.actions.length; ai++) {
@@ -4615,6 +4595,7 @@
         lastMessage: "",
         lastMessageKind: "", // "loading" | "success" | "error" | ""
       }
+      var proxyApiKeyDraft = ""
 
       function renderEndpointsTabIfActive() {
         var endpointsPane = document.getElementById("pane-endpoints")
@@ -4780,6 +4761,88 @@
 
         var html = ""
 
+        // ── Global API key ──
+        var proxyKeyState =
+          (lastStatusData && lastStatusData.proxyApiKey) || {}
+        var proxyKeySource = proxyKeyState.source || "none"
+        var proxyKeyStatus =
+          proxyKeySource === "settings"
+            ? L("endpoints.proxyApiKey.status.settings", "Settings")
+            : proxyKeySource === "env"
+              ? L("endpoints.proxyApiKey.status.env", "Env")
+              : L("endpoints.proxyApiKey.status.none", "Open")
+        var proxyKeyStatusKind = proxyKeySource === "none" ? "warn" : "good"
+        var proxyKeyValue = proxyApiKeyDisplayValue()
+        var proxyKeyActions =
+          endpointActionBtn(
+            L("endpoints.action.save", "Save"),
+            "saveProxyApiKeySetting()",
+            "primary"
+          ) +
+          endpointActionBtn(
+            L("endpoints.action.generate", "Generate"),
+            "generateProxyApiKeySetting()",
+            "secondary"
+          ) +
+          endpointActionBtn(
+            L("endpoints.action.clear", "Clear"),
+            "clearProxyApiKeySetting()",
+            "ghost"
+          ) +
+          endpointActionBtn(
+            L("endpoints.action.restart", "Restart"),
+            "vscode.postMessage({type:'runCommand',command:'agentVibes.restartServer'})",
+            "ghost"
+          ) +
+          endpointActionBtn(
+            L("endpoints.action.copy", "Copy"),
+            "copyProxyApiKeySetting()",
+            "ghost",
+            { disabled: !proxyKeyValue.trim() }
+          )
+        html +=
+          '<div style="border-bottom:1px solid var(--border)">' +
+          '<div style="display:flex;align-items:flex-end;gap:var(--sp-4);' +
+          'padding:var(--sp-3) 0;flex-wrap:wrap">' +
+          '<div style="flex:1 1 420px;min-width:260px">' +
+          '<div style="display:flex;align-items:baseline;gap:var(--sp-3);' +
+          'flex-wrap:wrap">' +
+          '<span style="font-weight:600;font-size:var(--text-sm)">' +
+          esc(L("endpoints.proxyApiKey.name", "Global PROXY_API_KEY")) +
+          "</span>" +
+          statusBadge(proxyKeyStatus, proxyKeyStatusKind) +
+          "</div>" +
+          '<div style="color:var(--fg-3);font-size:var(--text-xs);' +
+          'margin-top:2px">' +
+          esc(
+            L(
+              "endpoints.proxyApiKey.desc",
+              "Leave empty to inherit PROXY_API_KEY from the environment. Restart bridge after changes."
+            )
+          ) +
+          "</div>" +
+          '<input id="proxy-api-key-input" type="text" autocomplete="off" ' +
+          'spellcheck="false" value="' +
+          esc(proxyKeyValue) +
+          '" placeholder="' +
+          esc(
+            L(
+              "endpoints.proxyApiKey.placeholder",
+              "Paste a replacement key"
+            )
+          ) +
+          '" oninput="proxyApiKeyDraft=this.value" ' +
+          'onkeydown="if(event.key===\'Enter\'){event.preventDefault();saveProxyApiKeySetting()}" ' +
+          'style="margin-top:var(--sp-2);width:100%;height:28px;' +
+          'background:var(--input-bg);color:var(--fg);border:1px solid var(--border);' +
+          'border-radius:var(--radius);padding:0 var(--sp-2);' +
+          'font-family:var(--font-mono, monospace);font-size:var(--text-xs)" />' +
+          "</div>" +
+          '<div class="endpoint-actions" style="flex:0 0 auto;flex-wrap:wrap;' +
+          'justify-content:flex-end">' +
+          proxyKeyActions +
+          "</div></div></div>"
+
         // ── Health probe ──
         var healthUrl = bridgeUrl + "/health"
         html += endpointRow({
@@ -4859,6 +4922,7 @@
         // pair. While a connect/disconnect is in flight the toggle goes
         // into the .pending state (no extra spinner row).
         var anthropicUrl = bridgeUrl + "/v1/messages"
+        var anthropicCopyUrl = bridgeUrl
         var ccLoaded = !!s.loaded
         var ccWired = !!s.connected
         var ccOperation = s.operation || ""
@@ -4917,7 +4981,7 @@
             state: { disabled: ccBusy },
           })
         }
-        anthropicActions += copyBtn(anthropicUrl) + testBtn(anthropicUrl)
+        anthropicActions += copyBtn(anthropicCopyUrl) + testBtn(anthropicUrl)
         html += endpointRow({
           name: L("endpoints.anthropic.name", "Anthropic API"),
           desc: L(
@@ -4935,6 +4999,7 @@
         // No wire/unwire step — it's an open endpoint that tracks bridge
         // liveness like the health probe.
         var openaiUrl = bridgeUrl + "/v1/chat/completions"
+        var openaiCopyUrl = bridgeUrl + "/v1"
         html += endpointRow({
           name: L("endpoints.openai.name", "OpenAI API"),
           desc: L(
@@ -4946,7 +5011,7 @@
             ? L("endpoints.status.online", "Online")
             : L("endpoints.status.offline", "Offline"),
           statusKind: bridgeRunning ? "good" : "",
-          actions: copyBtn(openaiUrl) + testBtn(openaiUrl),
+          actions: copyBtn(openaiCopyUrl) + testBtn(openaiUrl),
         })
 
         // ── Gemini CLI ──
@@ -4954,16 +5019,19 @@
         // streaming variant); show the pattern instead of just /v1beta/models
         // (which is "list models" and would look invented).
         var geminiUrl = bridgeUrl + "/v1beta/models/{model}:generateContent"
+        var geminiCopyUrl = bridgeUrl + "/v1beta"
         html += endpointRow({
           name: L("endpoints.google.name", "Google API"),
           desc: L(
             "endpoints.gemini.desc",
-            "Drop-in for generativelanguage.googleapis.com. Used by Gemini CLI / google-genai SDK — planned."
+            "Drop-in for generativelanguage.googleapis.com. Used by Gemini CLI / google-genai SDK."
           ),
           url: geminiUrl,
-          status: L("clients.status.comingSoon", "Coming soon"),
-          statusKind: "warn",
-          actions: copyBtn(geminiUrl),
+          status: bridgeRunning
+            ? L("endpoints.status.online", "Online")
+            : L("endpoints.status.offline", "Offline"),
+          statusKind: bridgeRunning ? "good" : "",
+          actions: copyBtn(geminiCopyUrl) + testBtn(geminiCopyUrl + "/models"),
         })
 
         // Surface inline status when the live wire/unwire state machine
@@ -4988,10 +5056,64 @@
       }
 
       function endpointCopy(url) {
-        vscode.postMessage({ type: "copyToClipboard", text: url })
+        vscode.postMessage({
+          type: "copyToClipboard",
+          text: endpointCopyTarget(url),
+        })
+      }
+      function proxyApiKeyDisplayValue() {
+        var input = document.getElementById("proxy-api-key-input")
+        if (input && document.activeElement === input) return input.value
+        var state = (lastStatusData && lastStatusData.proxyApiKey) || {}
+        return proxyApiKeyDraft || String(state.value || "")
+      }
+      function proxyApiKeyInputValue() {
+        var input = document.getElementById("proxy-api-key-input")
+        if (input) return input.value
+        return proxyApiKeyDisplayValue()
+      }
+      function copyProxyApiKeySetting() {
+        var value = proxyApiKeyInputValue().trim()
+        if (!value) return
+        vscode.postMessage({ type: "copyToClipboard", text: value })
+      }
+      function endpointCopyTarget(url) {
+        if (url === bridgeUrl + "/v1/messages") return bridgeUrl
+        if (url === bridgeUrl + "/v1/chat/completions") return bridgeUrl + "/v1"
+        if (url === bridgeUrl + "/v1beta/models/{model}:generateContent") {
+          return bridgeUrl + "/v1beta"
+        }
+        return url
       }
       function endpointTest(url) {
         vscode.postMessage({ type: "testEndpoint", url: url })
+      }
+
+      function saveProxyApiKeySetting() {
+        var value = proxyApiKeyInputValue().trim()
+        proxyApiKeyDraft = ""
+        renderEndpointsTabIfActive()
+        vscode.postMessage({
+          type: "updateSetting",
+          key: "proxyApiKey",
+          value: value,
+        })
+      }
+
+      function generateProxyApiKeySetting() {
+        proxyApiKeyDraft = ""
+        renderEndpointsTabIfActive()
+        vscode.postMessage({ type: "generateProxyApiKey" })
+      }
+
+      function clearProxyApiKeySetting() {
+        proxyApiKeyDraft = ""
+        renderEndpointsTabIfActive()
+        vscode.postMessage({
+          type: "updateSetting",
+          key: "proxyApiKey",
+          value: "",
+        })
       }
 
       function claudeIntegrationConnect() {
@@ -6912,20 +7034,22 @@
 
       // ── Tests tab ──
       var TEST_DEFS = [
-        { id: "proxy", nameKey: "test.proxy.name", descKey: "test.proxy.desc" },
+        {
+          id: "patchEndpoint",
+          nameKey: "test.patchEndpoint.name",
+          descKey: "test.patchEndpoint.desc",
+        },
         { id: "ssl", nameKey: "test.ssl.name", descKey: "test.ssl.desc" },
         {
           id: "bridge",
           nameKey: "test.bridge.name",
           descKey: "test.bridge.desc",
         },
-        { id: "h2", nameKey: "test.h2.name", descKey: "test.h2.desc" },
         {
-          id: "forwarding",
-          nameKey: "test.forwarding.name",
-          descKey: "test.forwarding.desc",
+          id: "idleKiller",
+          nameKey: "test.idleKiller.name",
+          descKey: "test.idleKiller.desc",
         },
-        { id: "dns", nameKey: "test.dns.name", descKey: "test.dns.desc" },
         {
           id: "accounts",
           nameKey: "test.accounts.name",
@@ -7014,104 +7138,7 @@
         }
       }
 
-      // ── Context telemetry (Diagnostics tab) ──
-
-      var contextTelemetryHydrated = false
-
-      function refreshContextTelemetry() {
-        var root = document.getElementById("context-telemetry-root")
-        if (root && !root.children.length) {
-          root.innerHTML =
-            '<div class="muted" style="padding:var(--sp-2);">' +
-            (L("contextTelemetry.loading") || "Loading...") +
-            "</div>"
-        }
-        vscode.postMessage({ type: "getContextTelemetry" })
-      }
-
-      function handleContextTelemetryUpdate(data) {
-        var root = document.getElementById("context-telemetry-root")
-        if (!root) return
-        contextTelemetryHydrated = true
-        if (!data || typeof data !== "object") {
-          root.innerHTML =
-            '<div class="muted" style="padding:var(--sp-2);">' +
-            (L("contextTelemetry.unavailable") ||
-              "Telemetry unavailable. Start the bridge to see counters.") +
-            "</div>"
-          return
-        }
-        var grouped = data && data.grouped ? data.grouped : {}
-        var counters = data && data.counters ? data.counters : {}
-        var eventNames = Object.keys(grouped)
-        if (eventNames.length === 0) {
-          root.innerHTML =
-            '<div class="muted" style="padding:var(--sp-2);">' +
-            (L("contextTelemetry.empty") ||
-              "No context-management events recorded yet.") +
-            "</div>"
-          return
-        }
-        eventNames.sort()
-        var rows = eventNames.map(function (eventName) {
-          var scopes = grouped[eventName] || {}
-          var totalCount = Object.keys(scopes).reduce(function (acc, scope) {
-            var v = scopes[scope]
-            return acc + (typeof v === "number" ? v : 0)
-          }, 0)
-          var scopeCount = Object.keys(scopes).length
-          var scopeLabel =
-            scopeCount === 1 && scopes.global !== undefined
-              ? "global"
-              : scopeCount + " scope" + (scopeCount === 1 ? "" : "s")
-          var safeName = String(eventName).replace(/[^a-zA-Z0-9_.-]/g, "_")
-          return (
-            '<div class="test-row" data-event="' +
-            safeName +
-            '">' +
-            '<div class="test-row-head">' +
-            '<span class="test-name">' +
-            escapeHtml(eventName) +
-            "</span>" +
-            '<span class="test-status">' +
-            totalCount +
-            "</span>" +
-            "</div>" +
-            '<div class="muted" style="padding:0 var(--sp-2) var(--sp-2);font-size:11px;">' +
-            scopeLabel +
-            "</div>" +
-            "</div>"
-          )
-        })
-        root.innerHTML = rows.join("")
-        var hint = document.getElementById("context-telemetry-hint")
-        if (hint) {
-          var ts = data && data.timestamp ? data.timestamp : ""
-          var labelTemplate =
-            L("contextTelemetry.fetchedAt") || "Updated at {timestamp}"
-          var labelText = ts
-            ? labelTemplate.replace("{timestamp}", ts)
-            : L("contextTelemetry.hint") ||
-              "Cumulative counters since bridge start. Resets on bridge restart."
-          hint.textContent = labelText
-        }
-        // Reference counters so a future "raw export" affordance has direct
-        // access without re-fetching.  Stored on the root for inspection.
-        root.__contextTelemetryCounters = counters
-      }
-
-      function escapeHtml(value) {
-        if (value === null || value === undefined) return ""
-        return String(value)
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/"/g, "&quot;")
-          .replace(/'/g, "&#39;")
-      }
-
       initTests()
-      refreshContextTelemetry()
 
       vscode.postMessage({ type: "getAll" })
     </script>

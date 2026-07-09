@@ -27,6 +27,7 @@ export interface CodexContextLedgerProjection {
   messages: CodexExecutionRequest["messages"]
   contextMessages: CodexConversationMessage[]
   addedContextMessages: CodexConversationMessage[]
+  contextInitialized: boolean
   contextChanged: boolean
   changedKeys: string[]
 }
@@ -53,10 +54,9 @@ export function previewCodexContextLedgerProjection(
   entries: CodexContextEntry[]
 ): CodexContextLedgerProjection {
   const snapshot = state ?? createCodexContextLedgerState()
+  const wasInitialized = snapshot.initialized
   const normalizedEntries = normalizeEntries(entries)
-  const insertionIndex = snapshot.initialized
-    ? findCurrentTurnContextInsertionIndex(visibleMessages)
-    : 0
+  const insertionIndex = findCurrentTurnContextInsertionIndex(visibleMessages)
   const pendingMessages = buildPendingContextMessages(
     snapshot,
     normalizedEntries,
@@ -66,6 +66,7 @@ export function previewCodexContextLedgerProjection(
     normalizedEntries,
     insertionIndex
   )
+  const changedMessages = wasInitialized ? pendingMessages : []
 
   return {
     messages: mergeContextMessagesIntoVisibleMessages(
@@ -80,8 +81,9 @@ export function previewCodexContextLedgerProjection(
       role,
       content,
     })),
-    contextChanged: pendingMessages.length > 0,
-    changedKeys: pendingMessages.map((message) => message.key),
+    contextInitialized: !wasInitialized,
+    contextChanged: changedMessages.length > 0,
+    changedKeys: changedMessages.map((message) => message.key),
   }
 }
 
@@ -90,17 +92,16 @@ export function projectCodexContextLedgerMessages(
   visibleMessages: CodexExecutionRequest["messages"],
   entries: CodexContextEntry[]
 ): CodexContextLedgerProjection {
+  const wasInitialized = state.initialized
   const normalizedEntries = normalizeEntries(entries)
-  const insertionIndex = state.initialized
-    ? findCurrentTurnContextInsertionIndex(visibleMessages)
-    : 0
+  const insertionIndex = findCurrentTurnContextInsertionIndex(visibleMessages)
   const pendingMessages = buildPendingContextMessages(
     state,
     normalizedEntries,
     insertionIndex
   )
 
-  if (!state.initialized || pendingMessages.length > 0) {
+  if (!wasInitialized || pendingMessages.length > 0) {
     state.messages = buildCurrentContextMessages(
       normalizedEntries,
       insertionIndex
@@ -113,6 +114,8 @@ export function projectCodexContextLedgerMessages(
       normalizedEntries.map((entry) => [entry.key, entry.role])
     )
   }
+
+  const changedMessages = wasInitialized ? pendingMessages : []
 
   return {
     messages: mergeContextMessagesIntoVisibleMessages(
@@ -127,8 +130,9 @@ export function projectCodexContextLedgerMessages(
       role,
       content,
     })),
-    contextChanged: pendingMessages.length > 0,
-    changedKeys: pendingMessages.map((message) => message.key),
+    contextInitialized: !wasInitialized,
+    contextChanged: changedMessages.length > 0,
+    changedKeys: changedMessages.map((message) => message.key),
   }
 }
 

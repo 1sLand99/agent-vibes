@@ -3527,6 +3527,19 @@ export class GoogleService implements ProviderAdapter {
       genConfig.topK = dto.top_k
     }
 
+    const googleGenerationConfig = (
+      dto as CreateMessageDto & {
+        _googleGenerationConfig?: Record<string, unknown>
+      }
+    )._googleGenerationConfig
+    if (googleGenerationConfig) {
+      for (const [key, value] of Object.entries(googleGenerationConfig)) {
+        if (value !== undefined) {
+          genConfig[key] = value
+        }
+      }
+    }
+
     this.logger.debug(
       `Cloud Code output budget: requested=${dto.max_tokens || "(none)"} resolved=${resolvedMaxOutputTokens}`
     )
@@ -3552,6 +3565,19 @@ export class GoogleService implements ProviderAdapter {
     const request: Record<string, unknown> = {
       contents,
       generationConfig: genConfig,
+    }
+
+    const googleRequestFields = (
+      dto as CreateMessageDto & {
+        _googleRequestFields?: Record<string, unknown>
+      }
+    )._googleRequestFields
+    if (googleRequestFields) {
+      for (const [key, value] of Object.entries(googleRequestFields)) {
+        if (value !== undefined) {
+          request[key] = value
+        }
+      }
     }
 
     // Add tools if present. All models (including Claude via Cloud Code)

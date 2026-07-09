@@ -4523,7 +4523,8 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
 
   syncContextRecordsFromMessageRecords(
     state: ContextConversationState,
-    messageRecords: ContextTranscriptRecord[]
+    messageRecords: ContextTranscriptRecord[],
+    options?: { repairCodexReplacementHistory?: boolean }
   ): void {
     const activeCommit = getActiveCompactCommitFromTranscript(state.records)
     if (!activeCommit) {
@@ -4586,7 +4587,9 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       state.records
     )
     state.activeCompactionId = activeCommit.id
-    this.repairCodexReplacementHistoryState(state)
+    if (options?.repairCodexReplacementHistory) {
+      this.repairCodexReplacementHistoryState(state)
+    }
   }
 
   private repairCodexReplacementHistoryState(
@@ -5015,7 +5018,9 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
               : [],
           }
         : this.createContextState(messageRecords)
-    this.syncContextRecordsFromMessageRecords(contextState, messageRecords)
+    this.syncContextRecordsFromMessageRecords(contextState, messageRecords, {
+      repairCodexReplacementHistory: true,
+    })
     if (contextState.lastAppliedCompaction) {
       contextState.lastAppliedCompaction = {
         ...contextState.lastAppliedCompaction,

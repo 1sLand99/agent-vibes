@@ -136,25 +136,39 @@ export function projectCodexInputItems(
 
   const appendMessages = (messages: CodexProjectableMessage[]) => {
     const assistantMessageIdsWithRawItems = new Set<string>()
-    for (const msg of messages) {
-      if (msg.role !== "assistant") {
-        continue
+    const assistantMessageIndexesInRawRuns = new Set<number>()
+    let currentAssistantRunIndexes: number[] = []
+    let currentAssistantRunHasRawItems = false
+    const flushAssistantRun = () => {
+      if (currentAssistantRunHasRawItems) {
+        for (const index of currentAssistantRunIndexes) {
+          assistantMessageIndexesInRawRuns.add(index)
+        }
       }
-      const messageId =
-        typeof msg.messageId === "string" ? msg.messageId.trim() : ""
-      if (!messageId || !Array.isArray(msg.content)) {
-        continue
-      }
-      if (
-        (msg.content as CodexProjectableBlock[]).some(
-          (block) => block.type === CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE
-        )
-      ) {
-        assistantMessageIdsWithRawItems.add(messageId)
-      }
+      currentAssistantRunIndexes = []
+      currentAssistantRunHasRawItems = false
     }
 
-    for (const msg of messages) {
+    for (let index = 0; index < messages.length; index++) {
+      const msg = messages[index]!
+      if (msg.role !== "assistant") {
+        flushAssistantRun()
+        continue
+      }
+      currentAssistantRunIndexes.push(index)
+      const messageId =
+        typeof msg.messageId === "string" ? msg.messageId.trim() : ""
+      if (messageHasRawCodexResponseItems(msg)) {
+        currentAssistantRunHasRawItems = true
+        if (messageId) {
+          assistantMessageIdsWithRawItems.add(messageId)
+        }
+      }
+    }
+    flushAssistantRun()
+
+    for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+      const msg = messages[messageIndex]!
       const role = msg.role
       const messageContent: Array<Record<string, unknown>> = []
       let hasContent = false
@@ -197,16 +211,21 @@ export function projectCodexInputItems(
 
       const blocks = msg.content as CodexProjectableBlock[]
       const hasRawResponseItems =
-        role === "assistant" &&
-        blocks.some(
-          (block) => block.type === CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE
-        )
+        role === "assistant" && blocks.some(isRawCodexResponseItemBlock)
       const messageId =
         typeof msg.messageId === "string" ? msg.messageId.trim() : ""
       if (
         role === "assistant" &&
         messageId &&
         assistantMessageIdsWithRawItems.has(messageId) &&
+        !hasRawResponseItems
+      ) {
+        continue
+      }
+      if (
+        role === "assistant" &&
+        !messageId &&
+        assistantMessageIndexesInRawRuns.has(messageIndex) &&
         !hasRawResponseItems
       ) {
         continue
@@ -311,6 +330,23 @@ function projectReasoningItemFromThinkingBlock(
     summary: thinking ? [{ type: "summary_text", text: thinking }] : [],
     encrypted_content: signature || null,
   }
+}
+
+function messageHasRawCodexResponseItems(
+  message: CodexProjectableMessage
+): boolean {
+  return (
+    Array.isArray(message.content) &&
+    (message.content as CodexProjectableBlock[]).some(
+      isRawCodexResponseItemBlock
+    )
+  )
+}
+
+function isRawCodexResponseItemBlock(
+  block: CodexProjectableBlock | undefined
+): boolean {
+  return block?.type === CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE
 }
 
 export function projectCodexTools(

@@ -136,6 +136,14 @@ export class ConfigManager {
     ).trim()
   }
 
+  get proxyApiKey(): string {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<string>("proxyApiKey") ?? ""
+    ).trim()
+  }
+
   get antigravitySystemPrompt(): boolean {
     return (
       vscode.workspace

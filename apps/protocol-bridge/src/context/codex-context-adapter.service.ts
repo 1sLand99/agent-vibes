@@ -36,8 +36,6 @@ import {
   CodexRawResponseItemBlock,
   CodexReferenceContextItem,
   ContextCollapseCommit,
-  CodexMetaMessageLedgerEntry,
-  CodexMetaMessageLedgerState,
   CodexReplacementHistory,
   CodexReplacementHistoryItem,
   CodexTruncationPolicy,
@@ -138,6 +136,11 @@ export class CodexContextAdapterService {
       state.codexContext.truncationPolicy = {
         ...DEFAULT_CODEX_TRUNCATION_POLICY,
       }
+    }
+    if (state.codexContext.metaMessageLedger) {
+      delete state.codexContext.metaMessageLedger
+      state.codexContext.historyVersion =
+        (state.codexContext.historyVersion || 0) + 1
     }
     return state.codexContext
   }
@@ -623,7 +626,7 @@ export class CodexContextAdapterService {
     messages = repairOrphanedToolPairs(
       options.includeLiveMetaMessages === false
         ? preparedMessages
-        : this.projectAppendOnlyLiveMetaMessages(codex, preparedMessages),
+        : this.projectCurrentLiveMetaMessages(preparedMessages),
       {
         pendingToolUseIds: options.pendingToolUseIds,
       }
@@ -908,234 +911,25 @@ export class CodexContextAdapterService {
     return this.isSyntheticCodexHistoryText(text) ? "" : text
   }
 
-  private projectAppendOnlyLiveMetaMessages(
-    codex: CodexContextState,
+  private projectCurrentLiveMetaMessages(
     messages: UnifiedMessage[]
   ): UnifiedMessage[] {
-    const liveMetaMessages: Array<{
-      key: string
-      message: UnifiedMessage
-    }> = []
-    const visibleMessages: UnifiedMessage[] = []
-    const liveMetaOrdinalsByKind = new Map<string, number>()
+    const currentMessages = messages.filter(
+      (message) => !this.isLegacyRemovedAttachmentMessage(message)
+    )
+    return orderCodexMetaMessagesBeforeTranscript(currentMessages)
+  }
 
-    for (let index = 0; index < messages.length; index++) {
-      const message = messages[index]!
-      if (this.isAppendOnlyLiveMetaMessage(message)) {
-        const kind = message.attachmentKind || "attachment"
-        const ordinal = liveMetaOrdinalsByKind.get(kind) || 0
-        liveMetaOrdinalsByKind.set(kind, ordinal + 1)
-        liveMetaMessages.push({
-          key: this.buildLiveMetaMessageKey(message, ordinal),
-          message,
-        })
-      } else {
-        visibleMessages.push(message)
-      }
-    }
-
+  private isLegacyRemovedAttachmentMessage(message: UnifiedMessage): boolean {
     if (
-      liveMetaMessages.length === 0 &&
-      !codex.metaMessageLedger?.messages.length
+      message.role !== "user" ||
+      message.isMeta !== true ||
+      message.source !== "attachment"
     ) {
-      return orderCodexMetaMessagesBeforeTranscript(messages)
+      return false
     }
-
-    const orderedVisible =
-      orderCodexMetaMessagesBeforeTranscript(visibleMessages)
-    const ledger = this.ensureMetaMessageLedger(codex)
-    const insertionIndex = ledger.initialized
-      ? this.findCurrentTurnInsertionIndex(orderedVisible)
-      : 0
-    const currentByKey = new Map(
-      liveMetaMessages.map((entry) => [entry.key, entry])
-    )
-    const pending: CodexMetaMessageLedgerEntry[] = []
-
-    if (!ledger.initialized) {
-      for (const { key, message } of liveMetaMessages) {
-        pending.push(this.anchorLiveMetaMessage(key, message, insertionIndex))
-      }
-    } else {
-      for (const [key, signature] of Object.entries(
-        ledger.latestSignaturesByKey
-      )) {
-        if (currentByKey.has(key)) {
-          continue
-        }
-        pending.push(
-          this.anchorRemovedLiveMetaMessage(
-            key,
-            signature,
-            ledger.latestKindsByKey[key],
-            insertionIndex
-          )
-        )
-      }
-
-      for (const { key, message } of liveMetaMessages) {
-        const signature = this.signLiveMetaMessage(key, message)
-        if (ledger.latestSignaturesByKey[key] === signature) {
-          continue
-        }
-        pending.push(this.anchorLiveMetaMessage(key, message, insertionIndex))
-      }
-    }
-
-    if (!ledger.initialized || pending.length > 0) {
-      ledger.messages.push(...pending)
-      ledger.initialized = true
-      ledger.latestSignaturesByKey = Object.fromEntries(
-        liveMetaMessages.map(({ key, message }) => [
-          key,
-          this.signLiveMetaMessage(key, message),
-        ])
-      )
-      ledger.latestKindsByKey = Object.fromEntries(
-        liveMetaMessages.map(({ key, message }) => [
-          key,
-          message.attachmentKind || "investigation_memory",
-        ])
-      )
-    }
-
-    return this.mergeAnchoredMetaMessages(ledger.messages, orderedVisible)
-  }
-
-  private ensureMetaMessageLedger(
-    codex: CodexContextState
-  ): CodexMetaMessageLedgerState {
-    if (!codex.metaMessageLedger) {
-      codex.metaMessageLedger = {
-        initialized: false,
-        messages: [],
-        latestSignaturesByKey: {},
-        latestKindsByKey: {},
-      }
-    }
-    return codex.metaMessageLedger
-  }
-
-  private isAppendOnlyLiveMetaMessage(message: UnifiedMessage): boolean {
-    return (
-      message.role === "user" &&
-      message.isMeta === true &&
-      message.source === "attachment" &&
-      !this.getMessageRecordId(message) &&
-      !this.messageContainsToolResult(message)
-    )
-  }
-
-  private messageContainsToolResult(message: UnifiedMessage): boolean {
-    return (
-      Array.isArray(message.content) &&
-      message.content.some((block) => block?.type === "tool_result")
-    )
-  }
-
-  private buildLiveMetaMessageKey(
-    message: UnifiedMessage,
-    ordinal: number
-  ): string {
-    const kind = message.attachmentKind || "attachment"
-    return `attachment:${kind}:${ordinal}`
-  }
-
-  private anchorLiveMetaMessage(
-    key: string,
-    message: UnifiedMessage,
-    beforeVisibleIndex: number
-  ): CodexMetaMessageLedgerEntry {
-    return {
-      key,
-      signature: this.signLiveMetaMessage(key, message),
-      beforeVisibleIndex,
-      role: "user",
-      content: message.content,
-      source: message.source,
-      isMeta: message.isMeta,
-      attachmentKind: message.attachmentKind,
-    }
-  }
-
-  private anchorRemovedLiveMetaMessage(
-    key: string,
-    previousSignature: string,
-    kind: CodexMetaMessageLedgerEntry["attachmentKind"],
-    beforeVisibleIndex: number
-  ): CodexMetaMessageLedgerEntry {
-    return {
-      key,
-      signature: `removed:${previousSignature}`,
-      beforeVisibleIndex,
-      role: "user",
-      content: `[Context attachment removed: ${kind || "attachment"}]`,
-      source: "attachment",
-      isMeta: true,
-      attachmentKind: kind,
-    }
-  }
-
-  private signLiveMetaMessage(key: string, message: UnifiedMessage): string {
-    return this.hashStable({
-      key,
-      role: message.role,
-      source: message.source,
-      attachmentKind: message.attachmentKind,
-      content: message.content,
-    })
-  }
-
-  private mergeAnchoredMetaMessages(
-    metaMessages: CodexMetaMessageLedgerEntry[],
-    visibleMessages: UnifiedMessage[]
-  ): UnifiedMessage[] {
-    const byIndex = new Map<number, CodexMetaMessageLedgerEntry[]>()
-    for (const message of metaMessages) {
-      const index = Math.max(
-        0,
-        Math.min(message.beforeVisibleIndex, visibleMessages.length)
-      )
-      const existing = byIndex.get(index)
-      if (existing) {
-        existing.push(message)
-      } else {
-        byIndex.set(index, [message])
-      }
-    }
-
-    const merged: UnifiedMessage[] = []
-    for (let index = 0; index <= visibleMessages.length; index++) {
-      for (const message of byIndex.get(index) ?? []) {
-        merged.push({
-          role: message.role,
-          content: message.content as UnifiedMessage["content"],
-          source: message.source,
-          isMeta: message.isMeta,
-          attachmentKind: message.attachmentKind,
-        })
-      }
-      const visible = visibleMessages[index]
-      if (visible) {
-        merged.push(visible)
-      }
-    }
-    return merged
-  }
-
-  private findCurrentTurnInsertionIndex(messages: UnifiedMessage[]): number {
-    for (let index = messages.length - 1; index >= 0; index--) {
-      const message = messages[index]
-      if (message?.role === "user") {
-        return this.messageContainsToolResult(message) ? index + 1 : index
-      }
-    }
-    return messages.length
-  }
-
-  private getMessageRecordId(message: UnifiedMessage): string {
-    const recordId = (message as unknown as { recordId?: unknown }).recordId
-    return typeof recordId === "string" ? recordId : ""
+    const text = extractText(message.content).trim()
+    return /^\[Context attachment removed: [^\]]+\]$/u.test(text)
   }
 
   private recordsAfterReplacementAnchor(

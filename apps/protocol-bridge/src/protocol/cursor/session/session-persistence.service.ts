@@ -602,11 +602,44 @@ export class SessionPersistenceService {
       )
       state = {}
     }
+    state = this.scrubLegacyCodexContextState(state)
     return {
       conversationId,
       updatedAt: row.updated_at,
       state,
     }
+  }
+
+  private scrubLegacyCodexContextState(
+    state: Record<string, unknown>
+  ): Record<string, unknown> {
+    const scrubHolder = (value: unknown): boolean => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return false
+      }
+      const holder = value as { codexContext?: unknown }
+      const codexContext = holder.codexContext
+      if (
+        !codexContext ||
+        typeof codexContext !== "object" ||
+        Array.isArray(codexContext)
+      ) {
+        return false
+      }
+      const codex = codexContext as { metaMessageLedger?: unknown }
+      if (!("metaMessageLedger" in codex)) {
+        return false
+      }
+      delete codex.metaMessageLedger
+      return true
+    }
+
+    const rootChanged = scrubHolder(state)
+    const nestedChanged = scrubHolder(
+      (state as { contextState?: unknown }).contextState
+    )
+    const changed = rootChanged || nestedChanged
+    return changed ? { ...state } : state
   }
 
   private parseRestartRecoveryActivity(
