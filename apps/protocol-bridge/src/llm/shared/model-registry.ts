@@ -87,6 +87,7 @@ const CODEX_PRIORITY_SERVICE_TIERS = ["priority"] as const
 const CODEX_STANDARD_CONTEXT_TOKEN_LIMIT = 272_000
 const CODEX_SPARK_CONTEXT_TOKEN_LIMIT = 120_000
 const CODEX_MAX_CONTEXT_TOKEN_LIMIT = 1_000_000
+const CODEX_GPT56_CONTEXT_TOKEN_LIMIT = 372_000
 const CODEX_TRUNCATION_POLICY_TOKENS_10K = {
   mode: "tokens",
   limit: 10_000,
@@ -594,6 +595,48 @@ const CODEX_MODELS: Record<
       truncationPolicy: CODEX_TRUNCATION_POLICY_TOKENS_10K,
     }),
   },
+  "gpt-5.6-sol": {
+    cloudCodeId: "gpt-5.6-sol",
+    displayName: "GPT-5.6 Sol",
+    isThinking: true,
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high", "xhigh", "max", "ultra"],
+      "medium"
+    ),
+    codex: createCodexCatalogCapabilities({
+      contextTokenLimit: CODEX_GPT56_CONTEXT_TOKEN_LIMIT,
+      contextTokenLimitForMaxMode: CODEX_GPT56_CONTEXT_TOKEN_LIMIT,
+      supportedServiceTiers: CODEX_PRIORITY_SERVICE_TIERS,
+    }),
+  },
+  "gpt-5.6-terra": {
+    cloudCodeId: "gpt-5.6-terra",
+    displayName: "GPT-5.6 Terra",
+    isThinking: true,
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high", "xhigh", "max", "ultra"],
+      "medium"
+    ),
+    codex: createCodexCatalogCapabilities({
+      contextTokenLimit: CODEX_GPT56_CONTEXT_TOKEN_LIMIT,
+      contextTokenLimitForMaxMode: CODEX_GPT56_CONTEXT_TOKEN_LIMIT,
+      supportedServiceTiers: CODEX_PRIORITY_SERVICE_TIERS,
+    }),
+  },
+  "gpt-5.6-luna": {
+    cloudCodeId: "gpt-5.6-luna",
+    displayName: "GPT-5.6 Luna",
+    isThinking: true,
+    thinking: createLevelThinkingCapability(
+      ["low", "medium", "high", "xhigh", "max", "ultra"],
+      "medium"
+    ),
+    codex: createCodexCatalogCapabilities({
+      contextTokenLimit: CODEX_GPT56_CONTEXT_TOKEN_LIMIT,
+      contextTokenLimitForMaxMode: CODEX_GPT56_CONTEXT_TOKEN_LIMIT,
+      supportedServiceTiers: CODEX_PRIORITY_SERVICE_TIERS,
+    }),
+  },
   "gpt-5.5": {
     cloudCodeId: "gpt-5.5",
     displayName: "GPT-5.5",
@@ -711,6 +754,9 @@ const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
       "gpt-5.2",
       "gpt-5.2-codex",
       "gpt-5.3-codex",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
       "gpt-5.5",
       "gpt-5.4",
       "gpt-5.4-mini",
@@ -726,6 +772,9 @@ const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
       "gpt-5.2",
       "gpt-5.2-codex",
       "gpt-5.3-codex",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
       "gpt-5.5",
       "gpt-5.4",
       "gpt-5.4-mini",
@@ -742,6 +791,9 @@ const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
       "gpt-5.2-codex",
       "gpt-5.3-codex",
       "gpt-5.3-codex-spark",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
       "gpt-5.5",
       "gpt-5.4",
       "gpt-5.4-mini",
@@ -758,6 +810,9 @@ const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
       "gpt-5.2-codex",
       "gpt-5.3-codex",
       "gpt-5.3-codex-spark",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
       "gpt-5.5",
       "gpt-5.4",
       "gpt-5.4-mini",
@@ -919,6 +974,21 @@ const PUBLIC_MODEL_METADATA: Record<string, PublicModelMetadata> = {
     ownedBy: "openai",
     displayName: "GPT 5.3 Codex Spark",
   },
+  "gpt-5.6-sol": {
+    createdAt: 1783555200,
+    ownedBy: "openai",
+    displayName: "GPT 5.6 Sol",
+  },
+  "gpt-5.6-terra": {
+    createdAt: 1783555200,
+    ownedBy: "openai",
+    displayName: "GPT 5.6 Terra",
+  },
+  "gpt-5.6-luna": {
+    createdAt: 1783555200,
+    ownedBy: "openai",
+    displayName: "GPT 5.6 Luna",
+  },
   "gpt-5.5": {
     createdAt: 1778112000,
     ownedBy: "openai",
@@ -959,11 +1029,18 @@ export function resolveCloudCodeModel(alias: string): ModelEntry | null {
   }
   // Passthrough for unmapped gemini models
   if (normalized.startsWith("gemini")) {
+    const isThinking =
+      normalized.includes("thinking") ||
+      normalized.includes("-low") ||
+      normalized.includes("-medium") ||
+      normalized.includes("-high") ||
+      normalized.includes("-agent")
+
     return {
       cloudCodeId: normalized,
       displayName: normalized,
       family: "gemini",
-      isThinking: false,
+      isThinking,
       thinking: undefined,
       isClaudeThroughGoogle: false,
     }
@@ -1335,6 +1412,9 @@ export const CLAUDE_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
 ]
 
 const DEFAULT_VISIBLE_CODEX_CURSOR_MODEL_IDS = new Set([
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
   "gpt-5.5",
   "gpt-5.4",
   "gpt-5.4-mini",
@@ -1364,6 +1444,27 @@ function withCodexCursorDisplayCapabilities(
 }
 
 const RAW_BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
+  {
+    name: "gpt-5.6-sol",
+    displayName: "GPT-5.6 Sol",
+    shortName: "GPT-5.6 Sol",
+    family: "gpt",
+    isThinking: true,
+  },
+  {
+    name: "gpt-5.6-terra",
+    displayName: "GPT-5.6 Terra",
+    shortName: "GPT-5.6 Terra",
+    family: "gpt",
+    isThinking: true,
+  },
+  {
+    name: "gpt-5.6-luna",
+    displayName: "GPT-5.6 Luna",
+    shortName: "GPT-5.6 Luna",
+    family: "gpt",
+    isThinking: true,
+  },
   {
     name: "gpt-5.5",
     displayName: "GPT-5.5",

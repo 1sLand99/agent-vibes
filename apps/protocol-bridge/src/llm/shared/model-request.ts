@@ -4,7 +4,7 @@ export type ParsedThinkingSuffix =
   | {
       kind: "level"
       raw: string
-      level: "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+      level: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
     }
   | { kind: "budget"; raw: string; budgetTokens: number }
   | { kind: "unknown"; raw: string }
@@ -32,6 +32,7 @@ function parseThinkingSuffix(rawSuffix: string): ParsedThinkingSuffix {
     case "high":
     case "xhigh":
     case "max":
+    case "ultra":
       return { kind: "level", raw: rawSuffix, level: normalized }
     default:
       break

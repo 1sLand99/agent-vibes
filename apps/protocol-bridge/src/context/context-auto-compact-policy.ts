@@ -84,6 +84,12 @@ export function resolvePredictiveCompactTokenLimit(
     return undefined
   }
 
+  if (input.backend === "codex") {
+    // Codex does not have prepared compaction prewarm yet; keep predictive
+    // thresholds from becoming earlier real compaction triggers.
+    return undefined
+  }
+
   const outputReserve = Math.min(
     normalizePositiveInteger(input.maxOutputTokens) ??
       DEFAULT_TURN_OUTPUT_RESERVE_TOKENS,

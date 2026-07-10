@@ -1059,6 +1059,7 @@ export class CursorRequestParser {
         case "high":
           return 1
         case "max":
+        case "ultra":
         case "xhigh":
           return 2
         default:

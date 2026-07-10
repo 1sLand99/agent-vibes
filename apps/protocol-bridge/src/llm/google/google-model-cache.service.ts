@@ -307,7 +307,12 @@ export class GoogleModelCacheService implements OnModuleInit {
         info.supportsThinking === true ||
         typeof info.thinkingBudget === "number" ||
         typeof info.minThinkingBudget === "number" ||
-        modelId.toLowerCase().includes("thinking")
+        modelId.toLowerCase().includes("thinking") ||
+        (modelId.toLowerCase().startsWith("gemini-") &&
+          (modelId.toLowerCase().includes("-low") ||
+            modelId.toLowerCase().includes("-medium") ||
+            modelId.toLowerCase().includes("-high") ||
+            modelId.toLowerCase().includes("-agent")))
 
       const displayName =
         dynamicDisplayName ??

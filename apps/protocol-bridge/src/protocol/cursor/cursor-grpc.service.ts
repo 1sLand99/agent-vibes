@@ -74,6 +74,7 @@ import {
   PromptTokenBreakdownSnapshotSchema,
   CreatePlanArgsSchema,
   CreatePlanErrorSchema,
+  CreatePlanRequestQuerySchema,
   CreatePlanResultSchema,
   CreatePlanSuccessSchema,
   CreatePlanToolCallSchema,
@@ -164,7 +165,7 @@ import {
   ListMcpResourcesSuccessSchema,
   ListMcpResourcesToolCallSchema,
   LsArgsSchema,
-  type LsDirectoryTreeNode_File,
+  LsDirectoryTreeNode_FileSchema,
   LsDirectoryTreeNodeSchema,
   LsErrorSchema,
   LsRejectedSchema,
@@ -1496,6 +1497,17 @@ export class CursorGrpcService {
     queryCase: string,
     queryValue: unknown
   ): Buffer {
+    let normalizedValue = queryValue
+    if (queryCase === "createPlanRequestQuery") {
+      const record = queryValue as Record<string, unknown>
+      const rawArgs = record.args as Record<string, unknown>
+      const planArgs = this.buildCreatePlanArgs(rawArgs || {})
+      normalizedValue = create(CreatePlanRequestQuerySchema, {
+        args: planArgs,
+        toolCallId: safeString(record.toolCallId ?? record.tool_call_id),
+      })
+    }
+
     const msg = create(AgentServerMessageSchema, {
       message: {
         case: "interactionQuery" as const,
@@ -1503,7 +1515,7 @@ export class CursorGrpcService {
           id: queryId,
           query: {
             case: queryCase,
-            value: queryValue,
+            value: normalizedValue,
           } as InteractionQueryOneOf,
         }),
       },
@@ -2389,7 +2401,397 @@ export class CursorGrpcService {
       })
     }
 
+    if (oneOf.case === "readToolCall") {
+      return create(ToolCallSchema, {
+        ...this.normalizeToolCallMetadata(record),
+        tool: {
+          case: "readToolCall" as const,
+          value: this.normalizeReadToolCallForEncoding(oneOf.value),
+        },
+      })
+    }
+
+    if (oneOf.case === "lsToolCall") {
+      return create(ToolCallSchema, {
+        ...this.normalizeToolCallMetadata(record),
+        tool: {
+          case: "lsToolCall" as const,
+          value: this.normalizeLsToolCallForEncoding(oneOf.value),
+        },
+      })
+    }
+
+    if (oneOf.case === "webSearchToolCall") {
+      return create(ToolCallSchema, {
+        ...this.normalizeToolCallMetadata(record),
+        tool: {
+          case: "webSearchToolCall" as const,
+          value: this.normalizeWebSearchToolCallForEncoding(oneOf.value),
+        },
+      })
+    }
+
+    if (oneOf.case === "webFetchToolCall") {
+      return create(ToolCallSchema, {
+        ...this.normalizeToolCallMetadata(record),
+        tool: {
+          case: "webFetchToolCall" as const,
+          value: this.normalizeWebFetchToolCallForEncoding(oneOf.value),
+        },
+      })
+    }
+
+    if (oneOf.case === "updateTodosToolCall") {
+      return create(ToolCallSchema, {
+        ...this.normalizeToolCallMetadata(record),
+        tool: {
+          case: "updateTodosToolCall" as const,
+          value: this.normalizeUpdateTodosToolCallForEncoding(oneOf.value),
+        },
+      })
+    }
+
+    if (oneOf.case === "readTodosToolCall") {
+      return create(ToolCallSchema, {
+        ...this.normalizeToolCallMetadata(record),
+        tool: {
+          case: "readTodosToolCall" as const,
+          value: this.normalizeReadTodosToolCallForEncoding(oneOf.value),
+        },
+      })
+    }
+
+    if (oneOf.case === "createPlanToolCall") {
+      return create(ToolCallSchema, {
+        ...this.normalizeToolCallMetadata(record),
+        tool: {
+          case: "createPlanToolCall" as const,
+          value: this.normalizeCreatePlanToolCallForEncoding(oneOf.value),
+        },
+      })
+    }
+
     return create(ToolCallSchema, value as never)
+  }
+
+  private normalizeWebSearchToolCallForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(WebSearchToolCallSchema, {})
+    }
+    const record = value as Record<string, unknown>
+    const args = record.args as Record<string, unknown>
+    const result = record.result as Record<string, unknown>
+
+    let successValue: any = undefined
+    if (result && typeof result === "object") {
+      const oneOfResult = result.result as { case?: unknown; value?: unknown }
+      if (oneOfResult && oneOfResult.case === "success") {
+        const val = oneOfResult.value as Record<string, unknown>
+        const referencesRaw = Array.isArray(val?.references)
+          ? val.references
+          : []
+        successValue = {
+          case: "success" as const,
+          value: create(WebSearchSuccessSchema, {
+            references: referencesRaw.map((ref: any) =>
+              create(WebSearchReferenceSchema, {
+                title: safeString(ref?.title),
+                url: safeString(ref?.url),
+                chunk: safeString(ref?.chunk),
+              })
+            ),
+          }),
+        }
+      } else if (oneOfResult && oneOfResult.case === "rejected") {
+        const val = oneOfResult.value as Record<string, unknown>
+        successValue = {
+          case: "rejected" as const,
+          value: create(WebSearchRejectedSchema, {
+            reason: safeString(val?.reason),
+          }),
+        }
+      } else if (oneOfResult && oneOfResult.case === "error") {
+        const val = oneOfResult.value as Record<string, unknown>
+        successValue = {
+          case: "error" as const,
+          value: create(WebSearchErrorSchema, {
+            error: safeString(val?.error),
+          }),
+        }
+      }
+    }
+
+    return create(WebSearchToolCallSchema, {
+      args: create(WebSearchArgsSchema, {
+        searchTerm: safeString(
+          args?.searchTerm ?? args?.search_term ?? args?.searchTermStarted
+        ),
+        toolCallId: safeString(args?.toolCallId ?? args?.tool_call_id),
+      }),
+      ...(successValue
+        ? {
+            result: create(WebSearchResultSchema, {
+              result: successValue,
+            }),
+          }
+        : {}),
+    })
+  }
+
+  private normalizeWebFetchToolCallForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(WebFetchToolCallSchema, {})
+    }
+    const record = value as Record<string, unknown>
+    const args = record.args as Record<string, unknown>
+    const result = record.result as Record<string, unknown>
+
+    let successValue: any = undefined
+    if (result && typeof result === "object") {
+      const oneOfResult = result.result as { case?: unknown; value?: unknown }
+      if (oneOfResult && oneOfResult.case === "success") {
+        const val = oneOfResult.value as Record<string, unknown>
+        successValue = {
+          case: "success" as const,
+          value: create(WebFetchSuccessSchema, {
+            url: safeString(val?.url),
+            markdown: safeString(val?.markdown),
+          }),
+        }
+      } else if (oneOfResult && oneOfResult.case === "rejected") {
+        const val = oneOfResult.value as Record<string, unknown>
+        successValue = {
+          case: "rejected" as const,
+          value: create(WebFetchRejectedSchema, {
+            reason: safeString(val?.reason),
+          }),
+        }
+      } else if (oneOfResult && oneOfResult.case === "error") {
+        const val = oneOfResult.value as Record<string, unknown>
+        successValue = {
+          case: "error" as const,
+          value: create(WebFetchErrorSchema, {
+            url: safeString(val?.url),
+            error: safeString(val?.error),
+          }),
+        }
+      }
+    }
+
+    return create(WebFetchToolCallSchema, {
+      args: create(WebFetchArgsSchema, {
+        url: safeString(args?.url),
+        toolCallId: safeString(args?.toolCallId ?? args?.tool_call_id),
+      }),
+      ...(successValue
+        ? {
+            result: create(WebFetchResultSchema, {
+              result: successValue,
+            }),
+          }
+        : {}),
+    })
+  }
+
+  private normalizeUpdateTodosToolCallForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(UpdateTodosToolCallSchema, {})
+    }
+    const record = value as Record<string, unknown>
+    const args = record.args as Record<string, unknown>
+    const result = record.result as Record<string, unknown>
+
+    const normalizeTodos = (todosRaw: unknown): any[] => {
+      if (!Array.isArray(todosRaw)) return []
+      return todosRaw.map((todo, index) => {
+        if (!todo || typeof todo !== "object") return todo
+        const item = todo as Record<string, unknown>
+        return create(TodoItemSchema, {
+          id: safeString(
+            item.id ?? item.todo_id ?? item.todoId ?? `todo_${index}`
+          ),
+          content: safeString(item.content ?? item.text ?? item.title),
+          status: this.normalizeTodoStatusEnum(item.status),
+          createdAt:
+            this.normalizeOptionalBigInt(item.createdAt ?? item.created_at) ||
+            BigInt(Date.now()),
+          updatedAt:
+            this.normalizeOptionalBigInt(item.updatedAt ?? item.updated_at) ||
+            BigInt(Date.now()),
+          dependencies: Array.isArray(item.dependencies)
+            ? item.dependencies.map((d) => String(d))
+            : [],
+        })
+      })
+    }
+
+    let successValue: any = undefined
+    if (result && typeof result === "object") {
+      const oneOfResult = result.result as { case?: unknown; value?: unknown }
+      if (oneOfResult && oneOfResult.case === "success") {
+        const val = oneOfResult.value as Record<string, unknown>
+        successValue = {
+          case: "success" as const,
+          value: create(UpdateTodosSuccessSchema, {
+            todos: normalizeTodos(val?.todos),
+            totalCount: Number(val?.totalCount ?? val?.total_count ?? 0),
+            wasMerge: this.parseBooleanFlag(val?.wasMerge ?? val?.was_merge),
+          }),
+        }
+      } else if (oneOfResult && oneOfResult.case === "error") {
+        const val = oneOfResult.value as Record<string, unknown>
+        successValue = {
+          case: "error" as const,
+          value: create(UpdateTodosErrorSchema, {
+            error: safeString(val?.error),
+          }),
+        }
+      }
+    }
+
+    return create(UpdateTodosToolCallSchema, {
+      args: create(UpdateTodosArgsSchema, {
+        todos: normalizeTodos(args?.todos),
+        merge: this.parseBooleanFlag(args?.merge),
+      }),
+      ...(successValue
+        ? {
+            result: create(UpdateTodosResultSchema, {
+              result: successValue,
+            }),
+          }
+        : {}),
+    })
+  }
+
+  private normalizeReadTodosToolCallForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(ReadTodosToolCallSchema, {})
+    }
+    const record = value as Record<string, unknown>
+    const args = record.args as Record<string, unknown>
+    const result = record.result as Record<string, unknown>
+
+    const statusFilterRaw = Array.isArray(args?.statusFilter)
+      ? args.statusFilter
+      : Array.isArray(args?.status_filter)
+        ? args.status_filter
+        : []
+    const statusFilter = statusFilterRaw
+      .map((status) => this.normalizeTodoStatusEnum(status))
+      .filter((status) => Number.isFinite(status))
+
+    const idFilterRaw = args?.idFilter ?? args?.id_filter
+    const idFilter = Array.isArray(idFilterRaw)
+      ? idFilterRaw
+          .map((id: unknown) => safeString(id).trim())
+          .filter((id: string) => id.length > 0)
+      : []
+
+    const normalizeTodos = (todosRaw: unknown): any[] => {
+      if (!Array.isArray(todosRaw)) return []
+      return todosRaw.map((todo, index) => {
+        if (!todo || typeof todo !== "object") return todo
+        const item = todo as Record<string, unknown>
+        return create(TodoItemSchema, {
+          id: safeString(
+            item.id ?? item.todo_id ?? item.todoId ?? `todo_${index}`
+          ),
+          content: safeString(item.content ?? item.text ?? item.title),
+          status: this.normalizeTodoStatusEnum(item.status),
+          createdAt:
+            this.normalizeOptionalBigInt(item.createdAt ?? item.created_at) ||
+            BigInt(Date.now()),
+          updatedAt:
+            this.normalizeOptionalBigInt(item.updatedAt ?? item.updated_at) ||
+            BigInt(Date.now()),
+          dependencies: Array.isArray(item.dependencies)
+            ? item.dependencies.map((d) => String(d))
+            : [],
+        })
+      })
+    }
+
+    let successValue: any = undefined
+    if (result && typeof result === "object") {
+      const oneOfResult = result.result as { case?: unknown; value?: unknown }
+      if (oneOfResult && oneOfResult.case === "success") {
+        const val = oneOfResult.value as Record<string, unknown>
+        successValue = {
+          case: "success" as const,
+          value: create(ReadTodosSuccessSchema, {
+            todos: normalizeTodos(val?.todos),
+            totalCount: Number(val?.totalCount ?? val?.total_count ?? 0),
+          }),
+        }
+      } else if (oneOfResult && oneOfResult.case === "error") {
+        const val = oneOfResult.value as Record<string, unknown>
+        successValue = {
+          case: "error" as const,
+          value: create(ReadTodosErrorSchema, {
+            error: safeString(val?.error),
+          }),
+        }
+      }
+    }
+
+    return create(ReadTodosToolCallSchema, {
+      args: create(ReadTodosArgsSchema, {
+        statusFilter,
+        idFilter,
+      }),
+      ...(successValue
+        ? {
+            result: create(ReadTodosResultSchema, {
+              result: successValue,
+            }),
+          }
+        : {}),
+    })
+  }
+
+  private normalizeCreatePlanToolCallForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(CreatePlanToolCallSchema, {})
+    }
+    const record = value as Record<string, unknown>
+    const args = record.args as Record<string, unknown>
+    const result = record.result as Record<string, unknown>
+
+    const normalizedArgs = this.buildCreatePlanArgs(args || {})
+
+    let successValue: any = undefined
+    let planUri = ""
+    if (result && typeof result === "object") {
+      const oneOfResult = result.result as { case?: unknown; value?: unknown }
+      if (oneOfResult && oneOfResult.case === "success") {
+        successValue = {
+          case: "success" as const,
+          value: create(CreatePlanSuccessSchema, {}),
+        }
+      } else if (oneOfResult && oneOfResult.case === "error") {
+        const val = oneOfResult.value as Record<string, unknown>
+        successValue = {
+          case: "error" as const,
+          value: create(CreatePlanErrorSchema, {
+            error: safeString(val?.error),
+          }),
+        }
+      }
+      planUri = safeString(result.planUri ?? result.plan_uri)
+    }
+
+    return create(CreatePlanToolCallSchema, {
+      args: normalizedArgs,
+      ...(successValue || planUri
+        ? {
+            result: create(CreatePlanResultSchema, {
+              result: successValue,
+              planUri,
+            }),
+          }
+        : {}),
+    })
   }
 
   private normalizeToolCallMetadata(record: Record<string, unknown>) {
@@ -2416,6 +2818,211 @@ export class CursorGrpcService {
         content: safeString(entry.content),
       })
     )
+  }
+
+  private normalizeReadToolCallForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(ReadToolCallSchema, {})
+    }
+
+    const record = value as Record<string, unknown>
+    const args = record.args as Record<string, unknown>
+    const result = record.result as Record<string, unknown>
+
+    let normalizedResult:
+      | ReturnType<typeof create<typeof ReadToolResultSchema>>
+      | undefined = undefined
+    if (result && typeof result === "object") {
+      const oneOfResult = result.result as { case?: unknown; value?: unknown }
+      if (oneOfResult && oneOfResult.case === "success") {
+        const val = oneOfResult.value as Record<string, unknown>
+        const readRangeVal = (val?.readRange ?? val?.read_range) as
+          | Record<string, unknown>
+          | undefined
+        const relatedCursorRulePaths = Array.isArray(
+          val?.relatedCursorRulePaths
+        )
+          ? val.relatedCursorRulePaths
+          : Array.isArray(val?.related_cursor_rule_paths)
+            ? val.related_cursor_rule_paths
+            : []
+        const relatedRulesRaw = Array.isArray(val?.relatedCursorRules)
+          ? val.relatedCursorRules
+          : Array.isArray(val?.related_cursor_rules)
+            ? val.related_cursor_rules
+            : []
+        const relatedCursorRules = relatedRulesRaw.map((rule: any) =>
+          create(CursorRuleSchema, {
+            fullPath: safeString(
+              rule?.fullPath ?? rule?.full_path ?? rule?.name
+            ),
+            content: safeString(rule?.content),
+          })
+        )
+
+        const outputOneOf = val?.output as { case?: unknown; value?: unknown }
+        let outputVal: any = undefined
+        if (outputOneOf && outputOneOf.case === "content") {
+          outputVal = {
+            case: "content" as const,
+            value: safeString(outputOneOf.value),
+          }
+        } else if (
+          outputOneOf &&
+          outputOneOf.case === "data" &&
+          outputOneOf.value instanceof Uint8Array
+        ) {
+          outputVal = {
+            case: "data" as const,
+            value: outputOneOf.value,
+          }
+        } else if (
+          outputOneOf &&
+          outputOneOf.case === "dataBlobId" &&
+          outputOneOf.value instanceof Uint8Array
+        ) {
+          outputVal = {
+            case: "dataBlobId" as const,
+            value: outputOneOf.value,
+          }
+        } else if (
+          outputOneOf &&
+          outputOneOf.case === "contentBlobId" &&
+          outputOneOf.value instanceof Uint8Array
+        ) {
+          outputVal = {
+            case: "contentBlobId" as const,
+            value: outputOneOf.value,
+          }
+        }
+
+        normalizedResult = create(ReadToolResultSchema, {
+          result: {
+            case: "success" as const,
+            value: create(ReadToolSuccessSchema, {
+              output: outputVal,
+              isEmpty: this.parseBooleanFlag(val?.isEmpty ?? val?.is_empty),
+              exceededLimit: this.parseBooleanFlag(
+                val?.exceededLimit ?? val?.exceeded_limit
+              ),
+              totalLines: Number(val?.totalLines ?? val?.total_lines) || 0,
+              fileSize: Number(val?.fileSize ?? val?.file_size) || 0,
+              path: safeString(val?.path),
+              readRange:
+                readRangeVal && typeof readRangeVal === "object"
+                  ? create(ReadRangeSchema, {
+                      startLine:
+                        Number(
+                          readRangeVal.startLine ?? readRangeVal.start_line
+                        ) || 0,
+                      endLine:
+                        Number(readRangeVal.endLine ?? readRangeVal.end_line) ||
+                        0,
+                    })
+                  : undefined,
+              includeLineNumbers:
+                val?.includeLineNumbers !== undefined
+                  ? this.parseBooleanFlag(val.includeLineNumbers)
+                  : val?.include_line_numbers !== undefined
+                    ? this.parseBooleanFlag(val.include_line_numbers)
+                    : undefined,
+              relatedCursorRulePaths: relatedCursorRulePaths.map((p) =>
+                safeString(p)
+              ),
+              relatedCursorRules,
+            }),
+          },
+        })
+      } else if (oneOfResult && oneOfResult.case === "error") {
+        const val = oneOfResult.value as Record<string, unknown>
+        normalizedResult = create(ReadToolResultSchema, {
+          result: {
+            case: "error" as const,
+            value: create(ReadToolErrorSchema, {
+              errorMessage: safeString(val?.errorMessage ?? val?.error_message),
+            }),
+          },
+        })
+      } else {
+        normalizedResult = create(ReadToolResultSchema, result as never)
+      }
+    }
+
+    return create(ReadToolCallSchema, {
+      args: args ? create(ReadToolArgsSchema, args as never) : undefined,
+      result: normalizedResult,
+    })
+  }
+
+  private normalizeLsToolCallForEncoding(value: unknown) {
+    if (!value || typeof value !== "object") {
+      return create(LsToolCallSchema, {})
+    }
+
+    const record = value as Record<string, unknown>
+    const args = record.args as Record<string, unknown>
+    const result = record.result as Record<string, unknown>
+
+    let normalizedResult:
+      | ReturnType<typeof create<typeof LsResultSchema>>
+      | undefined = undefined
+    if (result && typeof result === "object") {
+      const oneOfResult = result.result as { case?: unknown; value?: unknown }
+      if (oneOfResult && oneOfResult.case === "success") {
+        const val = oneOfResult.value as Record<string, unknown>
+        normalizedResult = create(LsResultSchema, {
+          result: {
+            case: "success" as const,
+            value: create(LsSuccessSchema, {
+              directoryTreeRoot: this.buildLsDirectoryTreeNode(
+                val?.directoryTreeRoot ?? val?.directory_tree_root
+              ),
+            }),
+          },
+        })
+      } else if (oneOfResult && oneOfResult.case === "timeout") {
+        const val = oneOfResult.value as Record<string, unknown>
+        normalizedResult = create(LsResultSchema, {
+          result: {
+            case: "timeout" as const,
+            value: create(LsTimeoutSchema, {
+              directoryTreeRoot: this.buildLsDirectoryTreeNode(
+                val?.directoryTreeRoot ?? val?.directory_tree_root
+              ),
+            }),
+          },
+        })
+      } else if (oneOfResult && oneOfResult.case === "rejected") {
+        const val = oneOfResult.value as Record<string, unknown>
+        normalizedResult = create(LsResultSchema, {
+          result: {
+            case: "rejected" as const,
+            value: create(LsRejectedSchema, {
+              path: safeString(val?.path),
+              reason: safeString(val?.reason),
+            }),
+          },
+        })
+      } else if (oneOfResult && oneOfResult.case === "error") {
+        const val = oneOfResult.value as Record<string, unknown>
+        normalizedResult = create(LsResultSchema, {
+          result: {
+            case: "error" as const,
+            value: create(LsErrorSchema, {
+              path: safeString(val?.path),
+              error: safeString(val?.error),
+            }),
+          },
+        })
+      } else {
+        normalizedResult = create(LsResultSchema, result as never)
+      }
+    }
+
+    return create(LsToolCallSchema, {
+      args: args ? create(LsArgsSchema, args as never) : undefined,
+      result: normalizedResult,
+    })
   }
 
   private normalizeGrepToolCallForEncoding(value: unknown) {
@@ -5216,9 +5823,9 @@ export class CursorGrpcService {
           .filter((entry) => entry && typeof entry === "object")
           .map((entry) => {
             const file = entry as Record<string, unknown>
-            return {
+            return create(LsDirectoryTreeNode_FileSchema, {
               name: safeString(file.name),
-            }
+            })
           })
       : []
     const rawExtCounts =
@@ -5241,7 +5848,7 @@ export class CursorGrpcService {
     return create(LsDirectoryTreeNodeSchema, {
       absPath: safeString(node.absPath, fallbackAbsPath),
       childrenDirs,
-      childrenFiles: childrenFiles as LsDirectoryTreeNode_File[],
+      childrenFiles,
       childrenWereProcessed: this.parseBooleanFlag(
         node.childrenWereProcessed,
         childrenDirs.length > 0 || childrenFiles.length > 0
@@ -5313,7 +5920,7 @@ export class CursorGrpcService {
           a.downloadPath || a.download_path
         ).trim()
         return {
-          case: "readMcpResourceExecArgs" as const,
+          case: "readMcpResourceExecArgs",
           value: create(ReadMcpResourceExecArgsSchema, {
             server: safeString(a.serverName || a.server || a.server_name),
             uri: safeString(a.uri),

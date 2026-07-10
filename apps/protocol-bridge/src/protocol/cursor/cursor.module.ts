@@ -33,6 +33,7 @@ import { ClientSideToolV2ExecutorService } from "./tools/client-side-tool-v2-exe
 import { WebSearchAdapterFactory, WebSearchService } from "./web-search"
 import { TurnLifecycle } from "./turn/turn-lifecycle.service"
 import { TurnCleanupCoordinator } from "./turn/turn-cleanup-coordinator.service"
+import { TopLevelAgentTurnRunnerService } from "./turn/top-level-agent-turn-runner.service"
 import { MessageStore } from "./session/message-store.service"
 import { ToolCallLedger } from "./session/tool-call-ledger.service"
 import { SessionPersistenceService } from "./session/session-persistence.service"
@@ -86,6 +87,7 @@ import { BackgroundJobRegistry } from "./subagents-bridge/background-job-registr
     // in incrementally.
     TurnLifecycle,
     TurnCleanupCoordinator,
+    TopLevelAgentTurnRunnerService,
     // Step 3 additions: ledger + transactional message store + new
     // sessions/v2 schema persistence. Wired so SessionLifecycleService
     // (and follow-up callers in step 8) can resolve them from DI.
@@ -109,6 +111,7 @@ import { BackgroundJobRegistry } from "./subagents-bridge/background-job-registr
     SubagentTranscriptStore,
     TurnLifecycle,
     TurnCleanupCoordinator,
+    TopLevelAgentTurnRunnerService,
     MessageStore,
     ToolCallLedger,
     SessionPersistenceService,

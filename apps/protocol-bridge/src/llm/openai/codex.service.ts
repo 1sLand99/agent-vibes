@@ -90,6 +90,7 @@ import {
 } from "./codex-rate-limit-headers"
 import {
   getAllCodexAccountsRateLimitedRetrySeconds,
+  getCodexAllAccountsRateLimitRetryDelayMs,
   getCodexQuotaCooldownUntil,
   getCodexQuotaRemainingPercent,
   isCodexRateLimitSnapshotExhausted,
@@ -217,6 +218,15 @@ const CODEX_ACCOUNTS_DEFAULT_PATH = resolveDefaultAccountConfigPath(
 const CODEX_MODEL_TIER_ORDER: CodexModelTier[] = ["free", "plus", "team", "pro"]
 const DEFAULT_CODEX_RATE_LIMIT_MODEL = "gpt-5.5"
 const DEFAULT_CODEX_WEBSOCKET_STREAM_MAX_RETRIES = 2
+const DEFAULT_CODEX_ALL_RATE_LIMIT_MAX_RETRIES = 3
+const DEFAULT_CODEX_ALL_RATE_LIMIT_MAX_WAIT_SECONDS = 120
+const CODEX_WEBSOCKET_UPSTREAM_EVENT_SEEN = Symbol(
+  "codexWebSocketUpstreamEventSeen"
+)
+
+type CodexWebSocketStreamError = Error & {
+  [CODEX_WEBSOCKET_UPSTREAM_EVENT_SEEN]?: true
+}
 
 function parseNonNegativeInteger(
   value: string | undefined,
@@ -286,6 +296,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
   private readonly runtimeCache = new CodexRuntimeCacheStore()
   private readonly websocketStreamMaxRetries: number
+  private readonly allRateLimitMaxRetries: number
+  private readonly allRateLimitMaxWaitSeconds: number
 
   /**
    * Logical Codex turn lifecycle. Physical WebSocket transport still belongs
@@ -317,6 +329,17 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     this.websocketStreamMaxRetries = parseNonNegativeInteger(
       this.configService.get<string>("CODEX_WEBSOCKET_STREAM_MAX_RETRIES", ""),
       DEFAULT_CODEX_WEBSOCKET_STREAM_MAX_RETRIES
+    )
+    this.allRateLimitMaxRetries = parseNonNegativeInteger(
+      this.configService.get<string>("CODEX_ALL_RATE_LIMIT_MAX_RETRIES", ""),
+      DEFAULT_CODEX_ALL_RATE_LIMIT_MAX_RETRIES
+    )
+    this.allRateLimitMaxWaitSeconds = parseNonNegativeInteger(
+      this.configService.get<string>(
+        "CODEX_ALL_RATE_LIMIT_MAX_WAIT_SECONDS",
+        ""
+      ),
+      DEFAULT_CODEX_ALL_RATE_LIMIT_MAX_WAIT_SECONDS
     )
     this.accountStateStore = new BackendAccountStateStore(
       persistence,
@@ -2208,6 +2231,71 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     return selection.slot
   }
 
+  private getAllRateLimitRetryDelayMs(
+    error: CodexApiError,
+    retryAttempt: number
+  ): number | null {
+    return getCodexAllAccountsRateLimitRetryDelayMs({
+      statusCode: error.getStatus(),
+      retryAfterSeconds: error.retryAfterSeconds,
+      retryAttempt,
+      maxRetries: this.allRateLimitMaxRetries,
+      maxWaitSeconds: this.allRateLimitMaxWaitSeconds,
+    })
+  }
+
+  private async waitForAllRateLimitRetry(
+    error: CodexApiError,
+    modelName: string,
+    retryAttempt: number,
+    context: string,
+    abortSignal?: AbortSignal
+  ): Promise<boolean> {
+    const delayMs = this.getAllRateLimitRetryDelayMs(error, retryAttempt)
+    if (delayMs == null) {
+      return false
+    }
+
+    this.logger.warn(
+      `[Codex] All account(s) rate-limited for model=${modelName}; ` +
+        `waiting ${Math.ceil(delayMs / 1000)}s before retry ` +
+        `${retryAttempt + 1}/${this.allRateLimitMaxRetries} (${context})`
+    )
+    await this.sleepWithAbort(
+      delayMs,
+      abortSignal,
+      `Codex rate-limit retry wait aborted for model ${modelName}`
+    )
+    return true
+  }
+
+  private async sleepWithAbort(
+    delayMs: number,
+    abortSignal: AbortSignal | undefined,
+    abortMessage: string
+  ): Promise<void> {
+    if (delayMs <= 0) {
+      return
+    }
+
+    let timeout: NodeJS.Timeout | undefined
+    const delay = new Promise<void>((resolve) => {
+      timeout = setTimeout(resolve, delayMs)
+    })
+    const externalAbort = createAbortPromise(abortSignal, abortMessage)
+    try {
+      await Promise.race([
+        delay,
+        ...(externalAbort.promise ? [externalAbort.promise] : []),
+      ])
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout)
+      }
+      externalAbort.cleanup()
+    }
+  }
+
   // ── Non-streaming ────────────────────────────────────────────────────
 
   /**
@@ -2255,7 +2343,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     request: CodexExecutionRequest,
     forwardHeaders: CodexForwardHeaders | undefined,
     attempt: number,
-    slot?: CodexAccountSlot
+    slot?: CodexAccountSlot,
+    allRateLimitRetryAttempt: number = 0
   ): Promise<CodexReplacementHistoryItem[]> {
     if (this.accounts.length === 0) {
       throw new Error(
@@ -2265,11 +2354,33 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     const modelName = request.model
     const conversationId =
       this.getConversationId(request) || `compact-${crypto.randomUUID()}`
-    const requestSlot =
-      slot ||
-      this.selectRequestSlot(modelName, conversationId, {
-        preferWarmPool: false,
-      })
+    let requestSlot: CodexAccountSlot
+    try {
+      requestSlot =
+        slot ||
+        this.selectRequestSlot(modelName, conversationId, {
+          preferWarmPool: false,
+        })
+    } catch (error) {
+      if (
+        error instanceof CodexApiError &&
+        (await this.waitForAllRateLimitRetry(
+          error,
+          modelName,
+          allRateLimitRetryAttempt,
+          "compact slot selection"
+        ))
+      ) {
+        return this.compactConversationHistoryWithRetry(
+          request,
+          forwardHeaders,
+          attempt,
+          undefined,
+          allRateLimitRetryAttempt + 1
+        )
+      }
+      throw error
+    }
     const token = await this.getBearerToken(requestSlot)
     if (!token) {
       throw new Error(
@@ -2401,6 +2512,24 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
               nextSlot
             )
           }
+        }
+
+        if (
+          isCodexRateLimitRetryStatus(statusCode) &&
+          (await this.waitForAllRateLimitRetry(
+            error,
+            modelName,
+            allRateLimitRetryAttempt,
+            "compact request"
+          ))
+        ) {
+          return this.compactConversationHistoryWithRetry(
+            request,
+            forwardHeaders,
+            attempt,
+            undefined,
+            allRateLimitRetryAttempt + 1
+          )
         }
       }
       throw error
@@ -2811,17 +2940,40 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     request: CodexExecutionRequest,
     forwardHeaders?: CodexForwardHeaders,
     attempt: number = 1,
-    slot: CodexAccountSlot = this.selectRequestSlot(
-      request.model,
-      this.getConversationId(request),
-      {
-        preferWarmPool: !this.hasConversationContinuationState(
-          this.getConversationId(request)
-        ),
-      }
-    )
+    selectedSlot?: CodexAccountSlot,
+    allRateLimitRetryAttempt: number = 0
   ): Promise<AnthropicResponse> {
     const modelName = request.model
+    let slot: CodexAccountSlot
+    try {
+      slot =
+        selectedSlot ??
+        this.selectRequestSlot(request.model, this.getConversationId(request), {
+          preferWarmPool: !this.hasConversationContinuationState(
+            this.getConversationId(request)
+          ),
+        })
+    } catch (error) {
+      if (
+        error instanceof CodexApiError &&
+        (await this.waitForAllRateLimitRetry(
+          error,
+          modelName,
+          allRateLimitRetryAttempt,
+          "non-stream slot selection"
+        ))
+      ) {
+        return this.executeWithCooldownRetry(
+          request,
+          forwardHeaders,
+          attempt,
+          undefined,
+          allRateLimitRetryAttempt + 1
+        )
+      }
+      throw error
+    }
+
     const token = await this.getBearerToken(slot)
     if (!token) {
       throw new Error(
@@ -3044,6 +3196,24 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
               nextSlot
             )
           }
+        }
+
+        if (
+          isCodexRateLimitRetryStatus(statusCode) &&
+          (await this.waitForAllRateLimitRetry(
+            e,
+            modelName,
+            allRateLimitRetryAttempt,
+            "non-stream request"
+          ))
+        ) {
+          return this.executeWithCooldownRetry(
+            request,
+            forwardHeaders,
+            attempt,
+            undefined,
+            allRateLimitRetryAttempt + 1
+          )
         }
       }
       throw e
@@ -3834,17 +4004,43 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     forwardHeaders?: CodexForwardHeaders,
     abortSignal?: AbortSignal,
     attempt: number = 1,
-    slot: CodexAccountSlot = this.selectRequestSlot(
-      request.model,
-      this.getConversationId(request),
-      {
-        preferWarmPool: !this.hasConversationContinuationState(
-          this.getConversationId(request)
-        ),
-      }
-    )
+    selectedSlot?: CodexAccountSlot,
+    allRateLimitRetryAttempt: number = 0
   ): AsyncGenerator<string, void, unknown> {
     const modelName = request.model
+    let slot: CodexAccountSlot
+    try {
+      slot =
+        selectedSlot ??
+        this.selectRequestSlot(request.model, this.getConversationId(request), {
+          preferWarmPool: !this.hasConversationContinuationState(
+            this.getConversationId(request)
+          ),
+        })
+    } catch (error) {
+      if (
+        error instanceof CodexApiError &&
+        (await this.waitForAllRateLimitRetry(
+          error,
+          modelName,
+          allRateLimitRetryAttempt,
+          "stream slot selection",
+          abortSignal
+        ))
+      ) {
+        yield* this.executeStreamWithCooldownRetry(
+          request,
+          forwardHeaders,
+          abortSignal,
+          attempt,
+          undefined,
+          allRateLimitRetryAttempt + 1
+        )
+        return
+      }
+      throw error
+    }
+
     const token = await this.getBearerToken(slot)
     if (!token) {
       throw new Error(
@@ -3921,6 +4117,19 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             )
             if (abortedError) {
               throw abortedError
+            }
+
+            const receivedUpstreamEvent =
+              e instanceof Error &&
+              (e as CodexWebSocketStreamError)[
+                CODEX_WEBSOCKET_UPSTREAM_EVENT_SEEN
+              ] === true
+            if (receivedUpstreamEvent) {
+              this.logger.warn(
+                `[Codex] WebSocket stream failed after an upstream event; refusing to replay request: ` +
+                  `${e.message}`
+              )
+              throw e
             }
 
             if (
@@ -4221,6 +4430,31 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             )
             return
           }
+        }
+
+        if (
+          isCodexRateLimitRetryStatus(statusCode) &&
+          !emittedEvents &&
+          (await this.waitForAllRateLimitRetry(
+            e,
+            modelName,
+            allRateLimitRetryAttempt,
+            "stream request",
+            abortSignal
+          ))
+        ) {
+          if (conversationId) {
+            this.disposeTurnContext(conversationId, slot, modelName)
+          }
+          yield* this.executeStreamWithCooldownRetry(
+            request,
+            forwardHeaders,
+            abortSignal,
+            attempt,
+            undefined,
+            allRateLimitRetryAttempt + 1
+          )
+          return
         }
       }
       throw e
@@ -4681,6 +4915,15 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         )
         return
       } catch (error) {
+        if (
+          error instanceof Error &&
+          (error as CodexWebSocketStreamError)[
+            CODEX_WEBSOCKET_UPSTREAM_EVENT_SEEN
+          ] === true
+        ) {
+          throw error
+        }
+
         // Handle "Previous response with id ... not found" — the server evicted
         // the response from its cache. Clear turn context and retry with the full
         // input (no previous_response_id). This commonly happens when parallel
@@ -4984,6 +5227,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             : "Codex WebSocket stream aborted"
         )
       }
+    } catch (error) {
+      if (firstUpstreamMs !== undefined && error instanceof Error) {
+        ;(error as CodexWebSocketStreamError)[
+          CODEX_WEBSOCKET_UPSTREAM_EVENT_SEEN
+        ] = true
+      }
+      throw error
     } finally {
       if (abortSignal && abortListenerAttached) {
         abortSignal.removeEventListener("abort", onAbort)

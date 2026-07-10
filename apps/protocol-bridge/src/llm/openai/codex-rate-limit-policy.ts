@@ -99,3 +99,35 @@ export function getAllCodexAccountsRateLimitedRetrySeconds(
     : 0
   return retryAfterMs > 0 ? Math.ceil(retryAfterMs / 1000) : fallbackSeconds
 }
+
+export interface CodexAllAccountsRateLimitRetryContext {
+  statusCode: number
+  retryAfterSeconds?: number
+  retryAttempt: number
+  maxRetries: number
+  maxWaitSeconds: number
+}
+
+export function getCodexAllAccountsRateLimitRetryDelayMs(
+  context: CodexAllAccountsRateLimitRetryContext
+): number | null {
+  if (context.statusCode !== 429) {
+    return null
+  }
+  if (context.retryAttempt >= Math.max(0, context.maxRetries)) {
+    return null
+  }
+
+  const retryAfterSeconds = context.retryAfterSeconds
+  if (
+    typeof retryAfterSeconds !== "number" ||
+    !Number.isFinite(retryAfterSeconds) ||
+    retryAfterSeconds < 0
+  ) {
+    return null
+  }
+
+  const delayMs = Math.ceil(retryAfterSeconds * 1000)
+  const maxWaitMs = Math.max(0, context.maxWaitSeconds) * 1000
+  return delayMs <= maxWaitMs ? delayMs : null
+}

@@ -126,6 +126,7 @@ function normalizeOpenAiCompatReasoningEffort(effort: string): string {
     case "xhigh":
       return normalized
     case "max":
+    case "ultra":
     case "auto":
       return "xhigh"
     default:

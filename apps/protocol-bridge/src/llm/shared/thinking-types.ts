@@ -5,6 +5,7 @@ export type ThinkingIntentEffort =
   | "high"
   | "xhigh"
   | "max"
+  | "ultra"
 
 export type ThinkingIntent =
   | { mode: "disabled" }

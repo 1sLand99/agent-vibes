@@ -20,6 +20,8 @@ const PREVIOUS_LOG_FILE = path.join(
 const STARTUP_HEALTH_TIMEOUT_MS = 45000
 const STOP_GRACE_TIMEOUT_MS = 5000
 const STOP_FORCE_TIMEOUT_MS = 3000
+const LOG_MAX_BYTES = 10 * 1024 * 1024
+const LOG_MAINTENANCE_INTERVAL_MS = 60_000
 
 /**
  * Manages the Protocol Bridge process lifecycle (start / stop / restart).
@@ -31,6 +33,7 @@ export class BridgeManager extends EventEmitter {
   private process: ChildProcess | null = null
   private _state: ServerState = "stopped"
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null
+  private logMaintenanceTimer: ReturnType<typeof setInterval> | null = null
   private readonly intentionalStopPids = new Set<number>()
 
   constructor(
@@ -380,6 +383,34 @@ export class BridgeManager extends EventEmitter {
     }
   }
 
+  private startLogMaintenance(): void {
+    if (this.logMaintenanceTimer) return
+    this.rotateActiveLogIfNeeded()
+    this.logMaintenanceTimer = setInterval(() => {
+      this.rotateActiveLogIfNeeded()
+    }, LOG_MAINTENANCE_INTERVAL_MS)
+  }
+
+  private stopLogMaintenance(): void {
+    if (!this.logMaintenanceTimer) return
+    clearInterval(this.logMaintenanceTimer)
+    this.logMaintenanceTimer = null
+  }
+
+  private rotateActiveLogIfNeeded(): void {
+    try {
+      if (!fs.existsSync(LOG_FILE)) return
+      if (fs.statSync(LOG_FILE).size <= LOG_MAX_BYTES) return
+      fs.copyFileSync(LOG_FILE, PREVIOUS_LOG_FILE)
+      fs.truncateSync(LOG_FILE, 0)
+      logger.info(
+        `Rotated active bridge log after reaching ${LOG_MAX_BYTES} bytes`
+      )
+    } catch (error) {
+      logger.warn(`Failed to rotate active bridge log: ${String(error)}`)
+    }
+  }
+
   /**
    * Resolve which binary to run.
    * Priority: SEA binary > source dist/main.js
@@ -488,6 +519,9 @@ export class BridgeManager extends EventEmitter {
   }
 
   private startHealthCheck(): void {
+    this.startLogMaintenance()
+    if (this.healthCheckTimer) return
+
     const interval = this.config.healthCheckInterval
     if (interval <= 0) return
 
@@ -512,5 +546,6 @@ export class BridgeManager extends EventEmitter {
       clearInterval(this.healthCheckTimer)
       this.healthCheckTimer = null
     }
+    this.stopLogMaintenance()
   }
 }

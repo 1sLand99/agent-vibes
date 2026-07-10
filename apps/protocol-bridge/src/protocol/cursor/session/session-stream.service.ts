@@ -586,6 +586,7 @@ export class SessionStreamService {
       kind?: string
       deadline?: number
       streamId?: string
+      blocksTurn?: boolean
     }
   ): { id: number; promise: Promise<any> } {
     const session = this.sessionLifecycle.getSession(conversationId)
@@ -613,6 +614,7 @@ export class SessionStreamService {
       kind: options?.kind,
       deadline: options?.deadline,
       streamId: options?.streamId,
+      blocksTurn: options?.blocksTurn,
       createdAt: Date.now(),
     })
     session.lastActivityAt = new Date()
@@ -628,6 +630,16 @@ export class SessionStreamService {
     return { id: queryId, promise }
   }
 
+  hasBlockingInteractionQueries(conversationId: string): boolean {
+    const stream = this.streamRecords.get(conversationId)
+    return Boolean(
+      stream &&
+      Array.from(stream.pendingInteractionQueries.values()).some(
+        (query) => query.blocksTurn !== false
+      )
+    )
+  }
+
   interruptPendingInteractionQueries(
     conversationId: string,
     reason: string
@@ -640,7 +652,7 @@ export class SessionStreamService {
 
     const wasPending =
       this.sessionLifecycle.pendingToolCallCount(conversationId) > 0 ||
-      stream.pendingInteractionQueries.size > 0
+      this.hasBlockingInteractionQueries(conversationId)
     const entries = Array.from(stream.pendingInteractionQueries.entries())
     stream.pendingInteractionQueries.clear()
 
@@ -695,7 +707,7 @@ export class SessionStreamService {
 
     const wasPending =
       this.sessionLifecycle.pendingToolCallCount(conversationId) > 0 ||
-      stream!.pendingInteractionQueries.size > 0
+      this.hasBlockingInteractionQueries(conversationId)
 
     this.logger.log(
       `Resolve InteractionQuery id=${queryId} type=${pending.queryType}`

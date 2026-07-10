@@ -25,7 +25,6 @@ import {
   ContextCompactRunnerService,
   type ContextCompactRunnerSummaryProvider,
   ContextHookExecutorService,
-  type ContextInvestigationMemoryEntry,
   ContextManagerService,
   ContextNativeManagementService,
   ContextPipelineService,
@@ -176,7 +175,6 @@ import {
   SessionRestartRecovery,
   SessionTodoItem,
   SessionTodoStatus,
-  SessionTopLevelAgentTurnState,
   SubAgentContext,
 } from "./session/session-lifecycle.service"
 import { normalizeTaskBudgetTotal } from "./session/task-budget-state"
@@ -272,6 +270,7 @@ import {
 import { TurnHandle } from "./turn/turn-handle"
 import { TurnLifecycle } from "./turn/turn-lifecycle.service"
 import { TurnCleanupCoordinator } from "./turn/turn-cleanup-coordinator.service"
+import { TopLevelAgentTurnRunnerService } from "./turn/top-level-agent-turn-runner.service"
 import { MessageStore } from "./session/message-store.service"
 import { ToolCallLedger } from "./session/tool-call-ledger.service"
 import { AssistantToolBatchService } from "./session/assistant-tool-batch.service"
@@ -1330,16 +1329,14 @@ export class CursorConnectStreamService {
    */
   private readonly DEFAULT_HISTORY_MAX_TOKENS = 200_000
   /**
-   * cc-parity runaway cap (claude-code `maxTurns`). Per top-level turn —
-   * llmTurnCount resets to 1 each new user turn and increments once per
-   * continuation. The main agentic loop is event-driven (each tool batch's
-   * results re-enter continueAssistantAfterToolResult), so without this it
-   * has no upper bound; a single turn was observed running 69–92 rounds.
-   * Counts persist in session state across reconnects, so a ResumeAction
-   * cannot reset a runaway. Set high enough that legitimate large tasks are
-   * unaffected, low enough to stop a true runaway gracefully.
+   * cc-parity runaway cap (claude-code `maxTurns`). Per top-level turn,
+   * TopLevelAgentTurnRunnerService increments the persisted round counter
+   * once per model continuation. The hard cap is still needed because the
+   * Cursor bridge receives tool results as events, but the runner now owns the
+   * continuation lane and budget decision instead of scattering that state in
+   * the stream service.
    */
-  private readonly MAX_TOP_LEVEL_LLM_TURNS = 150
+  private readonly MAX_TOP_LEVEL_LLM_TURNS = 500
   // Cloud Code 输入 hard cap（从报错与流量观测验证）
   private readonly CLOUD_CODE_CONTEXT_LIMIT_TOKENS = 200_000
   // Safety margin: 0% — using Claude's exact tokenizer (@anthropic-ai/tokenizer),
@@ -1419,8 +1416,6 @@ export class CursorConnectStreamService {
     ".woff2",
     ".zip",
   ])
-  private readonly TOP_LEVEL_AGENT_SUMMARY_MEMORY_LIMIT = 8
-  private readonly TOOL_BATCH_SUMMARY_DETAILS_LIMIT = 6
   private readonly LEGACY_WEB_DOCUMENT_CHUNK_SIZE = 4_000
   private readonly MAX_LEGACY_WEB_DOCUMENTS_PER_CONVERSATION = 12
   private readonly EMPTY_CONTEXT_ATTACHMENT_SNAPSHOT: ContextAttachmentSnapshot =
@@ -1718,6 +1713,7 @@ export class CursorConnectStreamService {
     // activeAssistantToolBatch / toolExecutionOrderCounter state
     // machine that used to live as fields on SessionRecord.
     private readonly assistantToolBatch: AssistantToolBatchService,
+    private readonly topLevelAgentTurnRunner: TopLevelAgentTurnRunnerService,
     // Step 4 真正拆解: SessionStreamService owns shell streams /
     // background commands / edit-path queue / interaction queries /
     // currentStreamId rotation.
@@ -5974,8 +5970,9 @@ export class CursorConnectStreamService {
       session &&
       (this.isBackendStreamActive(session.conversationId) ||
         this.sessionManager.pendingToolCallCount(session.conversationId) > 0 ||
-        this.sessionStream.getStreamRecord(session.conversationId)!
-          .pendingInteractionQueries.size > 0)
+        this.sessionStream.hasBlockingInteractionQueries(
+          session.conversationId
+        ))
     )
   }
 
@@ -6037,6 +6034,8 @@ export class CursorConnectStreamService {
         this.sessionManager.pendingToolCallCount(conversationId)
       const pendingInteractionQueries =
         stream?.pendingInteractionQueries.size ?? 0
+      const blockingInteractionQueries =
+        this.sessionStream.hasBlockingInteractionQueries(conversationId)
       const deferredControlContinuations =
         session.deferredControlContinuations.length
       const activeTurn =
@@ -6044,7 +6043,7 @@ export class CursorConnectStreamService {
       const busy =
         activeBackendStreams > 0 ||
         pendingToolCalls > 0 ||
-        pendingInteractionQueries > 0 ||
+        blockingInteractionQueries ||
         deferredControlContinuations > 0
 
       sessions.push({
@@ -6387,6 +6386,12 @@ export class CursorConnectStreamService {
       normalized.includes("No tool output found for function call") ||
       normalized.includes(
         "Each tool_result block must have a corresponding tool_use block in the previous message."
+      ) ||
+      normalized.includes(
+        "I've reached the maximum number of tool iterations for this turn"
+      ) ||
+      normalized.includes(
+        "I've reached the maximum number of LLM continuation rounds for this turn"
       )
     )
   }
@@ -18796,17 +18801,15 @@ ${raw}
         conversationId,
         "deferred_tool",
         {
-          kind: "deferred_tool",
-          family: "create_plan",
-          toolCallId,
-          toolName: "create_plan",
-          toolInput: input,
+          kind: "todo_ui_ack",
+          originToolCallId: toolCallId,
         },
         {
           turnId: this.getCurrentParentTurnId(conversationId),
-          kind: "deferred_tool:create_plan",
-          deadline: Date.now() + 30 * 60 * 1000,
+          kind: "todo_ui_ack",
+          deadline: Date.now() + 30_000,
           streamId: this.sessionStream.getCurrentStreamId(conversationId),
+          blocksTurn: false,
         }
       )
 
@@ -19752,6 +19755,7 @@ ${raw}
         let toolResultContent: string
         let toolResultStatus: "success" | "error" = "success"
         let toolCompletedExtraData: ToolCompletedExtraData | undefined
+        let toolInputForProjection: Record<string, unknown> = parsedInput
         const bridgeInlineStartedAt = this.isSubAgentBridgeInlineTool(tc.name)
           ? Date.now()
           : 0
@@ -19977,10 +19981,37 @@ ${raw}
             if (result.state?.status === "error") {
               toolResultStatus = "error"
             }
+            toolCompletedExtraData = result.extraData
+
+            if (result.projection?.webSearchResult) {
+              const projected = result.projection.webSearchResult
+              toolInputForProjection = {
+                ...parsedInput,
+                ...(projected.query ? { query: projected.query } : {}),
+                references: Array.isArray(projected.references)
+                  ? projected.references.map((reference) => ({
+                      title: reference.title || "",
+                      url: reference.url || "",
+                      chunk: reference.chunk || "",
+                    }))
+                  : [],
+              }
+            } else if (result.projection?.webFetchResult) {
+              const projected = result.projection.webFetchResult
+              toolInputForProjection = {
+                ...parsedInput,
+                ...(projected.url ? { url: projected.url } : {}),
+              }
+              toolResultContent =
+                typeof projected.markdown === "string"
+                  ? projected.markdown
+                  : toolResultContent
+            }
+
             toolResults.push({
               type: "tool_result",
               tool_use_id: tc.id,
-              content: result.content,
+              content: toolResultContent,
             })
           } catch (err) {
             toolResultStatus = "error"
@@ -20032,7 +20063,7 @@ ${raw}
             this.grpcService.buildInnerToolCallCompletedInteractionUpdate(
               tc.id,
               tc.name,
-              parsedInput,
+              toolInputForProjection,
               toolResultContent,
               innerToolFamilyHint,
               ctx.subagentId,
@@ -20040,6 +20071,15 @@ ${raw}
             )
           )
         )
+
+        if (family === "update_todos" || family === "update_plan") {
+          await this.emitCreatePlanQueryForTodoWrite(
+            conversationId,
+            parentToolCallId,
+            parsedInput
+          )
+        }
+
         // ConversationStep accumulation: push a toolCall step so the
         // parent task bubble's detail panel renders the per-tool
         // breakdown (which tools the sub-agent used + their results).
@@ -20049,7 +20089,7 @@ ${raw}
           this.grpcService.buildToolCallConversationStep(
             tc.name,
             tc.id,
-            parsedInput,
+            toolInputForProjection,
             toolResultContent,
             toolCompletedExtraData,
             innerToolFamilyHint
@@ -26117,6 +26157,10 @@ ${raw}
     rawResponse: unknown
   ): Promise<boolean> {
     if (!payload) return false
+    if (payload.kind === "todo_ui_ack") {
+      this.logger.debug("Received todo UI acknowledgement")
+      return true
+    }
     if (
       payload.kind !== "inline_web_tool" &&
       payload.kind !== "deferred_tool"
@@ -27344,6 +27388,14 @@ ${raw}
         result.historyContent
       )
 
+      if (family === "update_todos" || family === "update_plan") {
+        await this.emitCreatePlanQueryForTodoWrite(
+          conversationId,
+          toolCallId,
+          input
+        )
+      }
+
       return true
     }
 
@@ -28056,135 +28108,6 @@ ${raw}
     return result
   }
 
-  private getTopLevelAgentTurnState(
-    session: SessionRecord,
-    conversationId: string
-  ): SessionTopLevelAgentTurnState {
-    if (
-      !this.contextState.getContextRecord(session.conversationId)!
-        .topLevelAgentTurnState
-    ) {
-      this.contextState.getContextRecord(
-        session.conversationId
-      )!.topLevelAgentTurnState = this.createInitialTopLevelAgentTurnState()
-      this.sessionManager.markSessionDirty(conversationId)
-    }
-
-    return this.contextState.getContextRecord(session.conversationId)!
-      .topLevelAgentTurnState
-  }
-
-  private resetTopLevelAgentTurnState(
-    session: SessionRecord,
-    conversationId: string
-  ): void {
-    // Investigation memory now lives in persistent context state rather than
-    // per-turn top-level agent state.  Do not clear it here; let bounded
-    // append/replace logic control retention so recent evidence can survive
-    // across top-level turns within the same conversation.
-    this.contextState.setTopLevelAgentTurnState(
-      conversationId,
-      this.createInitialTopLevelAgentTurnState()
-    )
-    this.sessionManager.markSessionDirty(conversationId)
-  }
-
-  private createInitialTopLevelAgentTurnState(): SessionTopLevelAgentTurnState {
-    return {
-      llmTurnCount: 1,
-      continuationBudget: {
-        continuationCount: 0,
-        lastHistoryTokens: 0,
-        lastDeltaTokens: 0,
-        startedAt: Date.now(),
-      },
-    }
-  }
-
-  private notePreparedToolBatch(
-    conversationId: string,
-    session: SessionRecord,
-    assistantBlocks: MessageContentItem[],
-    preparedTools: PreparedToolInvocation[]
-  ): void {
-    if (preparedTools.length === 0) return
-
-    const state = this.getTopLevelAgentTurnState(session, conversationId)
-    const assistantText = assistantBlocks
-      .filter(
-        (block): block is Extract<MessageContentItem, { type: "text" }> =>
-          block.type === "text"
-      )
-      .map((block) => block.text)
-      .join("")
-      .trim()
-
-    const tools = preparedTools.map((tool) => ({
-      toolCallId: tool.activeToolCall.id,
-      toolName: tool.protocolToolName,
-      input: tool.protocolToolInput,
-    }))
-    const readOnly = tools.every((tool) =>
-      this.isReadOnlyInvestigativeTool(tool.toolName, tool.input)
-    )
-
-    state.activeToolBatch = {
-      batchId: crypto.randomUUID(),
-      toolCallIds: tools.map((tool) => tool.toolCallId),
-      assistantText,
-      readOnly,
-      startedAt: Date.now(),
-      tools,
-    }
-    this.sessionManager.markSessionDirty(conversationId)
-  }
-
-  private recordCompletedToolResultInTopLevelState(
-    conversationId: string,
-    session: SessionRecord,
-    toolCallId: string,
-    toolResultContent: string
-  ): ContextInvestigationMemoryEntry | undefined {
-    const state = this.getTopLevelAgentTurnState(session, conversationId)
-    const activeBatch = state.activeToolBatch
-    if (!activeBatch) {
-      return undefined
-    }
-
-    const trackedTool = activeBatch.tools.find(
-      (tool) => tool.toolCallId === toolCallId
-    )
-    if (!trackedTool) {
-      return undefined
-    }
-
-    trackedTool.resultSummary =
-      this.buildToolResultSummaryPreview(toolResultContent)
-
-    const completed = activeBatch.tools.every(
-      (tool) => typeof tool.resultSummary === "string"
-    )
-    if (!completed) {
-      this.sessionManager.markSessionDirty(conversationId)
-      return undefined
-    }
-
-    const summary = this.buildCompletedToolBatchSummary(activeBatch)
-    this.contextState.appendInvestigationMemory(
-      conversationId,
-      summary,
-      this.TOP_LEVEL_AGENT_SUMMARY_MEMORY_LIMIT
-    )
-    // Fire-and-forget small-fast-model summary label for the completed
-    // tool batch. Mirrors cc's TOOL_USE_SUMMARY path: result is stashed on
-    // session.lastToolUseSummary and consumed once by the next event
-    // emission (cc SSE / Cursor diagnostics). Failures are silent.
-    this.scheduleToolUseSummaryLabel(conversationId, session, activeBatch)
-    state.activeToolBatch = undefined
-    this.sessionManager.markSessionDirty(conversationId)
-    return summary
-  }
-
   /**
    * Fire-and-forget: produce a ≤30-char git-subject style label for the
    * completed tool batch via small-fast-model fork and stash it on
@@ -28239,96 +28162,6 @@ ${raw}
           `tool_use_summary scheduling failed (silent): ${String(error)}`
         )
       })
-  }
-
-  private buildCompletedToolBatchSummary(
-    batch: SessionActiveToolBatch
-  ): ContextInvestigationMemoryEntry {
-    const label = this.buildToolBatchLabel(batch)
-    const detailLines = batch.tools
-      .slice(0, this.TOOL_BATCH_SUMMARY_DETAILS_LIMIT)
-      .map((tool) => {
-        const inputSummary = this.summarizeToolInputForMemory(
-          tool.toolName,
-          tool.input
-        )
-        const resultSummary = tool.resultSummary || "completed"
-        return `- ${tool.toolName}: ${inputSummary}; result=${resultSummary}`
-      })
-    const details = [
-      batch.assistantText
-        ? `Intent: ${this.truncateForToolSummary(batch.assistantText, 180)}`
-        : "",
-      ...detailLines,
-      batch.tools.length > this.TOOL_BATCH_SUMMARY_DETAILS_LIMIT
-        ? `- ...and ${batch.tools.length - this.TOOL_BATCH_SUMMARY_DETAILS_LIMIT} more tool result(s)`
-        : "",
-    ]
-      .filter((line) => line.length > 0)
-      .join("\n")
-
-    return {
-      batchId: batch.batchId,
-      label,
-      details,
-      toolCallIds: [...batch.toolCallIds],
-      toolCount: batch.tools.length,
-      readOnly: batch.readOnly,
-      createdAt: Date.now(),
-    }
-  }
-
-  private buildToolBatchLabel(batch: SessionActiveToolBatch): string {
-    const counts = new Map<string, number>()
-    for (const tool of batch.tools) {
-      counts.set(tool.toolName, (counts.get(tool.toolName) || 0) + 1)
-    }
-
-    const dominantTool = Array.from(counts.entries()).sort(
-      (a, b) => b[1] - a[1]
-    )[0]?.[0]
-    const firstTool = batch.tools[0]
-
-    if (dominantTool === "read_file" || dominantTool === "read_file_v2") {
-      const paths = batch.tools
-        .map((tool) => this.pickToolPath(tool.input))
-        .filter((value): value is string => !!value)
-      if (paths.length > 0) {
-        return `Read ${paths.slice(0, 2).join(", ")}${paths.length > 2 ? "..." : ""}`
-      }
-    }
-
-    if (dominantTool === "grep_search") {
-      const query = this.pickToolQuery(firstTool?.input)
-      if (query) {
-        return `Searched for ${this.truncateForToolSummary(query, 36)}`
-      }
-    }
-
-    if (dominantTool === "run_terminal_command") {
-      const command = this.pickShellCommand(firstTool?.input)
-      if (command) {
-        return `Ran ${this.truncateForToolSummary(command, 36)}`
-      }
-    }
-
-    if (dominantTool === "exec_command") {
-      const command = this.pickShellCommand(firstTool?.input)
-      if (command) {
-        return `Ran ${this.truncateForToolSummary(command, 36)}`
-      }
-    }
-
-    if (dominantTool === "read_lints") {
-      return "Read lint diagnostics"
-    }
-
-    return `Completed ${batch.tools.length} investigative tool call${batch.tools.length === 1 ? "" : "s"}`
-  }
-
-  private buildToolResultSummaryPreview(content: string): string {
-    const compact = content.replace(/\s+/g, " ").trim()
-    return this.truncateForToolSummary(compact, 160)
   }
 
   private summarizeToolInputForMemory(
@@ -29136,7 +28969,7 @@ ${raw}
     pendingToolUseIds: string[],
     normalizedHistory: SessionMessage[]
   ): TopLevelContinuationDecision {
-    const state = this.getTopLevelAgentTurnState(session, conversationId)
+    const state = this.topLevelAgentTurnRunner.getState(conversationId)
 
     // Cache fast path #1: history-token count keyed on the
     // normalizedHistory array reference.  Item 1 (normalize cache)
@@ -30137,12 +29970,27 @@ ${raw}
     const flatAssistantBlocks = this.flattenTurnAssistantContent(
       turnAssistantMessages
     )
-    this.notePreparedToolBatch(
+    const assistantText = flatAssistantBlocks
+      .filter(
+        (block): block is Extract<MessageContentItem, { type: "text" }> =>
+          block.type === "text"
+      )
+      .map((block) => block.text)
+      .join("")
+      .trim()
+    this.topLevelAgentTurnRunner.notePreparedToolBatch({
       conversationId,
-      registeredSession,
-      flatAssistantBlocks,
-      preparedTools
-    )
+      assistantText,
+      tools: preparedTools.map((tool) => ({
+        toolCallId: tool.activeToolCall.id,
+        toolName: tool.protocolToolName,
+        input: tool.protocolToolInput,
+      })),
+      callbacks: {
+        isReadOnlyTool: (toolName, input) =>
+          this.isReadOnlyInvestigativeTool(toolName, input),
+      },
+    })
 
     // Wire up the turn-level batch barrier: register ALL tool call IDs in the
     // batch so that shouldDeferToolBatchContinuation() can block continuation
@@ -32421,7 +32269,7 @@ ${raw}
     // Get or create session with the provided conversationId
     parsed = this.sanitizeParsedRequestForSession(parsed)
     let session = this.sessionManager.getOrCreateSession(conversationId, parsed)
-    this.resetTopLevelAgentTurnState(session, conversationId)
+    this.topLevelAgentTurnRunner.resetState(conversationId)
 
     // Map Cursor model name to backend model name
     const effectiveModel = parsed.model?.trim() || session.model
@@ -33165,7 +33013,16 @@ ${raw}
       return
     }
 
-    await this.runToolContinuationParentTurn(params)
+    const continuationLabel =
+      params.source === "shell" ? "shell continuation" : "tool continuation"
+    await this.topLevelAgentTurnRunner.runExclusive(
+      {
+        conversationId: params.conversationId,
+        continuationLabel,
+        toolCallId: params.toolCallId,
+      },
+      () => this.runToolContinuationParentTurn(params)
+    )
   }
 
   private async runToolContinuationParentTurn(
@@ -33465,25 +33322,16 @@ ${raw}
         `${continuationLabel} bootstrap: ${conversationId}`
       )
 
-    const topLevelTurnState = this.getTopLevelAgentTurnState(
-      activeSession,
-      conversationId
-    )
-    topLevelTurnState.llmTurnCount += 1
+    const continuationBudgetDecision =
+      this.topLevelAgentTurnRunner.reserveContinuationRound(conversationId, {
+        continuationLabel,
+        maxRounds: this.MAX_TOP_LEVEL_LLM_TURNS,
+      })
 
-    // cc-parity runaway cap: bound the event-driven main agentic loop per
-    // top-level turn. Without this the loop is driven purely by the model
-    // emitting tool calls, with no upper bound (a single turn was seen
-    // running 69–92 rounds). On exceeding the cap we finalize the turn
-    // gracefully with a notice instead of continuing unbounded.
-    if (topLevelTurnState.llmTurnCount > this.MAX_TOP_LEVEL_LLM_TURNS) {
-      this.logger.warn(
-        `[turn-runner] ${continuationLabel} reached max turns ` +
-          `(${this.MAX_TOP_LEVEL_LLM_TURNS}) for ${conversationId}; finalizing to prevent runaway`
-      )
+    if (continuationBudgetDecision.kind === "stop") {
       await this.emitAgentFinalTextResponse(
         activeSession,
-        `I've reached the maximum number of tool iterations for this turn (${this.MAX_TOP_LEVEL_LLM_TURNS}). Stopping here to avoid running unbounded — tell me how you'd like to continue.`
+        continuationBudgetDecision.notice
       )
       return
     }
@@ -35880,15 +35728,24 @@ ${raw}
       pendingToolCall.codexToolCallType || "function"
     )
 
-    const completedBatchSummary = this.recordCompletedToolResultInTopLevelState(
-      conversationId,
-      session,
-      toolCallId,
-      historyToolResultContent
-    )
+    const completedBatchSummary =
+      this.topLevelAgentTurnRunner.recordCompletedToolResult({
+        conversationId,
+        toolCallId,
+        toolResultContent: historyToolResultContent,
+        callbacks: {
+          summarizeToolInput: (toolName, input) =>
+            this.summarizeToolInputForMemory(toolName, input),
+        },
+      })
     if (completedBatchSummary) {
+      this.scheduleToolUseSummaryLabel(
+        conversationId,
+        session,
+        completedBatchSummary.batch
+      )
       this.logger.debug(
-        `Recorded internal tool-batch summary for working memory: ${completedBatchSummary.label}`
+        `Recorded internal tool-batch summary for working memory: ${completedBatchSummary.summary.label}`
       )
     }
 

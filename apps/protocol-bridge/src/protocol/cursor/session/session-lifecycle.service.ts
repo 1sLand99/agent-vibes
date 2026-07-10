@@ -882,6 +882,7 @@ export interface SessionStreamRecord {
       kind?: string
       deadline?: number
       streamId?: string
+      blocksTurn?: boolean
       createdAt: number
     }
   >
@@ -2122,13 +2123,12 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
    * session is still non-idle after the mutation.
    */
   notifyIfBecameIdleAfter(session: SessionRecord, wasPending: boolean): void {
-    const stream = this.sessionStream.getStreamRecord(session.conversationId)!
     if (!wasPending) return
     if (!this.onPendingWorkBecameIdleHandler) return
     const conversationId = session.conversationId
     const stillPending =
       this.pendingToolCallCount(conversationId) > 0 ||
-      stream.pendingInteractionQueries.size > 0
+      this.sessionStream.hasBlockingInteractionQueries(conversationId)
     if (stillPending) return
     try {
       this.onPendingWorkBecameIdleHandler(conversationId, session)
@@ -4647,7 +4647,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       const changed =
         history.anchorRecordId !== normalized.anchorRecordId ||
         history.anchorRecordCount !== normalized.anchorRecordCount ||
-        history.items.length !== normalized.items.length ||
+        !safeJsonEqual(history.items, normalized.items) ||
         history.summary !== normalized.summary
       return {
         history: normalized,
@@ -6283,13 +6283,12 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   ): PendingToolCall | undefined {
     const session = this.getSession(conversationId)
     if (session) {
-      const stream = this.sessionStream.getStreamRecord(session.conversationId)!
       // Snapshot pending state before mutation so notifyIfBecameIdle
       // can see the non-idle → idle edge if this consume is the last
       // outstanding work item.
       const wasPending =
         this.pendingToolCallCount(conversationId) > 0 ||
-        stream.pendingInteractionQueries.size > 0
+        this.sessionStream.hasBlockingInteractionQueries(conversationId)
       const toolCall = this.detachPendingToolCall(session, toolCallId)
       if (toolCall) {
         // Settle this tool in the batch barrier so that continuation is only
@@ -6333,14 +6332,13 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     toolCallId: string,
     reason?: string
   ): PendingToolCall | undefined {
-    const stream = this.sessionStream.getStreamRecord(conversationId)!
     const session = this.getSession(conversationId)
     if (!session) return undefined
 
     // Snapshot before mutation (see consumePendingToolCall).
     const wasPending =
       this.pendingToolCallCount(conversationId) > 0 ||
-      stream.pendingInteractionQueries.size > 0
+      this.sessionStream.hasBlockingInteractionQueries(conversationId)
 
     const toolCall = this.detachPendingToolCall(session, toolCallId)
     if (!toolCall) return undefined
@@ -7237,7 +7235,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
 
       const hasPendingWork =
         this.pendingToolCallCount(session.conversationId) > 0 ||
-        stream.pendingInteractionQueries.size > 0
+        this.sessionStream.hasBlockingInteractionQueries(session.conversationId)
       if (hasPendingWork) {
         this.logger.debug(
           `Skipping cleanup for session ${conversationId}: pendingToolCalls=${this.pendingToolCallCount(session.conversationId)}, pendingInteractionQueries=${stream.pendingInteractionQueries.size}`

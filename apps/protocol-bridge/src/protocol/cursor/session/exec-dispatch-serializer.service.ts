@@ -1,5 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common"
 
+const EXEC_DISPATCH_QUEUE_PRESSURE_THRESHOLD = 8
+
 /**
  * Per-conversation queue that ensures only one ExecServerMessage is in
  * flight to the Cursor IDE at a time.
@@ -69,7 +71,13 @@ export class ExecDispatchSerializerService {
     string,
     {
       inFlight?: { execId: number; label: string; sentAt: Date }
-      queue: Array<{ execId: number; frame: Buffer; label: string }>
+      queue: Array<{
+        execId: number
+        frame: Buffer
+        label: string
+        queuedAt: number
+      }>
+      queuePressureNotified?: boolean
     }
   >()
 
@@ -108,11 +116,21 @@ export class ExecDispatchSerializerService {
       return true
     }
 
-    state.queue.push({ execId, frame, label })
+    state.queue.push({ execId, frame, label, queuedAt: Date.now() })
     this.logger.debug(
       `ExecDispatch queued: conversation=${conversationId} execId=${execId} label=${label} ` +
         `(in-flight execId=${state.inFlight.execId} label=${state.inFlight.label}, queueDepth=${state.queue.length})`
     )
+    if (
+      !state.queuePressureNotified &&
+      state.queue.length >= EXEC_DISPATCH_QUEUE_PRESSURE_THRESHOLD
+    ) {
+      state.queuePressureNotified = true
+      this.logger.warn(
+        `ExecDispatch queue pressure: conversation=${conversationId} queueDepth=${state.queue.length} ` +
+          `inFlightExecId=${state.inFlight.execId}`
+      )
+    }
     return false
   }
 
@@ -137,11 +155,8 @@ export class ExecDispatchSerializerService {
     if (!state.inFlight || state.inFlight.execId !== execId) {
       // Either we never tracked this execId (e.g. inline tool that
       // bypassed the serializer) or release has already been called
-      // for it. Both are benign — just log at debug.
-      this.logger.debug(
-        `ExecDispatch release: conversation=${conversationId} execId=${execId} ` +
-          `(in-flight execId=${state.inFlight?.execId ?? "(none)"}); ignoring`
-      )
+      // for it. Both are benign and expected when result and stream-close
+      // arrive out of order, so avoid emitting one log line per duplicate.
       return undefined
     }
 
@@ -153,18 +168,23 @@ export class ExecDispatchSerializerService {
     )
 
     const next = state.queue.shift()
+    if (state.queue.length < EXEC_DISPATCH_QUEUE_PRESSURE_THRESHOLD) {
+      state.queuePressureNotified = false
+    }
     if (!next) {
       this.maybeCleanup(conversationId, state)
       return undefined
     }
 
+    const queueWaitMs = Date.now() - next.queuedAt
     state.inFlight = {
       execId: next.execId,
       label: next.label,
       sentAt: new Date(),
     }
     this.logger.debug(
-      `ExecDispatch dispatch (after release): conversation=${conversationId} execId=${next.execId} label=${next.label}`
+      `ExecDispatch dispatch (after release): conversation=${conversationId} execId=${next.execId} ` +
+        `label=${next.label} queueWaitMs=${queueWaitMs}`
     )
     emit(next.frame)
     return next.execId

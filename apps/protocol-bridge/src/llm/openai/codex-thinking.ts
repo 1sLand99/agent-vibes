@@ -9,6 +9,7 @@ const STANDARD_LEVEL_ORDER = [
   "high",
   "xhigh",
   "max",
+  "ultra",
 ] as const
 
 function normalizeSupportedLevels(modelName: string): {

@@ -2914,6 +2914,31 @@ export class GoogleService implements ProviderAdapter {
       }
     }
 
+    const modelLower = model.toLowerCase()
+    if (modelLower.startsWith("gemini-")) {
+      if (modelLower.includes("-low") || modelLower.includes("-extra-low")) {
+        return {
+          supportsThinking: true,
+          thinkingBudget: 1024,
+          minThinkingBudget: 128,
+        }
+      }
+      if (modelLower.includes("-medium")) {
+        return {
+          supportsThinking: true,
+          thinkingBudget: 4096,
+          minThinkingBudget: 128,
+        }
+      }
+      if (modelLower.includes("-high") || modelLower.includes("-agent")) {
+        return {
+          supportsThinking: true,
+          thinkingBudget: 10001,
+          minThinkingBudget: 128,
+        }
+      }
+    }
+
     const fallback: Record<
       string,
       {

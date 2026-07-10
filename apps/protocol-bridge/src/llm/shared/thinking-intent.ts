@@ -11,7 +11,8 @@ function isThinkingIntentEffort(value: unknown): value is ThinkingIntentEffort {
     value === "medium" ||
     value === "high" ||
     value === "xhigh" ||
-    value === "max"
+    value === "max" ||
+    value === "ultra"
   )
 }
 
@@ -46,9 +47,10 @@ export function normalizeRequestedThinkingEffort(
     case "high":
       return "high"
     case "max":
-    case "very_high":
+      return "max"
     case "ultra":
-      return normalized === "max" ? "max" : "xhigh"
+      return "ultra"
+    case "very_high":
     case "xhigh":
     case "extra_high":
       return "xhigh"
