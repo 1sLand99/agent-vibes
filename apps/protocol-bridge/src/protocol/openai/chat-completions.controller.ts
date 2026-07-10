@@ -15,6 +15,7 @@ import { renderOpenAiError } from "./openai-error"
 import type {
   OpenAiChatCompletionRequest,
   OpenAiCompletionRequest,
+  OpenAiResponsesRequest,
 } from "./openai-types"
 
 /**
@@ -23,6 +24,7 @@ import type {
  * Exposes the standard OpenAI surface so any OpenAI SDK pointed at this
  * bridge (baseURL = http://host:port/v1) works unchanged:
  *   - POST /v1/chat/completions
+ *   - POST /v1/responses
  *   - POST /v1/completions      (legacy text completion)
  *
  * Model listing (GET /v1/models) is served by the Anthropic MessagesController
@@ -83,6 +85,50 @@ export class ChatCompletionsController {
 
     try {
       return await this.chatCompletionsService.createChatCompletion(req)
+    } catch (error) {
+      const rendered = renderOpenAiError(error)
+      if (res && rendered.retryAfterSeconds != null) {
+        res.header("Retry-After", String(rendered.retryAfterSeconds))
+      }
+      throw new HttpException(rendered.body, rendered.status)
+    }
+  }
+
+  @Post("responses")
+  @HttpCode(200)
+  @ApiOperation({ summary: "Create a response (OpenAI Responses API)" })
+  async createResponse(
+    @Body() body: Record<string, unknown>,
+    @Res({ passthrough: true }) res?: FastifyReply
+  ) {
+    const req = body as unknown as OpenAiResponsesRequest
+    if (typeof req?.model !== "string" || req.model.trim() === "") {
+      throw this.buildMissingModelError()
+    }
+    if (req.input == null) {
+      throw new HttpException(
+        {
+          error: {
+            message: "you must provide an input parameter",
+            type: "invalid_request_error",
+            param: "input",
+            code: null,
+          },
+        },
+        400
+      )
+    }
+
+    if (req.stream && res) {
+      await this.streamResponse(
+        res,
+        this.chatCompletionsService.createResponseStream(req)
+      )
+      return
+    }
+
+    try {
+      return await this.chatCompletionsService.createResponse(req)
     } catch (error) {
       const rendered = renderOpenAiError(error)
       if (res && rendered.retryAfterSeconds != null) {

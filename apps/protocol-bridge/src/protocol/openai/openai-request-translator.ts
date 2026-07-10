@@ -26,6 +26,8 @@ import type {
   OpenAiCompletionRequest,
   OpenAiContentPart,
   OpenAiFunctionTool,
+  OpenAiResponseInputContentPart,
+  OpenAiResponsesRequest,
   OpenAiToolChoice,
 } from "./openai-types"
 
@@ -274,6 +276,100 @@ export function translateOpenAiChatToCreateMessage(
   }
 
   return dto
+}
+
+function translateResponseContent(
+  content: string | OpenAiResponseInputContentPart[]
+): string | OpenAiContentPart[] {
+  if (typeof content === "string") return content
+
+  const parts: OpenAiContentPart[] = []
+  for (const part of content) {
+    if (part.type === "input_text" || part.type === "output_text") {
+      parts.push({ type: "text", text: part.text })
+      continue
+    }
+    if (part.type === "input_image" && part.image_url) {
+      parts.push({
+        type: "image_url",
+        image_url: {
+          url: part.image_url,
+          ...(part.detail ? { detail: part.detail } : {}),
+        },
+      })
+    }
+  }
+  return parts
+}
+
+export function translateOpenAiResponseToCreateMessage(
+  req: OpenAiResponsesRequest
+): CreateMessageDto {
+  const messages: OpenAiChatMessage[] = []
+  if (req.instructions?.trim()) {
+    messages.push({ role: "system", content: req.instructions })
+  }
+
+  if (typeof req.input === "string") {
+    messages.push({ role: "user", content: req.input })
+  } else {
+    for (const item of req.input) {
+      if (item.type === "function_call") {
+        messages.push({
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: item.call_id || item.id || "",
+              type: "function",
+              function: { name: item.name, arguments: item.arguments },
+            },
+          ],
+        })
+        continue
+      }
+      if (item.type === "function_call_output") {
+        messages.push({
+          role: "tool",
+          tool_call_id: item.call_id,
+          content: item.output,
+        })
+        continue
+      }
+      messages.push({
+        role: item.role,
+        content: translateResponseContent(item.content),
+      })
+    }
+  }
+
+  const tools: OpenAiFunctionTool[] | undefined = req.tools?.map((tool) => ({
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+    },
+  }))
+  const toolChoice: OpenAiToolChoice | undefined =
+    typeof req.tool_choice === "object"
+      ? {
+          type: "function",
+          function: { name: req.tool_choice.name },
+        }
+      : req.tool_choice
+
+  return translateOpenAiChatToCreateMessage({
+    model: req.model,
+    messages,
+    tools,
+    tool_choice: toolChoice,
+    stream: req.stream,
+    max_completion_tokens: req.max_output_tokens,
+    temperature: req.temperature,
+    top_p: req.top_p,
+    reasoning_effort: req.reasoning?.effort,
+  })
 }
 
 /**

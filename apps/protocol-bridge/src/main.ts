@@ -413,6 +413,8 @@ ${empty}
 ${sep}
 ${line(`${c.orange}${c.bold}API Endpoints${c.reset}`)}
 ${line(`  ${c.purple}POST${c.reset} /v1/messages ${c.dim}·· Anthropic API${c.reset}`)}
+${line(`  ${c.purple}POST${c.reset} /v1/chat/completions ${c.dim}·· OpenAI Chat API${c.reset}`)}
+${line(`  ${c.purple}POST${c.reset} /v1/responses ${c.dim}·· OpenAI Responses API${c.reset}`)}
 ${line(`  ${c.purple}GET ${c.reset} /v1/models   ${c.dim}·· List available models${c.reset}`)}
 ${line(`  ${c.purple}POST${c.reset} /agent.v1.*  ${c.dim}·· Cursor gRPC endpoints${c.reset}`)}
 ${line(`  ${c.purple}GET ${c.reset} /health      ${c.dim}·· Health check${c.reset}`)}

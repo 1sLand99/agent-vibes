@@ -4,18 +4,23 @@ import type { AnthropicResponse } from "../../shared/anthropic"
 import {
   translateOpenAiChatToCreateMessage,
   translateOpenAiCompletionToCreateMessage,
+  translateOpenAiResponseToCreateMessage,
 } from "./openai-request-translator"
 import {
   OpenAiChatStreamTranslator,
   OpenAiCompletionStreamTranslator,
+  OpenAiResponsesStreamTranslator,
   translateAnthropicToOpenAiChat,
   translateAnthropicToOpenAiCompletion,
+  translateAnthropicToOpenAiResponse,
 } from "./openai-response-translator"
 import type {
   OpenAiChatCompletionRequest,
   OpenAiChatCompletionResponse,
   OpenAiCompletionRequest,
   OpenAiCompletionResponse,
+  OpenAiResponsesRequest,
+  OpenAiResponsesResponse,
 } from "./openai-types"
 
 /**
@@ -71,6 +76,47 @@ export class ChatCompletionsService {
       includeUsage: req.stream_options?.include_usage === true,
     })
 
+    const upstream = this.messagesService.createMessageStream(dto)
+    for await (const chunk of upstream) {
+      for (const frame of translator.push(chunk)) {
+        yield frame
+      }
+    }
+    for (const frame of translator.finish()) {
+      yield frame
+    }
+  }
+
+  // ── Responses API ─────────────────────────────────────────────────────
+
+  async createResponse(
+    req: OpenAiResponsesRequest
+  ): Promise<OpenAiResponsesResponse> {
+    const dto = translateOpenAiResponseToCreateMessage(req)
+    dto.stream = false
+    const response: AnthropicResponse =
+      await this.messagesService.createMessage(dto)
+    return translateAnthropicToOpenAiResponse(
+      response,
+      req,
+      Math.floor(Date.now() / 1000)
+    )
+  }
+
+  async *createResponseStream(
+    req: OpenAiResponsesRequest
+  ): AsyncGenerator<string, void, unknown> {
+    const dto = translateOpenAiResponseToCreateMessage(req)
+    dto.stream = true
+    const translator = new OpenAiResponsesStreamTranslator({
+      id: `resp_${this.randomId()}`,
+      createdAt: Math.floor(Date.now() / 1000),
+      request: req,
+    })
+
+    for (const frame of translator.start()) {
+      yield frame
+    }
     const upstream = this.messagesService.createMessageStream(dto)
     for await (const chunk of upstream) {
       for (const frame of translator.push(chunk)) {

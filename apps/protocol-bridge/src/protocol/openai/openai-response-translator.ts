@@ -21,6 +21,10 @@ import type {
   OpenAiChatCompletionResponse,
   OpenAiCompletionResponse,
   OpenAiFinishReason,
+  OpenAiResponseOutputItem,
+  OpenAiResponsesRequest,
+  OpenAiResponsesResponse,
+  OpenAiResponsesUsage,
   OpenAiToolCall,
   OpenAiUsage,
 } from "./openai-types"
@@ -122,6 +126,101 @@ export function translateAnthropicToOpenAiChat(
     choices: [choice],
     usage: mapUsage(response.usage),
   }
+}
+
+function mapResponsesUsage(
+  usage: AnthropicResponse["usage"]
+): OpenAiResponsesUsage {
+  const cachedTokens = usage.cache_read_input_tokens || 0
+  const inputTokens = (usage.input_tokens || 0) + cachedTokens
+  const outputTokens = usage.output_tokens || 0
+  return {
+    input_tokens: inputTokens,
+    input_tokens_details: { cached_tokens: cachedTokens },
+    output_tokens: outputTokens,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: inputTokens + outputTokens,
+  }
+}
+
+function buildResponsesEnvelope(
+  id: string,
+  createdAt: number,
+  request: OpenAiResponsesRequest,
+  output: OpenAiResponseOutputItem[],
+  usage: OpenAiResponsesUsage,
+  status: OpenAiResponsesResponse["status"]
+): OpenAiResponsesResponse {
+  return {
+    id,
+    object: "response",
+    created_at: createdAt,
+    status,
+    error: null,
+    incomplete_details:
+      status === "incomplete" ? { reason: "max_output_tokens" } : null,
+    instructions: request.instructions ?? null,
+    max_output_tokens: request.max_output_tokens ?? null,
+    model: request.model,
+    output,
+    parallel_tool_calls: request.parallel_tool_calls ?? true,
+    previous_response_id: request.previous_response_id ?? null,
+    reasoning: request.reasoning ?? null,
+    store: request.store ?? false,
+    temperature: request.temperature ?? null,
+    tool_choice: request.tool_choice ?? "auto",
+    tools: request.tools ?? [],
+    top_p: request.top_p ?? null,
+    metadata: request.metadata ?? {},
+    usage,
+  }
+}
+
+export function translateAnthropicToOpenAiResponse(
+  response: AnthropicResponse,
+  request: OpenAiResponsesRequest,
+  createdAt: number
+): OpenAiResponsesResponse {
+  let text = ""
+  const output: OpenAiResponseOutputItem[] = []
+
+  for (const block of response.content) {
+    if (block.type === "text") {
+      text += block.text
+      continue
+    }
+    if (block.type === "tool_use") {
+      output.push({
+        id: block.id,
+        type: "function_call",
+        status: "completed",
+        call_id: block.id,
+        name: block.name,
+        arguments: JSON.stringify(block.input ?? {}),
+      })
+    }
+  }
+
+  if (text) {
+    output.unshift({
+      id: response.id || `msg_${cryptoRandomId()}`,
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text, annotations: [] }],
+    })
+  }
+
+  const status =
+    response.stop_reason === "max_tokens" ? "incomplete" : "completed"
+  return buildResponsesEnvelope(
+    response.id || `resp_${cryptoRandomId()}`,
+    createdAt,
+    request,
+    output,
+    mapResponsesUsage(response.usage),
+    status
+  )
 }
 
 /**
@@ -427,6 +526,293 @@ export class OpenAiChatStreamTranslator {
   }
 }
 
+type OpenAiResponseMessageItem = Extract<
+  OpenAiResponseOutputItem,
+  { type: "message" }
+>
+type OpenAiResponseFunctionItem = Extract<
+  OpenAiResponseOutputItem,
+  { type: "function_call" }
+>
+type OpenAiResponseStreamBlock =
+  | {
+      kind: "text"
+      item: OpenAiResponseMessageItem
+      outputIndex: number
+      done: boolean
+    }
+  | {
+      kind: "tool"
+      item: OpenAiResponseFunctionItem
+      outputIndex: number
+      done: boolean
+    }
+
+function emptyResponsesUsage(): OpenAiResponsesUsage {
+  return {
+    input_tokens: 0,
+    input_tokens_details: { cached_tokens: 0 },
+    output_tokens: 0,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: 0,
+  }
+}
+
+export class OpenAiResponsesStreamTranslator {
+  private readonly frames = new AnthropicSseFrameBuffer()
+  private readonly output: OpenAiResponseOutputItem[] = []
+  private readonly usage = emptyResponsesUsage()
+  private readonly blocks = new Map<number, OpenAiResponseStreamBlock>()
+  private readonly response: OpenAiResponsesResponse
+  private sequenceNumber = 0
+  private stopReason: string | null = null
+
+  constructor(opts: {
+    id: string
+    createdAt: number
+    request: OpenAiResponsesRequest
+  }) {
+    this.response = buildResponsesEnvelope(
+      opts.id,
+      opts.createdAt,
+      opts.request,
+      this.output,
+      this.usage,
+      "in_progress"
+    )
+  }
+
+  start(): string[] {
+    return [
+      this.event("response.created", { response: this.response }),
+      this.event("response.in_progress", { response: this.response }),
+    ]
+  }
+
+  push(raw: string): string[] {
+    const output: string[] = []
+    for (const event of this.frames.push(raw)) {
+      output.push(...this.handleEvent(event))
+    }
+    return output
+  }
+
+  finish(): string[] {
+    const output: string[] = []
+    for (const block of this.blocks.values()) {
+      if (!block.done) output.push(...this.closeBlock(block))
+    }
+
+    this.response.status =
+      this.stopReason === "max_tokens" ? "incomplete" : "completed"
+    this.response.incomplete_details =
+      this.response.status === "incomplete"
+        ? { reason: "max_output_tokens" }
+        : null
+    output.push(this.event("response.completed", { response: this.response }))
+    output.push("data: [DONE]\n\n")
+    return output
+  }
+
+  private handleEvent(event: AnthropicSseEvent): string[] {
+    switch (event.type) {
+      case "message_start":
+        this.updateUsage(
+          (event.message?.usage as Record<string, unknown> | undefined) ?? {}
+        )
+        return []
+      case "content_block_start":
+        return this.startBlock(event)
+      case "content_block_delta":
+        return this.updateBlock(event)
+      case "content_block_stop": {
+        const block = this.blocks.get(event.index ?? 0)
+        return block ? this.closeBlock(block) : []
+      }
+      case "message_delta":
+        this.stopReason =
+          (event.delta?.stop_reason as string | null | undefined) ??
+          this.stopReason
+        this.updateUsage(event.usage ?? {})
+        return []
+      default:
+        return []
+    }
+  }
+
+  private startBlock(event: AnthropicSseEvent): string[] {
+    const blockIndex = event.index ?? 0
+    const block = event.content_block ?? {}
+    const outputIndex = this.output.length
+
+    if (block.type === "tool_use") {
+      const callId = (block.id as string) || `call_${cryptoRandomId()}`
+      const item: OpenAiResponseFunctionItem = {
+        id: callId,
+        type: "function_call",
+        status: "in_progress",
+        call_id: callId,
+        name: (block.name as string) || "",
+        arguments: "",
+      }
+      this.output.push(item)
+      this.blocks.set(blockIndex, {
+        kind: "tool",
+        item,
+        outputIndex,
+        done: false,
+      })
+      return [
+        this.event("response.output_item.added", {
+          output_index: outputIndex,
+          item,
+        }),
+      ]
+    }
+
+    if (block.type !== "text") return []
+
+    const item: OpenAiResponseMessageItem = {
+      id: `msg_${cryptoRandomId()}`,
+      type: "message",
+      status: "in_progress",
+      role: "assistant",
+      content: [{ type: "output_text", text: "", annotations: [] }],
+    }
+    this.output.push(item)
+    this.blocks.set(blockIndex, {
+      kind: "text",
+      item,
+      outputIndex,
+      done: false,
+    })
+    const part = item.content[0]
+    const frames = [
+      this.event("response.output_item.added", {
+        output_index: outputIndex,
+        item,
+      }),
+      this.event("response.content_part.added", {
+        item_id: item.id,
+        output_index: outputIndex,
+        content_index: 0,
+        part,
+      }),
+    ]
+    const initialText = (block.text as string) || ""
+    if (initialText) {
+      part.text += initialText
+      frames.push(
+        this.event("response.output_text.delta", {
+          item_id: item.id,
+          output_index: outputIndex,
+          content_index: 0,
+          delta: initialText,
+          logprobs: [],
+        })
+      )
+    }
+    return frames
+  }
+
+  private updateBlock(event: AnthropicSseEvent): string[] {
+    const block = this.blocks.get(event.index ?? 0)
+    if (!block || block.done) return []
+    const delta = event.delta ?? {}
+
+    if (block.kind === "text" && delta.type === "text_delta") {
+      const text = (delta.text as string) || ""
+      if (!text) return []
+      block.item.content[0].text += text
+      return [
+        this.event("response.output_text.delta", {
+          item_id: block.item.id,
+          output_index: block.outputIndex,
+          content_index: 0,
+          delta: text,
+          logprobs: [],
+        }),
+      ]
+    }
+
+    if (block.kind === "tool" && delta.type === "input_json_delta") {
+      const partial = (delta.partial_json as string) || ""
+      if (!partial) return []
+      block.item.arguments += partial
+      return [
+        this.event("response.function_call_arguments.delta", {
+          item_id: block.item.id,
+          output_index: block.outputIndex,
+          delta: partial,
+        }),
+      ]
+    }
+
+    return []
+  }
+
+  private closeBlock(block: OpenAiResponseStreamBlock): string[] {
+    if (block.done) return []
+    block.done = true
+    block.item.status = "completed"
+
+    if (block.kind === "tool") {
+      return [
+        this.event("response.function_call_arguments.done", {
+          item_id: block.item.id,
+          output_index: block.outputIndex,
+          arguments: block.item.arguments,
+        }),
+        this.event("response.output_item.done", {
+          output_index: block.outputIndex,
+          item: block.item,
+        }),
+      ]
+    }
+
+    const part = block.item.content[0]
+    return [
+      this.event("response.output_text.done", {
+        item_id: block.item.id,
+        output_index: block.outputIndex,
+        content_index: 0,
+        text: part.text,
+        logprobs: [],
+      }),
+      this.event("response.content_part.done", {
+        item_id: block.item.id,
+        output_index: block.outputIndex,
+        content_index: 0,
+        part,
+      }),
+      this.event("response.output_item.done", {
+        output_index: block.outputIndex,
+        item: block.item,
+      }),
+    ]
+  }
+
+  private updateUsage(raw: Record<string, unknown>): void {
+    const cachedTokens = Number(raw.cache_read_input_tokens || 0)
+    if (raw.input_tokens !== undefined || cachedTokens > 0) {
+      this.usage.input_tokens = Number(raw.input_tokens || 0) + cachedTokens
+      this.usage.input_tokens_details.cached_tokens = cachedTokens
+    }
+    if (raw.output_tokens !== undefined) {
+      this.usage.output_tokens = Number(raw.output_tokens || 0)
+    }
+    this.usage.total_tokens = this.usage.input_tokens + this.usage.output_tokens
+  }
+
+  private event(type: string, fields: Record<string, unknown>): string {
+    return formatOpenAiResponseSse(type, {
+      type,
+      sequence_number: this.sequenceNumber++,
+      ...fields,
+    })
+  }
+}
+
 /**
  * Stateful translator for the legacy `/v1/completions` streaming surface.
  * Only text deltas are surfaced (thinking/tool_use blocks have no place in
@@ -482,6 +868,10 @@ export class OpenAiCompletionStreamTranslator {
       ],
     })
   }
+}
+
+function formatOpenAiResponseSse(eventType: string, payload: unknown): string {
+  return `event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`
 }
 
 function formatOpenAiSse(chunk: unknown): string {

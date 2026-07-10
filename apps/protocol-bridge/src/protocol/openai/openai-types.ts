@@ -144,6 +144,139 @@ export interface OpenAiChatCompletionChunk {
   usage?: OpenAiUsage | null
 }
 
+// ── Responses API ───────────────────────────────────────────────────────
+
+export interface OpenAiResponseInputTextPart {
+  type: "input_text" | "output_text"
+  text: string
+}
+
+export interface OpenAiResponseInputImagePart {
+  type: "input_image"
+  image_url: string
+  detail?: string
+}
+
+export type OpenAiResponseInputContentPart =
+  | OpenAiResponseInputTextPart
+  | OpenAiResponseInputImagePart
+
+export interface OpenAiResponseInputMessage {
+  type?: "message"
+  role: "system" | "developer" | "user" | "assistant"
+  content: string | OpenAiResponseInputContentPart[]
+}
+
+export interface OpenAiResponseFunctionCallInput {
+  type: "function_call"
+  id?: string
+  call_id: string
+  name: string
+  arguments: string
+}
+
+export interface OpenAiResponseFunctionCallOutputInput {
+  type: "function_call_output"
+  call_id: string
+  output: string
+}
+
+export type OpenAiResponseInputItem =
+  | OpenAiResponseInputMessage
+  | OpenAiResponseFunctionCallInput
+  | OpenAiResponseFunctionCallOutputInput
+
+export interface OpenAiResponseFunctionTool {
+  type: "function"
+  name: string
+  description?: string
+  parameters?: Record<string, unknown>
+  strict?: boolean
+}
+
+export type OpenAiResponseToolChoice =
+  | "none"
+  | "auto"
+  | "required"
+  | { type: "function"; name: string }
+
+export interface OpenAiResponsesRequest {
+  model: string
+  input: string | OpenAiResponseInputItem[]
+  instructions?: string
+  tools?: OpenAiResponseFunctionTool[]
+  tool_choice?: OpenAiResponseToolChoice
+  stream?: boolean
+  max_output_tokens?: number
+  temperature?: number
+  top_p?: number
+  reasoning?: { effort?: string; summary?: string }
+  parallel_tool_calls?: boolean
+  previous_response_id?: string | null
+  store?: boolean
+  metadata?: Record<string, string>
+  [key: string]: unknown
+}
+
+export interface OpenAiResponseOutputText {
+  type: "output_text"
+  text: string
+  annotations: Array<Record<string, unknown>>
+  logprobs?: unknown[]
+}
+
+export interface OpenAiResponseMessageOutput {
+  id: string
+  type: "message"
+  status: "in_progress" | "completed"
+  role: "assistant"
+  content: [OpenAiResponseOutputText]
+}
+
+export interface OpenAiResponseFunctionCallOutput {
+  id: string
+  type: "function_call"
+  status: "in_progress" | "completed"
+  call_id: string
+  name: string
+  arguments: string
+}
+
+export type OpenAiResponseOutputItem =
+  | OpenAiResponseMessageOutput
+  | OpenAiResponseFunctionCallOutput
+
+export interface OpenAiResponsesUsage {
+  input_tokens: number
+  input_tokens_details: { cached_tokens: number }
+  output_tokens: number
+  output_tokens_details: { reasoning_tokens: number }
+  total_tokens: number
+}
+
+export interface OpenAiResponsesResponse {
+  id: string
+  object: "response"
+  created_at: number
+  status: "in_progress" | "completed" | "incomplete"
+  error: null
+  incomplete_details: { reason: string } | null
+  instructions: string | null
+  max_output_tokens: number | null
+  model: string
+  output: OpenAiResponseOutputItem[]
+  parallel_tool_calls: boolean
+  previous_response_id: string | null
+  reasoning: { effort?: string; summary?: string } | null
+  store: boolean
+  temperature: number | null
+  tool_choice: OpenAiResponseToolChoice
+  tools: OpenAiResponseFunctionTool[]
+  top_p: number | null
+  metadata: Record<string, string>
+  usage: OpenAiResponsesUsage
+}
+
 // ── Legacy Completions (text) ───────────────────────────────────────────
 
 export interface OpenAiCompletionRequest {

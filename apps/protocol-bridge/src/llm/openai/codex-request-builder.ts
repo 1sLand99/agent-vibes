@@ -75,11 +75,6 @@ export function buildCodexRequest(
     input: responsesPayload.input,
     stream: true,
     store: false,
-    parallel_tool_calls: resolveParallelToolCallsForRequest(
-      request.parallelToolCalls,
-      effectiveCapabilities
-    ),
-    tool_choice: "auto",
     include: reasoning ? ["reasoning.encrypted_content"] : [],
   }
 
@@ -105,6 +100,11 @@ export function buildCodexRequest(
 
   if (responsesPayload.tools && responsesPayload.tools.length > 0) {
     codexRequest.tools = responsesPayload.tools
+    codexRequest.tool_choice = "auto"
+    codexRequest.parallel_tool_calls = resolveParallelToolCallsForRequest(
+      request.parallelToolCalls,
+      effectiveCapabilities
+    )
   }
 
   const clientMetadata = request.clientMetadata
