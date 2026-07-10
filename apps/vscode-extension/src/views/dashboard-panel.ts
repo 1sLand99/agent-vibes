@@ -510,7 +510,7 @@ export class DashboardPanel {
       const target = new URL(head)
       const isHttps = target.protocol === "https:"
       const port = target.port ? Number(target.port) : isHttps ? 443 : 80
-      const apiPath = target.pathname || "/health"
+      const apiPath = "/health"
 
       const headers: Record<string, string> = {
         accept: "application/json,text/plain;q=0.8,*/*;q=0.5",

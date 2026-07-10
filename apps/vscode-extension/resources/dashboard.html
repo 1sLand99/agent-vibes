@@ -5058,7 +5058,7 @@
       function endpointCopy(url) {
         vscode.postMessage({
           type: "copyToClipboard",
-          text: endpointCopyTarget(url),
+          text: new URL(url).origin,
         })
       }
       function proxyApiKeyDisplayValue() {
@@ -5076,14 +5076,6 @@
         var value = proxyApiKeyInputValue().trim()
         if (!value) return
         vscode.postMessage({ type: "copyToClipboard", text: value })
-      }
-      function endpointCopyTarget(url) {
-        if (url === bridgeUrl + "/v1/messages") return bridgeUrl
-        if (url === bridgeUrl + "/v1/chat/completions") return bridgeUrl + "/v1"
-        if (url === bridgeUrl + "/v1beta/models/{model}:generateContent") {
-          return bridgeUrl + "/v1beta"
-        }
-        return url
       }
       function endpointTest(url) {
         vscode.postMessage({ type: "testEndpoint", url: url })
