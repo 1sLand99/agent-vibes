@@ -41,7 +41,7 @@ lerna-debug.log*
 # dotenv environment variable files
 .env
 .env.*
-!.env.example
+!.env.local.example
 .env.local
 
 # Antigravity account credentials
