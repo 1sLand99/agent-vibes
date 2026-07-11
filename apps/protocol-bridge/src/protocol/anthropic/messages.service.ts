@@ -26,6 +26,7 @@ import {
   ModelRouterService,
 } from "../../llm/shared/model-router.service"
 import type { AnthropicResponse } from "../../shared/anthropic"
+import { adaptAnthropicMessageToCodexExecutionRequest } from "./codex-request-adapter"
 import { CountTokensDto } from "./dto/count-tokens.dto"
 import { CreateMessageDto } from "./dto/create-message.dto"
 import { TokenizerService } from "./tokenizer.service"
@@ -596,7 +597,10 @@ export class MessagesService implements OnModuleInit {
 
     if (route.backend === "codex") {
       this.logger.log(`[ROUTE] Codex backend | model: ${route.model}`)
-      return await this.codexService.sendClaudeMessage(dto, codexForwardHeaders)
+      return await this.codexService.sendMessage(
+        adaptAnthropicMessageToCodexExecutionRequest(dto),
+        codexForwardHeaders
+      )
     }
 
     this.logger.log(`[ROUTE] Google backend | model: ${route.model}`)
@@ -743,7 +747,10 @@ export class MessagesService implements OnModuleInit {
       this.logger.log(
         `[ROUTE] Codex backend | model: ${route.model} | stream: true`
       )
-      yield* this.codexService.sendClaudeMessageStream(dto, codexForwardHeaders)
+      yield* this.codexService.sendMessageStream(
+        adaptAnthropicMessageToCodexExecutionRequest(dto),
+        codexForwardHeaders
+      )
       return
     }
     this.logger.log(

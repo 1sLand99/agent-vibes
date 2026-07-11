@@ -68,6 +68,22 @@ const EN: Record<string, string> = {
     "Applied Cursor idle extension host patch. Fully restart Cursor to apply.",
   "patches.idleKillerAlreadyApplied":
     "Cursor idle extension host patch is already applied. Fully restart Cursor to apply.",
+  "patches.agentInputDockFailed":
+    "Failed to update the Agent input dock: {detail}",
+  "patches.agentInputDockApplied":
+    "Agent input dock is enabled. Fully restart Cursor to apply.",
+  "patches.agentInputDockAlreadyApplied":
+    "Agent input dock is already enabled.",
+  "patches.agentInputDockDisabled":
+    "Agent input dock is disabled. Fully restart Cursor to apply.",
+  "patches.trafficCaptureFailed":
+    "Failed to enable Cursor traffic capture: {detail}",
+  "patches.trafficCaptureApplied":
+    "Cursor traffic capture is enabled. Fully restart Cursor before collecting logs.",
+  "patches.trafficCaptureAlreadyApplied":
+    "Cursor traffic capture is already enabled.",
+  "patches.trafficCaptureDisabled":
+    "Cursor traffic capture is disabled. Fully restart Cursor to stop capture logging.",
   "patches.checksumsAutoUpdated": "Also updated {count} Cursor checksum(s).",
 
   // ── Credential sync ──
@@ -252,6 +268,18 @@ const ZH: Record<string, string> = {
     "已应用 Cursor 空闲扩展宿主补丁。请完整重启 Cursor 以应用。",
   "patches.idleKillerAlreadyApplied":
     "Cursor 空闲扩展宿主补丁已生效。请完整重启 Cursor 以应用。",
+  "patches.agentInputDockFailed": "更新 Agent 输入停靠失败：{detail}",
+  "patches.agentInputDockApplied":
+    "已启用 Agent 输入停靠。请完整重启 Cursor 以应用。",
+  "patches.agentInputDockAlreadyApplied": "Agent 输入停靠已经启用。",
+  "patches.agentInputDockDisabled":
+    "已关闭 Agent 输入停靠。请完整重启 Cursor 以应用。",
+  "patches.trafficCaptureFailed": "启用 Cursor 流量抓取失败：{detail}",
+  "patches.trafficCaptureApplied":
+    "已启用 Cursor 流量抓取。请完整重启 Cursor 后再收集日志。",
+  "patches.trafficCaptureAlreadyApplied": "Cursor 流量抓取已经启用。",
+  "patches.trafficCaptureDisabled":
+    "已关闭 Cursor 流量抓取。请完整重启 Cursor 以停止抓包日志。",
   "patches.checksumsAutoUpdated": "已同时更新 {count} 个 Cursor 校验和。",
 
   // ── Credential sync ──

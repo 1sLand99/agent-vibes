@@ -33,6 +33,11 @@ export interface CursorPatchResetResult {
   errors: string[]
 }
 
+export interface CursorPatchOriginalContentResult {
+  content: string | null
+  error: string | null
+}
+
 type CursorPatchRestorePlanEntry = {
   relativePath: string
   backupPath: string
@@ -167,6 +172,66 @@ export class CursorPatchBaselineService {
       added.push(relativePath)
     }
 
+    if (!manifest.files.includes(relativePath)) {
+      manifest.files.push(relativePath)
+      added.push(relativePath)
+    }
+
+    manifest.files.sort()
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n")
+    CursorPatchBaselineService.invalidateStatusCache()
+    return Array.from(new Set(added))
+  }
+
+  captureOriginalContent(filePath: string, content: string): string[] {
+    const appRootPath = getCursorAppRootPath()
+    if (!appRootPath) {
+      throw new Error("Cursor installation not found")
+    }
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`Cursor file not found: ${filePath}`)
+    }
+
+    const installVersion = getCursorInstallVersion()
+    const installFingerprint = getCursorInstallFingerprint()
+    const status = this.getStatus()
+    const backupRootPath = status.backupRootPath
+    const manifestPath = status.manifestPath
+    if (!backupRootPath || !manifestPath) {
+      throw new Error("Cursor patch backup paths are unavailable")
+    }
+
+    const relativePath = path.relative(appRootPath, filePath)
+    if (
+      relativePath.startsWith("..") ||
+      path.isAbsolute(relativePath) ||
+      relativePath.length === 0
+    ) {
+      throw new Error(`File is outside Cursor app root: ${filePath}`)
+    }
+
+    ensureDir(backupRootPath)
+    const manifest =
+      this.readManifest(manifestPath) ??
+      ({
+        version: 1,
+        appRootPath,
+        installVersion,
+        installFingerprint,
+        files: [],
+      } satisfies CursorPatchManifest)
+    const backupPath = this.getBackupFilePath(
+      appRootPath,
+      installFingerprint,
+      relativePath
+    )
+
+    const added: string[] = []
+    if (!fs.existsSync(backupPath)) {
+      ensureDir(path.dirname(backupPath))
+      fs.writeFileSync(backupPath, content, "utf-8")
+      added.push(relativePath)
+    }
     if (!manifest.files.includes(relativePath)) {
       manifest.files.push(relativePath)
       added.push(relativePath)
@@ -347,6 +412,42 @@ export class CursorPatchBaselineService {
         success: false,
         restored: 0,
         errors: [error instanceof Error ? error.message : String(error)],
+      }
+    }
+  }
+
+  readOriginal(filePath: string): CursorPatchOriginalContentResult {
+    try {
+      const status = this.getStatus()
+      if (!status.appRootPath || !status.manifestPath) {
+        return { content: null, error: "Cursor installation not found" }
+      }
+      const relativePath = path.relative(status.appRootPath, filePath)
+      if (
+        relativePath.startsWith("..") ||
+        path.isAbsolute(relativePath) ||
+        relativePath.length === 0
+      ) {
+        return {
+          content: null,
+          error: `File is outside Cursor app root: ${filePath}`,
+        }
+      }
+      const plan = this.buildRestorePlan(status, [relativePath])
+      if (plan.errors.length > 0 || !plan.entries[0]) {
+        return {
+          content: null,
+          error: plan.errors.join("; ") || `Backup missing: ${relativePath}`,
+        }
+      }
+      return {
+        content: fs.readFileSync(plan.entries[0].backupPath, "utf-8"),
+        error: null,
+      }
+    } catch (error) {
+      return {
+        content: null,
+        error: error instanceof Error ? error.message : String(error),
       }
     }
   }

@@ -249,7 +249,7 @@ export class DashboardPanel {
   }): Promise<void> {
     switch (msg.type) {
       case "getAll":
-        this.sendAllData()
+        this.sendAllDataNow()
         break
 
       case "addAccount":
@@ -1174,6 +1174,10 @@ export class DashboardPanel {
     )
     const idlePatchStatus =
       this.cursorPatchService.getIdleExtensionHostKillerStatus()
+    const agentInputDockStatus =
+      this.cursorPatchService.getAgentInputDockPatchStatus()
+    const trafficCaptureStatus =
+      this.cursorPatchService.getTrafficCapturePatchStatus()
     const bridgeEndpointPatchStatus =
       this.cursorPatchService.getBridgeEndpointPatchStatus(this.config.port)
     const bridgeEndpointLifecycle =
@@ -1285,6 +1289,55 @@ export class DashboardPanel {
         (idlePatchStatus.applied &&
           !idlePatchStatus.managedBaseline &&
           idlePatchStatus.legacyBackupClean))
+    const agentInputDockHint = !agentInputDockStatus.fileExists
+      ? locale === "zh"
+        ? "未找到 Cursor workbench 文件。"
+        : "Cursor workbench file was not found."
+      : agentInputDockStatus.applied
+        ? locale === "zh"
+          ? `已覆盖 ${agentInputDockStatus.workbenchFiles} 个 Cursor 工作台入口；打开底部面板（终端等）时自动把 Agent 输入停靠到底部、腾出编辑区，隐藏面板时还原；拖动 Agent 标签可在编辑区、底部与右侧 Chat 间切换。`
+          : `Active in ${agentInputDockStatus.workbenchFiles} Cursor workbench file(s); opening a bottom panel view (terminal, etc.) docks the Agent input at the bottom to free the editor and restores it when the panel hides. Drag the Agent tab to move between the editor, bottom panel, and Chat.`
+        : agentInputDockStatus.partial
+          ? locale === "zh"
+            ? `检测到旧版或不完整的 Agent 输入停靠（${agentInputDockStatus.legacyFiles} 个旧入口）；重新开启可安全迁移到当前版本。`
+            : `An older or incomplete Agent input dock is present (${agentInputDockStatus.legacyFiles} legacy file(s)); enable it again to migrate safely.`
+          : agentInputDockStatus.canApply
+            ? this.config.agentInputDockEnabled
+              ? locale === "zh"
+                ? "默认开启；打开底部面板（终端等）时自动把 Agent 输入停靠到底部、腾出编辑区，隐藏面板时还原；也可拖动 Agent 标签在编辑区、底部与右侧 Chat 间切换。"
+                : "Enabled by default. Opening a bottom panel view (terminal, etc.) docks the Agent input at the bottom to free the editor and restores it when hidden; drag the Agent tab to move between the editor, bottom panel, and Chat."
+              : locale === "zh"
+                ? "当前已关闭；开启后需完整重启 Cursor。"
+                : "Currently disabled. Fully restart Cursor after enabling."
+            : locale === "zh"
+              ? "当前 Cursor 工作台无法安全应用此功能。"
+              : "This Cursor workbench cannot apply the feature safely."
+    const agentInputDockToggleDisabled =
+      !agentInputDockStatus.fileExists || !agentInputDockStatus.canApply
+    const trafficCaptureMatchedRules =
+      trafficCaptureStatus.appliedRules + trafficCaptureStatus.availableRules
+    const trafficCaptureHint = !trafficCaptureStatus.fileExists
+      ? locale === "zh"
+        ? "未找到 Cursor workbench 文件。"
+        : "Cursor workbench file was not found."
+      : trafficCaptureStatus.applied
+        ? locale === "zh"
+          ? `已启用 ${trafficCaptureStatus.appliedRules}/${trafficCaptureStatus.totalRules} 个抓包点。请求和响应正文会写入 Cursor 日志，可能包含敏感数据，仅建议在调试期间使用。`
+          : `${trafficCaptureStatus.appliedRules}/${trafficCaptureStatus.totalRules} capture hooks are active. Request and response bodies are written to Cursor logs and may contain sensitive data; use only while debugging.`
+        : trafficCaptureStatus.partial
+          ? locale === "zh"
+            ? `检测到 ${trafficCaptureStatus.appliedRules}/${trafficCaptureStatus.totalRules} 个抓包点已启用。再次应用可补齐当前构建支持的抓包点。`
+            : `${trafficCaptureStatus.appliedRules}/${trafficCaptureStatus.totalRules} capture hooks are active. Apply again to repair the supported hooks for this build.`
+          : trafficCaptureStatus.canApply
+            ? locale === "zh"
+              ? `默认关闭。当前构建支持 ${trafficCaptureMatchedRules}/${trafficCaptureStatus.totalRules} 个抓包点；启用后需完整重启 Cursor。`
+              : `Disabled by default. This build supports ${trafficCaptureMatchedRules}/${trafficCaptureStatus.totalRules} capture hooks; fully restart Cursor after enabling.`
+            : locale === "zh"
+              ? `当前 Cursor 构建仅识别 ${trafficCaptureMatchedRules}/${trafficCaptureStatus.totalRules} 个安全抓包点，因此不会应用。`
+              : `This Cursor build exposes only ${trafficCaptureMatchedRules}/${trafficCaptureStatus.totalRules} safe capture hooks, so no changes will be applied.`
+    const trafficCaptureToggleDisabled = trafficCaptureStatus.applied
+      ? !trafficCaptureStatus.managedBaseline
+      : !trafficCaptureStatus.fileExists || !trafficCaptureStatus.canApply
     const channelAccountsData = {
       codex: this.getChannelData("codex"),
       "openai-compat": this.getChannelData("openai-compat"),
@@ -1596,6 +1649,36 @@ export class DashboardPanel {
                 ],
               },
               {
+                label: st.groups.patch.items.agentInputDock.label,
+                desc: st.groups.patch.items.agentInputDock.desc,
+                type: "commandToggle",
+                value: agentInputDockStatus.applied,
+                hint: agentInputDockHint,
+                onCommand: CMD.ENABLE_AGENT_INPUT_DOCK_PATCH,
+                offCommand: CMD.DISABLE_AGENT_INPUT_DOCK_PATCH,
+                disabled: agentInputDockToggleDisabled,
+              },
+              {
+                label: st.groups.patch.items.trafficCapture.label,
+                desc: st.groups.patch.items.trafficCapture.desc,
+                type: "commandToggle",
+                value: trafficCaptureStatus.applied,
+                hint: trafficCaptureHint,
+                onCommand: CMD.APPLY_CURSOR_TRAFFIC_CAPTURE_PATCH,
+                offCommand: CMD.DISABLE_CURSOR_TRAFFIC_CAPTURE_PATCH,
+                disabled: trafficCaptureToggleDisabled,
+              },
+
+              {
+                label: st.groups.patch.items.fixChecksums.label,
+                desc: st.groups.patch.items.fixChecksums.desc,
+                value: translateOnOff(
+                  locale,
+                  checksumToggleValue ? "On" : "Off"
+                ),
+                hint: checksumStatusDesc,
+              },
+              {
                 label: st.groups.patch.items.resetPatches.label,
                 desc: st.groups.patch.items.resetPatches.desc,
                 type: "actions",
@@ -1608,15 +1691,6 @@ export class DashboardPanel {
                     disabled: !resetPatchState.canReset,
                   },
                 ],
-              },
-              {
-                label: st.groups.patch.items.fixChecksums.label,
-                desc: st.groups.patch.items.fixChecksums.desc,
-                value: translateOnOff(
-                  locale,
-                  checksumToggleValue ? "On" : "Off"
-                ),
-                hint: checksumStatusDesc,
               },
             ],
           },

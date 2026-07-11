@@ -21,6 +21,7 @@ export class StatusIndicator {
   private state: ServerState = "stopped"
   private cursorConnection: CursorConnectionState = "unwired"
   private connectionPollTimer: ReturnType<typeof setInterval> | null = null
+  private connectionRefreshTimer: ReturnType<typeof setTimeout> | null = null
   private transientStatus: {
     text: string
     tooltip: string
@@ -41,8 +42,7 @@ export class StatusIndicator {
       100
     )
     this.item.command = "agentVibes.openDashboard"
-    this.refreshCursorConnection()
-    this.update("stopped")
+    this.render()
     this.item.show()
     this.startConnectionPoll()
   }
@@ -66,6 +66,18 @@ export class StatusIndicator {
         this.render()
       }
     }, CURSOR_CONNECTION_POLL_INTERVAL_MS)
+  }
+
+  private scheduleCursorConnectionRefresh(): void {
+    if (this.connectionRefreshTimer || !this.getCursorConnectionState) return
+    this.connectionRefreshTimer = setTimeout(() => {
+      this.connectionRefreshTimer = null
+      const previous = this.cursorConnection
+      const next = this.refreshCursorConnection()
+      if (next !== previous && !this.transientStatus) {
+        this.render()
+      }
+    }, 0)
   }
 
   private serviceSegment(): {
@@ -142,9 +154,11 @@ export class StatusIndicator {
 
   update(state: ServerState): void {
     this.state = state
-    // Bridge state changes are a good moment to re-sync connection state too.
-    this.refreshCursorConnection()
     this.render()
+    // Keep bridge state rendering immediate. The connection probe can inspect
+    // large Cursor bundles, so it must not run inside the activation or bridge
+    // state-change call stack.
+    this.scheduleCursorConnectionRefresh()
   }
 
   showBusy(label: string, tooltip?: string): void {
@@ -163,6 +177,10 @@ export class StatusIndicator {
   }
 
   dispose(): void {
+    if (this.connectionRefreshTimer) {
+      clearTimeout(this.connectionRefreshTimer)
+      this.connectionRefreshTimer = null
+    }
     if (this.connectionPollTimer) {
       clearInterval(this.connectionPollTimer)
       this.connectionPollTimer = null

@@ -8,7 +8,21 @@ import {
   getDefaultDataDir,
 } from "../utils/platform"
 import { CursorChecksumsService } from "./cursor-checksums"
+import {
+  CURSOR_AGENT_INPUT_DOCK_PATCH_MARKERS,
+  getCursorAgentInputDockDetails,
+  hasCursorAgentInputDockPatch,
+  patchCursorAgentInputDockContent,
+  removeCursorAgentInputDockPatchContent,
+} from "./cursor-agent-input-dock"
 import { CursorPatchBaselineService } from "./cursor-patch-baseline"
+import {
+  CURSOR_TRAFFIC_CAPTURE_MARKERS,
+  CURSOR_TRAFFIC_CAPTURE_RULES,
+  getCursorTrafficCaptureDetails,
+  patchCursorTrafficCaptureContent,
+  patchCursorTrafficCaptureRules,
+} from "./cursor-traffic-capture"
 
 type Logger = typeof LoggerInstance
 
@@ -17,17 +31,16 @@ const IDLE_EXTENSION_HOST_KILLER_MARKER =
   "[AGENT_VIBES_DISABLE_IDLE_EXTENSION_HOST_KILLER]"
 const IDLE_EXTENSION_HOST_KILLER_PATCH_INSERTION = `/*${IDLE_EXTENSION_HOST_KILLER_MARKER}*/return;`
 const BRIDGE_ENDPOINT_PATCH_MARKER = "[AGENT_VIBES_CURSOR_BRIDGE_ENDPOINT]"
-const BRIDGE_ENDPOINT_PATCH_INSERTION = `/*${BRIDGE_ENDPOINT_PATCH_MARKER}*/`
-const BRIDGE_ENDPOINT_STORAGE_GUARD_MARKER =
-  "[AGENT_VIBES_CURSOR_STORAGE_GUARD]"
-const BRIDGE_ENDPOINT_PERSISTENT_GUARD_MARKER =
-  "[AGENT_VIBES_CURSOR_ENDPOINT_GUARD]"
+const PLAN_EDITOR_TAB_PATCH_MARKER =
+  "[AGENT_VIBES_PRESERVE_CHAT_EDITOR_TAB_FOR_PLAN]"
+const READ_TODOS_BUBBLE_TRANSLATION_PATCH_MARKER =
+  "[AGENT_VIBES_READ_TODOS_BUBBLE_TRANSLATION]"
+const READ_TODOS_RESULT_TRANSLATION_PATCH_MARKER =
+  "[AGENT_VIBES_READ_TODOS_RESULT_TRANSLATION]"
 const BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER =
   "[AGENT_VIBES_CURSOR_CREDENTIALS_GUARD]"
-const BRIDGE_ENDPOINT_MODULE_ID =
-  '"out-build/vs/platform/reactivestorage/browser/reactiveStorageService.js"'
-const BRIDGE_ENDPOINT_MODULE_SEARCH_LIMIT = 120_000
 const BRIDGE_ENDPOINT_MIN_TARGETS = 4
+const SEMANTIC_METHOD_LOCAL_SEARCH_BYTES = 64 * 1024
 const CURSOR_OPEN_AGENTS_WINDOW_ON_STARTUP_KEY =
   "cursor/userOpenAgentsWindowOnStartupPreference"
 const CURSOR_FIRST_WINDOW_OPEN_GLASS_TREATMENT_KEY =
@@ -41,22 +54,6 @@ const CURSOR_AUTH_SUBSCRIPTION_STATUS_KEY =
 const CURSOR_ENTITLEMENT_MEMBERSHIP_TYPE = "ultra"
 const CURSOR_ENTITLEMENT_SUBSCRIPTION_STATUS = "active"
 const CURSOR_NODE_EXTRA_CA_CERTS_ENV_KEY = "NODE_EXTRA_CA_CERTS"
-const CURSOR_CREDS_ENDPOINT_FIELDS = [
-  "backendUrl",
-  "repoBackendUrl",
-  "cppBackendUrl",
-  "telemBackendUrl",
-  "cmdkBackendUrl",
-  "geoCppBackendUrl",
-  "cppConfigBackendUrl",
-  "bcProxyUrl",
-  "agentUrl",
-] as const
-const CURSOR_CREDS_AGENT_ENDPOINT_FIELDS = [
-  "agentBackendUrlPrivacy",
-  "agentBackendUrlNonPrivacy",
-] as const
-
 const IDLE_EXTENSION_HOST_KILLER_PATCH = {
   name: "Disable Cursor Idle Extension Host Killer",
   marker: IDLE_EXTENSION_HOST_KILLER_MARKER,
@@ -67,71 +64,27 @@ const BRIDGE_ENDPOINT_PATCH = {
   marker: BRIDGE_ENDPOINT_PATCH_MARKER,
 }
 
+const PLAN_EDITOR_TAB_PATCH = {
+  name: "Preserve Chat Editor Tab When Opening Plan",
+  marker: PLAN_EDITOR_TAB_PATCH_MARKER,
+}
+
+const READ_TODOS_TRANSLATION_PATCH = {
+  name: "Cursor Read Todos Translation",
+}
+
 const CURSOR_ENTITLEMENT_PATCH = {
   name: "Cursor Entitlement State",
 }
 
-/**
- * Patch rules for Cursor's workbench.desktop.main.js.
- * Each rule identifies a code pattern via regex and injects logging hooks
- * to capture gRPC transport traffic (request/response payloads).
- */
-interface PatchRule {
-  name: string
-  find: RegExp
-  replace: string
-  marker: string
-}
-
-const TRANSPORT_PATCHES: PatchRule[] = [
-  {
-    name: "Transport Request Initiation",
-    find: /this\.structuredLogService\.debug\("transport","Initiating stream AI connect",\{service:e\.typeName,method:t\.name,streamId:(\w+),requestId:(\w+)\?\?"not-found"/,
-    replace:
-      'console.warn("[TRANSPORT_REQUEST]",JSON.stringify({service:e.typeName,method:t.name,streamId:$1,requestId:$2,requestType:t.I?.typeName,responseType:t.O?.typeName})),this.structuredLogService.debug("transport","Initiating stream AI connect",{service:e.typeName,method:t.name,streamId:$1,requestId:$2??"not-found"',
-    marker: "[TRANSPORT_REQUEST]",
-  },
-  {
-    name: "Transport Request Payload",
-    find: /const (\w+)=new t\.I\((\w+)\);(\w+)=(\w+)\.wrap\(\1\.toBinary\(\)\)/,
-    replace:
-      'const $1=new t.I($2);(()=>{try{console.warn("[TRANSPORT_REQUEST_PAYLOAD]",JSON.stringify({type:t.I?.typeName,payload:$1.toJson?$1.toJson():$2}))}catch(xErr){console.warn("[TRANSPORT_REQUEST_PAYLOAD]",JSON.stringify({type:t.I?.typeName,error:String(xErr)}))}})();$3=$4.wrap($1.toBinary())',
-    marker: "[TRANSPORT_REQUEST_PAYLOAD]",
-  },
-  {
-    name: "Transport Response Chunk",
-    find: /this\._proxy\.\$pushAiConnectTransportStreamChunk\((\w+),(\w+),(\w+)\)/,
-    replace:
-      '(console.warn("[TRANSPORT_CHUNK]",JSON.stringify({streamId:$2,chunkSize:$1?.length||0,chunkB64:$1?btoa(String.fromCharCode.apply(null,$1.slice(0,2000))):null})),this._proxy.$pushAiConnectTransportStreamChunk($1,$2,$3))',
-    marker: "[TRANSPORT_CHUNK]",
-  },
-  {
-    name: "Transport Response Yield",
-    find: /for await\(const (\w+) of (\w+)\)\{if\((\w+)\.token\.isCancellationRequested\)continue;yield t\.O\.fromBinary\(\1\.buffer\)\}/,
-    replace:
-      'for await(const $1 of $2){if($3.token.isCancellationRequested)continue;const xResp=t.O.fromBinary($1.buffer);(()=>{try{console.warn("[TRANSPORT_RESPONSE]",JSON.stringify({type:t.O?.typeName,payload:xResp.toJson?xResp.toJson():xResp}))}catch(xErr){console.warn("[TRANSPORT_RESPONSE]",JSON.stringify({type:t.O?.typeName,error:String(xErr)}))}})();yield xResp}',
-    marker: "[TRANSPORT_RESPONSE]",
-  },
-  {
-    name: "Unary Request Payload",
-    find: /const (\w+)=new a\.I\((\w+)\),(\w+)=(\w+)\.wrap\(\1\.toBinary\(\)\)/,
-    replace:
-      'const $1=new a.I($2);(()=>{try{const svc=o.typeName,mth=a.name;const skip=["GetTeams","GetUser","GetSubscription","CheckQueuePosition","FlushEvents","Batch","SubmitLogs","SubmitSpans","BootstrapStatsig","ReportClientNumericMetrics"];if(skip.includes(mth))return;console.warn("[UNARY_REQUEST]",JSON.stringify({service:svc,method:mth,type:a.I?.typeName,payload:$1.toJson?$1.toJson():$2}))}catch(xErr){console.warn("[UNARY_REQUEST]",JSON.stringify({service:o.typeName,method:a.name,type:a.I?.typeName,error:String(xErr)}))}})();const $3=$4.wrap($1.toBinary())',
-    marker: "[UNARY_REQUEST]",
-  },
-  {
-    name: "Unary Response",
-    find: /const (\w+)=(\w+)\.message,(\w+)=\2\.header,(\w+)=\2\.trailer,(\w+)=a\.O\.fromBinary\(\1\)/,
-    replace:
-      'const $1=$2.message,$3=$2.header,$4=$2.trailer,$5=a.O.fromBinary($1);(()=>{try{const svc=o.typeName,mth=a.name;const skip=["GetTeams","GetUser","GetSubscription","CheckQueuePosition","FlushEvents","Batch","SubmitLogs","SubmitSpans","BootstrapStatsig","ReportClientNumericMetrics"];if(skip.includes(mth))return;console.warn("[UNARY_RESPONSE]",JSON.stringify({service:svc,method:mth,type:a.O?.typeName,payload:$5.toJson?$5.toJson():$5}))}catch(xErr){console.warn("[UNARY_RESPONSE]",JSON.stringify({service:o.typeName,method:a.name,type:a.O?.typeName,error:String(xErr)}))}})()',
-    marker: "[UNARY_RESPONSE]",
-  },
-]
-
 const PATCH_MARKERS = [
   IDLE_EXTENSION_HOST_KILLER_MARKER,
   BRIDGE_ENDPOINT_PATCH_MARKER,
-  ...TRANSPORT_PATCHES.map((p) => p.marker),
+  ...CURSOR_AGENT_INPUT_DOCK_PATCH_MARKERS,
+  PLAN_EDITOR_TAB_PATCH_MARKER,
+  READ_TODOS_BUBBLE_TRANSLATION_PATCH_MARKER,
+  READ_TODOS_RESULT_TRANSLATION_PATCH_MARKER,
+  ...CURSOR_TRAFFIC_CAPTURE_MARKERS,
 ]
 
 type IdleExtensionHostKillerLocation = {
@@ -140,24 +93,16 @@ type IdleExtensionHostKillerLocation = {
   bodyEnd: number
 }
 
-type BridgeEndpointConstantsLocation = {
+type MethodLocation = {
   start: number
+  bodyStart: number
   end: number
-  segment: string
 }
-
-type CursorBridgeEndpointKind = "api" | "agent"
 
 type BridgeEndpointSegmentSummary = {
   hasMarker: boolean
-  hasStorageGuard: boolean
-  hasPersistentGuard: boolean
-  targetCount: number
-  apiTargetCount: number
-  agentTargetCount: number
   localCount: number
   matchingLocalCount: number
-  firstCurrentUrl: string | null
 }
 
 type CursorStartupPreferencePatchDetails = {
@@ -219,26 +164,39 @@ type CursorApplicationUserEntitlementNormalization = {
 export function locateIdleExtensionHostKillerMethod(
   content: string
 ): IdleExtensionHostKillerLocation | null {
-  const methodPattern =
-    /async\s+maybeStopExtensionHostsForIdle\s*\([^)]*\)\s*\{/g
-  let match: RegExpExecArray | null
+  const anchor = "idle_extension_host_killer_config"
+  let anchorIndex = content.indexOf(anchor)
+  while (anchorIndex >= 0) {
+    const evidenceStart = Math.max(
+      0,
+      anchorIndex - SEMANTIC_METHOD_LOCAL_SEARCH_BYTES
+    )
+    const evidenceEnd = Math.min(
+      content.length,
+      anchorIndex + SEMANTIC_METHOD_LOCAL_SEARCH_BYTES
+    )
+    if (
+      !isIdleExtensionHostKillerMethodBody(
+        content.slice(evidenceStart, evidenceEnd)
+      )
+    ) {
+      anchorIndex = content.indexOf(anchor, anchorIndex + 1)
+      continue
+    }
 
-  while ((match = methodPattern.exec(content)) !== null) {
-    const openBraceOffset = match[0].lastIndexOf("{")
-    if (openBraceOffset < 0) continue
-    const openBrace = match.index + openBraceOffset
-
-    const closeBrace = findMatchingBrace(content, openBrace)
-    if (closeBrace === null) continue
-
-    const body = content.slice(openBrace + 1, closeBrace)
-    if (isIdleExtensionHostKillerMethodBody(body)) {
+    const method = locateSemanticMethodAt(
+      content,
+      anchorIndex,
+      isIdleExtensionHostKillerMethodBody
+    )
+    if (method !== null) {
       return {
-        methodStart: match.index,
-        bodyStart: openBrace + 1,
-        bodyEnd: closeBrace,
+        methodStart: method.start,
+        bodyStart: method.bodyStart + 1,
+        bodyEnd: method.end,
       }
     }
+    anchorIndex = content.indexOf(anchor, anchorIndex + 1)
   }
 
   return null
@@ -270,6 +228,348 @@ export function patchIdleExtensionHostKillerContent(
   )
 }
 
+function locatePlanEditorOpenMethod(content: string): MethodLocation | null {
+  const pattern = /async\s+openPlanInEditor\s*\([^)]*\)\s*\{/gu
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(content)) !== null) {
+    const bodyStart = match.index + match[0].lastIndexOf("{")
+    const end = findMatchingBrace(content, bodyStart)
+    if (end === null) continue
+    const body = content.slice(bodyStart + 1, end)
+    const isPlanEditorOpen =
+      body.includes(".composerId") &&
+      body.includes(".selectedComposerId") &&
+      body.includes(".openEditor(") &&
+      body.includes("preserveFocus")
+    if (!isPlanEditorOpen) continue
+    return { start: match.index, bodyStart, end }
+  }
+
+  return null
+}
+
+/**
+ * Cursor opens plans in the editor by default. When the active Chat editor is
+ * still a preview tab, opening the plan replaces that preview and Composer
+ * subsequently falls back to the side pane. Pin the existing Chat editor just
+ * before the native plan open so the plan becomes a sibling editor tab.
+ */
+export function patchPlanEditorTabContent(content: string): string | null {
+  if (content.includes(PLAN_EDITOR_TAB_PATCH_MARKER)) return content
+
+  const location = locatePlanEditorOpenMethod(content)
+  if (!location) return null
+  const body = content.slice(location.bodyStart + 1, location.end)
+  const composerIdMatch =
+    /const ([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*\?\.composerId,/u.exec(body)
+  const openEditorMatch =
+    /await this\.[A-Za-z_$][\w$]*\.openEditor\(\{resource:/u.exec(body)
+  const composerIdVariable = composerIdMatch?.[1]
+  if (!composerIdVariable || !openEditorMatch) return null
+
+  const insertionAt = location.bodyStart + 1 + openEditorMatch.index
+  const insertion =
+    `${composerIdVariable}&&this._composerViewsService.pinComposerEditor(${composerIdVariable}),` +
+    `/*${PLAN_EDITOR_TAB_PATCH_MARKER}*/`
+  return content.slice(0, insertionAt) + insertion + content.slice(insertionAt)
+}
+
+export function isPlanEditorTabPatchApplied(content: string): boolean {
+  const location = locatePlanEditorOpenMethod(content)
+  return (
+    location !== null &&
+    content
+      .slice(location.bodyStart + 1, location.end)
+      .includes(PLAN_EDITOR_TAB_PATCH_MARKER)
+  )
+}
+
+type CaseBlockLocation = {
+  start: number
+  bodyStart: number
+  end: number
+}
+
+function locateCaseBlocks(
+  content: string,
+  caseName: string
+): CaseBlockLocation[] {
+  const pattern = new RegExp(`case"${caseName}":\\{`, "gu")
+  const locations: CaseBlockLocation[] = []
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(content)) !== null) {
+    const bodyStart = match.index + match[0].lastIndexOf("{")
+    const end = findMatchingBrace(content, bodyStart)
+    if (end === null) continue
+    locations.push({ start: match.index, bodyStart, end })
+  }
+
+  return locations
+}
+
+function resolveCursorMessageTypeSymbol(
+  content: string,
+  messageType: string
+): string | null {
+  const escapedType = messageType.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")
+  const pattern = new RegExp(
+    `([A-Za-z_$][\\w$]*)=[A-Za-z_$][\\w$]*\\.makeMessageType\\("${escapedType}"`,
+    "u"
+  )
+  return pattern.exec(content)?.[1] ?? null
+}
+
+function resolveCursorTodoReadSymbols(
+  content: string,
+  todoItemSymbol: string
+): { params: string; result: string } | null {
+  const escapedSymbol = todoItemSymbol.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")
+  const todoItemPattern = new RegExp(
+    `${escapedSymbol}=[A-Za-z_$][\\w$]*\\.makeMessageType\\("aiserver\\.v1\\.TodoItem"`,
+    "u"
+  )
+  const todoItemDefinition = todoItemPattern.exec(content)
+  if (todoItemDefinition?.index === undefined) return null
+
+  const localDefinitions = content.slice(
+    Math.max(0, todoItemDefinition.index - 2_000),
+    Math.min(content.length, todoItemDefinition.index + 2_000)
+  )
+  const params = resolveCursorMessageTypeSymbol(
+    localDefinitions,
+    "aiserver.v1.TodoReadParams"
+  )
+  const result = resolveCursorMessageTypeSymbol(
+    localDefinitions,
+    "aiserver.v1.TodoReadResult"
+  )
+  return params && result ? { params, result } : null
+}
+
+function hasUnsupportedReadTodosTranslation(content: string): boolean {
+  return /case"readTodosToolCall":(?=(?:case"[^"]+":)+throw new Error\(`Unsupported tool type for (?:bubble|result) translation:)/u.test(
+    content
+  )
+}
+
+/**
+ * Cursor 3.11 exposes ReadTodosToolCall in agent.v1 and renders its live card,
+ * but its ToolCall -> legacy ToolFormer translators still reject that oneof.
+ * Complete both conversions using symbols discovered from the adjacent native
+ * UpdateTodos conversion instead of depending on minified identifier names.
+ */
+export function patchReadTodosTranslationContent(
+  content: string
+): string | null {
+  if (!hasUnsupportedReadTodosTranslation(content)) {
+    return content
+  }
+
+  const updateTodoBlocks = locateCaseBlocks(content, "updateTodosToolCall")
+  let bubbleInsertion: { at: number; value: string } | null = null
+  let resultInsertion: { at: number; value: string } | null = null
+
+  for (const location of updateTodoBlocks) {
+    const body = content.slice(location.bodyStart, location.end + 1)
+    if (!bubbleInsertion && body.includes(".TODO_WRITE")) {
+      const bubbleMatch =
+        /^\{([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.TODO_WRITE;const ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.tool\.value\.args;\3&&\(([A-Za-z_$][\w$]*)=new /u.exec(
+          body
+        )
+      const todoMappingMatch =
+        /new ([A-Za-z_$][\w$]*)\(\{id:([A-Za-z_$][\w$]*)\.id,content:\2\.content,status:([A-Za-z_$][\w$]*)\(\2\.status\),dependencies:\2\.dependencies\}\)/u.exec(
+          body
+        )
+      const readSymbols = todoMappingMatch
+        ? resolveCursorTodoReadSymbols(content, todoMappingMatch[1]!)
+        : null
+      if (bubbleMatch && readSymbols) {
+        const [, toolVariable, toolEnum, argsVariable, source, paramsVariable] =
+          bubbleMatch
+        if (
+          !toolVariable ||
+          !toolEnum ||
+          !argsVariable ||
+          !source ||
+          !paramsVariable
+        ) {
+          return null
+        }
+        bubbleInsertion = {
+          at: location.end + 1,
+          value:
+            `case"readTodosToolCall":{/*${READ_TODOS_BUBBLE_TRANSLATION_PATCH_MARKER}*/` +
+            `${toolVariable}=${toolEnum}.TODO_READ;const ${argsVariable}=${source}.tool.value.args;` +
+            `${argsVariable}&&(${paramsVariable}=new ${readSymbols.params}({read:!0}));break}`,
+        }
+      }
+    }
+
+    if (
+      !resultInsertion &&
+      body.includes(".tool=") &&
+      body.includes(".TODO_WRITE")
+    ) {
+      const resultMatch =
+        /^\{const ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.tool\.value;if\(([A-Za-z_$][\w$]*)\.tool=([A-Za-z_$][\w$]*)\.TODO_WRITE,/u.exec(
+          body
+        )
+      const todoMappingMatch =
+        /new ([A-Za-z_$][\w$]*)\(\{id:([A-Za-z_$][\w$]*)\.id,content:\2\.content,status:([A-Za-z_$][\w$]*)\(\2\.status\),dependencies:\2\.dependencies\}\)/u.exec(
+          body
+        )
+      if (resultMatch && todoMappingMatch) {
+        const [, callVariable, source, outputVariable, toolEnum] = resultMatch
+        const [, nativeTodoItem, , normalizeStatus] = todoMappingMatch
+        if (
+          !callVariable ||
+          !source ||
+          !outputVariable ||
+          !toolEnum ||
+          !nativeTodoItem ||
+          !normalizeStatus
+        ) {
+          return null
+        }
+        const readSymbols = resolveCursorTodoReadSymbols(
+          content,
+          nativeTodoItem
+        )
+        if (!readSymbols) return null
+        resultInsertion = {
+          at: location.end + 1,
+          value:
+            `case"readTodosToolCall":{/*${READ_TODOS_RESULT_TRANSLATION_PATCH_MARKER}*/` +
+            `const ${callVariable}=${source}.tool.value;${outputVariable}.tool=${toolEnum}.TODO_READ;` +
+            `if(${callVariable}.result?.result?.case==="success"){const agentVibesReadResult=${callVariable}.result.result.value;` +
+            `${outputVariable}.result={case:"todoReadResult",value:new ${readSymbols.result}({todos:(agentVibesReadResult.todos??[]).map(agentVibesTodo=>new ${nativeTodoItem}({id:agentVibesTodo.id,content:agentVibesTodo.content,status:${normalizeStatus}(agentVibesTodo.status),dependencies:agentVibesTodo.dependencies}))})}}` +
+            `else ${callVariable}.result?.result?.case==="error"&&(${outputVariable}.result={case:"todoReadResult",value:new ${readSymbols.result}({todos:[]})});break}`,
+        }
+      }
+    }
+  }
+
+  if (
+    (!content.includes(READ_TODOS_BUBBLE_TRANSLATION_PATCH_MARKER) &&
+      !bubbleInsertion) ||
+    (!content.includes(READ_TODOS_RESULT_TRANSLATION_PATCH_MARKER) &&
+      !resultInsertion)
+  ) {
+    return null
+  }
+
+  let nextContent = content
+  const insertions = [bubbleInsertion, resultInsertion]
+    .filter((entry): entry is { at: number; value: string } => entry !== null)
+    .sort((left, right) => right.at - left.at)
+  for (const insertion of insertions) {
+    const marker = insertion.value.includes(
+      READ_TODOS_BUBBLE_TRANSLATION_PATCH_MARKER
+    )
+      ? READ_TODOS_BUBBLE_TRANSLATION_PATCH_MARKER
+      : READ_TODOS_RESULT_TRANSLATION_PATCH_MARKER
+    if (nextContent.includes(marker)) continue
+    nextContent =
+      nextContent.slice(0, insertion.at) +
+      insertion.value +
+      nextContent.slice(insertion.at)
+  }
+
+  nextContent = nextContent.replace(
+    /case"readTodosToolCall":(?=(?:case"[^"]+":)+throw new Error\(`Unsupported tool type for (?:bubble|result) translation:)/gu,
+    ""
+  )
+  return hasUnsupportedReadTodosTranslation(nextContent) ? null : nextContent
+}
+
+export function isReadTodosTranslationPatchApplied(content: string): boolean {
+  return !hasUnsupportedReadTodosTranslation(content)
+}
+
+type CursorWorkbenchPatchExclusion = "bridgeEndpoint" | "trafficCapture"
+
+function rebuildCursorWorkbenchWithActivePatches(
+  currentContent: string,
+  originalContent: string,
+  exclusions: ReadonlySet<CursorWorkbenchPatchExclusion>
+): string | null {
+  if (PATCH_MARKERS.some((marker) => originalContent.includes(marker))) {
+    return null
+  }
+
+  let nextContent = originalContent
+  if (
+    !exclusions.has("bridgeEndpoint") &&
+    currentContent.includes(BRIDGE_ENDPOINT_PATCH_MARKER)
+  ) {
+    const bridgePort = getAppliedBridgeEndpointPort(currentContent)
+    if (bridgePort === null) return null
+    const patched = patchBridgeEndpointContent(nextContent, bridgePort)
+    if (patched === null) return null
+    nextContent = patched
+  }
+  if (currentContent.includes(IDLE_EXTENSION_HOST_KILLER_MARKER)) {
+    const patched = patchIdleExtensionHostKillerContent(nextContent)
+    if (patched === null) return null
+    nextContent = patched
+  }
+  if (hasCursorAgentInputDockPatch(currentContent)) {
+    const patched = patchCursorAgentInputDockContent(nextContent)
+    if (patched === null) return null
+    nextContent = patched
+  }
+  if (currentContent.includes(PLAN_EDITOR_TAB_PATCH_MARKER)) {
+    const patched = patchPlanEditorTabContent(nextContent)
+    if (patched === null) return null
+    nextContent = patched
+  }
+  if (
+    currentContent.includes(READ_TODOS_BUBBLE_TRANSLATION_PATCH_MARKER) ||
+    currentContent.includes(READ_TODOS_RESULT_TRANSLATION_PATCH_MARKER)
+  ) {
+    const patched = patchReadTodosTranslationContent(nextContent)
+    if (patched === null) return null
+    nextContent = patched
+  }
+  if (!exclusions.has("trafficCapture")) {
+    const activeCaptureRules =
+      getCursorTrafficCaptureDetails(currentContent).appliedRuleNames
+    if (activeCaptureRules.length > 0) {
+      const patched = patchCursorTrafficCaptureRules(
+        nextContent,
+        activeCaptureRules
+      )
+      if (patched === null) return null
+      nextContent = patched
+    }
+  }
+  return nextContent
+}
+
+export function rebuildCursorWorkbenchWithoutTrafficCapture(
+  currentContent: string,
+  originalContent: string
+): string | null {
+  return rebuildCursorWorkbenchWithActivePatches(
+    currentContent,
+    originalContent,
+    new Set(["trafficCapture"])
+  )
+}
+
+function rebuildCursorWorkbenchWithoutBridgeEndpoint(
+  currentContent: string,
+  originalContent: string
+): string | null {
+  return rebuildCursorWorkbenchWithActivePatches(
+    currentContent,
+    originalContent,
+    new Set(["bridgeEndpoint"])
+  )
+}
+
 function normalizeBridgePort(port: number): number {
   return Number.isInteger(port) && port > 0 && port <= 65535 ? port : 2026
 }
@@ -278,7 +578,15 @@ export function getCursorBridgeEndpointUrl(port: number): string {
   return `https://localhost:${normalizeBridgePort(port)}`
 }
 
-function getCursorBridgeEndpointWorkbenchPaths(): string[] {
+function getAppliedBridgeEndpointPort(content: string): number | null {
+  if (!content.includes(BRIDGE_ENDPOINT_PATCH_MARKER)) return null
+  const match = /https:\/\/localhost:(\d+)/u.exec(content)
+  if (!match?.[1]) return null
+  const port = Number.parseInt(match[1], 10)
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null
+}
+
+function getCursorWorkbenchPaths(): string[] {
   const desktopPath = getCursorWorkbenchPath()
   if (!desktopPath || !fs.existsSync(desktopPath)) {
     return []
@@ -296,329 +604,109 @@ function getCursorBridgeEndpointWorkbenchPaths(): string[] {
   return [...new Set(paths)]
 }
 
-function locateBridgeEndpointConstants(
-  content: string
-): BridgeEndpointConstantsLocation | null {
-  const moduleIndex = content.indexOf(BRIDGE_ENDPOINT_MODULE_ID)
-  if (moduleIndex < 0) {
-    return null
-  }
-
-  const end = Math.min(
-    content.length,
-    moduleIndex + BRIDGE_ENDPOINT_MODULE_SEARCH_LIMIT
-  )
-  const segment = content.slice(moduleIndex, end)
-
-  return {
-    start: moduleIndex,
-    end,
-    segment,
-  }
-}
-
-function getCursorBridgeEndpointKind(
-  value: string
-): CursorBridgeEndpointKind | null {
-  try {
-    const url = new URL(value)
-    if (url.protocol !== "https:") {
-      return null
-    }
-    if (/^api\d+\.cursor\.sh$/u.test(url.hostname)) {
-      return "api"
-    }
-    if (/^repo\d+\.cursor\.sh$/u.test(url.hostname)) {
-      return "api"
-    }
-    if (/^agent[a-z0-9-]*\.api\d+\.cursor\.sh$/u.test(url.hostname)) {
-      return "agent"
-    }
-  } catch {
-    return null
-  }
-
-  return null
-}
-
 function isLocalBridgeEndpoint(value: string | null): boolean {
   return value !== null && /^https:\/\/localhost:\d+$/u.test(value)
 }
 
-function summarizeBridgeEndpointSegment(
-  segment: string,
+function summarizeLocalBridgeEndpoints(
+  content: string,
   bridgeUrl: string
 ): BridgeEndpointSegmentSummary {
   const summary: BridgeEndpointSegmentSummary = {
-    hasMarker: segment.includes(BRIDGE_ENDPOINT_PATCH_MARKER),
-    hasStorageGuard: segment.includes(BRIDGE_ENDPOINT_STORAGE_GUARD_MARKER),
-    hasPersistentGuard: segment.includes(
-      BRIDGE_ENDPOINT_PERSISTENT_GUARD_MARKER
-    ),
-    targetCount: 0,
-    apiTargetCount: 0,
-    agentTargetCount: 0,
+    hasMarker: content.includes(BRIDGE_ENDPOINT_PATCH_MARKER),
     localCount: 0,
     matchingLocalCount: 0,
-    firstCurrentUrl: null,
   }
 
   const stringLiteralPattern = /"([^"\\]*(?:\\.[^"\\]*)*)"/gu
   let match: RegExpExecArray | null
-  while ((match = stringLiteralPattern.exec(segment)) !== null) {
+  while ((match = stringLiteralPattern.exec(content)) !== null) {
     const value = match[1]
     if (value === undefined) {
       continue
     }
-    const kind = getCursorBridgeEndpointKind(value)
-    if (kind !== null) {
-      summary.targetCount++
-      if (kind === "api") {
-        summary.apiTargetCount++
-      } else {
-        summary.agentTargetCount++
-      }
-      summary.firstCurrentUrl ??= value
-      continue
-    }
-
     if (isLocalBridgeEndpoint(value)) {
       summary.localCount++
       if (value === bridgeUrl) {
         summary.matchingLocalCount++
       }
-      summary.firstCurrentUrl ??= value
     }
   }
 
   return summary
 }
 
-function hasFreshBridgeEndpointTargets(
+function needsLegacyStaticEndpointMigration(
   summary: BridgeEndpointSegmentSummary
 ): boolean {
-  return (
-    summary.targetCount >= BRIDGE_ENDPOINT_MIN_TARGETS &&
-    summary.apiTargetCount > 0 &&
-    summary.agentTargetCount > 0
-  )
-}
-
-function hasManagedBridgeEndpointTargets(
-  summary: BridgeEndpointSegmentSummary
-): boolean {
-  return (
-    summary.hasMarker && (summary.localCount > 0 || summary.targetCount > 0)
-  )
-}
-
-function locateExistingBridgeEndpointStorageGuard(
-  segment: string
-): { start: number; end: number } | null {
-  const markerIndex = segment.indexOf(BRIDGE_ENDPOINT_STORAGE_GUARD_MARKER)
-  if (markerIndex < 0) {
-    return null
-  }
-
-  const start = segment.lastIndexOf("/*", markerIndex)
-  if (start < 0) {
-    return null
-  }
-
-  const arrowIndex = segment.indexOf("=>", markerIndex)
-  if (arrowIndex < 0) {
-    return null
-  }
-
-  const bodyStart = segment.indexOf("{", arrowIndex)
-  if (bodyStart < 0) {
-    return null
-  }
-
-  const bodyEnd = findMatchingBrace(segment, bodyStart)
-  if (bodyEnd === null) {
-    return null
-  }
-
-  return {
-    start,
-    end: segment[bodyEnd + 1] === "," ? bodyEnd + 2 : bodyEnd + 1,
-  }
-}
-
-function canRemoveBridgeEndpointStorageGuard(segment: string): boolean {
-  return (
-    !segment.includes(BRIDGE_ENDPOINT_STORAGE_GUARD_MARKER) ||
-    locateExistingBridgeEndpointStorageGuard(segment) !== null
-  )
-}
-
-function removeBridgeEndpointStorageGuard(segment: string): string | null {
-  const location = locateExistingBridgeEndpointStorageGuard(segment)
-  if (location === null) {
-    return segment.includes(BRIDGE_ENDPOINT_STORAGE_GUARD_MARKER)
-      ? null
-      : segment
-  }
-
-  return segment.slice(0, location.start) + segment.slice(location.end)
-}
-
-function locateExistingBridgeEndpointPersistentGuard(
-  segment: string
-): { start: number; end: number } | null {
-  const markerIndex = segment.indexOf(BRIDGE_ENDPOINT_PERSISTENT_GUARD_MARKER)
-  if (markerIndex < 0) {
-    return null
-  }
-
-  const start = segment.lastIndexOf("/*", markerIndex)
-  if (start < 0) {
-    return null
-  }
-
-  const arrowIndex = segment.indexOf("=>", markerIndex)
-  if (arrowIndex < 0) {
-    return null
-  }
-
-  const bodyStart = segment.indexOf("{", arrowIndex)
-  if (bodyStart < 0) {
-    return null
-  }
-
-  const bodyEnd = findMatchingBrace(segment, bodyStart)
-  if (bodyEnd === null) {
-    return null
-  }
-
-  return {
-    start,
-    end: segment[bodyEnd + 1] === "," ? bodyEnd + 2 : bodyEnd + 1,
-  }
-}
-
-function locateBridgeEndpointMigrationInsertion(
-  segment: string
-): number | null {
-  const cursorCredsIndex = segment.indexOf("cursorCreds:")
-  if (cursorCredsIndex < 0) {
-    return null
-  }
-
-  const tail = segment.slice(cursorCredsIndex)
-  const identifier = String.raw`[A-Za-z_$][\w$]*`
-  const match = new RegExp(
-    String.raw`\},${identifier}=\[\(${identifier},${identifier}\)=>`,
-    "u"
-  ).exec(tail)
-  if (!match) {
-    return null
-  }
-
-  const arrayStart = match[0].lastIndexOf("[")
-  if (arrayStart < 0) {
-    return null
-  }
-
-  return cursorCredsIndex + match.index + arrayStart + 1
-}
-
-function getBridgeEndpointPersistentGuard(bridgeUrl: string): string {
-  return `/*${BRIDGE_ENDPOINT_PERSISTENT_GUARD_MARKER}*/(e,t)=>{const n="${bridgeUrl}",r=t?.cursorCreds;if(!r||typeof r!="object")return t;const a=e=>{const t={...(e||{})};for(const e in t)typeof t[e]=="string"&&(t[e]=n);return t.default=n,t},s={...r,backendUrl:n,repoBackendUrl:n,cppBackendUrl:n,telemBackendUrl:n,cmdkBackendUrl:n,geoCppBackendUrl:n,cppConfigBackendUrl:n,bcProxyUrl:n,agentUrl:n,agentBackendUrlPrivacy:a(r.agentBackendUrlPrivacy),agentBackendUrlNonPrivacy:a(r.agentBackendUrlNonPrivacy)};let o={...t,cursorCreds:s};return o.cppConfig&&typeof o.cppConfig=="object"&&typeof o.cppConfig.cppUrl=="string"?{...o,cppConfig:{...o.cppConfig,cppUrl:n}}:o},`
-}
-
-function canPatchBridgeEndpointPersistentGuard(segment: string): boolean {
-  return segment.includes(BRIDGE_ENDPOINT_PERSISTENT_GUARD_MARKER)
-    ? locateExistingBridgeEndpointPersistentGuard(segment) !== null
-    : locateBridgeEndpointMigrationInsertion(segment) !== null
-}
-
-function patchBridgeEndpointPersistentGuard(
-  segment: string,
-  bridgeUrl: string
-): string | null {
-  const guard = getBridgeEndpointPersistentGuard(bridgeUrl)
-  const existingGuard = locateExistingBridgeEndpointPersistentGuard(segment)
-  if (existingGuard !== null) {
-    return (
-      segment.slice(0, existingGuard.start) +
-      guard +
-      segment.slice(existingGuard.end)
-    )
-  }
-
-  const insertion = locateBridgeEndpointMigrationInsertion(segment)
-  if (insertion === null) {
-    return null
-  }
-
-  return segment.slice(0, insertion) + guard + segment.slice(insertion)
+  return summary.hasMarker && summary.localCount >= BRIDGE_ENDPOINT_MIN_TARGETS
 }
 
 function getBridgeEndpointCredentialsGuard(): string {
-  return `/*${BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER}*/`
+  return `/*${BRIDGE_ENDPOINT_PATCH_MARKER}*//*${BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER}*/`
 }
 
-function getBridgeEndpointCredentialsGuardMethod(bridgeUrl: string): string {
-  return `getEffectiveCredentials(){const e=this.reactiveStorageService.applicationUserPersistentStorage.cursorCreds,t=this.testBackendUrlOverride,agentVibesNormalize=${getBridgeEndpointCredentialsGuard()}(base,url="${bridgeUrl}")=>({...base,backendUrl:url,repoBackendUrl:url,cppBackendUrl:url,telemBackendUrl:url,geoCppBackendUrl:url,cppConfigBackendUrl:url,cmdkBackendUrl:url,bcProxyUrl:url,agentUrl:url,agentBackendUrlPrivacy:{default:url},agentBackendUrlNonPrivacy:{default:url}});if(!t)return agentVibesNormalize(e);const n=this.getAgentBackendUrls(t);return agentVibesNormalize({...e,backendUrl:t,repoBackendUrl:t,cppBackendUrl:t,telemBackendUrl:t,geoCppBackendUrl:t,cppConfigBackendUrl:t,cmdkBackendUrl:t,bcProxyUrl:t,agentUrl:t,agentBackendUrlNonPrivacy:n},t)}`
+function getBridgeEndpointCredentialsGuardBody(bridgeUrl: string): string {
+  return `const e=this.reactiveStorageService.applicationUserPersistentStorage.cursorCreds,agentVibesNormalize=${getBridgeEndpointCredentialsGuard()}(base,url="${bridgeUrl}")=>{const r={...(base||{})},s=e=>/(?:backend|proxy|agent).*url|url.*(?:backend|proxy|agent)/i.test(e),t=e=>{const r={...(e||{})};for(const e in r)typeof r[e]=="string"&&(r[e]=url);return r.default=url,r};for(const e in r)if(s(e)){const s=r[e];r[e]=s&&typeof s=="object"?t(s):url}return r};return agentVibesNormalize(e)}`
 }
 
 function locateExistingBridgeEndpointCredentialsGuard(
   content: string
-): { start: number; end: number } | null {
+): MethodLocation | null {
   const markerIndex = content.indexOf(BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER)
   if (markerIndex < 0) {
     return null
   }
 
-  const methodStart = content.lastIndexOf(
-    "getEffectiveCredentials(){",
-    markerIndex
+  return locateSemanticMethodAt(content, markerIndex, (body) =>
+    body.includes(BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER)
   )
-  if (methodStart < 0) {
-    return null
-  }
-
-  const bodyStart = content.indexOf("{", methodStart)
-  if (bodyStart < 0 || bodyStart > markerIndex) {
-    return null
-  }
-
-  const bodyEnd = findMatchingBrace(content, bodyStart)
-  if (bodyEnd === null) {
-    return null
-  }
-
-  return { start: methodStart, end: bodyEnd + 1 }
 }
 
-function hasCurrentBridgeEndpointCredentialsGuard(content: string): boolean {
-  const existingGuard = locateExistingBridgeEndpointCredentialsGuard(content)
+function hasCurrentBridgeEndpointCredentialsGuard(
+  content: string,
+  bridgeUrl: string,
+  existingGuard = locateExistingBridgeEndpointCredentialsGuard(content)
+): boolean {
   if (existingGuard === null) {
     return false
   }
 
   const guard = content.slice(existingGuard.start, existingGuard.end)
-  return guard.includes("repoBackendUrl:url") && guard.includes("agentUrl:url")
+  return (
+    guard.includes("agentVibesNormalize") &&
+    guard.includes("backend|proxy|agent).*url") &&
+    guard.includes('url="' + bridgeUrl + '"')
+  )
 }
 
-function locateBridgeEndpointCredentialsGuard(
+function locateBridgeEndpointCredentialsMethod(
   content: string
-): RegExpExecArray | null {
-  const identifier = String.raw`[A-Za-z_$][\w$]*`
-  const pattern = new RegExp(
-    String.raw`getEffectiveCredentials\(\)\{const (${identifier})=this\.reactiveStorageService\.applicationUserPersistentStorage\.cursorCreds,(${identifier})=this\.testBackendUrlOverride;if\(!\2\)return \1;const (${identifier})=this\.getAgentBackendUrls\(\2\);return\{\.\.\.\1,backendUrl:\2,repoBackendUrl:\2,telemBackendUrl:\2,geoCppBackendUrl:\2,cppConfigBackendUrl:\2,cmdkBackendUrl:\2,bcProxyUrl:\2,agentBackendUrlNonPrivacy:\3\}\}`,
-    "u"
-  )
-  return pattern.exec(content)
+): MethodLocation | null {
+  const credentialAnchor = ".applicationUserPersistentStorage.cursorCreds"
+  let anchorIndex = content.indexOf(credentialAnchor)
+  while (anchorIndex >= 0) {
+    const method = locateSemanticMethodAt(
+      content,
+      anchorIndex,
+      (body) =>
+        body.includes("reactiveStorageService") &&
+        body.includes("applicationUserPersistentStorage.cursorCreds")
+    )
+    if (method !== null) {
+      return method
+    }
+    anchorIndex = content.indexOf(credentialAnchor, anchorIndex + 1)
+  }
+
+  return null
 }
 
 function canPatchBridgeEndpointCredentialsGuard(content: string): boolean {
   return (
     (content.includes(BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER) &&
       locateExistingBridgeEndpointCredentialsGuard(content) !== null) ||
-    locateBridgeEndpointCredentialsGuard(content) !== null
+    locateBridgeEndpointCredentialsMethod(content) !== null
   )
 }
 
@@ -634,122 +722,57 @@ function patchBridgeEndpointCredentialsGuard(
 
     return (
       content.slice(0, existingGuard.start) +
-      getBridgeEndpointCredentialsGuardMethod(bridgeUrl) +
+      content.slice(existingGuard.start, existingGuard.bodyStart + 1) +
+      getBridgeEndpointCredentialsGuardBody(bridgeUrl) +
       content.slice(existingGuard.end)
     )
   }
 
-  const match = locateBridgeEndpointCredentialsGuard(content)
-  if (!match) {
-    return null
-  }
-
-  if (!match[1] || !match[2] || !match[3]) {
+  const method = locateBridgeEndpointCredentialsMethod(content)
+  if (!method) {
     return null
   }
 
   return (
-    content.slice(0, match.index) +
-    getBridgeEndpointCredentialsGuardMethod(bridgeUrl) +
-    content.slice(match.index + match[0].length)
+    content.slice(0, method.start) +
+    content.slice(method.start, method.bodyStart + 1) +
+    getBridgeEndpointCredentialsGuardBody(bridgeUrl) +
+    content.slice(method.end)
   )
 }
 
 export function canPatchBridgeEndpointContent(content: string): boolean {
-  const location = locateBridgeEndpointConstants(content)
-  if (!location) {
-    return false
-  }
-
-  const bridgeUrl = getCursorBridgeEndpointUrl(2026)
-  const summary = summarizeBridgeEndpointSegment(location.segment, bridgeUrl)
-  return (
-    (hasFreshBridgeEndpointTargets(summary) ||
-      hasManagedBridgeEndpointTargets(summary)) &&
-    canRemoveBridgeEndpointStorageGuard(location.segment) &&
-    canPatchBridgeEndpointPersistentGuard(location.segment) &&
-    canPatchBridgeEndpointCredentialsGuard(content)
-  )
+  return canPatchBridgeEndpointCredentialsGuard(content)
 }
 
 export function patchBridgeEndpointContent(
   content: string,
   port: number
 ): string | null {
-  const location = locateBridgeEndpointConstants(content)
-  if (!location) {
-    return null
-  }
-
   const bridgeUrl = getCursorBridgeEndpointUrl(port)
-  let segment = location.segment
-  const beforeSummary = summarizeBridgeEndpointSegment(segment, bridgeUrl)
-
-  if (
-    !hasFreshBridgeEndpointTargets(beforeSummary) &&
-    !hasManagedBridgeEndpointTargets(beforeSummary)
-  ) {
+  const beforeSummary = summarizeLocalBridgeEndpoints(content, bridgeUrl)
+  if (needsLegacyStaticEndpointMigration(beforeSummary)) {
     return null
   }
 
-  let replaced = 0
-  let markerInserted = beforeSummary.hasMarker
-  segment = segment.replace(
-    /"([^"\\]*(?:\\.[^"\\]*)*)"/gu,
-    (match: string, value: string): string => {
-      const shouldReplace =
-        getCursorBridgeEndpointKind(value) !== null ||
-        (beforeSummary.hasMarker && isLocalBridgeEndpoint(value))
-      if (!shouldReplace) {
-        return match
-      }
-
-      const marker = markerInserted ? "" : BRIDGE_ENDPOINT_PATCH_INSERTION
-      markerInserted = true
-      replaced++
-      return `"${bridgeUrl}"${marker}`
-    }
-  )
-
-  const segmentWithoutStorageGuard = removeBridgeEndpointStorageGuard(segment)
-  if (segmentWithoutStorageGuard === null) {
-    return null
-  }
-  segment = segmentWithoutStorageGuard
-
-  const segmentWithoutPersistentGuard = segment
-  const segmentWithPersistentGuard = patchBridgeEndpointPersistentGuard(
-    segment,
-    bridgeUrl
-  )
-  if (segmentWithPersistentGuard === null) {
-    return null
-  }
-  segment = segmentWithPersistentGuard
-  const persistentGuardChanged = segment !== segmentWithoutPersistentGuard
-
-  const afterSummary = summarizeBridgeEndpointSegment(segment, bridgeUrl)
-  if (
-    !afterSummary.hasMarker ||
-    afterSummary.hasStorageGuard ||
-    !afterSummary.hasPersistentGuard ||
-    afterSummary.targetCount > 0 ||
-    afterSummary.localCount < BRIDGE_ENDPOINT_MIN_TARGETS ||
-    afterSummary.localCount !== afterSummary.matchingLocalCount ||
-    (replaced === 0 &&
-      !beforeSummary.hasStorageGuard &&
-      !persistentGuardChanged)
-  ) {
-    return null
-  }
-
-  const contentWithEndpointPatch =
-    content.slice(0, location.start) + segment + content.slice(location.end)
   const contentWithCredentialsGuard = patchBridgeEndpointCredentialsGuard(
-    contentWithEndpointPatch,
+    content,
     bridgeUrl
   )
   if (contentWithCredentialsGuard === null) {
+    return null
+  }
+
+  const afterSummary = summarizeLocalBridgeEndpoints(
+    contentWithCredentialsGuard,
+    bridgeUrl
+  )
+  if (
+    !afterSummary.hasMarker ||
+    afterSummary.localCount !== 1 ||
+    afterSummary.localCount !== afterSummary.matchingLocalCount ||
+    contentWithCredentialsGuard === content
+  ) {
     return null
   }
 
@@ -767,56 +790,41 @@ export function getBridgeEndpointDetails(
   coverage: Omit<CursorBridgeEndpointCoverage, "workbenchFiles">
 } {
   const bridgeUrl = getCursorBridgeEndpointUrl(port)
-  const location = locateBridgeEndpointConstants(content)
-  if (!location) {
-    return {
-      currentUrl: null,
-      applied: false,
-      canApply: false,
-      requiresPortUpdate: false,
-      coverage: {
-        apiTargets: 0,
-        agentTargets: 0,
-        localEndpoints: 0,
-        matchingLocalEndpoints: 0,
-        credentialsGuard: false,
-        persistentGuard: false,
-        storageGuardRemoved: false,
-      },
-    }
-  }
-
-  const summary = summarizeBridgeEndpointSegment(location.segment, bridgeUrl)
-  const credentialsGuard = hasCurrentBridgeEndpointCredentialsGuard(content)
+  const summary = summarizeLocalBridgeEndpoints(content, bridgeUrl)
+  const existingGuard = locateExistingBridgeEndpointCredentialsGuard(content)
+  const credentialsGuard = hasCurrentBridgeEndpointCredentialsGuard(
+    content,
+    bridgeUrl,
+    existingGuard
+  )
+  const legacyStaticEndpointMigration =
+    needsLegacyStaticEndpointMigration(summary)
   const canApply =
-    (hasFreshBridgeEndpointTargets(summary) ||
-      hasManagedBridgeEndpointTargets(summary)) &&
-    canRemoveBridgeEndpointStorageGuard(location.segment) &&
-    canPatchBridgeEndpointPersistentGuard(location.segment) &&
-    canPatchBridgeEndpointCredentialsGuard(content)
+    legacyStaticEndpointMigration ||
+    existingGuard !== null ||
+    locateBridgeEndpointCredentialsMethod(content) !== null
   const applied =
     summary.hasMarker &&
-    !summary.hasStorageGuard &&
-    summary.hasPersistentGuard &&
     credentialsGuard &&
-    summary.targetCount === 0 &&
-    summary.localCount >= BRIDGE_ENDPOINT_MIN_TARGETS &&
+    !legacyStaticEndpointMigration &&
+    summary.localCount === 1 &&
     summary.localCount === summary.matchingLocalCount
 
   return {
-    currentUrl: summary.firstCurrentUrl,
+    currentUrl: summary.matchingLocalCount > 0 ? bridgeUrl : null,
     applied,
     canApply,
     requiresPortUpdate:
-      summary.hasMarker && summary.localCount > 0 && canApply && !applied,
+      legacyStaticEndpointMigration ||
+      (summary.hasMarker && canApply && !applied),
     coverage: {
-      apiTargets: summary.apiTargetCount,
-      agentTargets: summary.agentTargetCount,
+      apiTargets: 0,
+      agentTargets: 0,
       localEndpoints: summary.localCount,
       matchingLocalEndpoints: summary.matchingLocalCount,
       credentialsGuard,
-      persistentGuard: summary.hasPersistentGuard,
-      storageGuardRemoved: !summary.hasStorageGuard,
+      persistentGuard: true,
+      storageGuardRemoved: true,
     },
   }
 }
@@ -879,10 +887,15 @@ function firstEndpointUrl(
   if (currentUrl !== null || typeof value !== "string") {
     return currentUrl
   }
-  return getCursorBridgeEndpointKind(value) !== null ||
-    isLocalBridgeEndpoint(value)
+  return /^https?:\/\//u.test(value) || isLocalBridgeEndpoint(value)
     ? value
     : currentUrl
+}
+
+function isCursorBridgeEndpointField(field: string): boolean {
+  return /(?:backend|proxy|agent).*url|url.*(?:backend|proxy|agent)/iu.test(
+    field
+  )
 }
 
 function normalizeCursorAgentEndpointMap(
@@ -934,19 +947,21 @@ export function normalizeCursorApplicationUserEndpointValue(
   let currentUrl: string | null = null
   const cursorCreds: Record<string, unknown> = { ...parsed.cursorCreds }
 
-  for (const field of CURSOR_CREDS_ENDPOINT_FIELDS) {
-    currentUrl = firstEndpointUrl(currentUrl, cursorCreds[field])
-    if (cursorCreds[field] !== bridgeUrl) {
-      cursorCreds[field] = bridgeUrl
-      changed = true
+  for (const [field, fieldValue] of Object.entries(cursorCreds)) {
+    if (!isCursorBridgeEndpointField(field)) {
+      continue
     }
-  }
 
-  for (const field of CURSOR_CREDS_AGENT_ENDPOINT_FIELDS) {
-    const normalizedMap = normalizeCursorAgentEndpointMap(
-      cursorCreds[field],
-      bridgeUrl
-    )
+    if (typeof fieldValue === "string") {
+      currentUrl = firstEndpointUrl(currentUrl, fieldValue)
+      if (fieldValue !== bridgeUrl) {
+        cursorCreds[field] = bridgeUrl
+        changed = true
+      }
+      continue
+    }
+
+    const normalizedMap = normalizeCursorAgentEndpointMap(fieldValue, bridgeUrl)
     currentUrl = currentUrl ?? normalizedMap.currentUrl
     if (normalizedMap.changed) {
       cursorCreds[field] = normalizedMap.value
@@ -1017,7 +1032,7 @@ export function normalizeCursorApplicationUserEntitlementValue(
   }
 }
 
-function getCursorPersistentEndpointPatchDetails(
+function _getCursorPersistentEndpointPatchDetails(
   port: number
 ): CursorPersistentEndpointPatchDetails {
   const filePath = getCursorGlobalStorageStateDbPath()
@@ -1172,7 +1187,7 @@ function getCursorEntitlementPatchDetails(): CursorEntitlementPatchDetails {
   return result
 }
 
-function getCursorStartupPreferencePatchDetails(): CursorStartupPreferencePatchDetails {
+function _getCursorStartupPreferencePatchDetails(): CursorStartupPreferencePatchDetails {
   const filePath = getCursorGlobalStorageStateDbPath()
   const result: CursorStartupPreferencePatchDetails = {
     filePath,
@@ -1463,6 +1478,56 @@ function findMatchingBrace(
   return null
 }
 
+function locateSemanticMethodAt(
+  content: string,
+  anchorIndex: number,
+  predicate: (body: string) => boolean
+): MethodLocation | null {
+  const localStart = Math.max(
+    0,
+    anchorIndex - SEMANTIC_METHOD_LOCAL_SEARCH_BYTES
+  )
+  const searchStarts = localStart === 0 ? [0] : [localStart, 0]
+
+  for (const searchStart of searchStarts) {
+    const methodPattern = /(?:async\s+)?[A-Za-z_$][\w$]*\s*\([^{};]*\)\s*\{/gu
+    methodPattern.lastIndex = searchStart
+    const candidates: Array<{ start: number; bodyStart: number }> = []
+    let match: RegExpExecArray | null
+
+    while ((match = methodPattern.exec(content)) !== null) {
+      if (match.index > anchorIndex) {
+        break
+      }
+      candidates.push({
+        start: match.index,
+        bodyStart: match.index + match[0].lastIndexOf("{"),
+      })
+    }
+
+    for (let index = candidates.length - 1; index >= 0; index--) {
+      const candidate = candidates[index]
+      if (!candidate) {
+        continue
+      }
+      const end = findMatchingBrace(content, candidate.bodyStart)
+      if (end === null || end < anchorIndex) {
+        continue
+      }
+      const body = content.slice(candidate.bodyStart + 1, end)
+      if (predicate(body)) {
+        return {
+          start: candidate.start,
+          bodyStart: candidate.bodyStart,
+          end: end + 1,
+        }
+      }
+    }
+  }
+
+  return null
+}
+
 export interface PatchStatus {
   filePath: string | null
   fileExists: boolean
@@ -1492,6 +1557,30 @@ export interface CursorBridgeEndpointPatchStatus {
   currentUrl: string | null
   requiresPortUpdate: boolean
   coverage: CursorBridgeEndpointCoverage
+}
+
+export interface CursorTrafficCapturePatchStatus {
+  filePath: string | null
+  fileExists: boolean
+  applied: boolean
+  partial: boolean
+  canApply: boolean
+  managedBaseline: boolean
+  totalRules: number
+  appliedRules: number
+  availableRules: number
+  missingRules: string[]
+}
+
+export interface CursorAgentInputDockPatchStatus {
+  filePath: string | null
+  fileExists: boolean
+  applied: boolean
+  partial: boolean
+  canApply: boolean
+  managedBaseline: boolean
+  workbenchFiles: number
+  legacyFiles: number
 }
 
 export interface CursorBridgeEndpointCoverage {
@@ -1527,13 +1616,17 @@ type CursorPatchStatusOptions = {
 }
 
 /**
- * CursorPatchService — Manages patching and restoring Cursor's
- * workbench.desktop.main.js to inject transport-layer traffic capture.
+ * CursorPatchService — Manages independent Cursor workbench patches and their
+ * shared original-file baseline.
  */
 export class CursorPatchService {
   private static bridgeEndpointStatusCache: CursorPatchStatusCache<CursorBridgeEndpointPatchStatus> | null =
     null
   private static idleKillerStatusCache: CursorPatchStatusCache<CursorSinglePatchStatus> | null =
+    null
+  private static agentInputDockStatusCache: CursorPatchStatusCache<CursorAgentInputDockPatchStatus> | null =
+    null
+  private static trafficCaptureStatusCache: CursorPatchStatusCache<CursorTrafficCapturePatchStatus> | null =
     null
   private static legacyStatusCache: CursorPatchStatusCache<PatchStatus> | null =
     null
@@ -1549,6 +1642,8 @@ export class CursorPatchService {
   static invalidateStatusCache(): void {
     CursorPatchService.bridgeEndpointStatusCache = null
     CursorPatchService.idleKillerStatusCache = null
+    CursorPatchService.agentInputDockStatusCache = null
+    CursorPatchService.trafficCaptureStatusCache = null
     CursorPatchService.legacyStatusCache = null
     CursorChecksumsService.invalidateStatusCache()
     CursorPatchBaselineService.invalidateStatusCache()
@@ -1571,20 +1666,42 @@ export class CursorPatchService {
 
   private static setCachedStatus<T>(
     key: string,
-    status: T
+    status: T,
+    expiresAt = Date.now() + CURSOR_PATCH_STATUS_CACHE_TTL_MS
   ): CursorPatchStatusCache<T> {
     return {
       key,
-      expiresAt: Date.now() + CURSOR_PATCH_STATUS_CACHE_TTL_MS,
+      expiresAt,
       status,
     }
+  }
+
+  private static getBridgeEndpointCacheKey(
+    port: number,
+    filePaths: string[]
+  ): string {
+    const caCertPath = getCursorBridgeCaCertPath()
+    const trackedPaths = caCertPath ? [...filePaths, caCertPath] : filePaths
+    const signatures = trackedPaths.map((filePath) => {
+      try {
+        const stat = fs.statSync(filePath)
+        return `${filePath}:${stat.size}:${stat.mtimeMs}`
+      } catch {
+        return `${filePath}:missing`
+      }
+    })
+    return `bridge:${normalizeBridgePort(port)}:${signatures.join("|")}`
   }
 
   getBridgeEndpointPatchStatus(
     port: number,
     options: CursorPatchStatusOptions = {}
   ): CursorBridgeEndpointPatchStatus {
-    const cacheKey = `bridge:${normalizeBridgePort(port)}`
+    const filePaths = getCursorWorkbenchPaths()
+    const cacheKey = CursorPatchService.getBridgeEndpointCacheKey(
+      port,
+      filePaths
+    )
     const cached = CursorPatchService.getCachedStatus(
       CursorPatchService.bridgeEndpointStatusCache,
       cacheKey,
@@ -1594,7 +1711,6 @@ export class CursorPatchService {
       return cached
     }
 
-    const filePaths = getCursorBridgeEndpointWorkbenchPaths()
     const filePath = filePaths[0] ?? getCursorWorkbenchPath()
     const endpointUrl = getCursorBridgeEndpointUrl(port)
     const result: CursorBridgeEndpointPatchStatus = {
@@ -1620,7 +1736,11 @@ export class CursorPatchService {
 
     if (filePaths.length === 0) {
       CursorPatchService.bridgeEndpointStatusCache =
-        CursorPatchService.setCachedStatus(cacheKey, result)
+        CursorPatchService.setCachedStatus(
+          cacheKey,
+          result,
+          Number.POSITIVE_INFINITY
+        )
       return result
     }
 
@@ -1628,13 +1748,24 @@ export class CursorPatchService {
     result.managedBaseline = filePaths.every((path) =>
       this.baseline.hasOriginal(path)
     )
-    const workbenchDetails = filePaths.map((path) =>
-      getBridgeEndpointDetails(fs.readFileSync(path, "utf-8"), port)
+    const workbenchContents = filePaths.map((path) =>
+      fs.readFileSync(path, "utf-8")
     )
-    const startupPreferenceDetails = getCursorStartupPreferencePatchDetails()
-    const persistentEndpointDetails =
-      getCursorPersistentEndpointPatchDetails(port)
-    const entitlementDetails = getCursorEntitlementPatchDetails()
+    const workbenchDetails = workbenchContents.map((content) =>
+      getBridgeEndpointDetails(content, port)
+    )
+    const planEditorTabTargets = workbenchContents.filter(
+      (content) => locatePlanEditorOpenMethod(content) !== null
+    )
+    const planEditorTabPatchApplied =
+      planEditorTabTargets.length > 0
+        ? planEditorTabTargets.every(isPlanEditorTabPatchApplied)
+        : workbenchContents.every(
+            (content) => !content.includes("openPlanInEditor(")
+          )
+    const readTodosTranslationPatchApplied = workbenchContents.every(
+      isReadTodosTranslationPatchApplied
+    )
     const nodeCaDetails = getCursorNodeCaPatchDetails()
     result.coverage = {
       workbenchFiles: workbenchDetails.length,
@@ -1657,9 +1788,7 @@ export class CursorPatchService {
       credentialsGuard:
         workbenchDetails.length > 0 &&
         workbenchDetails.every((details) => details.coverage.credentialsGuard),
-      persistentGuard:
-        workbenchDetails.length > 0 &&
-        workbenchDetails.every((details) => details.coverage.persistentGuard),
+      persistentGuard: true,
       storageGuardRemoved:
         workbenchDetails.length > 0 &&
         workbenchDetails.every(
@@ -1669,43 +1798,39 @@ export class CursorPatchService {
 
     result.applied =
       workbenchDetails.every((details) => details.applied) &&
-      (!startupPreferenceDetails.fileExists ||
-        startupPreferenceDetails.applied) &&
-      (!persistentEndpointDetails.fileExists ||
-        persistentEndpointDetails.applied) &&
-      (!entitlementDetails.fileExists || entitlementDetails.applied) &&
+      planEditorTabPatchApplied &&
+      readTodosTranslationPatchApplied &&
       nodeCaDetails.applied
     result.canApply =
       workbenchDetails.some((details) => details.canApply) ||
-      (startupPreferenceDetails.fileExists &&
-        startupPreferenceDetails.canApply) ||
-      (persistentEndpointDetails.fileExists &&
-        persistentEndpointDetails.canApply) ||
-      (entitlementDetails.fileExists && entitlementDetails.canApply) ||
+      planEditorTabTargets.some(
+        (content) => !isPlanEditorTabPatchApplied(content)
+      ) ||
+      workbenchContents.some(
+        (content) => !isReadTodosTranslationPatchApplied(content)
+      ) ||
       nodeCaDetails.canApply
     result.currentUrl =
-      persistentEndpointDetails.currentUrl ??
       workbenchDetails.find((details) => !details.applied)?.currentUrl ??
       workbenchDetails[0]?.currentUrl ??
       null
-    result.requiresPortUpdate =
-      workbenchDetails.some((details) => details.requiresPortUpdate) ||
-      (startupPreferenceDetails.fileExists &&
-        startupPreferenceDetails.changed) ||
-      (persistentEndpointDetails.fileExists &&
-        persistentEndpointDetails.changed) ||
-      (entitlementDetails.fileExists && entitlementDetails.changed) ||
-      nodeCaDetails.changed
+    result.requiresPortUpdate = workbenchDetails.some(
+      (details) => details.requiresPortUpdate
+    )
 
     CursorPatchService.bridgeEndpointStatusCache =
-      CursorPatchService.setCachedStatus(cacheKey, result)
+      CursorPatchService.setCachedStatus(
+        cacheKey,
+        result,
+        Number.POSITIVE_INFINITY
+      )
     return result
   }
 
   applyBridgeEndpointPatch(port: number): CursorPatchApplyResult {
     this.invalidateStatusCache()
 
-    const filePaths = getCursorBridgeEndpointWorkbenchPaths()
+    const filePaths = getCursorWorkbenchPaths()
     if (filePaths.length === 0) {
       return {
         success: false,
@@ -1716,26 +1841,89 @@ export class CursorPatchService {
       }
     }
 
+    const legacyStaticPatchPaths = filePaths.filter((path) => {
+      const content = fs.readFileSync(path, "utf-8")
+      return needsLegacyStaticEndpointMigration(
+        summarizeLocalBridgeEndpoints(content, getCursorBridgeEndpointUrl(port))
+      )
+    })
+    if (legacyStaticPatchPaths.length > 0) {
+      const migrationPlans: Array<{ path: string; content: string }> = []
+      for (const legacyPath of legacyStaticPatchPaths) {
+        const currentContent = fs.readFileSync(legacyPath, "utf-8")
+        const original = this.baseline.readOriginal(legacyPath)
+        if (!original.content) {
+          return {
+            success: false,
+            applied: 0,
+            checksumApplied: false,
+            checksumUpdated: 0,
+            errors: [
+              `Cannot migrate the legacy Cursor direct patch without the managed baseline: ${original.error || legacyPath}`,
+            ],
+          }
+        }
+        const content = rebuildCursorWorkbenchWithoutBridgeEndpoint(
+          currentContent,
+          original.content
+        )
+        if (content === null) {
+          return {
+            success: false,
+            applied: 0,
+            checksumApplied: false,
+            checksumUpdated: 0,
+            errors: [
+              `Cannot migrate the legacy Cursor direct patch without changing other active patches: ${legacyPath}`,
+            ],
+          }
+        }
+        migrationPlans.push({ path: legacyPath, content })
+      }
+      for (const migrationPlan of migrationPlans) {
+        fs.writeFileSync(migrationPlan.path, migrationPlan.content, "utf-8")
+      }
+    }
+
     const workbenchStatuses = filePaths.map((path) => {
       const content = fs.readFileSync(path, "utf-8")
       return {
         path,
         content,
         status: getBridgeEndpointDetails(content, port),
+        hasPlanEditorTabTarget: locatePlanEditorOpenMethod(content) !== null,
+        planEditorTabPatchApplied: isPlanEditorTabPatchApplied(content),
+        readTodosTranslationPatchApplied:
+          isReadTodosTranslationPatchApplied(content),
       }
     })
-    const startupPreferenceStatus = getCursorStartupPreferencePatchDetails()
-    const persistentEndpointStatus =
-      getCursorPersistentEndpointPatchDetails(port)
-    const entitlementStatus = getCursorEntitlementPatchDetails()
+    const planEditorTabStatuses = workbenchStatuses.filter(
+      ({ hasPlanEditorTabTarget }) => hasPlanEditorTabTarget
+    )
+    if (
+      planEditorTabStatuses.length === 0 &&
+      workbenchStatuses.some(({ content }) =>
+        content.includes("openPlanInEditor(")
+      )
+    ) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: [`Pattern not found: ${PLAN_EDITOR_TAB_PATCH.name}`],
+      }
+    }
     const nodeCaStatus = getCursorNodeCaPatchDetails()
     if (
       workbenchStatuses.every(({ status }) => status.applied) &&
-      (!startupPreferenceStatus.fileExists ||
-        startupPreferenceStatus.applied) &&
-      (!persistentEndpointStatus.fileExists ||
-        persistentEndpointStatus.applied) &&
-      (!entitlementStatus.fileExists || entitlementStatus.applied) &&
+      planEditorTabStatuses.every(
+        ({ planEditorTabPatchApplied }) => planEditorTabPatchApplied
+      ) &&
+      workbenchStatuses.every(
+        ({ readTodosTranslationPatchApplied }) =>
+          readTodosTranslationPatchApplied
+      ) &&
       nodeCaStatus.applied
     ) {
       return this.finalizePatchApply({ applied: 0, forceChecksum: true })
@@ -1745,148 +1933,75 @@ export class CursorPatchService {
     let restartRequired = false
 
     for (const workbenchStatus of workbenchStatuses) {
-      if (workbenchStatus.status.applied) {
-        continue
+      let nextContent = workbenchStatus.content
+
+      if (!workbenchStatus.status.applied) {
+        const bridgePatchedContent = patchBridgeEndpointContent(
+          nextContent,
+          port
+        )
+        if (bridgePatchedContent === null) {
+          return {
+            success: false,
+            applied,
+            checksumApplied: false,
+            checksumUpdated: 0,
+            errors: [
+              `Pattern not found: Cursor Bridge Endpoint (${workbenchStatus.path})`,
+            ],
+            restartRequired,
+          }
+        }
+
+        nextContent = bridgePatchedContent
       }
 
-      const nextContent = patchBridgeEndpointContent(
-        workbenchStatus.content,
-        port
-      )
-      if (nextContent === null) {
-        return {
-          success: false,
-          applied,
-          checksumApplied: false,
-          checksumUpdated: 0,
-          errors: [
-            `Pattern not found: Cursor Bridge Endpoint (${workbenchStatus.path})`,
-          ],
-          restartRequired,
+      if (
+        workbenchStatus.hasPlanEditorTabTarget &&
+        !workbenchStatus.planEditorTabPatchApplied
+      ) {
+        const planEditorPatchedContent = patchPlanEditorTabContent(nextContent)
+        if (planEditorPatchedContent === null) {
+          return {
+            success: false,
+            applied,
+            checksumApplied: false,
+            checksumUpdated: 0,
+            errors: [
+              `Pattern not found: ${PLAN_EDITOR_TAB_PATCH.name} (${workbenchStatus.path})`,
+            ],
+            restartRequired,
+          }
         }
+        nextContent = planEditorPatchedContent
+      }
+
+      if (!workbenchStatus.readTodosTranslationPatchApplied) {
+        const readTodosPatchedContent =
+          patchReadTodosTranslationContent(nextContent)
+        if (readTodosPatchedContent === null) {
+          return {
+            success: false,
+            applied,
+            checksumApplied: false,
+            checksumUpdated: 0,
+            errors: [
+              `Pattern not found: ${READ_TODOS_TRANSLATION_PATCH.name} (${workbenchStatus.path})`,
+            ],
+            restartRequired,
+          }
+        }
+        nextContent = readTodosPatchedContent
+      }
+
+      if (nextContent === workbenchStatus.content) {
+        continue
       }
 
       this.baseline.ensureOriginals([workbenchStatus.path])
       fs.writeFileSync(workbenchStatus.path, nextContent, "utf-8")
       applied += 1
       restartRequired = true
-    }
-
-    if (
-      startupPreferenceStatus.fileExists &&
-      startupPreferenceStatus.canApply &&
-      startupPreferenceStatus.sql !== null &&
-      startupPreferenceStatus.filePath
-    ) {
-      const updateResult = runSqlite(
-        startupPreferenceStatus.filePath,
-        startupPreferenceStatus.sql
-      )
-      if (!updateResult.success) {
-        return {
-          success: false,
-          applied,
-          checksumApplied: false,
-          checksumUpdated: 0,
-          errors: [
-            `Failed to update Cursor startup preferences: ${updateResult.error}`,
-          ],
-          restartRequired,
-        }
-      }
-      applied += 1
-      restartRequired = true
-    } else if (
-      startupPreferenceStatus.fileExists &&
-      startupPreferenceStatus.error
-    ) {
-      return {
-        success: false,
-        applied,
-        checksumApplied: false,
-        checksumUpdated: 0,
-        errors: [
-          `Failed to read Cursor startup preferences: ${startupPreferenceStatus.error}`,
-        ],
-        restartRequired,
-      }
-    }
-
-    if (
-      persistentEndpointStatus.fileExists &&
-      persistentEndpointStatus.canApply &&
-      persistentEndpointStatus.sql !== null &&
-      persistentEndpointStatus.filePath
-    ) {
-      const updateResult = runSqlite(
-        persistentEndpointStatus.filePath,
-        persistentEndpointStatus.sql
-      )
-      if (!updateResult.success) {
-        return {
-          success: false,
-          applied,
-          checksumApplied: false,
-          checksumUpdated: 0,
-          errors: [
-            `Failed to update Cursor endpoint storage: ${updateResult.error}`,
-          ],
-          restartRequired,
-        }
-      }
-      applied += 1
-      restartRequired = true
-    } else if (
-      persistentEndpointStatus.fileExists &&
-      persistentEndpointStatus.error
-    ) {
-      return {
-        success: false,
-        applied,
-        checksumApplied: false,
-        checksumUpdated: 0,
-        errors: [
-          `Failed to read Cursor endpoint storage: ${persistentEndpointStatus.error}`,
-        ],
-        restartRequired,
-      }
-    }
-
-    if (
-      entitlementStatus.fileExists &&
-      entitlementStatus.canApply &&
-      entitlementStatus.sql !== null &&
-      entitlementStatus.filePath
-    ) {
-      const updateResult = runSqlite(
-        entitlementStatus.filePath,
-        entitlementStatus.sql
-      )
-      if (!updateResult.success) {
-        return {
-          success: false,
-          applied,
-          checksumApplied: false,
-          checksumUpdated: 0,
-          errors: [
-            `Failed to update Cursor entitlement storage: ${updateResult.error}`,
-          ],
-          restartRequired,
-        }
-      }
-      applied += 1
-      restartRequired = true
-    } else if (entitlementStatus.fileExists && entitlementStatus.error) {
-      return {
-        success: false,
-        applied,
-        checksumApplied: false,
-        checksumUpdated: 0,
-        errors: [
-          `Failed to read Cursor entitlement storage: ${entitlementStatus.error}`,
-        ],
-        restartRequired,
-      }
     }
 
     if (nodeCaStatus.canApply && !nodeCaStatus.applied) {
@@ -1904,7 +2019,6 @@ export class CursorPatchService {
         }
       }
       applied += 1
-      restartRequired = true
     } else if (nodeCaStatus.error && !nodeCaStatus.applied) {
       return {
         success: false,
@@ -1920,6 +2034,209 @@ export class CursorPatchService {
       `Applied patch: Cursor Bridge Endpoint (${getCursorBridgeEndpointUrl(port)})`
     )
     return this.finalizePatchApply({ applied, restartRequired })
+  }
+
+  getAgentInputDockPatchStatus(
+    options: CursorPatchStatusOptions = {}
+  ): CursorAgentInputDockPatchStatus {
+    const filePaths = getCursorWorkbenchPaths()
+    const cacheKey =
+      filePaths.length === 0
+        ? "agent-input-dock:missing"
+        : `agent-input-dock:${filePaths
+            .map((filePath) => {
+              const stat = fs.statSync(filePath)
+              return `${filePath}:${stat.size}:${stat.mtimeMs}`
+            })
+            .join("|")}`
+    const cached = CursorPatchService.getCachedStatus(
+      CursorPatchService.agentInputDockStatusCache,
+      cacheKey,
+      options.force
+    )
+    if (cached) return cached
+
+    const result: CursorAgentInputDockPatchStatus = {
+      filePath: filePaths[0] ?? getCursorWorkbenchPath(),
+      fileExists: filePaths.length > 0,
+      applied: false,
+      partial: false,
+      canApply: false,
+      managedBaseline: false,
+      workbenchFiles: filePaths.length,
+      legacyFiles: 0,
+    }
+    if (filePaths.length === 0) {
+      CursorPatchService.agentInputDockStatusCache =
+        CursorPatchService.setCachedStatus(cacheKey, result)
+      return result
+    }
+
+    const details = filePaths.map((filePath) =>
+      getCursorAgentInputDockDetails(fs.readFileSync(filePath, "utf-8"))
+    )
+    result.applied = details.every((detail) => detail.applied)
+    result.partial =
+      !result.applied &&
+      details.some((detail) => detail.applied || detail.partial)
+    result.canApply = details.every((detail) => detail.canApply)
+    result.managedBaseline = filePaths.every((filePath) =>
+      this.baseline.hasOriginal(filePath)
+    )
+    result.legacyFiles = details.filter(
+      (detail) => detail.legacyMarkers.length > 0
+    ).length
+
+    CursorPatchService.agentInputDockStatusCache =
+      CursorPatchService.setCachedStatus(cacheKey, result)
+    return result
+  }
+
+  applyAgentInputDockPatch(): CursorPatchApplyResult {
+    this.invalidateStatusCache()
+
+    const filePaths = getCursorWorkbenchPaths()
+    if (filePaths.length === 0) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: ["Cursor workbench file not found"],
+      }
+    }
+
+    const plans = filePaths.map((filePath) => {
+      const content = fs.readFileSync(filePath, "utf-8")
+      return {
+        filePath,
+        content,
+        details: getCursorAgentInputDockDetails(content),
+      }
+    })
+    if (plans.every((plan) => plan.details.applied)) {
+      return this.finalizePatchApply({ applied: 0, forceChecksum: true })
+    }
+
+    const nextPlans: Array<{
+      filePath: string
+      content: string
+      nextContent: string
+    }> = []
+    for (const plan of plans) {
+      const nextContent = patchCursorAgentInputDockContent(plan.content)
+      if (nextContent === null) {
+        return {
+          success: false,
+          applied: 0,
+          checksumApplied: false,
+          checksumUpdated: 0,
+          errors: [
+            `Agent input dock cannot safely migrate the existing runtime: ${plan.filePath}`,
+          ],
+        }
+      }
+      nextPlans.push({ ...plan, nextContent })
+    }
+
+    const changedPlans = nextPlans.filter(
+      (plan) => plan.nextContent !== plan.content
+    )
+    if (changedPlans.length === 0) {
+      return this.finalizePatchApply({ applied: 0, forceChecksum: true })
+    }
+
+    const unmanagedPlans = changedPlans.filter(
+      (plan) => !this.baseline.hasOriginal(plan.filePath)
+    )
+    const baselineCandidates = unmanagedPlans.map((plan) => ({
+      filePath: plan.filePath,
+      cleanContent: removeCursorAgentInputDockPatchContent(plan.content),
+    }))
+    if (
+      baselineCandidates.length > 0 &&
+      baselineCandidates.every(
+        (candidate) =>
+          candidate.cleanContent !== null &&
+          !PATCH_MARKERS.some((marker) =>
+            candidate.cleanContent!.includes(marker)
+          )
+      )
+    ) {
+      for (const candidate of baselineCandidates) {
+        this.baseline.captureOriginalContent(
+          candidate.filePath,
+          candidate.cleanContent!
+        )
+      }
+    }
+    for (const plan of changedPlans) {
+      fs.writeFileSync(plan.filePath, plan.nextContent, "utf-8")
+    }
+    this.logger.info(
+      `Applied patch: Agent Input Dock (${changedPlans.length} workbench file(s))`
+    )
+    return this.finalizePatchApply({
+      applied: changedPlans.length,
+      restartRequired: true,
+    })
+  }
+
+  disableAgentInputDockPatch(): CursorPatchApplyResult {
+    this.invalidateStatusCache()
+
+    const filePaths = getCursorWorkbenchPaths()
+    if (filePaths.length === 0) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: ["Cursor workbench file not found"],
+      }
+    }
+
+    const activeFiles = filePaths
+      .map((filePath) => ({
+        filePath,
+        currentContent: fs.readFileSync(filePath, "utf-8"),
+      }))
+      .filter(({ currentContent }) =>
+        hasCursorAgentInputDockPatch(currentContent)
+      )
+    if (activeFiles.length === 0) {
+      return this.finalizePatchApply({ applied: 0 })
+    }
+
+    const nextFiles: Array<{ filePath: string; nextContent: string }> = []
+    for (const activeFile of activeFiles) {
+      const nextContent = removeCursorAgentInputDockPatchContent(
+        activeFile.currentContent
+      )
+      if (nextContent === null) {
+        return {
+          success: false,
+          applied: 0,
+          checksumApplied: false,
+          checksumUpdated: 0,
+          errors: [
+            `Agent input dock could not be disabled because its owned runtime boundary is incomplete: ${activeFile.filePath}`,
+          ],
+        }
+      }
+      nextFiles.push({ filePath: activeFile.filePath, nextContent })
+    }
+
+    for (const nextFile of nextFiles) {
+      fs.writeFileSync(nextFile.filePath, nextFile.nextContent, "utf-8")
+    }
+    this.logger.info(
+      `Disabled patch: Agent Input Dock (${nextFiles.length} workbench file(s))`
+    )
+    return this.finalizePatchApply({
+      applied: nextFiles.length,
+      restartRequired: true,
+    })
   }
 
   getIdleExtensionHostKillerStatus(
@@ -2024,6 +2341,152 @@ export class CursorPatchService {
     return this.finalizePatchApply({ applied: 1 })
   }
 
+  getTrafficCapturePatchStatus(
+    options: CursorPatchStatusOptions = {}
+  ): CursorTrafficCapturePatchStatus {
+    const filePath = getCursorWorkbenchPath()
+    let cacheKey = "traffic-capture:missing"
+    if (filePath && fs.existsSync(filePath)) {
+      const fileStat = fs.statSync(filePath)
+      cacheKey = `traffic-capture:${fileStat.size}:${fileStat.mtimeMs}`
+    }
+    const cached = CursorPatchService.getCachedStatus(
+      CursorPatchService.trafficCaptureStatusCache,
+      cacheKey,
+      options.force
+    )
+    if (cached) return cached
+
+    const result: CursorTrafficCapturePatchStatus = {
+      filePath,
+      fileExists: false,
+      applied: false,
+      partial: false,
+      canApply: false,
+      managedBaseline: false,
+      totalRules: CURSOR_TRAFFIC_CAPTURE_RULES.length,
+      appliedRules: 0,
+      availableRules: 0,
+      missingRules: [],
+    }
+    if (!filePath || !fs.existsSync(filePath)) {
+      CursorPatchService.trafficCaptureStatusCache =
+        CursorPatchService.setCachedStatus(cacheKey, result)
+      return result
+    }
+
+    result.fileExists = true
+    result.managedBaseline = this.baseline.hasOriginal(filePath)
+    const details = getCursorTrafficCaptureDetails(
+      fs.readFileSync(filePath, "utf-8")
+    )
+    result.applied = details.applied
+    result.partial = details.partial
+    result.canApply = details.canApply
+    result.appliedRules = details.appliedRuleNames.length
+    result.availableRules = details.availableRuleNames.length
+    result.missingRules = details.missingRuleNames
+
+    CursorPatchService.trafficCaptureStatusCache =
+      CursorPatchService.setCachedStatus(cacheKey, result)
+    return result
+  }
+
+  applyTrafficCapturePatch(): CursorPatchApplyResult {
+    this.invalidateStatusCache()
+
+    const filePath = getCursorWorkbenchPath()
+    if (!filePath || !fs.existsSync(filePath)) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: ["Cursor workbench file not found"],
+      }
+    }
+
+    const content = fs.readFileSync(filePath, "utf-8")
+    const details = getCursorTrafficCaptureDetails(content)
+    if (details.applied) {
+      return this.finalizePatchApply({ applied: 0, forceChecksum: true })
+    }
+    const nextContent = patchCursorTrafficCaptureContent(content)
+    if (nextContent === null) {
+      const detail = details.missingRuleNames.join(", ") || "unknown rules"
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: [`Traffic capture is unavailable for: ${detail}`],
+      }
+    }
+
+    this.baseline.ensureOriginals([filePath])
+    fs.writeFileSync(filePath, nextContent, "utf-8")
+    this.logger.info(
+      `Applied patch: Cursor Traffic Capture (${CURSOR_TRAFFIC_CAPTURE_RULES.length} hooks)`
+    )
+    return this.finalizePatchApply({ applied: 1 })
+  }
+
+  disableTrafficCapturePatch(): CursorPatchApplyResult {
+    this.invalidateStatusCache()
+
+    const filePath = getCursorWorkbenchPath()
+    if (!filePath || !fs.existsSync(filePath)) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: ["Cursor workbench file not found"],
+      }
+    }
+
+    const currentContent = fs.readFileSync(filePath, "utf-8")
+    const captureDetails = getCursorTrafficCaptureDetails(currentContent)
+    if (
+      !captureDetails.applied &&
+      captureDetails.appliedRuleNames.length === 0
+    ) {
+      return this.finalizePatchApply({ applied: 0 })
+    }
+
+    const original = this.baseline.readOriginal(filePath)
+    if (!original.content) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: [
+          `Cannot disable traffic capture without the managed Cursor baseline: ${original.error || "backup unavailable"}`,
+        ],
+      }
+    }
+    const nextContent = rebuildCursorWorkbenchWithoutTrafficCapture(
+      currentContent,
+      original.content
+    )
+    if (nextContent === null) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: [
+          "Traffic capture could not be disabled without changing active Cursor patches",
+        ],
+      }
+    }
+
+    fs.writeFileSync(filePath, nextContent, "utf-8")
+    this.logger.info("Disabled patch: Cursor Traffic Capture")
+    return this.finalizePatchApply({ applied: 1 })
+  }
+
   /** Get the current patch status of the Cursor installation */
   getStatus(options: CursorPatchStatusOptions = {}): PatchStatus {
     const cacheKey = "legacy"
@@ -2066,6 +2529,14 @@ export class CursorPatchService {
         applied: content.includes(BRIDGE_ENDPOINT_PATCH.marker),
       },
       {
+        name: PLAN_EDITOR_TAB_PATCH.name,
+        applied: isPlanEditorTabPatchApplied(content),
+      },
+      {
+        name: READ_TODOS_TRANSLATION_PATCH.name,
+        applied: isReadTodosTranslationPatchApplied(content),
+      },
+      {
         name: CURSOR_ENTITLEMENT_PATCH.name,
         applied: !entitlementDetails.fileExists || entitlementDetails.applied,
       },
@@ -2073,10 +2544,6 @@ export class CursorPatchService {
         name: IDLE_EXTENSION_HOST_KILLER_PATCH.name,
         applied: content.includes(IDLE_EXTENSION_HOST_KILLER_PATCH.marker),
       },
-      ...TRANSPORT_PATCHES.map((p) => ({
-        name: p.name,
-        applied: content.includes(p.marker),
-      })),
     ]
     result.allApplied = result.patches.every((p) => p.applied)
 
@@ -2139,17 +2606,22 @@ export class CursorPatchService {
       )
     }
 
-    for (const patch of TRANSPORT_PATCHES) {
-      if (content.includes(patch.marker)) {
-        continue // already applied
-      }
-      if (patch.find.test(content)) {
-        content = content.replace(patch.find, patch.replace)
-        applied++
-        this.logger.info(`Applied patch: ${patch.name}`)
-      } else {
-        errors.push(`Pattern not found: ${patch.name}`)
-      }
+    const planEditorPatchedContent = patchPlanEditorTabContent(content)
+    if (planEditorPatchedContent === null) {
+      errors.push(`Pattern not found: ${PLAN_EDITOR_TAB_PATCH.name}`)
+    } else if (planEditorPatchedContent !== content) {
+      content = planEditorPatchedContent
+      applied++
+      this.logger.info(`Applied patch: ${PLAN_EDITOR_TAB_PATCH.name}`)
+    }
+
+    const readTodosPatchedContent = patchReadTodosTranslationContent(content)
+    if (readTodosPatchedContent === null) {
+      errors.push(`Pattern not found: ${READ_TODOS_TRANSLATION_PATCH.name}`)
+    } else if (readTodosPatchedContent !== content) {
+      content = readTodosPatchedContent
+      applied++
+      this.logger.info(`Applied patch: ${READ_TODOS_TRANSLATION_PATCH.name}`)
     }
 
     if (content !== original) {

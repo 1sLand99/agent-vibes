@@ -10,7 +10,7 @@ import {
 } from "./context-attachment-builder.service"
 import { ContextProjectionService } from "./context-projection.service"
 import { ContextTelemetryService } from "./context-telemetry.service"
-import { CONTEXT_MICROCOMPACT_CLEARED_MARKER } from "./context-microcompact-marker"
+import { CONTEXT_MICROCOMPACT_CLEARED_MARKER } from "../shared/context-compaction"
 import {
   createCompactBoundaryRecord,
   createCompactSummaryRecord,

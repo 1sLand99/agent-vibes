@@ -2,7 +2,7 @@
  * CodexService — Core executor for Codex (OpenAI Responses API) reverse proxy.
  *
  * Handles:
- * - Claude → Codex request translation
+ * - Canonical Codex request execution
  * - HTTP POST to Codex upstream (SSE streaming)
  * - WebSocket transport (with automatic fallback to HTTP)
  * - Codex SSE → Claude SSE response translation
@@ -30,7 +30,6 @@ import type {
   ProviderAdapter,
   ProviderWarmupHint,
 } from "../shared/provider-adapter.interface"
-import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse } from "../../shared/anthropic"
 import {
   getAccountConfigPathCandidates,
@@ -53,7 +52,7 @@ import {
 } from "../shared/account-cooldown"
 import { BackendAccountStateStore } from "../shared/backend-account-state-store"
 import { PersistenceService } from "../../persistence"
-import type { CodexReplacementHistoryItem } from "../../context"
+import type { CodexReplacementHistoryItem } from "../../shared/provider-content"
 import {
   BackendPoolStatus,
   type CodexRateLimitAccountSummary,
@@ -172,6 +171,7 @@ import {
   shouldRetryCodexWebSocketBeforeHttpFallback,
   shouldRetryCodexSessionWebSocketError,
 } from "./codex-transport-error-policy"
+import { CodexStreamAttemptBuffer } from "./codex-stream-attempt-buffer"
 import {
   isCodexAuthRetryStatus,
   isCodexGatewayTransientStatus,
@@ -194,7 +194,6 @@ import {
   type PersistedCodexAccountRecord,
   upsertCodexPersistedAccountRecord,
 } from "./codex-account-records"
-import { createCodexExecutionRequestFromClaude } from "./codex-request-translator"
 import {
   createStreamState,
   translateCodexSseEvent,
@@ -220,13 +219,6 @@ const DEFAULT_CODEX_RATE_LIMIT_MODEL = "gpt-5.5"
 const DEFAULT_CODEX_WEBSOCKET_STREAM_MAX_RETRIES = 2
 const DEFAULT_CODEX_ALL_RATE_LIMIT_MAX_RETRIES = 3
 const DEFAULT_CODEX_ALL_RATE_LIMIT_MAX_WAIT_SECONDS = 120
-const CODEX_WEBSOCKET_UPSTREAM_EVENT_SEEN = Symbol(
-  "codexWebSocketUpstreamEventSeen"
-)
-
-type CodexWebSocketStreamError = Error & {
-  [CODEX_WEBSOCKET_UPSTREAM_EVENT_SEEN]?: true
-}
 
 function parseNonNegativeInteger(
   value: string | undefined,
@@ -2313,16 +2305,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
   }
 
-  async sendClaudeMessage(
-    dto: CreateMessageDto,
-    forwardHeaders?: CodexForwardHeaders
-  ): Promise<AnthropicResponse> {
-    return this.sendMessage(
-      createCodexExecutionRequestFromClaude(dto),
-      forwardHeaders
-    )
-  }
-
   async compactConversationHistory(
     request: CodexExecutionRequest,
     forwardHeaders?: CodexForwardHeaders
@@ -3700,18 +3682,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     }
   }
 
-  async *sendClaudeMessageStream(
-    dto: CreateMessageDto,
-    forwardHeadersOrAbortSignal?: CodexForwardHeaders | AbortSignal,
-    abortSignal?: AbortSignal
-  ): AsyncGenerator<string, void, unknown> {
-    yield* this.sendMessageStream(
-      createCodexExecutionRequestFromClaude(dto),
-      forwardHeadersOrAbortSignal,
-      abortSignal
-    )
-  }
-
   async prewarmSessionConnection(
     request: Pick<
       CodexExecutionRequest,
@@ -4092,6 +4062,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         !this.isHttpFallbackTransport(conversationId, slot, modelName)
       ) {
         while (true) {
+          const attemptBuffer = new CodexStreamAttemptBuffer()
           try {
             for await (const event of this.streamViaWebSocket(
               slot,
@@ -4104,8 +4075,14 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
               forwardHeaders,
               abortSignal
             )) {
+              for (const readyEvent of attemptBuffer.push(event)) {
+                emittedEvents = true
+                yield readyEvent
+              }
+            }
+            for (const readyEvent of attemptBuffer.finish()) {
               emittedEvents = true
-              yield event
+              yield readyEvent
             }
             markAccountSuccess(slot, modelName)
             return
@@ -4119,22 +4096,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
               throw abortedError
             }
 
-            const receivedUpstreamEvent =
-              e instanceof Error &&
-              (e as CodexWebSocketStreamError)[
-                CODEX_WEBSOCKET_UPSTREAM_EVENT_SEEN
-              ] === true
-            if (receivedUpstreamEvent) {
-              this.logger.warn(
-                `[Codex] WebSocket stream failed after an upstream event; refusing to replay request: ` +
-                  `${e.message}`
-              )
-              throw e
-            }
-
             if (
               shouldRetryCodexWebSocketBeforeHttpFallback(e, {
-                emittedEvents,
+                emittedEvents:
+                  emittedEvents || attemptBuffer.hasCommittedOutput(),
                 retryCount: websocketRetryCount,
                 maxRetries: this.websocketStreamMaxRetries,
               })
@@ -4147,7 +4112,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
                 `WebSocket stream retry ${websocketRetryCount}/${this.websocketStreamMaxRetries}`
               )
               this.logger.warn(
-                `[Codex] WebSocket streaming unavailable before first event, retrying ` +
+                `[Codex] WebSocket stream ended before downstream output, retrying ` +
                   `(${websocketRetryCount}/${this.websocketStreamMaxRetries}): ` +
                   `${e instanceof Error ? e.message : String(e)}`
               )
@@ -4915,15 +4880,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         )
         return
       } catch (error) {
-        if (
-          error instanceof Error &&
-          (error as CodexWebSocketStreamError)[
-            CODEX_WEBSOCKET_UPSTREAM_EVENT_SEEN
-          ] === true
-        ) {
-          throw error
-        }
-
         // Handle "Previous response with id ... not found" — the server evicted
         // the response from its cache. Clear turn context and retry with the full
         // input (no previous_response_id). This commonly happens when parallel
@@ -4985,94 +4941,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           return
         }
 
-        if (!shouldRetryCodexSessionWebSocketError(error)) {
-          throw error
-        }
-
-        this.logger.warn(
-          `[Codex] Reconnecting stale WebSocket session ${sessionId} before streamed retry`
-        )
-        this.wsService.invalidateSessionConnection(
-          sessionId,
-          ws,
-          "stream_retry_reconnect"
-        )
-        this.applyCodexTurnStateHeader(wsHeaders, turnContext)
-        ws = await this.wsService.ensureSessionConnection(
-          sessionId,
-          wsUrl,
-          wsHeaders,
-          slot.proxyUrl || undefined
-        )
-        this.captureCodexTurnStateFromConnection(turnContext, ws)
-        try {
-          yield* this.streamViaWebSocketConnection(
-            ws,
-            slot,
-            modelName,
-            reverseToolMap,
-            cacheId,
-            codexRequest,
-            requestStartedAt,
-            sessionId,
-            abortSignal,
-            conversationId,
-            forwardHeaders,
-            turnContext
-          )
-        } catch (retryError) {
-          if (
-            shouldReplayCodexRequestWithoutPreviousResponseId(retryError, {
-              conversationId,
-              currentRequest: codexRequest,
-              originalRequest: originalCodexRequest,
-            })
-          ) {
-            this.logger.warn(
-              `[Codex] Previous response_id rejected by server for ${conversationId} after WebSocket retry, ` +
-                `retrying without previous_response_id (full input)`
-            )
-            this.beginFullCodexResponseChain(
-              turnContext,
-              conversationId,
-              originalCodexRequest,
-              "Server rejected stale previous_response_id after WebSocket retry"
-            )
-            codexRequest = originalCodexRequest
-            const wsStillUsable = ws.readyState === WebSocket.OPEN
-            if (!wsStillUsable) {
-              this.wsService.invalidateSessionConnection(
-                sessionId,
-                ws,
-                "previous_response_rejected_after_retry"
-              )
-              this.applyCodexTurnStateHeader(wsHeaders, turnContext)
-              ws = await this.wsService.ensureSessionConnection(
-                sessionId,
-                wsUrl,
-                wsHeaders,
-                slot.proxyUrl || undefined
-              )
-              this.captureCodexTurnStateFromConnection(turnContext, ws)
-            }
-            yield* this.streamViaWebSocketConnection(
-              ws,
-              slot,
-              modelName,
-              reverseToolMap,
-              cacheId,
-              codexRequest,
-              Date.now(),
-              sessionId,
-              abortSignal,
-              conversationId,
-              forwardHeaders,
-              turnContext
-            )
-            return
-          }
-          throw retryError
-        }
+        // Transport retries are owned by executeStreamWithCooldownRetry so the
+        // retry budget, continuation reset, and HTTPS fallback are applied once
+        // at the request level.
+        throw error
       }
     } finally {
       release()
@@ -5227,13 +5099,6 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             : "Codex WebSocket stream aborted"
         )
       }
-    } catch (error) {
-      if (firstUpstreamMs !== undefined && error instanceof Error) {
-        ;(error as CodexWebSocketStreamError)[
-          CODEX_WEBSOCKET_UPSTREAM_EVENT_SEEN
-        ] = true
-      }
-      throw error
     } finally {
       if (abortSignal && abortListenerAttached) {
         abortSignal.removeEventListener("abort", onAbort)

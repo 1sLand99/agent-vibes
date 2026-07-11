@@ -365,7 +365,11 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   CLIENT_SIDE_TOOL_V2_CREATE_PLAN: {
     name: "create_plan",
     description:
-      "Create an implementation plan for a task. Maps to Cursor's " +
+      "Create a persisted implementation-plan document in Cursor. " +
+      "Use this only when the user explicitly asks to create or open " +
+      "a plan document; do not call it by default for ordinary task " +
+      "tracking, internal planning, or TODO status updates because it " +
+      "opens a dedicated plan view in the IDE. Maps to Cursor's " +
       "`agent.v1.CreatePlanArgs` proto message. The plan can be a " +
       "simple linear list (use `steps`) or a richer document with a " +
       "narrative body (`plan`), an `overview`, scoped `todos`, and " +

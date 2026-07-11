@@ -48,7 +48,7 @@ import type {
   LooseMessageContent,
   UnifiedMessage,
 } from "../../context/types"
-import { CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE } from "../../context/types"
+import { CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE } from "../../shared/provider-content"
 import type { SessionMessage } from "../../protocol/cursor/session/session-lifecycle.service"
 
 /** Backends that may need thinking handling on the wire. */

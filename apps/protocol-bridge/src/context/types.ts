@@ -5,6 +5,18 @@
  * supporting both content-block tool calls and function-call style fields.
  */
 
+import {
+  CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
+  type CodexRawResponseItemBlock,
+  type CodexReplacementHistoryItem,
+} from "../shared/provider-content"
+
+export {
+  CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
+  type CodexRawResponseItemBlock,
+  type CodexReplacementHistoryItem,
+}
+
 /**
  * Text content block
  */
@@ -395,8 +407,6 @@ export interface CodexReferenceContextItem {
   updatedAt: number
 }
 
-export type CodexReplacementHistoryItem = Record<string, unknown>
-
 export interface CodexMetaMessageLedgerEntry {
   key: string
   signature: string
@@ -435,14 +445,6 @@ export interface CodexAppendOnlyAttachmentLedgerState {
   latestSignaturesByKind: Partial<
     Record<ContextProjectionAttachment["kind"], string>
   >
-}
-
-export const CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE = "codex_response_item"
-
-export interface CodexRawResponseItemBlock {
-  type: typeof CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE
-  item: CodexReplacementHistoryItem
-  [key: string]: unknown
 }
 
 export interface CodexReplacementHistory {

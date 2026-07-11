@@ -1,7 +1,6 @@
-import { CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE } from "../../context"
 import { codexResponseOutputItemToInputItem } from "./codex-response-items"
 import { sanitizeResponsesToolCallIntegrity } from "../shared/openai-tool-call-integrity"
-import { appendLanguageDirectiveToText } from "../shared/language-directive"
+import { CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE } from "../../shared/provider-content"
 import {
   type CodexConversationTool,
   type CodexExecutionRequest,
@@ -101,21 +100,9 @@ export function projectCodexNativeRequest(
 }
 
 export function buildCodexInstructions(
-  request: Pick<
-    CodexExecutionRequest,
-    "system" | "contextMessages" | "messages" | "clientIsClaudeCode"
-  >
+  request: Pick<CodexExecutionRequest, "system">
 ): string {
-  return appendLanguageDirectiveToText(
-    serializeCodexInstructions(request.system),
-    request.messages,
-    {
-      skip:
-        request.clientIsClaudeCode === true ||
-        (request.contextMessages?.length || 0) > 0 ||
-        request.messages.some((message) => message.role === "developer"),
-    }
-  )
+  return serializeCodexInstructions(request.system)
 }
 
 export function projectCodexInputItems(

@@ -63,6 +63,10 @@ export function shouldFallbackToHttpAfterCodexWebSocketError(
     return error.shouldFallbackToHttp()
   }
 
+  if (shouldRetryCodexSessionWebSocketError(error)) {
+    return true
+  }
+
   const message = getErrorMessage(error)
   return (
     message.includes("handshake timeout") ||

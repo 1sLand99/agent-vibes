@@ -236,6 +236,7 @@ import {
   resolveCursorToolDefinitionKey,
   type ToolDefinition,
 } from "./tools/cursor-tool-mapper"
+import { projectCodexUpdatePlanToCursorTodos } from "./tools/cursor-todo-plan-protocol"
 import {
   type DiscoverToolCatalogEntry,
   formatDiscoverToolResultText,
@@ -460,7 +461,6 @@ type DeferredToolFamily =
   | "command_status"
   | "read_todos"
   | "update_todos"
-  | "update_plan"
   | "get_mcp_tools"
   | "list_mcp_resource_templates"
   | "read_url_content"
@@ -558,8 +558,7 @@ const STREAMING_PRECOMPUTE_SAFE_DEFERRED_FAMILIES: ReadonlySet<DeferredToolFamil
     // in the Cursor `agent.v1` deferred catalog. Streaming precompute is a
     // Cursor-protocol-side optimisation; listing these here was a residue
     // from an aborted "register them as cursor deferred tools" experiment
-    // that would have violated the cursor surface contract (cf.
-    // tests/cursor_protocol_full_regression_prompt.md L11-L15). The inline
+    // that would have violated the Cursor surface contract. The inline
     // implementations below (executeInlineReadUrlContent /
     // executeInlineViewContentChunk) remain because they still serve the
     // Antigravity backend's tool-call dispatch.
@@ -15060,8 +15059,16 @@ ${raw}
       }
     }
 
+    if (normalized === "update_plan") {
+      return {
+        toolName: "update_todos",
+        input: projectCodexUpdatePlanToCursorTodos(input),
+        historyToolName: "update_plan",
+        historyToolInput: input,
+      }
+    }
+
     if (
-      normalized === "update_plan" ||
       normalized === "request_user_input" ||
       normalized === "view_image" ||
       normalized === "spawn_agent" ||
@@ -15829,9 +15836,6 @@ ${raw}
 
     if (snake.includes("command_status") || compact.includes("commandstatus")) {
       return "command_status"
-    }
-    if (snake === "update_plan" || compact === "updateplan") {
-      return "update_plan"
     }
     if (snake === "request_user_input" || compact === "requestuserinput") {
       return "request_user_input"
@@ -16827,91 +16831,6 @@ ${raw}
       updatedAt: String(todo.updatedAt),
       dependencies: todo.dependencies,
     }
-  }
-
-  private serializeTodoItemForCreatePlan(
-    todo: SessionTodoItem
-  ): Record<string, unknown> {
-    return {
-      id: todo.id,
-      content: todo.content,
-      status: this.todoStatusToProtocolEnum(todo.status),
-      createdAt: BigInt(todo.createdAt),
-      updatedAt: BigInt(todo.updatedAt),
-      dependencies: todo.dependencies,
-    }
-  }
-
-  /**
-   * Convert session todos into the format expected by CreatePlanRequestQuery.args.todos.
-   */
-  private sessionTodosToCreatePlanTodos(
-    conversationId: string
-  ): Array<Record<string, unknown>> {
-    const session = this.sessionManager.getSession(conversationId)
-    if (
-      !session ||
-      this.contextState.getContextRecord(session.conversationId)!.todos
-        .length === 0
-    )
-      return []
-    return this.contextState
-      .getContextRecord(session.conversationId)!
-      .todos.map((todo) => this.serializeTodoItemForCreatePlan(todo))
-  }
-
-  /**
-   * Parse phases from LLM tool input for CreatePlanRequestQuery.
-   */
-  private parsePhasesFromInput(
-    input: Record<string, unknown>
-  ): Array<{ name: string; todos: Array<Record<string, unknown>> }> {
-    const rawPhases = input.phases
-    if (!Array.isArray(rawPhases)) return []
-    const nowTs = Date.now()
-    return rawPhases
-      .filter(
-        (entry): entry is Record<string, unknown> =>
-          !!entry && typeof entry === "object"
-      )
-      .map((phase) => ({
-        name:
-          typeof phase.name === "string"
-            ? phase.name.trim()
-            : typeof phase.title === "string"
-              ? phase.title.trim()
-              : "",
-        todos: Array.isArray(phase.todos)
-          ? phase.todos
-              .filter(
-                (t): t is Record<string, unknown> =>
-                  !!t && typeof t === "object"
-              )
-              .map((t, index) => {
-                const createdAtRaw =
-                  this.pickFirstNumber(t, ["createdAt", "created_at"]) ?? nowTs
-                const updatedAtRaw =
-                  this.pickFirstNumber(t, ["updatedAt", "updated_at"]) ?? nowTs
-                return {
-                  id:
-                    this.pickFirstString(t, ["id", "todo_id", "todoId"]) ||
-                    `phase_todo_${nowTs}_${index}`,
-                  content:
-                    this.pickFirstString(t, ["content", "text", "title"]) || "",
-                  status: this.todoStatusToProtocolEnum(
-                    this.normalizeTodoStatus(t.status)
-                  ),
-                  createdAt: BigInt(Math.floor(createdAtRaw)),
-                  updatedAt: BigInt(Math.floor(updatedAtRaw)),
-                  dependencies: Array.isArray(t.dependencies)
-                    ? t.dependencies.filter(
-                        (d): d is string => typeof d === "string"
-                      )
-                    : [],
-                }
-              })
-          : [],
-      }))
   }
 
   private parseTodoItemsForSession(
@@ -18771,74 +18690,6 @@ ${raw}
     }
   }
 
-  /**
-   * After an inline todo_write, emit a createPlanRequestQuery so that
-   * Cursor IDE renders the TODO panel.  This bridges the gap between
-   * agent-vibes' inline execution model and Cursor's expectation that
-   * update_todos is a client-side tool whose UI side-effects happen
-   * locally.
-   */
-  // eslint-disable-next-line @typescript-eslint/require-await
-  private async emitCreatePlanQueryForTodoWrite(
-    conversationId: string,
-    toolCallId: string,
-    input: Record<string, unknown>
-  ): Promise<void> {
-    const todos = this.sessionTodosToCreatePlanTodos(conversationId)
-    if (!todos || todos.length === 0) {
-      return
-    }
-
-    // Keep the plan body brief and non-duplicative. The actual checklist
-    // belongs in `todos`, which Cursor renders in the lower section.
-    const plan =
-      this.pickFirstString(input, ["plan", "overview", "description"]) ||
-      this.pickFirstString(input, ["title", "name"]) ||
-      "Task Plan"
-
-    const { id: interactionQueryId } =
-      this.sessionStream.registerInteractionQuery(
-        conversationId,
-        "deferred_tool",
-        {
-          kind: "todo_ui_ack",
-          originToolCallId: toolCallId,
-        },
-        {
-          turnId: this.getCurrentParentTurnId(conversationId),
-          kind: "todo_ui_ack",
-          deadline: Date.now() + 30_000,
-          streamId: this.sessionStream.getCurrentStreamId(conversationId),
-          blocksTurn: false,
-        }
-      )
-
-    this.logger.debug(
-      `Emitting createPlanRequestQuery after todo_write (${todos.length} todos, queryId=${interactionQueryId})`
-    )
-
-    this.emit(
-      conversationId,
-      this.grpcService.createInteractionQueryResponse(
-        interactionQueryId,
-        "createPlanRequestQuery",
-        {
-          args: {
-            plan,
-            todos,
-            overview: "",
-            name:
-              this.pickFirstString(input, ["title", "name", "plan"]) ||
-              "Task Plan",
-            isProject: false,
-            phases: this.parsePhasesFromInput(input),
-          },
-          toolCallId,
-        }
-      )
-    )
-  }
-
   // ────────────────────────────────────────────────────────────────────
   // SUB-AGENT (task) – event-driven state machine
   // ────────────────────────────────────────────────────────────────────
@@ -19684,6 +19535,15 @@ ${raw}
         } catch {
           parsedInput = { _raw: tc.inputJson }
         }
+        const normalizedSubAgentToolName = tc.name.trim().toLowerCase()
+        const protocolToolName =
+          normalizedSubAgentToolName === "update_plan"
+            ? "update_todos"
+            : tc.name
+        const protocolToolInput =
+          normalizedSubAgentToolName === "update_plan"
+            ? projectCodexUpdatePlanToCursorTodos(parsedInput)
+            : parsedInput
 
         // Beat between tools so individual long deferred tools
         // (web_fetch / deep_search / read_semsearch_files / fetch) cannot
@@ -19700,7 +19560,7 @@ ${raw}
         // `cursor-ide-browser-browser_navigate`, ...) still get the
         // "mcp" hint instead of falling through to truncatedToolCall.
         const innerToolFamilyHint = this.classifyExecToolFamilyHint(
-          tc.name,
+          protocolToolName,
           session
         )
 
@@ -19727,8 +19587,8 @@ ${raw}
           yieldSubAgentUpdate(
             this.grpcService.buildInnerToolCallStartedInteractionUpdate(
               tc.id,
-              tc.name,
-              parsedInput,
+              protocolToolName,
+              protocolToolInput,
               innerToolFamilyHint,
               ctx.subagentId
             )
@@ -19749,14 +19609,16 @@ ${raw}
         //   4. Hard error — tool is in neither category. Tell the model
         //      what is available so it stops looping on a non-existent
         //      tool.
-        const family = this.classifyDeferredToolFamily(tc.name)
+        const family = this.classifyDeferredToolFamily(protocolToolName)
         const isExecDispatchable =
-          !family && this.grpcService.isExecDispatchableTool(tc.name)
+          !family && this.grpcService.isExecDispatchableTool(protocolToolName)
         let toolResultContent: string
         let toolResultStatus: "success" | "error" = "success"
         let toolCompletedExtraData: ToolCompletedExtraData | undefined
-        let toolInputForProjection: Record<string, unknown> = parsedInput
-        const bridgeInlineStartedAt = this.isSubAgentBridgeInlineTool(tc.name)
+        let toolInputForProjection: Record<string, unknown> = protocolToolInput
+        const bridgeInlineStartedAt = this.isSubAgentBridgeInlineTool(
+          protocolToolName
+        )
           ? Date.now()
           : 0
         if (bridgeInlineStartedAt > 0) {
@@ -19766,8 +19628,8 @@ ${raw}
         }
         const bridgeInlineResult = await this.executeSubAgentBridgeInlineTool(
           conversationId,
-          tc.name,
-          parsedInput,
+          protocolToolName,
+          protocolToolInput,
           ctx.allowedWorkspaceRoots
         )
         if (bridgeInlineResult) {
@@ -19974,8 +19836,8 @@ ${raw}
             const result = await this.executeDeferredTool(
               conversationId,
               family,
-              tc.name,
-              parsedInput
+              protocolToolName,
+              protocolToolInput
             )
             toolResultContent = result.content
             if (result.state?.status === "error") {
@@ -20062,7 +19924,7 @@ ${raw}
           yieldSubAgentUpdate(
             this.grpcService.buildInnerToolCallCompletedInteractionUpdate(
               tc.id,
-              tc.name,
+              protocolToolName,
               toolInputForProjection,
               toolResultContent,
               innerToolFamilyHint,
@@ -20072,14 +19934,6 @@ ${raw}
           )
         )
 
-        if (family === "update_todos" || family === "update_plan") {
-          await this.emitCreatePlanQueryForTodoWrite(
-            conversationId,
-            parentToolCallId,
-            parsedInput
-          )
-        }
-
         // ConversationStep accumulation: push a toolCall step so the
         // parent task bubble's detail panel renders the per-tool
         // breakdown (which tools the sub-agent used + their results).
@@ -20087,7 +19941,7 @@ ${raw}
         // matching proto oneof case.
         ctx.conversationSteps.push(
           this.grpcService.buildToolCallConversationStep(
-            tc.name,
+            protocolToolName,
             tc.id,
             toolInputForProjection,
             toolResultContent,
@@ -24407,70 +24261,6 @@ ${raw}
     }
   }
 
-  private executeInlineUpdatePlan(
-    conversationId: string,
-    input: Record<string, unknown>
-  ): {
-    content: string
-    state: { status: ToolResultStatus; message?: string }
-  } {
-    const rawPlan = Array.isArray(input.plan) ? input.plan : []
-    const nowTs = Date.now()
-    const todos = rawPlan.flatMap((entry, index) => {
-      if (!entry || typeof entry !== "object") return []
-      const item = entry as Record<string, unknown>
-      const step =
-        this.pickFirstString(item, ["step", "content", "title", "name"]) || ""
-      if (!step) return []
-      return [
-        {
-          id:
-            this.pickFirstString(item, ["id", "todo_id", "todoId"]) ||
-            `plan_${index + 1}`,
-          content: step,
-          status: this.normalizeTodoStatus(item.status),
-          createdAt: nowTs,
-          updatedAt: nowTs,
-          dependencies: this.pickStringArray(item, [
-            "dependencies",
-            "depends_on",
-            "dependsOn",
-          ]),
-        },
-      ]
-    })
-
-    if (todos.length === 0) {
-      return {
-        content: "[update_plan error] Missing required plan items",
-        state: { status: "error", message: "missing plan items" },
-      }
-    }
-
-    const todoWriteInput: Record<string, unknown> = {
-      merge: false,
-      todos,
-    }
-    const todoWriteResult = this.executeInlineTodoWrite(
-      conversationId,
-      todoWriteInput
-    )
-    input.explanation = this.pickFirstString(input, ["explanation"]) || ""
-    input.todos = todoWriteInput.todos
-    input.updated_todos = todoWriteInput.updated_todos
-    input.updatedTodos = todoWriteInput.updatedTodos
-    input.total_count = todoWriteInput.total_count
-    input.totalCount = todoWriteInput.totalCount
-
-    return {
-      content:
-        todoWriteResult.state.status === "success"
-          ? "Plan updated"
-          : todoWriteResult.content,
-      state: todoWriteResult.state,
-    }
-  }
-
   private executeInlineListMcpResourceTemplates(
     input: Record<string, unknown>
   ): {
@@ -25698,11 +25488,6 @@ ${raw}
     if (family === "update_todos") {
       return Promise.resolve(this.executeInlineTodoWrite(conversationId, input))
     }
-    if (family === "update_plan") {
-      return Promise.resolve(
-        this.executeInlineUpdatePlan(conversationId, input)
-      )
-    }
     if (family === "web_search" || family === "web_fetch") {
       return this.executeInlineWebTool(conversationId, toolName, input, options)
     }
@@ -26157,10 +25942,6 @@ ${raw}
     rawResponse: unknown
   ): Promise<boolean> {
     if (!payload) return false
-    if (payload.kind === "todo_ui_ack") {
-      this.logger.debug("Received todo UI acknowledgement")
-      return true
-    }
     if (
       payload.kind !== "inline_web_tool" &&
       payload.kind !== "deferred_tool"
@@ -26517,54 +26298,23 @@ ${raw}
 
     if (family === "create_plan") {
       const title = this.pickFirstString(input, ["title", "name"]) || ""
-
-      // LLM tool definition sends `steps: string[]`, map to plan text and todos
-      const rawSteps = Array.isArray(input.steps) ? input.steps : []
-      const stepsStrings = rawSteps
-        .map((s: unknown) => (typeof s === "string" ? s.trim() : ""))
-        .filter((s: string) => s.length > 0)
-
-      // Build plan text: prefer explicit narrative fields only.
-      // Do not mirror steps/todos into `plan`, otherwise Cursor's plan page
-      // shows the same content twice: once in the plan body and again in todos.
-      let plan =
+      const plan =
         this.pickFirstString(input, ["plan", "overview"]) ||
         this.pickFirstString(input, ["description"]) ||
-        ""
-      if (!plan) {
-        plan = title || "Plan"
-      }
-
-      // Build todos: prefer session todos, then convert steps strings
-      let todos = this.sessionTodosToCreatePlanTodos(conversationId)
-      if (
-        (!todos || (Array.isArray(todos) && todos.length === 0)) &&
-        stepsStrings.length > 0
-      ) {
-        const nowTs = Date.now()
-        todos = stepsStrings.map((content: string, index: number) => ({
-          id: `step_${nowTs}_${index}`,
-          content,
-          status: 1, // TODO_STATUS_PENDING
-          createdAt: BigInt(nowTs),
-          updatedAt: BigInt(nowTs),
-          dependencies: [],
-        }))
-      }
+        title ||
+        "Plan"
 
       return this.grpcService.createInteractionQueryResponse(
         interactionQueryId,
         "createPlanRequestQuery",
         {
           args: {
+            ...input,
             plan,
-            todos,
-            overview: this.pickFirstString(input, ["overview"]) || "",
             name: title,
             isProject:
               this.pickFirstBoolean(input, ["isProject", "is_project"]) ||
               false,
-            phases: this.parsePhasesFromInput(input),
           },
           toolCallId,
         }
@@ -27227,17 +26977,6 @@ ${raw}
       }
     }
 
-    if (family === "update_plan") {
-      const planItems = Array.isArray(input.plan) ? input.plan : []
-      if (planItems.length === 0) {
-        await emitDeferredInlineToolResult(
-          "[update_plan error] Missing required plan items",
-          { status: "error", message: "missing plan items" }
-        )
-        return true
-      }
-    }
-
     if (family === "request_user_input") {
       const questions = Array.isArray(input.questions) ? input.questions : []
       if (questions.length === 0) {
@@ -27387,14 +27126,6 @@ ${raw}
         result.extraData,
         result.historyContent
       )
-
-      if (family === "update_todos" || family === "update_plan") {
-        await this.emitCreatePlanQueryForTodoWrite(
-          conversationId,
-          toolCallId,
-          input
-        )
-      }
 
       return true
     }
@@ -27553,24 +27284,17 @@ ${raw}
     // ToolCallDeltaUpdate(taskToolCallDelta) — that's a separate channel
     // anchored to the same callId.
     //
-    // `read_todos` was historically here too, but as of Cursor v3.x the
-    // IDE's `convertToolCallToBubbleData` switch (workbench.desktop.main.js,
-    // function `zms`) explicitly throws "Unsupported tool type for bubble
-    // translation: readTodosToolCall" — even though the proto oneof case is
-    // defined and the inner ToolFormer enum (`xn.TODO_READ = 34`) plus its
-    // "Reading todos" / "Read todos" status strings exist. The IDE simply
-    // forgot to wire the readTodosToolCall envelope into the bubble
-    // translator, falling back to the literal `[Tool: readTodosToolCall]`
-    // textDelta. Until Cursor ships the missing case, we suppress the
-    // lifecycle envelope on bridge side and let read_todos run inline so
-    // the assistant text stream stays clean. The model still receives the
-    // tool result through the normal inline_tool_result path.
+    // Cursor 3.11+ renders `readTodosToolCall` as a native "Read Todos"
+    // bubble. Keep it on the same typed lifecycle path as update_todos so
+    // started/completed frames expose the protocol-defined filters and
+    // result todo set instead of silently executing only in model history.
     //
     // `generate_image` also needs both channels. The InteractionQuery only
     // carries the approval response; the actual image preview is rendered from
     // the GenerateImageToolCall result emitted in toolCallCompleted.
     const UI_CARD_TOOL_FAMILIES: ReadonlySet<DeferredToolFamily> =
       new Set<DeferredToolFamily>([
+        "read_todos",
         "update_todos",
         "create_plan",
         "task",
@@ -29240,41 +28964,6 @@ ${raw}
         preparedTool.protocolToolInput
       )
     ) {
-      // UI-card sidecar label
-      // ────────────────────
-      // The Cursor IDE renders most ToolCall.tool oneof cases as their own
-      // UI card by looking up a per-case display template. The four
-      // "UI-card" families below were added more recently to the agent.v1
-      // proto, and older IDE builds (and some renderer paths even on
-      // current builds — e.g. nested sub-agent bubbles, history replay)
-      // do not yet ship a template for them. When that lookup misses,
-      // the IDE falls back to a raw label like `[Tool: readTodosToolCall]`
-      // sitting flush against the previous text block, with no human
-      // context attached.
-      //
-      // The protocol-conformant fix would live on the IDE side. From the
-      // bridge we cannot change the renderer, but we *can* prepend a one-
-      // line human-readable announcement via a `textDelta` so the user at
-      // least sees `Reading todos...` / `Updating todos...` / `Creating
-      // plan...` / `Running sub-agent task: <type>` next to the raw
-      // label. On builds that *do* render the card, this text shows up
-      // as a brief lead-in and is harmless.
-      //
-      // Intentionally limited to this whitelist — every other ToolCall
-      // case already gets a proper card rendering, and adding a sidecar
-      // label there would just add visual noise.
-      const sidecarLabel = this.resolveUiCardSidecarLabel(
-        preparedTool.protocolToolName,
-        preparedTool.deferredToolFamily,
-        preparedTool.protocolToolInput
-      )
-      if (sidecarLabel) {
-        this.emit(
-          conversationId,
-          this.grpcService.createAgentTextResponse(`${sidecarLabel}\n`)
-        )
-      }
-
       this.emit(
         conversationId,
         this.grpcService.createToolCallStartedResponse(
@@ -29289,98 +28978,6 @@ ${raw}
         conversationId,
         activeToolCall.id
       )
-    }
-  }
-
-  /**
-   * Resolves a single-line human-readable sidecar label for the four
-   * "UI-card" tool families (`read_todos` / `update_todos` / `create_plan`
-   * / `task`) whose dedicated ToolCall oneof cases the Cursor IDE may not
-   * have a renderer template for, causing the bubble to fall back to a
-   * raw `[Tool: <case>]` label. Returns `undefined` for tools that already
-   * have a proper card renderer or that we should not annotate.
-   *
-   * Kept on the connect-stream service (not the grpc service) because the
-   * decision depends on the prepared tool input, which is a connect-stream
-   * concept and not part of the lower grpc envelope builders.
-   */
-  private resolveUiCardSidecarLabel(
-    toolName: string,
-    deferredFamily: DeferredToolFamily | undefined,
-    input: Record<string, unknown>
-  ): string | undefined {
-    const family =
-      deferredFamily || this.normalizeDeferredToolFamily(toolName) || toolName
-    switch (family) {
-      case "read_todos": {
-        const statusFilter = Array.isArray(input.status_filter)
-          ? input.status_filter
-          : Array.isArray(input.statusFilter)
-            ? input.statusFilter
-            : []
-        const idFilter = Array.isArray(input.id_filter)
-          ? input.id_filter
-          : Array.isArray(input.idFilter)
-            ? input.idFilter
-            : []
-        const filterParts: string[] = []
-        if (statusFilter.length > 0) {
-          filterParts.push(`status=${statusFilter.join("|")}`)
-        }
-        if (idFilter.length > 0) {
-          const ids = idFilter
-            .map((value: unknown) => String(value))
-            .filter((value: string) => value.length > 0)
-          if (ids.length > 0) {
-            filterParts.push(
-              `ids=${ids.length > 4 ? `${ids.slice(0, 4).join(",")}…` : ids.join(",")}`
-            )
-          }
-        }
-        return filterParts.length > 0
-          ? `Reading todos (${filterParts.join(", ")})`
-          : "Reading todos"
-      }
-      case "update_todos": {
-        const merge =
-          input.merge === true ||
-          input.merge === "true" ||
-          input.merge === 1 ||
-          input.merge === "1"
-        const todos = Array.isArray(input.todos) ? input.todos : []
-        const count = todos.length
-        return merge
-          ? `Updating todos (merge=true, ${count} item${count === 1 ? "" : "s"})`
-          : `Updating todos (replace, ${count} item${count === 1 ? "" : "s"})`
-      }
-      case "create_plan": {
-        const title =
-          (typeof input.title === "string" && input.title.trim()) ||
-          (typeof input.name === "string" && input.name.trim()) ||
-          ""
-        return title
-          ? `Creating plan: ${title.length > 80 ? `${title.slice(0, 80)}…` : title}`
-          : "Creating plan"
-      }
-      case "task": {
-        const subagentType =
-          (typeof input.subagent_type === "string" && input.subagent_type) ||
-          (typeof input.subagentType === "string" && input.subagentType) ||
-          "general-purpose"
-        const description =
-          (typeof input.description === "string" && input.description.trim()) ||
-          ""
-        const runInBackground =
-          input.run_in_background === true || input.runInBackground === true
-        const prefix = runInBackground
-          ? `Spawning background sub-agent (${subagentType})`
-          : `Running sub-agent (${subagentType})`
-        return description
-          ? `${prefix}: ${description.length > 80 ? `${description.slice(0, 80)}…` : description}`
-          : prefix
-      }
-      default:
-        return undefined
     }
   }
 

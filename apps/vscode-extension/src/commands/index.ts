@@ -341,6 +341,175 @@ export function registerCommands(
   )
 
   context.subscriptions.push(
+    vscode.commands.registerCommand(
+      CMD.ENABLE_AGENT_INPUT_DOCK_PATCH,
+      async () => {
+        const result = cursorPatch.applyAgentInputDockPatch()
+        if (!result.success) {
+          const detail = result.errors.join("; ") || t("checksums.unknownError")
+          void vscode.window.showErrorMessage(
+            tFmt("patches.agentInputDockFailed", { detail })
+          )
+          return
+        }
+
+        await vscode.workspace
+          .getConfiguration("agentVibes")
+          .update(
+            "agentInputDockEnabled",
+            true,
+            vscode.ConfigurationTarget.Global
+          )
+
+        let message =
+          result.applied > 0
+            ? t("patches.agentInputDockApplied")
+            : t("patches.agentInputDockAlreadyApplied")
+        if (result.checksumUpdated > 0) {
+          message +=
+            " " +
+            tFmt("patches.checksumsAutoUpdated", {
+              count: result.checksumUpdated,
+            })
+        }
+
+        if (result.restartRequired === true) {
+          const action = await vscode.window.showInformationMessage(
+            message,
+            t("forwarding.action.quit"),
+            t("setup.action.later")
+          )
+          if (action === t("forwarding.action.quit")) {
+            await vscode.commands.executeCommand("workbench.action.quit")
+          }
+        } else {
+          void vscode.window.showInformationMessage(message)
+        }
+      }
+    )
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      CMD.DISABLE_AGENT_INPUT_DOCK_PATCH,
+      async () => {
+        const result = cursorPatch.disableAgentInputDockPatch()
+        if (!result.success) {
+          const detail = result.errors.join("; ") || t("checksums.unknownError")
+          void vscode.window.showErrorMessage(
+            tFmt("patches.agentInputDockFailed", { detail })
+          )
+          return
+        }
+
+        await vscode.workspace
+          .getConfiguration("agentVibes")
+          .update(
+            "agentInputDockEnabled",
+            false,
+            vscode.ConfigurationTarget.Global
+          )
+
+        let message = t("patches.agentInputDockDisabled")
+        if (result.checksumUpdated > 0) {
+          message +=
+            " " +
+            tFmt("patches.checksumsAutoUpdated", {
+              count: result.checksumUpdated,
+            })
+        }
+
+        if (result.restartRequired === true) {
+          const action = await vscode.window.showInformationMessage(
+            message,
+            t("forwarding.action.quit"),
+            t("setup.action.later")
+          )
+          if (action === t("forwarding.action.quit")) {
+            await vscode.commands.executeCommand("workbench.action.quit")
+          }
+        } else {
+          void vscode.window.showInformationMessage(message)
+        }
+      }
+    )
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      CMD.APPLY_CURSOR_TRAFFIC_CAPTURE_PATCH,
+      async () => {
+        const result = cursorPatch.applyTrafficCapturePatch()
+        if (!result.success) {
+          const detail = result.errors.join("; ") || t("checksums.unknownError")
+          void vscode.window.showErrorMessage(
+            tFmt("patches.trafficCaptureFailed", { detail })
+          )
+          return
+        }
+
+        let message =
+          result.applied > 0
+            ? t("patches.trafficCaptureApplied")
+            : t("patches.trafficCaptureAlreadyApplied")
+        if (result.checksumUpdated > 0) {
+          message +=
+            " " +
+            tFmt("patches.checksumsAutoUpdated", {
+              count: result.checksumUpdated,
+            })
+        }
+
+        if (result.restartRequired === true) {
+          const action = await vscode.window.showInformationMessage(
+            message,
+            t("forwarding.action.quit"),
+            t("setup.action.later")
+          )
+          if (action === t("forwarding.action.quit")) {
+            await vscode.commands.executeCommand("workbench.action.quit")
+          }
+        } else {
+          void vscode.window.showInformationMessage(message)
+        }
+      }
+    )
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      CMD.DISABLE_CURSOR_TRAFFIC_CAPTURE_PATCH,
+      async () => {
+        const result = cursorPatch.disableTrafficCapturePatch()
+        if (!result.success) {
+          const detail = result.errors.join("; ") || t("checksums.unknownError")
+          void vscode.window.showErrorMessage(
+            tFmt("patches.trafficCaptureFailed", { detail })
+          )
+          return
+        }
+
+        let message = t("patches.trafficCaptureDisabled")
+        if (result.checksumUpdated > 0) {
+          message +=
+            " " +
+            tFmt("patches.checksumsAutoUpdated", {
+              count: result.checksumUpdated,
+            })
+        }
+        const action = await vscode.window.showInformationMessage(
+          message,
+          t("forwarding.action.quit"),
+          t("setup.action.later")
+        )
+        if (action === t("forwarding.action.quit")) {
+          await vscode.commands.executeCommand("workbench.action.quit")
+        }
+      }
+    )
+  )
+
+  context.subscriptions.push(
     vscode.commands.registerCommand(CMD.RESET_CURSOR_PATCHES, async () => {
       const result = cursorPatchManager.resetAllPatches()
       if (!result.success) {
@@ -350,6 +519,14 @@ export function registerCommands(
         )
         return
       }
+
+      await vscode.workspace
+        .getConfiguration("agentVibes")
+        .update(
+          "agentInputDockEnabled",
+          false,
+          vscode.ConfigurationTarget.Global
+        )
 
       const action = await vscode.window.showInformationMessage(
         tFmt("patches.resetSummary", { count: result.restored }),

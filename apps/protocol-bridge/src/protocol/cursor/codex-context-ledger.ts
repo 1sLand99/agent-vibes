@@ -241,10 +241,12 @@ function messageContainsToolResult(
   if (!message || !Array.isArray(message.content)) {
     return false
   }
-  return message.content.some(
-    (block) =>
-      !!block && typeof block === "object" && block.type === "tool_result"
-  )
+  return message.content.some((block) => {
+    if (!block || typeof block !== "object") {
+      return false
+    }
+    return (block as { type?: unknown }).type === "tool_result"
+  })
 }
 
 function normalizeEntries(entries: CodexContextEntry[]): CodexContextEntry[] {

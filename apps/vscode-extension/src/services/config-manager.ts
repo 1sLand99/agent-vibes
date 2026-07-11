@@ -120,6 +120,14 @@ export class ConfigManager {
     )
   }
 
+  get agentInputDockEnabled(): boolean {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<boolean>("agentInputDockEnabled") ?? true
+    )
+  }
+
   get thinkingBudgetAuto(): boolean {
     return (
       vscode.workspace

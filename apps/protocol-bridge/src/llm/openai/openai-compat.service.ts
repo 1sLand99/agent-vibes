@@ -49,7 +49,8 @@ import {
 } from "../shared/backend-pool-status"
 import { sanitizeOpenAiChatToolCallIntegrity } from "../shared/openai-tool-call-integrity"
 import { resolveThinkingIntentFromDto } from "../shared/thinking-intent"
-import { translateClaudeToCodex } from "./codex-request-translator"
+import { adaptAnthropicMessageToCodexExecutionRequest } from "../../protocol/anthropic/codex-request-adapter"
+import { buildCodexRequest } from "./codex-request-builder"
 import {
   createStreamState as createCodexStreamState,
   translateCodexSseEvent,
@@ -2889,10 +2890,12 @@ export class OpenaiCompatService implements OnModuleInit {
     const reverseToolMap = buildReverseMapFromClaudeTools(dto.tools)
 
     // Translate to Codex Responses API format
-    const codexRequest = translateClaudeToCodex(dto, modelName) as Record<
-      string,
-      unknown
-    >
+    const codexRequest = buildCodexRequest(
+      adaptAnthropicMessageToCodexExecutionRequest(dto, modelName, {
+        languageDirectiveMode: "dynamic",
+      }),
+      modelName
+    ) as Record<string, unknown>
     const url = this.buildResponsesUrlForAccount(account)
     const headers = this.buildHeadersForAccount(account, true)
     const requestBody = JSON.stringify(codexRequest)
@@ -3120,10 +3123,12 @@ export class OpenaiCompatService implements OnModuleInit {
     const reverseToolMap = buildReverseMapFromClaudeTools(dto.tools)
 
     // Translate to Codex Responses API format
-    const codexRequest = translateClaudeToCodex(dto, modelName) as Record<
-      string,
-      unknown
-    >
+    const codexRequest = buildCodexRequest(
+      adaptAnthropicMessageToCodexExecutionRequest(dto, modelName, {
+        languageDirectiveMode: "dynamic",
+      }),
+      modelName
+    ) as Record<string, unknown>
     const url = this.buildResponsesUrlForAccount(account)
     const headers = this.buildHeadersForAccount(account, true) // Responses API always streams
     const requestBody = JSON.stringify(codexRequest)

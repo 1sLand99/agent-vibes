@@ -12,6 +12,10 @@ import { NetworkManager } from "./services/network-manager"
 import { logger } from "./utils/logger"
 import { executePrivileged } from "./utils/terminal"
 import {
+  registerAgentInputPanel,
+  revealAgentInputPanelForDock,
+} from "./views/agent-input-panel"
+import {
   StatusIndicator,
   type CursorConnectionState,
 } from "./views/status-indicator"
@@ -41,6 +45,7 @@ export async function activate(
   const cursorPatchManager = new CursorPatchManagerService()
   const cert = new CertManager(config)
   const updater = new ExtensionUpdateService(context)
+  registerAgentInputPanel(context)
 
   // Create UI
   const getCursorConnectionState = (): CursorConnectionState => {
@@ -57,20 +62,98 @@ export async function activate(
   statusIndicator = new StatusIndicator(getCursorConnectionState)
 
   let forwardingRepairPromptShown = false
-  let directPatchRestartPromptShown = false
+  let cursorPatchRestartPromptShown = false
 
-  const maybeApplyCursorDirectPatch = async (): Promise<void> => {
-    if (config.trafficMode !== "cursorPatch") return
+  const promptForCursorPatchRestart = async (
+    message: string
+  ): Promise<void> => {
+    if (cursorPatchRestartPromptShown) return
+    cursorPatchRestartPromptShown = true
+    const action = await vscode.window.showInformationMessage(
+      message,
+      t("forwarding.action.quit"),
+      t("setup.action.later")
+    )
+    if (action === t("forwarding.action.quit")) {
+      await vscode.commands.executeCommand("workbench.action.quit")
+    }
+  }
+
+  const maybeApplyCursorIdleKillerPatch = async (
+    promptForRestart = true
+  ): Promise<boolean> => {
+    const status = cursorPatch.getIdleExtensionHostKillerStatus()
+    if (!status.fileExists || status.applied || !status.canApply) {
+      return false
+    }
+
+    const result = cursorPatch.applyIdleExtensionHostKillerPatch()
+    if (!result.success) {
+      logger.warn(
+        `Cursor idle extension host protection could not be applied: ${result.errors.join("; ")}`
+      )
+      return false
+    }
+
+    logger.info("Cursor idle extension host protection applied by default")
+    const restartRequired = result.restartRequired === true
+    if (restartRequired && promptForRestart) {
+      await promptForCursorPatchRestart(t("patches.idleKillerApplied"))
+    }
+    return restartRequired
+  }
+
+  const maybeSyncAgentInputDockPatch = async (
+    promptForRestart = true
+  ): Promise<boolean> => {
+    const status = cursorPatch.getAgentInputDockPatchStatus()
+    if (!status.fileExists) return false
+
+    const enabled = config.agentInputDockEnabled
+    if (enabled && status.applied) return false
+    if (!enabled && !status.applied && !status.partial) return false
+    if (enabled && !status.canApply) return false
+
+    const result = enabled
+      ? cursorPatch.applyAgentInputDockPatch()
+      : cursorPatch.disableAgentInputDockPatch()
+    if (!result.success) {
+      logger.warn(
+        `Agent input dock could not be ${enabled ? "enabled" : "disabled"}: ${result.errors.join("; ")}`
+      )
+      return false
+    }
+
+    logger.info(
+      `Agent input dock ${enabled ? "enabled" : "disabled"} from extension settings`
+    )
+    const restartRequired = result.restartRequired === true
+    if (restartRequired && promptForRestart) {
+      await promptForCursorPatchRestart(
+        t(
+          enabled
+            ? "patches.agentInputDockApplied"
+            : "patches.agentInputDockDisabled"
+        )
+      )
+    }
+    return restartRequired
+  }
+
+  const maybeApplyCursorDirectPatch = async (
+    promptForRestart = true
+  ): Promise<boolean> => {
+    if (config.trafficMode !== "cursorPatch") return false
 
     const status = cursorPatch.getBridgeEndpointPatchStatus(config.port)
     if (!status.fileExists || !status.canApply) {
       statusIndicator?.update(bridge?.state ?? "stopped")
-      return
+      return false
     }
     if (status.applied && !status.requiresPortUpdate) {
       cursorPatchManager.ensureBridgeEndpointPatchTracked(status)
       statusIndicator?.update(bridge?.state ?? "stopped")
-      return
+      return false
     }
 
     const result = cursorPatch.applyBridgeEndpointPatch(config.port)
@@ -79,7 +162,7 @@ export async function activate(
         `Cursor direct connection patch could not be applied: ${result.errors.join("; ")}`
       )
       statusIndicator?.update(bridge?.state ?? "stopped")
-      return
+      return false
     }
 
     const patchedStatus = cursorPatch.getBridgeEndpointPatchStatus(
@@ -91,16 +174,38 @@ export async function activate(
     logger.info("Cursor direct connection patch applied from traffic mode")
     statusIndicator?.update(bridge?.state ?? "stopped")
 
-    if (result.restartRequired !== true) return
-    if (directPatchRestartPromptShown) return
-    directPatchRestartPromptShown = true
-    const action = await vscode.window.showInformationMessage(
-      t("patches.bridgeEndpointApplied"),
-      t("forwarding.action.quit"),
-      t("setup.action.later")
-    )
-    if (action === t("forwarding.action.quit")) {
-      await vscode.commands.executeCommand("workbench.action.quit")
+    const restartRequired = result.restartRequired === true
+    if (restartRequired && promptForRestart) {
+      await promptForCursorPatchRestart(t("patches.bridgeEndpointApplied"))
+    }
+    return restartRequired
+  }
+
+  const maybeApplyDefaultCursorPatches = async (): Promise<void> => {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    const directRestartRequired = await maybeApplyCursorDirectPatch(false)
+    const agentInputRestartRequired = await maybeSyncAgentInputDockPatch(false)
+    const idleRestartRequired = await maybeApplyCursorIdleKillerPatch(false)
+    if (
+      config.agentInputDockEnabled &&
+      !agentInputRestartRequired &&
+      cursorPatch.getAgentInputDockPatchStatus({ force: true }).applied
+    ) {
+      try {
+        await revealAgentInputPanelForDock()
+      } catch (error) {
+        logger.warn(
+          `Agent input dock panel could not be initialized: ${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+    }
+    if (directRestartRequired) {
+      await promptForCursorPatchRestart(t("patches.bridgeEndpointApplied"))
+    } else if (agentInputRestartRequired) {
+      await promptForCursorPatchRestart(t("patches.agentInputDockApplied"))
+    } else if (idleRestartRequired) {
+      await promptForCursorPatchRestart(t("patches.idleKillerApplied"))
     }
   }
 
@@ -150,10 +255,21 @@ export async function activate(
       const trafficModeChanged = event.affectsConfiguration(
         "agentVibes.trafficMode"
       )
-      if (!portChanged && !trafficModeChanged) return
+      const agentInputDockChanged = event.affectsConfiguration(
+        "agentVibes.agentInputDockEnabled"
+      )
+      if (!portChanged && !trafficModeChanged && !agentInputDockChanged) return
+
+      if (agentInputDockChanged && !portChanged && !trafficModeChanged) {
+        await maybeSyncAgentInputDockPatch()
+        return
+      }
 
       if (trafficModeChanged && !portChanged) {
         await maybeApplyCursorDirectPatch()
+        if (agentInputDockChanged) {
+          await maybeSyncAgentInputDockPatch()
+        }
         statusIndicator?.update(bridge?.state ?? "stopped")
         return
       }
@@ -163,6 +279,9 @@ export async function activate(
         if (trafficModeChanged) {
           await maybeApplyCursorDirectPatch()
           statusIndicator?.update(bridge?.state ?? "stopped")
+        }
+        if (agentInputDockChanged) {
+          await maybeSyncAgentInputDockPatch()
         }
         return
       }
@@ -198,6 +317,9 @@ export async function activate(
       if (config.trafficMode === "cursorPatch") {
         await maybeApplyCursorDirectPatch()
       }
+      if (agentInputDockChanged) {
+        await maybeSyncAgentInputDockPatch()
+      }
 
       if (
         config.trafficMode === "systemForwarding" &&
@@ -219,7 +341,9 @@ export async function activate(
     })
   )
 
-  void maybeApplyCursorDirectPatch()
+  setTimeout(() => {
+    void maybeApplyDefaultCursorPatches()
+  }, 0)
 
   // Push disposables
   context.subscriptions.push({

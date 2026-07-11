@@ -42,6 +42,12 @@ export const CMD = {
   APPLY_CURSOR_BRIDGE_ENDPOINT_PATCH:
     "agentVibes.applyCursorBridgeEndpointPatch",
   APPLY_CURSOR_IDLE_KILLER_PATCH: "agentVibes.applyCursorIdleKillerPatch",
+  ENABLE_AGENT_INPUT_DOCK_PATCH: "agentVibes.enableAgentInputDockPatch",
+  DISABLE_AGENT_INPUT_DOCK_PATCH: "agentVibes.disableAgentInputDockPatch",
+  APPLY_CURSOR_TRAFFIC_CAPTURE_PATCH:
+    "agentVibes.applyCursorTrafficCapturePatch",
+  DISABLE_CURSOR_TRAFFIC_CAPTURE_PATCH:
+    "agentVibes.disableCursorTrafficCapturePatch",
   RESET_CURSOR_PATCHES: "agentVibes.resetCursorPatches",
   COMPACT_CURRENT_SESSION: "agentVibes.compactCurrentSession",
   CLEAR_CACHE: "agentVibes.clearCache",

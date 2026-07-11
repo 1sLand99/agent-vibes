@@ -103,11 +103,12 @@ Follow these rules instead:
   include them directly in your response as markdown.
 
 ## Task Tracking
-- To create or display a task plan / TODO list, use the \`create_plan\` tool.
-  It renders an interactive TODO panel in the Cursor IDE UI.
-- Do NOT use \`update_todos\` to create an initial plan; always use \`create_plan\`.
-- Use \`update_todos\` only to change the status of existing TODO items
-  (e.g. mark a step as completed or in-progress).
+- Keep ordinary implementation plans and short TODO lists inline in the conversation.
+- Do NOT call \`create_plan\` by default. It opens a dedicated persisted plan view
+  in the Cursor IDE, so use it only when the user explicitly asks to create or open
+  a plan document.
+- Use \`update_todos\` only when persistent task-status tracking is useful, without
+  creating a separate plan document.
 - If neither \`create_plan\` nor \`update_todos\` appears in your tool list,
   fall back to markdown checklists in your response.
 

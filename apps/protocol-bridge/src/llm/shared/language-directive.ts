@@ -285,6 +285,27 @@ export function appendLanguageDirectiveToAnthropicSystem(
   options: { skip?: boolean } = {}
 ): string | Array<Record<string, unknown>> {
   const directive = buildLanguageDirective(messages, options)
+  return appendDirectiveToAnthropicSystem(system, directive)
+}
+
+/**
+ * Append a request-stable language directive to an Anthropic `system` value.
+ * This variant is used by continuation-capable adapters whose static
+ * instructions must not change merely because a later user turn switches
+ * language.
+ */
+export function appendStableLanguageDirectiveToAnthropicSystem(
+  system: unknown,
+  options: { skip?: boolean } = {}
+): string | Array<Record<string, unknown>> {
+  const directive = buildStableLanguageDirective(options)
+  return appendDirectiveToAnthropicSystem(system, directive)
+}
+
+function appendDirectiveToAnthropicSystem(
+  system: unknown,
+  directive: string
+): string | Array<Record<string, unknown>> {
   if (!directive) {
     return (system ?? "") as string | Array<Record<string, unknown>>
   }

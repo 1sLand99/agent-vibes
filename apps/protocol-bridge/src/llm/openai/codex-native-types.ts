@@ -1,9 +1,9 @@
-import { type LooseMessageContent } from "../../context"
+import type { ProviderMessageContent } from "../../shared/provider-content"
 import type { ThinkingIntent } from "../shared/thinking-types"
 
 export interface CodexConversationMessage {
   role: "user" | "assistant" | "developer"
-  content: LooseMessageContent
+  content: ProviderMessageContent
   /**
    * Split-sibling assistant message id. Main Cursor streaming persists each
    * content block separately while sharing this id; Codex projection uses it
@@ -50,13 +50,6 @@ export interface CodexExecutionRequest {
   serviceTier?: string
   parallelToolCalls?: boolean
   cacheUserId?: string
-  /**
-   * True when the request originates from the Claude Code frontend (set from
-   * `dto._clientIsClaudeCode` by the Claude→Codex translator). Suppresses the
-   * forced language directive in the built instructions — CC manages its own
-   * response/thinking language.
-   */
-  clientIsClaudeCode?: boolean
   /**
    * @deprecated previous_response_id 现在由 CodexService.streamViaWebSocket() 在 transport 层自动注入，
    * 由 strict incremental delta 校验保护。不再从外部传入。该字段不参与请求构建。

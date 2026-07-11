@@ -67,7 +67,8 @@
   ],
   "icon": "resources/icon.png",
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onView:agentVibes.agentInput"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -171,6 +172,26 @@
         "category": "Agent Vibes"
       },
       {
+        "command": "agentVibes.enableAgentInputDockPatch",
+        "title": "Enable Agent Input Dock",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.disableAgentInputDockPatch",
+        "title": "Disable Agent Input Dock",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.applyCursorTrafficCapturePatch",
+        "title": "Enable Cursor Traffic Capture",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.disableCursorTrafficCapturePatch",
+        "title": "Disable Cursor Traffic Capture",
+        "category": "Agent Vibes"
+      },
+      {
         "command": "agentVibes.resetCursorPatches",
         "title": "Reset Cursor Patches",
         "category": "Agent Vibes"
@@ -200,6 +221,25 @@
         "icon": "$(archive)"
       }
     ],
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "agentVibesAgentInput",
+          "title": "Agent",
+          "icon": "resources/icon.png"
+        }
+      ]
+    },
+    "views": {
+      "agentVibesAgentInput": [
+        {
+          "id": "agentVibes.agentInput",
+          "name": "Agent",
+          "visibility": "visible",
+          "when": "config.agentVibes.agentInputDockEnabled"
+        }
+      ]
+    },
     "configuration": {
       "title": "Agent Vibes",
       "properties": {
@@ -256,6 +296,11 @@
             "Do not manage Cursor connection automatically."
           ],
           "description": "How Agent Vibes connects Cursor IDE traffic to the local bridge"
+        },
+        "agentVibes.agentInputDockEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a bottom panel view (terminal, etc.) opens, dock the Agent input at the bottom to free the editor, and restore it when the panel hides. Drag the Agent tab to move between the editor, bottom panel, and Chat."
         },
         "agentVibes.healthCheckInterval": {
           "type": "number",

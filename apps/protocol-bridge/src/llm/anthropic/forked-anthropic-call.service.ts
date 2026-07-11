@@ -6,6 +6,7 @@ import {
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicForwardHeaders } from "./anthropic-api.service"
 import type { AnthropicResponse } from "../../shared/anthropic"
+import { adaptAnthropicMessageToCodexExecutionRequest } from "../../protocol/anthropic/codex-request-adapter"
 import { KiroService } from "../aws/kiro.service"
 import { GoogleService } from "../google/google.service"
 import { CodexService } from "../openai/codex.service"
@@ -367,7 +368,9 @@ export class ForkedAnthropicCallService {
           abortSignal: params.abortSignal,
         })
       case "codex":
-        return this.codex.sendClaudeMessage(dto)
+        return this.codex.sendMessage(
+          adaptAnthropicMessageToCodexExecutionRequest(dto)
+        )
       case "openai-compat":
         return this.openaiCompat.sendClaudeMessage(dto)
       default: {

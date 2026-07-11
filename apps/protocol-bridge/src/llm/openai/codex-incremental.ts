@@ -1,5 +1,5 @@
 import { createHash } from "crypto"
-import { CONTEXT_MICROCOMPACT_CLEARED_MARKER } from "../../context/context-microcompact-marker"
+import { CONTEXT_MICROCOMPACT_CLEARED_MARKER } from "../../shared/context-compaction"
 import type { CodexInputItem } from "./codex-native-types"
 import { isCodexApiVisibleInputItem } from "./codex-response-items"
 

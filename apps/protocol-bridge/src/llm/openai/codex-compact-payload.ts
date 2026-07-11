@@ -1,4 +1,4 @@
-import type { CodexReplacementHistoryItem } from "../../context"
+import type { CodexReplacementHistoryItem } from "../../shared/provider-content"
 import { CodexApiError } from "./codex-api-error"
 import type { CodexRequest } from "./codex-native-types"
 
