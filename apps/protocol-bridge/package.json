@@ -14,7 +14,7 @@
     "format:fix": "prettier --write \"src/**/*.{js,ts}\"",
     "lint": "eslint \"{src,test}/**/*.{js,ts}\"",
     "lint:fix": "eslint \"{src,test}/**/*.{js,ts}\" --fix",
-    "test": "jest --passWithNoTests",
+    "test": "tsx --test test/*.testcase.ts && jest --passWithNoTests",
     "clean": "node ../../scripts/rm-paths.js dist node_modules .turbo",
     "types": "tsc --noEmit -p tsconfig.build.json",
     "codex:instructions:sync": "node ../../scripts/codex/sync-codex-model-instructions.js",

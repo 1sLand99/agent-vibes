@@ -1,5 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common"
 import { ContextAttachmentSnapshot } from "./context-attachment-builder.service"
+import type { ContextModelProfile } from "./context-model-profile"
 import {
   ContextCompactionCandidate,
   ContextCompactionPlan,
@@ -74,6 +75,7 @@ export class ContextCompactRunnerService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       strategy?: "auto" | "manual" | "reactive"
       integrityMode?: "strict-adjacent" | "global"
       summaryProvider: ContextCompactRunnerSummaryProvider
@@ -163,6 +165,7 @@ export class ContextCompactRunnerService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       autoCompactTokenLimit?: number
       predictiveCompactTokenLimit?: number
       strategy?: "auto" | "manual" | "reactive"

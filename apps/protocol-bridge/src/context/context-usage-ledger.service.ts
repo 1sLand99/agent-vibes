@@ -2,6 +2,10 @@ import { Injectable } from "@nestjs/common"
 import { fingerprintProjectedAttachments } from "./attachment-fingerprint"
 import { ContextAttachmentSnapshot } from "./context-attachment-builder.service"
 import { ContextProjectionService } from "./context-projection.service"
+import {
+  ContextModelProfile,
+  isContextAccountingProfileCompatible,
+} from "./context-model-profile"
 import { TokenCounterService } from "./token-counter.service"
 import {
   ContextConversationState,
@@ -24,6 +28,7 @@ export class ContextUsageLedgerService {
     usage: Omit<ContextUsageSnapshot, "totalTokens" | "recordedAt">,
     options?: {
       projectedTokenCount?: number
+      accountingProfileKey?: string
       recordedCompactionId?: string
       attachmentFingerprint?: string
     }
@@ -40,6 +45,7 @@ export class ContextUsageLedgerService {
         recordedAt: Date.now(),
       },
       projectedTokenCount: options?.projectedTokenCount,
+      accountingProfileKey: options?.accountingProfileKey,
       recordedCompactionId: options?.recordedCompactionId,
       attachmentFingerprint: options?.attachmentFingerprint,
     }
@@ -47,10 +53,14 @@ export class ContextUsageLedgerService {
 
   buildProjectionLedger(
     state: ContextConversationState,
-    projectedMessages: ProjectedContextMessage[]
+    projectedMessages: ProjectedContextMessage[],
+    contextProfile: ContextModelProfile
   ): Pick<
     ContextUsageLedgerState,
-    "projectedTokenCount" | "recordedCompactionId" | "attachmentFingerprint"
+    | "projectedTokenCount"
+    | "accountingProfileKey"
+    | "recordedCompactionId"
+    | "attachmentFingerprint"
   > {
     const asUnified = projectedMessages.map((message) => ({
       role: message.role,
@@ -58,7 +68,12 @@ export class ContextUsageLedgerService {
     })) as UnifiedMessage[]
 
     return {
-      projectedTokenCount: this.tokenCounter.countMessages(asUnified),
+      projectedTokenCount: this.tokenCounter.countMessages(
+        asUnified,
+        true,
+        contextProfile.tokenizer
+      ),
+      accountingProfileKey: contextProfile.key,
       recordedCompactionId: this.projection.getActiveCommit(state)?.id,
       attachmentFingerprint: fingerprintProjectedAttachments(projectedMessages),
     }
@@ -70,6 +85,7 @@ export class ContextUsageLedgerService {
     options?: {
       attachmentSnapshot?: ContextAttachmentSnapshot
       attachmentTokenBudget?: number
+      contextProfile?: ContextModelProfile
     }
   ): number {
     const projected =
@@ -82,10 +98,25 @@ export class ContextUsageLedgerService {
       role: message.role,
       content: message.content,
     })) as UnifiedMessage[]
-    const rawEstimate = this.tokenCounter.countMessages(asUnified)
+    const tokenizer = options?.contextProfile?.tokenizer ?? "claude"
+    const rawEstimate = this.tokenCounter.countMessages(
+      asUnified,
+      true,
+      tokenizer
+    )
     const anchorId = state.usageLedger.anchorRecordId
     const usage = state.usageLedger.lastUsage
     const projectedTokenCount = state.usageLedger.projectedTokenCount
+
+    if (
+      options?.contextProfile &&
+      !isContextAccountingProfileCompatible(
+        state.usageLedger.accountingProfileKey,
+        options.contextProfile.key
+      )
+    ) {
+      return rawEstimate
+    }
 
     if (!anchorId || !usage || projectedTokenCount == null) {
       return rawEstimate
@@ -130,6 +161,9 @@ export class ContextUsageLedgerService {
       return projectedTokenCount
     }
 
-    return projectedTokenCount + this.tokenCounter.countMessages(suffixMessages)
+    return (
+      projectedTokenCount +
+      this.tokenCounter.countMessages(suffixMessages, true, tokenizer)
+    )
   }
 }

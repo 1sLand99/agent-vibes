@@ -14,6 +14,16 @@ import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
 
+/**
+ * The Kiro CLI mirror token file. It is deliberately excluded from discovery
+ * (see {@link harvestDirectory} for the full rationale): it is written in a
+ * denormalized `authMethod: "social"` shape even for IdC/Builder ID accounts
+ * and reuses the IdC refresh token, so treating it as a login source both
+ * manufactures a phantom social account and collides with the genuine IDE
+ * entry on the dedup key.
+ */
+const CLI_MIRROR_TOKEN_FILENAME = "kiro-auth-token-cli.json"
+
 export interface DiscoveredKiroToken {
   /** Absolute path of the file that produced this entry. */
   sourcePath: string
@@ -278,6 +288,19 @@ function harvestDirectory(dir: string): DiscoveredKiroToken[] {
     parsed: SsoClientRegistrationJson & { startUrl?: string }
   }> = []
   for (const filePath of files) {
+    // Skip the Kiro CLI mirror file. `kiro-auth-token-cli.json` is written by
+    // the Kiro CLI (and by Agent Vibes' own force-cli-login) in a denormalized
+    // `authMethod: "social"` / `provider: "google"` shape even when the
+    // underlying account is IdC/Builder ID, reusing the IdC refresh token.
+    // Treating it as a discoverable login source (a) manufactures a phantom
+    // "Kiro Social (google)" account whose IdC refresh token the social
+    // endpoint rejects with HTTP 401 "Bad credentials", and (b) collides on
+    // the dedup key with the genuine `kiro-auth-token.json` IdC entry, hiding
+    // the real account. Genuine IDE logins live in `kiro-auth-token.json` and
+    // the Kiro IDE global cache.
+    if (path.basename(filePath).toLowerCase() === CLI_MIRROR_TOKEN_FILENAME) {
+      continue
+    }
     const parsed = loadJsonFile<
       SsoTokenJson & SsoClientRegistrationJson & { startUrl?: string }
     >(filePath)
@@ -338,9 +361,11 @@ export function discoverLocalKiroTokens(): DiscoveredKiroToken[] {
   for (const dir of dirs) {
     if (!fs.existsSync(dir)) continue
     for (const entry of harvestDirectory(dir)) {
-      // Dedupe by refresh token + region — same identity may be cached in
-      // multiple files (one per scope).
-      const key = `${entry.region}|${entry.refreshToken}`
+      // Dedupe by authMethod + refresh token + region — same identity may be
+      // cached in multiple files (one per scope). authMethod is part of the
+      // key so an IdC token and a social token that happen to share a refresh
+      // token never collide and evict the genuine entry.
+      const key = `${entry.authMethod}|${entry.region}|${entry.refreshToken}`
       if (seen.has(key)) continue
       seen.add(key)
       all.push(entry)

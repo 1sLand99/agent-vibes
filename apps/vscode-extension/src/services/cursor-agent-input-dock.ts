@@ -1,17 +1,22 @@
 export const AGENT_INPUT_VIEW_ID = "agentVibes.agentInput"
 export const AGENT_INPUT_CONTAINER_ID = "agentVibesAgentInput"
 
-// Single source of truth for the runtime version. Bump this one constant when
-// the injected runtime changes: the current marker, the legacy marker list and
-// the injected <style> id are all derived from it.
-const AGENT_INPUT_DOCK_VERSION = 74
+// Single source of truth for the shared injected runtime version. Dock and
+// Workspace Control remain independent features inside this runtime.
+const AGENT_INPUT_RUNTIME_VERSION = 88
 
+const agentInputRuntimeMarkerFor = (version: number): string =>
+  "[AGENT_VIBES_AGENT_INPUT_RUNTIME_V" + version + "]"
 const agentInputDockMarkerFor = (version: number): string =>
   "[AGENT_VIBES_AGENT_INPUT_DOCK_V" + version + "]"
 
+export const CURSOR_AGENT_INPUT_RUNTIME_PATCH_MARKER =
+  agentInputRuntimeMarkerFor(AGENT_INPUT_RUNTIME_VERSION)
 export const CURSOR_AGENT_INPUT_DOCK_PATCH_MARKER = agentInputDockMarkerFor(
-  AGENT_INPUT_DOCK_VERSION
+  AGENT_INPUT_RUNTIME_VERSION
 )
+export const CURSOR_WORKSPACE_CONTROL_PATCH_MARKER =
+  "[AGENT_VIBES_WORKSPACE_CONTROL_V1]"
 
 // Historical marker names used before the V-numbered scheme (V7+).
 const CURSOR_AGENT_INPUT_DOCK_LEGACY_NAMED_MARKERS = [
@@ -25,16 +30,30 @@ const CURSOR_AGENT_INPUT_DOCK_LEGACY_NAMED_MARKERS = [
 
 // All prior V-numbered markers (V7 .. current-1) are derived from the version
 // counter, so bumping the runtime only requires incrementing
-// AGENT_INPUT_DOCK_VERSION above.
+// AGENT_INPUT_RUNTIME_VERSION above.
 const CURSOR_AGENT_INPUT_DOCK_LEGACY_MARKERS: readonly string[] = [
-  ...Array.from({ length: AGENT_INPUT_DOCK_VERSION - 7 }, (_unused, index) =>
-    agentInputDockMarkerFor(AGENT_INPUT_DOCK_VERSION - 1 - index)
+  ...Array.from({ length: AGENT_INPUT_RUNTIME_VERSION - 7 }, (_unused, index) =>
+    agentInputDockMarkerFor(AGENT_INPUT_RUNTIME_VERSION - 1 - index)
   ),
   ...CURSOR_AGENT_INPUT_DOCK_LEGACY_NAMED_MARKERS,
 ]
 
+const CURSOR_AGENT_INPUT_RUNTIME_LEGACY_MARKERS: readonly string[] = Array.from(
+  { length: AGENT_INPUT_RUNTIME_VERSION - 7 },
+  (_unused, index) =>
+    agentInputRuntimeMarkerFor(AGENT_INPUT_RUNTIME_VERSION - 1 - index)
+)
+
 export const CURSOR_AGENT_INPUT_DOCK_PATCH_MARKERS: readonly string[] = [
   CURSOR_AGENT_INPUT_DOCK_PATCH_MARKER,
+  ...CURSOR_AGENT_INPUT_DOCK_LEGACY_MARKERS,
+]
+
+export const CURSOR_AGENT_INPUT_RUNTIME_PATCH_MARKERS: readonly string[] = [
+  CURSOR_AGENT_INPUT_RUNTIME_PATCH_MARKER,
+  CURSOR_AGENT_INPUT_DOCK_PATCH_MARKER,
+  CURSOR_WORKSPACE_CONTROL_PATCH_MARKER,
+  ...CURSOR_AGENT_INPUT_RUNTIME_LEGACY_MARKERS,
   ...CURSOR_AGENT_INPUT_DOCK_LEGACY_MARKERS,
 ]
 
@@ -52,6 +71,41 @@ export type CursorAgentInputDockDetails = {
 
 export type AgentInputDockPlacement = "bottom" | "editor" | "chat"
 export type AgentInputDockDragSource = "bottom" | "native"
+export type WorkspaceControlRuntimeConfig = {
+  bridgePort: number
+  controlToken: string
+  useHttps: boolean
+}
+
+export function readWorkspaceControlRuntimeConfig(
+  content: string
+): WorkspaceControlRuntimeConfig | null {
+  const match = /const workspaceControlConfig = (\{[^\n]+\})/u.exec(content)
+  if (!match) return null
+
+  try {
+    const parsed = JSON.parse(
+      match[1]!
+    ) as Partial<WorkspaceControlRuntimeConfig>
+    if (
+      !Number.isInteger(parsed.bridgePort) ||
+      parsed.bridgePort! < 0 ||
+      parsed.bridgePort! > 65_535 ||
+      typeof parsed.controlToken !== "string" ||
+      typeof parsed.useHttps !== "boolean"
+    ) {
+      return null
+    }
+    return {
+      bridgePort: parsed.bridgePort!,
+      controlToken: parsed.controlToken,
+      useHttps: parsed.useHttps,
+    }
+  } catch {
+    return null
+  }
+}
+
 export type AgentInputDockDropOwner = "extension" | "cursor" | "none"
 export type AgentInputDockPhase =
   | "revealing"
@@ -145,15 +199,39 @@ export function resolveAgentInputDockDropOwner(
   return "cursor"
 }
 
-const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
-  "/*" +
-  CURSOR_AGENT_INPUT_DOCK_PATCH_MARKER +
-  "*" +
-  "/" +
-  `
+export function isTopAnchoredAgentInput(
+  rootTop: number,
+  rootBottom: number,
+  inputTop: number,
+  inputBottom: number
+): boolean {
+  if (rootBottom <= rootTop || inputBottom <= inputTop) return false
+  const topSpace = Math.max(0, inputTop - rootTop)
+  const bottomSpace = Math.max(0, rootBottom - inputBottom)
+  return topSpace <= bottomSpace
+}
+
+function buildCursorAgentInputRuntimePatchInsertion(
+  agentInputDockEnabled: boolean,
+  workspaceControlEnabled: boolean,
+  runtimeConfig: WorkspaceControlRuntimeConfig | null
+): string {
+  return (
+    "/*" +
+    CURSOR_AGENT_INPUT_RUNTIME_PATCH_MARKER +
+    "*" +
+    "/" +
+    `
 ;(() => {
-  const styleId = "agent-vibes-agent-input-dock-v${AGENT_INPUT_DOCK_VERSION}"
-  const ownedPanelId = ${JSON.stringify(AGENT_INPUT_CONTAINER_ID)}
+  ${agentInputDockEnabled ? `/*${CURSOR_AGENT_INPUT_DOCK_PATCH_MARKER}*/` : ""}
+  const agentInputDockEnabled = ${JSON.stringify(agentInputDockEnabled)}
+  ${workspaceControlEnabled ? `/*${CURSOR_WORKSPACE_CONTROL_PATCH_MARKER}*/` : ""}
+  const workspaceControlEnabled = ${JSON.stringify(workspaceControlEnabled)}
+  const styleId = "agent-vibes-agent-input-runtime-v${AGENT_INPUT_RUNTIME_VERSION}"
+  const workspaceControlConfig = ${workspaceControlEnabled ? JSON.stringify(runtimeConfig) : "null"}
+  const ownedPanelId = agentInputDockEnabled
+    ? ${JSON.stringify(AGENT_INPUT_CONTAINER_ID)}
+    : "__agent_vibes_disabled_dock__"
   const ownedPanelCompositeId = "workbench.view.extension." + ownedPanelId
   const ownedPanelCompositeSelector =
     "[id='" + ownedPanelCompositeId + "']"
@@ -212,12 +290,29 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
   const fillEditableAttribute = "data-agent-vibes-input-fill-editable"
   const nativeSwitchAttribute = "data-agent-vibes-native-switch"
   const officialChatAttribute = "data-agent-vibes-official-chat"
+  const projectPickerAttribute = "data-agent-vibes-project-picker"
+  const projectPickerTriggerAttribute =
+    "data-agent-vibes-project-picker-trigger"
+  const projectPickerMenuAttribute = "data-agent-vibes-project-picker-menu"
+  const branchPickerAttribute = "data-agent-vibes-branch-picker"
+  const branchPickerTriggerAttribute =
+    "data-agent-vibes-branch-picker-trigger"
+  const branchPickerMenuAttribute = "data-agent-vibes-branch-picker-menu"
+  const pickerDockAttribute = "data-agent-vibes-dock-pickers"
+  const topInputAttribute = "data-agent-vibes-input-top"
+  const projectPickerRefreshMs = 10_000
+  const branchPickerRefreshMs = 10_000
   const transition = ${reduceAgentInputDockState.toString()}
   const resolveDropOwner = ${resolveAgentInputDockDropOwner.toString()}
+  const isTopAnchoredInput = ${isTopAnchoredAgentInput.toString()}
   const states = new Map()
+  const projectPickerStates = new Map()
+  const branchPickerStates = new Map()
   const nativeRequests = new Map()
   let activeComposerId = null
   let mounted = null
+  let openProjectPicker = null
+  let openBranchPicker = null
   let tabDrag = null
   let bottomPointerDrag = null
   let panelRevealPromise = null
@@ -1908,7 +2003,774 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
     return getState(composerId)
   }
 
+  const projectControlOrigin =
+    workspaceControlConfig && workspaceControlConfig.bridgePort > 0
+      ? (workspaceControlConfig.useHttps ? "https" : "http") +
+        "://localhost:" + workspaceControlConfig.bridgePort
+      : null
+
+  const requestProjectControl = async (path, options = {}) => {
+    if (!projectControlOrigin) {
+      throw new Error("Project control is unavailable")
+    }
+    const response = await fetch(projectControlOrigin + path, {
+      ...options,
+      headers: {
+        authorization: "Bearer " + workspaceControlConfig.controlToken,
+        ...(options.body ? { "content-type": "application/json" } : {}),
+      },
+    })
+    if (!response.ok) {
+      throw new Error("Project control returned HTTP " + response.status)
+    }
+    return response.json()
+  }
+
+  const getProjectPickerState = composerId => {
+    let state = projectPickerStates.get(composerId)
+    if (!state) {
+      state = {
+        data: null,
+        error: null,
+        loadedAt: 0,
+        request: null,
+      }
+      projectPickerStates.set(composerId, state)
+    }
+    return state
+  }
+
+  const getProjectPickerElements = composerId =>
+    Array.from(
+      document.querySelectorAll("[" + projectPickerAttribute + "]")
+    ).filter(picker => picker.dataset.composerId === composerId)
+
+  const getUnavailableProjectLabel = folderUri => {
+    const path = folderUri.replace(/\\/$/u, "").split("/").pop()
+    return "Unavailable: " + (path ? decodeURIComponent(path) : folderUri)
+  }
+
+  const getProjectPickerPresentation = state => {
+    if (state.error) {
+      return {
+        label: "Projects unavailable",
+        title: state.error,
+        disabled: true,
+        workspaceKey: null,
+        options: [],
+      }
+    }
+
+    const data = state.data
+    if (!data) {
+      return {
+        label: "Loading projects...",
+        title: "Loading projects",
+        disabled: true,
+        workspaceKey: null,
+        options: [],
+      }
+    }
+    if (data.kind === "ambiguous") {
+      return {
+        label: "Project window unavailable",
+        title:
+          "Close other Cursor windows before choosing a project for a new chat",
+        disabled: true,
+        workspaceKey: null,
+        options: [],
+      }
+    }
+    if (data.kind !== "ready") {
+      return {
+        label: "Projects unavailable",
+        title: "The extension host has not published this workspace",
+        disabled: true,
+        workspaceKey: null,
+        options: [],
+      }
+    }
+
+    const options = []
+    if (data.selectedFolderUri && !data.selectedFolderAvailable) {
+      options.push({
+        value: data.selectedFolderUri,
+        label: getUnavailableProjectLabel(data.selectedFolderUri),
+        disabled: true,
+        selected: true,
+      })
+    }
+    data.folders.forEach(folder => {
+      options.push({
+        value: folder.uri,
+        label: folder.name,
+        disabled: false,
+        selected: data.selectedFolderAvailable
+          ? folder.uri === (data.selectedFolderUri || data.folders[0]?.uri)
+          : false,
+      })
+    })
+    if (options.length === 0) {
+      options.push({
+        value: "",
+        label: "No workspace folders",
+        disabled: true,
+        selected: true,
+      })
+    }
+
+    const selectedOption =
+      options.find(option => option.selected) ?? options[0]
+    return {
+      label: selectedOption.label,
+      title: data.selectedFolderAvailable
+        ? "Default project for this chat"
+        : "The selected project is no longer open",
+      // A single available folder is still shown as the current project
+      // default instead of being disabled; only a folderless window disables
+      // the picker.
+      disabled: data.folders.length === 0,
+      workspaceKey: data.workspaceKey,
+      options,
+    }
+  }
+
+  const closeProjectPicker = (restoreFocus = false) => {
+    if (!openProjectPicker) return
+    const { picker, menu } = openProjectPicker
+    openProjectPicker = null
+    menu.remove()
+    const trigger = picker.querySelector(
+      "button[" + projectPickerTriggerAttribute + "]"
+    )
+    if (trigger instanceof HTMLButtonElement) {
+      trigger.setAttribute("aria-expanded", "false")
+      if (restoreFocus) trigger.focus()
+    }
+  }
+
+  const positionProjectPickerMenu = (trigger, menu) => {
+    const triggerRect = trigger.getBoundingClientRect()
+    const gap = 6
+    const edge = 8
+    const width = Math.max(220, Math.min(320, menu.offsetWidth))
+    menu.style.width = width + "px"
+    const left = Math.min(
+      Math.max(edge, triggerRect.left),
+      window.innerWidth - width - edge
+    )
+    const menuHeight = menu.offsetHeight
+    const topAbove = triggerRect.top - menuHeight - gap
+    const top = topAbove >= edge
+      ? topAbove
+      : Math.min(
+          window.innerHeight - menuHeight - edge,
+          triggerRect.bottom + gap
+        )
+    menu.style.left = left + "px"
+    menu.style.top = Math.max(edge, top) + "px"
+  }
+
+  const moveProjectPickerFocus = (menu, direction) => {
+    const options = Array.from(
+      menu.querySelectorAll("button[role='option']:not(:disabled)")
+    )
+    if (options.length === 0) return
+    const activeIndex = options.indexOf(document.activeElement)
+    const nextIndex = activeIndex < 0
+      ? direction > 0 ? 0 : options.length - 1
+      : (activeIndex + direction + options.length) % options.length
+    options[nextIndex].focus()
+  }
+
+  const openProjectPickerMenu = picker => {
+    const trigger = picker.querySelector(
+      "button[" + projectPickerTriggerAttribute + "]"
+    )
+    if (!(trigger instanceof HTMLButtonElement) || trigger.disabled) return
+    const composerId = picker.dataset.composerId
+    if (!composerId) return
+    const presentation = getProjectPickerPresentation(
+      getProjectPickerState(composerId)
+    )
+    if (presentation.disabled || presentation.options.length === 0) return
+
+    closeProjectPicker()
+    const menu = document.createElement("div")
+    menu.setAttribute(projectPickerMenuAttribute, "")
+    menu.setAttribute("role", "listbox")
+    menu.setAttribute("aria-label", "Project")
+    presentation.options.forEach(option => {
+      const item = document.createElement("button")
+      item.type = "button"
+      item.setAttribute("role", "option")
+      item.setAttribute("aria-selected", option.selected ? "true" : "false")
+      item.disabled = option.disabled
+      item.dataset.value = option.value
+
+      const label = document.createElement("span")
+      label.className = "agent-vibes-project-picker-option-label"
+      label.textContent = option.label
+      const check = document.createElement("span")
+      check.className = "codicon codicon-check"
+      check.setAttribute("aria-hidden", "true")
+      if (!option.selected) check.style.visibility = "hidden"
+      item.append(label, check)
+      item.addEventListener("click", () => {
+        closeProjectPicker(true)
+        void selectProject(picker, option.value)
+      })
+      menu.append(item)
+    })
+    menu.addEventListener("keydown", event => {
+      if (event.key === "Escape") {
+        event.preventDefault()
+        closeProjectPicker(true)
+        return
+      }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault()
+        moveProjectPickerFocus(menu, event.key === "ArrowDown" ? 1 : -1)
+        return
+      }
+      if (event.key === "Home" || event.key === "End") {
+        event.preventDefault()
+        const options = Array.from(
+          menu.querySelectorAll("button[role='option']:not(:disabled)")
+        )
+        const option = event.key === "Home"
+          ? options[0]
+          : options[options.length - 1]
+        option?.focus()
+      }
+    })
+    document.body.append(menu)
+    openProjectPicker = { picker, menu }
+    trigger.setAttribute("aria-expanded", "true")
+    positionProjectPickerMenu(trigger, menu)
+    const selected = menu.querySelector(
+      "button[role='option'][aria-selected='true']:not(:disabled)"
+    )
+    const first = menu.querySelector("button[role='option']:not(:disabled)")
+    ;(selected ?? first)?.focus()
+  }
+
+  const toggleProjectPicker = picker => {
+    if (openProjectPicker?.picker === picker) {
+      closeProjectPicker(true)
+      return
+    }
+    openProjectPickerMenu(picker)
+  }
+
+  const renderProjectPicker = composerId => {
+    const presentation = getProjectPickerPresentation(
+      getProjectPickerState(composerId)
+    )
+    getProjectPickerElements(composerId).forEach(picker => {
+      const trigger = picker.querySelector(
+        "button[" + projectPickerTriggerAttribute + "]"
+      )
+      const label = picker.querySelector(
+        ".agent-vibes-project-picker-trigger-label"
+      )
+      if (!(trigger instanceof HTMLButtonElement) || !(label instanceof HTMLElement)) {
+        return
+      }
+      label.textContent = presentation.label
+      trigger.disabled = presentation.disabled
+      trigger.title = presentation.title
+      if (presentation.workspaceKey) {
+        picker.dataset.workspaceKey = presentation.workspaceKey
+      } else {
+        delete picker.dataset.workspaceKey
+      }
+      if (presentation.disabled && openProjectPicker?.picker === picker) {
+        closeProjectPicker()
+      }
+    })
+  }
+
+  const loadProjectPicker = (composerId, force = false) => {
+    const state = getProjectPickerState(composerId)
+    if (!workspaceControlConfig?.controlToken || !projectControlOrigin) {
+      state.error = "Project control is not configured"
+      renderProjectPicker(composerId)
+      return
+    }
+    if (!force && state.data && Date.now() - state.loadedAt < projectPickerRefreshMs) {
+      renderProjectPicker(composerId)
+      return
+    }
+    if (state.request) return
+
+    state.error = null
+    state.request = requestProjectControl(
+      "/api/agent-input/projects/" + encodeURIComponent(composerId)
+    )
+      .then(data => {
+        state.data = data
+        state.loadedAt = Date.now()
+      })
+      .catch(error => {
+        state.error = error instanceof Error ? error.message : String(error)
+      })
+      .finally(() => {
+        state.request = null
+        renderProjectPicker(composerId)
+      })
+  }
+
+  const selectProject = async (picker, folderUri) => {
+    const composerId = picker.dataset.composerId
+    const workspaceKey = picker.dataset.workspaceKey
+    if (!composerId || !workspaceKey || !folderUri) return
+
+    const trigger = picker.querySelector(
+      "button[" + projectPickerTriggerAttribute + "]"
+    )
+    if (trigger instanceof HTMLButtonElement) trigger.disabled = true
+    try {
+      await requestProjectControl(
+        "/api/agent-input/projects/" + encodeURIComponent(composerId),
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            workspaceKey,
+            folderUri,
+          }),
+        }
+      )
+    } catch (error) {
+      const state = getProjectPickerState(composerId)
+      state.error = error instanceof Error ? error.message : String(error)
+    }
+    loadProjectPicker(composerId, true)
+    // The active project drives which repository the branch picker inspects,
+    // so refresh it whenever the project selection changes.
+    loadBranchPicker(composerId, true)
+  }
+
+  const ensurePickerDock = input => {
+    let dock = input.querySelector("[" + pickerDockAttribute + "]")
+    if (!(dock instanceof HTMLElement)) {
+      dock = document.createElement("div")
+      dock.setAttribute(pickerDockAttribute, "")
+    }
+    // Mount the picker dock as the input box's first child so it inherits the
+    // input's visibility and docking transitions (it never orphans when the
+    // input moves between surfaces). CSS then floats it just above the box's
+    // top edge as a top-left row in normal placement, and falls back to an
+    // in-flow leading row when docked inside the panel host.
+    if (input.firstElementChild !== dock) {
+      input.insertBefore(dock, input.firstChild)
+    }
+    return dock
+  }
+
+  const ensureProjectPicker = (dock, composerId) => {
+    let picker = dock.querySelector("[" + projectPickerAttribute + "]")
+    if (!(picker instanceof HTMLElement)) {
+      picker = document.createElement("div")
+      picker.setAttribute(projectPickerAttribute, "")
+      const trigger = document.createElement("button")
+      trigger.type = "button"
+      trigger.setAttribute(projectPickerTriggerAttribute, "")
+      trigger.setAttribute("aria-label", "Project")
+      trigger.setAttribute("aria-haspopup", "listbox")
+      trigger.setAttribute("aria-expanded", "false")
+      const icon = document.createElement("span")
+      icon.className = "codicon codicon-folder"
+      icon.setAttribute("aria-hidden", "true")
+      const label = document.createElement("span")
+      label.className = "agent-vibes-project-picker-trigger-label"
+      const chevron = document.createElement("span")
+      chevron.className = "codicon codicon-chevron-down"
+      chevron.setAttribute("aria-hidden", "true")
+      trigger.append(icon, label, chevron)
+      trigger.addEventListener("click", event => {
+        event.stopPropagation()
+        toggleProjectPicker(picker)
+      })
+      trigger.addEventListener("keydown", event => {
+        if (event.key !== "ArrowDown") return
+        event.preventDefault()
+        openProjectPickerMenu(picker)
+      })
+      picker.append(trigger)
+    }
+
+    // The project pill is always the leading element inside the dock.
+    if (dock.firstElementChild !== picker) {
+      dock.insertBefore(picker, dock.firstChild)
+    }
+
+    if (picker.dataset.composerId !== composerId) {
+      picker.dataset.composerId = composerId
+      delete picker.dataset.workspaceKey
+    }
+    renderProjectPicker(composerId)
+    loadProjectPicker(composerId)
+  }
+
+  const getBranchPickerState = composerId => {
+    let state = branchPickerStates.get(composerId)
+    if (!state) {
+      state = {
+        data: null,
+        error: null,
+        actionError: null,
+        loadedAt: 0,
+        request: null,
+      }
+      branchPickerStates.set(composerId, state)
+    }
+    return state
+  }
+
+  const getBranchPickerElements = composerId =>
+    Array.from(
+      document.querySelectorAll("[" + branchPickerAttribute + "]")
+    ).filter(picker => picker.dataset.composerId === composerId)
+
+  const getBranchPickerPresentation = state => {
+    if (state.error) {
+      return {
+        label: "Branch unavailable",
+        title: state.error,
+        disabled: true,
+        options: [],
+      }
+    }
+    const data = state.data
+    if (!data) {
+      return {
+        label: "Loading branches...",
+        title: "Loading branches",
+        disabled: true,
+        options: [],
+      }
+    }
+    if (data.kind === "no-project") {
+      return {
+        label: "No project",
+        title: "Choose a project for this chat first",
+        disabled: true,
+        options: [],
+      }
+    }
+    if (data.kind === "no-repo") {
+      return {
+        label: "No branch",
+        title: "This project is not a Git repository",
+        disabled: true,
+        options: [],
+      }
+    }
+    if (data.kind !== "ready") {
+      return {
+        label: "Branch unavailable",
+        title: data.message || "Git branch information is unavailable",
+        disabled: true,
+        options: [],
+      }
+    }
+
+    const branches = Array.isArray(data.branches) ? data.branches : []
+    const current = typeof data.current === "string" ? data.current : null
+    const options = branches.map(branch => ({
+      value: branch,
+      label: branch,
+      disabled: false,
+      selected: branch === current,
+    }))
+    const baseTitle = current
+      ? "Switch the Git branch for this project"
+      : "Detached HEAD — choose a branch to check out"
+    if (options.length === 0) {
+      return {
+        label: current || "No branches",
+        title: state.actionError
+          ? state.actionError
+          : current
+            ? "Current branch"
+            : "This repository has no local branches",
+        disabled: true,
+        options: [],
+      }
+    }
+    return {
+      label: current || "Detached HEAD",
+      title: state.actionError || baseTitle,
+      disabled: false,
+      options,
+    }
+  }
+
+  const closeBranchPicker = (restoreFocus = false) => {
+    if (!openBranchPicker) return
+    const { picker, menu } = openBranchPicker
+    openBranchPicker = null
+    menu.remove()
+    const trigger = picker.querySelector(
+      "button[" + branchPickerTriggerAttribute + "]"
+    )
+    if (trigger instanceof HTMLButtonElement) {
+      trigger.setAttribute("aria-expanded", "false")
+      if (restoreFocus) trigger.focus()
+    }
+  }
+
+  const openBranchPickerMenu = picker => {
+    const trigger = picker.querySelector(
+      "button[" + branchPickerTriggerAttribute + "]"
+    )
+    if (!(trigger instanceof HTMLButtonElement) || trigger.disabled) return
+    const composerId = picker.dataset.composerId
+    if (!composerId) return
+    const presentation = getBranchPickerPresentation(
+      getBranchPickerState(composerId)
+    )
+    if (presentation.disabled || presentation.options.length === 0) return
+
+    closeBranchPicker()
+    const menu = document.createElement("div")
+    menu.setAttribute(branchPickerMenuAttribute, "")
+    menu.setAttribute("role", "listbox")
+    menu.setAttribute("aria-label", "Branch")
+    presentation.options.forEach(option => {
+      const item = document.createElement("button")
+      item.type = "button"
+      item.setAttribute("role", "option")
+      item.setAttribute("aria-selected", option.selected ? "true" : "false")
+      item.disabled = option.disabled
+      item.dataset.value = option.value
+
+      const label = document.createElement("span")
+      label.className = "agent-vibes-branch-picker-option-label"
+      label.textContent = option.label
+      const check = document.createElement("span")
+      check.className = "codicon codicon-check"
+      check.setAttribute("aria-hidden", "true")
+      if (!option.selected) check.style.visibility = "hidden"
+      item.append(label, check)
+      item.addEventListener("click", () => {
+        closeBranchPicker(true)
+        void selectBranch(picker, option.value)
+      })
+      menu.append(item)
+    })
+    menu.addEventListener("keydown", event => {
+      if (event.key === "Escape") {
+        event.preventDefault()
+        closeBranchPicker(true)
+        return
+      }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault()
+        moveProjectPickerFocus(menu, event.key === "ArrowDown" ? 1 : -1)
+        return
+      }
+      if (event.key === "Home" || event.key === "End") {
+        event.preventDefault()
+        const options = Array.from(
+          menu.querySelectorAll("button[role='option']:not(:disabled)")
+        )
+        const option = event.key === "Home"
+          ? options[0]
+          : options[options.length - 1]
+        option?.focus()
+      }
+    })
+    document.body.append(menu)
+    openBranchPicker = { picker, menu }
+    trigger.setAttribute("aria-expanded", "true")
+    positionProjectPickerMenu(trigger, menu)
+    const selected = menu.querySelector(
+      "button[role='option'][aria-selected='true']:not(:disabled)"
+    )
+    const first = menu.querySelector("button[role='option']:not(:disabled)")
+    ;(selected ?? first)?.focus()
+  }
+
+  const toggleBranchPicker = picker => {
+    if (openBranchPicker?.picker === picker) {
+      closeBranchPicker(true)
+      return
+    }
+    openBranchPickerMenu(picker)
+  }
+
+  const renderBranchPicker = composerId => {
+    const presentation = getBranchPickerPresentation(
+      getBranchPickerState(composerId)
+    )
+    getBranchPickerElements(composerId).forEach(picker => {
+      const trigger = picker.querySelector(
+        "button[" + branchPickerTriggerAttribute + "]"
+      )
+      const label = picker.querySelector(
+        ".agent-vibes-branch-picker-trigger-label"
+      )
+      if (
+        !(trigger instanceof HTMLButtonElement) ||
+        !(label instanceof HTMLElement)
+      ) {
+        return
+      }
+      label.textContent = presentation.label
+      trigger.disabled = presentation.disabled
+      trigger.title = presentation.title
+      if (presentation.disabled && openBranchPicker?.picker === picker) {
+        closeBranchPicker()
+      }
+    })
+  }
+
+  const loadBranchPicker = (composerId, force = false) => {
+    const state = getBranchPickerState(composerId)
+    if (!workspaceControlConfig?.controlToken || !projectControlOrigin) {
+      state.error = "Project control is not configured"
+      renderBranchPicker(composerId)
+      return
+    }
+    if (
+      !force &&
+      state.data &&
+      Date.now() - state.loadedAt < branchPickerRefreshMs
+    ) {
+      renderBranchPicker(composerId)
+      return
+    }
+    if (state.request) return
+
+    state.error = null
+    state.request = requestProjectControl(
+      "/api/agent-input/branches/" + encodeURIComponent(composerId)
+    )
+      .then(data => {
+        state.data = data
+        state.loadedAt = Date.now()
+      })
+      .catch(error => {
+        state.error = error instanceof Error ? error.message : String(error)
+      })
+      .finally(() => {
+        state.request = null
+        renderBranchPicker(composerId)
+      })
+  }
+
+  const selectBranch = async (picker, branch) => {
+    const composerId = picker.dataset.composerId
+    if (!composerId || !branch) return
+
+    const trigger = picker.querySelector(
+      "button[" + branchPickerTriggerAttribute + "]"
+    )
+    if (trigger instanceof HTMLButtonElement) trigger.disabled = true
+    const state = getBranchPickerState(composerId)
+    state.actionError = null
+    let failed = false
+    try {
+      const result = await requestProjectControl(
+        "/api/agent-input/branches/" + encodeURIComponent(composerId),
+        {
+          method: "PUT",
+          body: JSON.stringify({ branch }),
+        }
+      )
+      if (result && result.ok === false) {
+        failed = true
+        state.actionError =
+          typeof result.message === "string" && result.message
+            ? result.message
+            : "Failed to switch branch"
+      }
+    } catch (error) {
+      failed = true
+      state.actionError = error instanceof Error ? error.message : String(error)
+    }
+    // Reload to reflect the new HEAD on success; on failure the checkout was a
+    // no-op, so keep the cached branch list and surface actionError instead of
+    // wiping it with a fresh request.
+    if (failed) {
+      renderBranchPicker(composerId)
+    } else {
+      loadBranchPicker(composerId, true)
+    }
+  }
+
+  const ensureBranchPicker = (dock, composerId) => {
+    let picker = dock.querySelector("[" + branchPickerAttribute + "]")
+    if (!(picker instanceof HTMLElement)) {
+      picker = document.createElement("div")
+      picker.setAttribute(branchPickerAttribute, "")
+      const trigger = document.createElement("button")
+      trigger.type = "button"
+      trigger.setAttribute(branchPickerTriggerAttribute, "")
+      trigger.setAttribute("aria-label", "Branch")
+      trigger.setAttribute("aria-haspopup", "listbox")
+      trigger.setAttribute("aria-expanded", "false")
+      const icon = document.createElement("span")
+      icon.className = "codicon codicon-git-branch"
+      icon.setAttribute("aria-hidden", "true")
+      const label = document.createElement("span")
+      label.className = "agent-vibes-branch-picker-trigger-label"
+      const chevron = document.createElement("span")
+      chevron.className = "codicon codicon-chevron-down"
+      chevron.setAttribute("aria-hidden", "true")
+      trigger.append(icon, label, chevron)
+      trigger.addEventListener("click", event => {
+        event.stopPropagation()
+        toggleBranchPicker(picker)
+      })
+      trigger.addEventListener("keydown", event => {
+        if (event.key !== "ArrowDown") return
+        event.preventDefault()
+        openBranchPickerMenu(picker)
+      })
+      picker.append(trigger)
+    }
+
+    // The branch pill trails the project pill inside the dock.
+    if (dock.lastElementChild !== picker) {
+      dock.append(picker)
+    }
+
+    if (picker.dataset.composerId !== composerId) {
+      picker.dataset.composerId = composerId
+    }
+    renderBranchPicker(composerId)
+    loadBranchPicker(composerId)
+  }
+
+  const syncPickerInputPlacement = (input, root) => {
+    const rootBounds = root.getBoundingClientRect()
+    const inputBounds = input.getBoundingClientRect()
+    if (
+      isTopAnchoredInput(
+        rootBounds.top,
+        rootBounds.bottom,
+        inputBounds.top,
+        inputBounds.bottom
+      )
+    ) {
+      input.setAttribute(topInputAttribute, "")
+    } else {
+      input.removeAttribute(topInputAttribute)
+    }
+  }
+
+  const ensureDockPickers = (input, composerId, root) => {
+    const dock = ensurePickerDock(input)
+    ensureProjectPicker(dock, composerId)
+    ensureBranchPicker(dock, composerId)
+    syncPickerInputPlacement(input, root)
+  }
+
   const primeNativeRoots = () => {
+    if (!agentInputDockEnabled) return
     document.querySelectorAll(nativeRootSelector).forEach(root => {
       if (!(root instanceof HTMLElement)) return
       const composerId = root.getAttribute("data-composer-id")
@@ -1919,7 +2781,7 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
 
   const scan = () => {
     try {
-      if (pendingLastComposerClose) {
+      if (agentInputDockEnabled && pendingLastComposerClose) {
         settleLastComposerClose(pendingLastComposerClose)
         return
       }
@@ -1933,8 +2795,9 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
         if (!composerId) return
         const location = getNativeLocation(root)
         const surface = getNativeSurface(root)
-        const state = getRootState(root, composerId)
-        syncRootPlacement(root, state)
+        if (agentInputDockEnabled) {
+          syncRootPlacement(root, getRootState(root, composerId))
+        }
         const input = findReadyInput(root)
         // When an input is already docked for this composer, a different
         // .full-input-box appearing in the native root is an inline
@@ -1950,6 +2813,9 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
           return
         }
         if (input) {
+          if (workspaceControlEnabled) {
+            ensureDockPickers(input, composerId, root)
+          }
           records.push({
             composerId,
             root,
@@ -1960,6 +2826,7 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
         }
       })
 
+      if (!agentInputDockEnabled) return
       if (settleChatMove()) return
       if (syncAutoBottomDock()) return
 
@@ -2375,8 +3242,8 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
     if (document.getElementById(styleId)) return
     const style = document.createElement("style")
     style.id = styleId
-    style.textContent =
-      nativeRootSelector + ":not([" + placementAttribute + "]) " + inputSelector + "," +
+    const dockSurfaceStyles = agentInputDockEnabled
+      ? nativeRootSelector + ":not([" + placementAttribute + "]) " + inputSelector + "," +
       nativeRootSelector + "[" + placementAttribute + "='bottom'] [" + sourceAnchorAttribute + "] + " + inputSelector + "," +
       nativeRootSelector + "[" + placementAttribute + "='editor']:not([" + surfaceAttribute + "='editor']) " + inputSelector + "," +
       nativeRootSelector + "[" + placementAttribute + "='chat']:not([" + surfaceAttribute + "='pane']) " + inputSelector +
@@ -2404,8 +3271,41 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
       "[" + panelBodyAttribute + "]{position:relative!important;overflow:hidden!important}" +
       "[" + panelBodyAttribute + "][" + panelMountedAttribute + "] .monaco-list{display:none!important}" +
       "[" + panelHostAttribute + "]{position:absolute;inset:0;display:flex;flex-direction:column;align-items:stretch;box-sizing:border-box;width:100%;height:100%;min-height:0;padding:8px 12px}" +
-      "[" + panelHostAttribute + "]>" + inputSelector + "{display:flex!important;flex:1 1 auto!important;flex-direction:column!important;width:100%!important;height:100%!important;min-height:0!important;max-width:none!important;max-height:none!important;margin:0!important}" +
-      "[" + panelHostAttribute + "] [" + fillShellAttribute + "]{display:flex!important;flex:1 1 auto!important;flex-direction:column!important;width:100%!important;min-width:0!important;min-height:0!important}" +
+      "[" + panelHostAttribute + "]>" + inputSelector + "{display:flex!important;flex:1 1 auto!important;flex-direction:column!important;width:100%!important;height:100%!important;min-height:0!important;max-width:none!important;max-height:none!important;margin:0!important}"
+      : ""
+    const workspaceControlStyles = workspaceControlEnabled
+      ? inputSelector + ":has(>[" + pickerDockAttribute + "]){position:relative}" +
+      inputSelector + "[" + topInputAttribute + "]:not([" + dockedInputAttribute + "]){margin-top:26px!important}" +
+      "[" + pickerDockAttribute + "]{position:absolute;left:0;bottom:calc(100% + 4px);z-index:5;display:flex;align-items:center;box-sizing:border-box;gap:2px;max-width:100%;min-width:0;margin:0;padding:0}" +
+      "[" + panelHostAttribute + "] [" + pickerDockAttribute + "]{position:static;width:100%;margin:0 0 6px}" +
+      "[" + projectPickerAttribute + "],[" + branchPickerAttribute + "]{display:flex;align-items:center;box-sizing:border-box;flex:0 1 auto;min-width:0;max-width:100%;margin:0;padding:0}" +
+      "button[" + projectPickerTriggerAttribute + "]{display:inline-flex;align-items:center;box-sizing:border-box;max-width:240px;height:22px;min-width:0;padding:0 6px;border:none!important;border-radius:6px;background:transparent!important;color:inherit;font:inherit;font-size:12px;line-height:22px;outline:none;box-shadow:none!important;gap:4px;cursor:pointer}" +
+      "button[" + projectPickerTriggerAttribute + "]:hover:not(:disabled),button[" + projectPickerTriggerAttribute + "][aria-expanded='true']{background:var(--vscode-toolbar-hoverBackground)!important}" +
+      "button[" + projectPickerTriggerAttribute + "]:disabled{cursor:default;opacity:.68}" +
+      "button[" + projectPickerTriggerAttribute + "]:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:1px}" +
+      "button[" + projectPickerTriggerAttribute + "] .agent-vibes-project-picker-trigger-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" +
+      "button[" + projectPickerTriggerAttribute + "] .codicon{flex:0 0 auto;font-size:12px;opacity:.7}" +
+      "[" + projectPickerMenuAttribute + "]{position:fixed;z-index:2600;box-sizing:border-box;min-width:220px;max-width:320px;max-height:280px;padding:4px;overflow-x:hidden;overflow-y:auto;border:1px solid var(--vscode-menu-border,var(--vscode-widget-border));border-radius:6px;background:var(--vscode-menu-background,var(--vscode-editorWidget-background));color:var(--vscode-menu-foreground,var(--vscode-foreground));box-shadow:0 4px 16px var(--vscode-widget-shadow);font-family:var(--vscode-font-family);font-size:12px}" +
+      "[" + projectPickerMenuAttribute + "] button[role='option']{display:flex;align-items:center;box-sizing:border-box;width:100%;height:28px;padding:0 8px;border:none;border-radius:4px;background:transparent;color:inherit;font:inherit;text-align:left;gap:8px;outline:none;cursor:pointer}" +
+      "[" + projectPickerMenuAttribute + "] button[role='option']:hover:not(:disabled),[" + projectPickerMenuAttribute + "] button[role='option']:focus-visible{background:var(--vscode-list-hoverBackground)}" +
+      "[" + projectPickerMenuAttribute + "] button[role='option']:disabled{opacity:.55;cursor:default}" +
+      "[" + projectPickerMenuAttribute + "] .agent-vibes-project-picker-option-label{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" +
+      "[" + projectPickerMenuAttribute + "] .codicon{flex:0 0 auto;font-size:13px}" +
+      "button[" + branchPickerTriggerAttribute + "]{display:inline-flex;align-items:center;box-sizing:border-box;max-width:180px;height:22px;min-width:0;padding:0 6px;border:none!important;border-radius:6px;background:transparent!important;color:inherit;font:inherit;font-size:12px;line-height:22px;outline:none;box-shadow:none!important;gap:4px;cursor:pointer}" +
+      "button[" + branchPickerTriggerAttribute + "]:hover:not(:disabled),button[" + branchPickerTriggerAttribute + "][aria-expanded='true']{background:var(--vscode-toolbar-hoverBackground)!important}" +
+      "button[" + branchPickerTriggerAttribute + "]:disabled{cursor:default;opacity:.68}" +
+      "button[" + branchPickerTriggerAttribute + "]:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:1px}" +
+      "button[" + branchPickerTriggerAttribute + "] .agent-vibes-branch-picker-trigger-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" +
+      "button[" + branchPickerTriggerAttribute + "] .codicon{flex:0 0 auto;font-size:12px;opacity:.7}" +
+      "[" + branchPickerMenuAttribute + "]{position:fixed;z-index:2600;box-sizing:border-box;min-width:220px;max-width:320px;max-height:280px;padding:4px;overflow-x:hidden;overflow-y:auto;border:1px solid var(--vscode-menu-border,var(--vscode-widget-border));border-radius:6px;background:var(--vscode-menu-background,var(--vscode-editorWidget-background));color:var(--vscode-menu-foreground,var(--vscode-foreground));box-shadow:0 4px 16px var(--vscode-widget-shadow);font-family:var(--vscode-font-family);font-size:12px}" +
+      "[" + branchPickerMenuAttribute + "] button[role='option']{display:flex;align-items:center;box-sizing:border-box;width:100%;height:28px;padding:0 8px;border:none;border-radius:4px;background:transparent;color:inherit;font:inherit;text-align:left;gap:8px;outline:none;cursor:pointer}" +
+      "[" + branchPickerMenuAttribute + "] button[role='option']:hover:not(:disabled),[" + branchPickerMenuAttribute + "] button[role='option']:focus-visible{background:var(--vscode-list-hoverBackground)}" +
+      "[" + branchPickerMenuAttribute + "] button[role='option']:disabled{opacity:.55;cursor:default}" +
+      "[" + branchPickerMenuAttribute + "] .agent-vibes-branch-picker-option-label{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" +
+      "[" + branchPickerMenuAttribute + "] .codicon{flex:0 0 auto;font-size:13px}"
+      : ""
+    const dockPanelStyles = agentInputDockEnabled
+      ? "[" + panelHostAttribute + "] [" + fillShellAttribute + "]{display:flex!important;flex:1 1 auto!important;flex-direction:column!important;width:100%!important;min-width:0!important;min-height:0!important}" +
       "[" + panelHostAttribute + "] [" + fillEditorAttribute + "]{display:flex!important;flex:1 1 auto!important;flex-direction:column!important;width:100%!important;height:auto!important;min-height:0!important;max-height:none!important}" +
       "[" + panelHostAttribute + "] [" + fillScrollAttribute + "]{display:flex!important;flex:1 1 auto!important;flex-direction:column!important;width:100%!important;min-height:0!important}" +
       "[" + panelHostAttribute + "] [" + fillGridAttribute + "]{flex:1 1 auto!important;width:100%!important;min-height:0!important}" +
@@ -2426,17 +3326,22 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
       "[" + dropZoneAttribute + "][" + dropActiveAttribute + "]::before{border-color:var(--vscode-focusBorder)}" +
       "[" + dropZoneAttribute + "][" + dropActiveAttribute + "]::after{border-color:var(--vscode-button-background);background:var(--vscode-button-background);color:var(--vscode-button-foreground)}" +
       "@media (prefers-reduced-motion:reduce){[" + dropZoneAttribute + "]{transition:none}}"
+      : ""
+    style.textContent =
+      dockSurfaceStyles + workspaceControlStyles + dockPanelStyles
     document.head.appendChild(style)
 
-    rememberOwnedPanelAction()
+    if (agentInputDockEnabled) rememberOwnedPanelAction()
     primeNativeRoots()
     observer = new MutationObserver(mutations => {
       if (!mutations.some(mutationTouchesRuntime)) return
       primeNativeRoots()
-      const available =
-        Boolean(document.querySelector(nativeRootSelector + " " + inputSelector)) ||
-        Boolean(mounted)
-      setPanelAvailable(available)
+      if (agentInputDockEnabled) {
+        const available =
+          Boolean(document.querySelector(nativeRootSelector + " " + inputSelector)) ||
+          Boolean(mounted)
+        setPanelAvailable(available)
+      }
       scheduleScan()
     })
     observer.observe(document.body, {
@@ -2455,6 +3360,23 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
       "click",
       event => {
         const target = event.target
+        if (
+          openProjectPicker &&
+          target instanceof Node &&
+          !openProjectPicker.picker.contains(target) &&
+          !openProjectPicker.menu.contains(target)
+        ) {
+          closeProjectPicker()
+        }
+        if (
+          openBranchPicker &&
+          target instanceof Node &&
+          !openBranchPicker.picker.contains(target) &&
+          !openBranchPicker.menu.contains(target)
+        ) {
+          closeBranchPicker()
+        }
+        if (!agentInputDockEnabled) return
         beginLastComposerClose(target)
         const ownedPanelTab =
           target instanceof Element
@@ -2483,14 +3405,21 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
       },
       true
     )
-    window.addEventListener("dragstart", beginTabDrag, true)
-    window.addEventListener("dragover", updateTabDrag, true)
-    window.addEventListener("drop", dropTabDrag, true)
-    window.addEventListener("dragend", finishTabDrag, true)
-    window.addEventListener("pointerdown", beginBottomPointerDrag, true)
-    window.addEventListener("pointermove", updateBottomPointerDrag, true)
-    window.addEventListener("pointerup", completeBottomPointerDrag, true)
-    window.addEventListener("pointercancel", cancelBottomPointerDrag, true)
+    if (agentInputDockEnabled) {
+      window.addEventListener("dragstart", beginTabDrag, true)
+      window.addEventListener("dragover", updateTabDrag, true)
+      window.addEventListener("drop", dropTabDrag, true)
+      window.addEventListener("dragend", finishTabDrag, true)
+      window.addEventListener("pointerdown", beginBottomPointerDrag, true)
+      window.addEventListener("pointermove", updateBottomPointerDrag, true)
+      window.addEventListener("pointerup", completeBottomPointerDrag, true)
+      window.addEventListener("pointercancel", cancelBottomPointerDrag, true)
+    }
+    window.addEventListener("resize", () => {
+      closeProjectPicker()
+      closeBranchPicker()
+      scheduleScan()
+    })
     window.addEventListener(
       "dragleave",
       event => {
@@ -2501,10 +3430,16 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
       true
     )
     window.addEventListener("blur", () => {
-      cancelBottomPointerDrag()
-      clearTabDrag()
+      closeProjectPicker()
+      closeBranchPicker()
+      if (agentInputDockEnabled) {
+        cancelBottomPointerDrag()
+        clearTabDrag()
+      }
     })
-    document.addEventListener("keydown", handleHistoryNavigation, true)
+    if (agentInputDockEnabled) {
+      document.addEventListener("keydown", handleHistoryNavigation, true)
+    }
     scan()
   }
 
@@ -2515,6 +3450,8 @@ const CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION =
   }
 })()
 `
+  )
+}
 
 function findMatchingBrace(
   content: string,
@@ -2650,6 +3587,22 @@ function removeMarkedRuntime(content: string, marker: string): string | null {
   return chunks.join("")
 }
 
+const CURSOR_AGENT_INPUT_RUNTIME_BOUNDARY_MARKERS: readonly string[] = [
+  CURSOR_AGENT_INPUT_RUNTIME_PATCH_MARKER,
+  ...CURSOR_AGENT_INPUT_RUNTIME_LEGACY_MARKERS,
+  ...CURSOR_AGENT_INPUT_DOCK_LEGACY_MARKERS,
+]
+
+const CURSOR_AGENT_INPUT_SHARED_RUNTIME_BOUNDARY_MARKERS: readonly string[] = [
+  CURSOR_AGENT_INPUT_RUNTIME_PATCH_MARKER,
+  ...CURSOR_AGENT_INPUT_RUNTIME_LEGACY_MARKERS,
+]
+
+const CURSOR_AGENT_INPUT_RUNTIME_BOUNDARY_PATTERN_SOURCE =
+  CURSOR_AGENT_INPUT_RUNTIME_BOUNDARY_MARKERS.map((marker) =>
+    marker.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")
+  ).join("|")
+
 function findCursorAgentInputDockMarkers(content: string): Set<string> {
   return new Set(
     content.match(
@@ -2658,42 +3611,78 @@ function findCursorAgentInputDockMarkers(content: string): Set<string> {
   )
 }
 
+function findCursorAgentInputRuntimeBoundaryMarkers(
+  content: string
+): Set<string> {
+  const markers = new Set(
+    content.match(
+      new RegExp(CURSOR_AGENT_INPUT_RUNTIME_BOUNDARY_PATTERN_SOURCE, "gu")
+    ) ?? []
+  )
+  const sharedRuntimeMarkers = new Set(
+    CURSOR_AGENT_INPUT_SHARED_RUNTIME_BOUNDARY_MARKERS.filter((marker) =>
+      markers.has(marker)
+    )
+  )
+  return sharedRuntimeMarkers.size > 0 ? sharedRuntimeMarkers : markers
+}
+
+function canRewriteCursorAgentInputRuntime(content: string): boolean {
+  const boundaryMarkers = findCursorAgentInputRuntimeBoundaryMarkers(content)
+  const hasCurrentBoundary = boundaryMarkers.has(
+    CURSOR_AGENT_INPUT_RUNTIME_PATCH_MARKER
+  )
+  if (
+    !hasCurrentBoundary &&
+    boundaryMarkers.size === 0 &&
+    (content.includes(CURSOR_AGENT_INPUT_DOCK_PATCH_MARKER) ||
+      content.includes(CURSOR_WORKSPACE_CONTROL_PATCH_MARKER))
+  ) {
+    return false
+  }
+
+  for (const marker of boundaryMarkers) {
+    if (!canRemoveMarkedRuntime(content, marker)) return false
+  }
+  return content.length > 0
+}
+
 export function getCursorAgentInputDockDetails(
   content: string
 ): CursorAgentInputDockDetails {
   const markers = findCursorAgentInputDockMarkers(content)
   const hasCurrentMarker = markers.has(CURSOR_AGENT_INPUT_DOCK_PATCH_MARKER)
+  const hasCurrentBoundary = content.includes(
+    CURSOR_AGENT_INPUT_RUNTIME_PATCH_MARKER
+  )
   const legacyMarkers = CURSOR_AGENT_INPUT_DOCK_LEGACY_MARKERS.filter(
     (marker) => markers.has(marker)
   )
-  const applied = hasCurrentMarker && legacyMarkers.length === 0
-  if (applied) {
-    return {
-      applied: true,
-      partial: false,
-      canApply: canRemoveMarkedRuntime(
-        content,
-        CURSOR_AGENT_INPUT_DOCK_PATCH_MARKER
-      ),
-      legacyMarkers: [],
-    }
-  }
-
-  let canApply = content.length > 0
-  if (canApply) {
-    for (const marker of markers) {
-      if (!canRemoveMarkedRuntime(content, marker)) {
-        canApply = false
-        break
-      }
-    }
-  }
+  const applied =
+    hasCurrentMarker && hasCurrentBoundary && legacyMarkers.length === 0
 
   return {
-    applied: false,
-    partial: hasCurrentMarker || legacyMarkers.length > 0,
-    canApply,
+    applied,
+    partial: !applied && (hasCurrentMarker || legacyMarkers.length > 0),
+    canApply: canRewriteCursorAgentInputRuntime(content),
     legacyMarkers: [...legacyMarkers],
+  }
+}
+
+export function getCursorWorkspaceControlDetails(
+  content: string
+): CursorAgentInputDockDetails {
+  const hasMarker = content.includes(CURSOR_WORKSPACE_CONTROL_PATCH_MARKER)
+  const hasCurrentBoundary = content.includes(
+    CURSOR_AGENT_INPUT_RUNTIME_PATCH_MARKER
+  )
+  const applied = hasMarker && hasCurrentBoundary
+
+  return {
+    applied,
+    partial: hasMarker && !applied,
+    canApply: canRewriteCursorAgentInputRuntime(content),
+    legacyMarkers: [],
   }
 }
 
@@ -2701,16 +3690,42 @@ export function hasCursorAgentInputDockPatch(content: string): boolean {
   return findCursorAgentInputDockMarkers(content).size > 0
 }
 
-export function removeCursorAgentInputDockPatchContent(
+export function hasCursorWorkspaceControlPatch(content: string): boolean {
+  return content.includes(CURSOR_WORKSPACE_CONTROL_PATCH_MARKER)
+}
+
+export function removeCursorAgentInputRuntimePatchContent(
   content: string
 ): string | null {
   let nextContent = content
-  for (const marker of findCursorAgentInputDockMarkers(content)) {
+  for (const marker of findCursorAgentInputRuntimeBoundaryMarkers(content)) {
     const cleanedContent = removeMarkedRuntime(nextContent, marker)
     if (cleanedContent === null) return null
     nextContent = cleanedContent
   }
   return nextContent
+}
+
+function rewriteCursorAgentInputRuntime(
+  content: string,
+  agentInputDockEnabled: boolean,
+  workspaceControlEnabled: boolean,
+  runtimeConfig: WorkspaceControlRuntimeConfig | null
+): string | null {
+  if (!canRewriteCursorAgentInputRuntime(content)) return null
+  if (workspaceControlEnabled && runtimeConfig === null) return null
+
+  const nextContent = removeCursorAgentInputRuntimePatchContent(content)
+  if (nextContent === null) return null
+  if (!agentInputDockEnabled && !workspaceControlEnabled) return nextContent
+
+  return (
+    buildCursorAgentInputRuntimePatchInsertion(
+      agentInputDockEnabled,
+      workspaceControlEnabled,
+      runtimeConfig
+    ) + nextContent
+  )
 }
 
 export function patchCursorAgentInputDockContent(
@@ -2720,8 +3735,65 @@ export function patchCursorAgentInputDockContent(
   if (details.applied && details.canApply) return content
   if (!details.canApply) return null
 
-  const nextContent = removeCursorAgentInputDockPatchContent(content)
-  if (nextContent === null) return null
+  const workspaceDetails = getCursorWorkspaceControlDetails(content)
+  return rewriteCursorAgentInputRuntime(
+    content,
+    true,
+    workspaceDetails.applied,
+    readWorkspaceControlRuntimeConfig(content)
+  )
+}
 
-  return CURSOR_AGENT_INPUT_DOCK_PATCH_INSERTION + nextContent
+export function removeCursorAgentInputDockPatchContent(
+  content: string
+): string | null {
+  if (!hasCursorAgentInputDockPatch(content)) return content
+
+  const workspaceDetails = getCursorWorkspaceControlDetails(content)
+  return rewriteCursorAgentInputRuntime(
+    content,
+    false,
+    workspaceDetails.applied,
+    readWorkspaceControlRuntimeConfig(content)
+  )
+}
+
+export function patchCursorWorkspaceControlContent(
+  content: string,
+  runtimeConfig: WorkspaceControlRuntimeConfig
+): string | null {
+  const details = getCursorWorkspaceControlDetails(content)
+  if (
+    details.applied &&
+    details.canApply &&
+    JSON.stringify(readWorkspaceControlRuntimeConfig(content)) ===
+      JSON.stringify(runtimeConfig)
+  ) {
+    return content
+  }
+  if (!details.canApply) return null
+
+  return rewriteCursorAgentInputRuntime(
+    content,
+    getCursorAgentInputDockDetails(content).applied ||
+      CURSOR_AGENT_INPUT_DOCK_LEGACY_MARKERS.some((marker) =>
+        content.includes(marker)
+      ),
+    true,
+    runtimeConfig
+  )
+}
+
+export function removeCursorWorkspaceControlPatchContent(
+  content: string
+): string | null {
+  if (!hasCursorWorkspaceControlPatch(content)) return content
+
+  const dockDetails = getCursorAgentInputDockDetails(content)
+  return rewriteCursorAgentInputRuntime(
+    content,
+    dockDetails.applied || dockDetails.legacyMarkers.length > 0,
+    false,
+    null
+  )
 }

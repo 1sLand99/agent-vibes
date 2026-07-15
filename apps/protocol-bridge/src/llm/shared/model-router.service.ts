@@ -336,8 +336,12 @@ export class ModelRouterService {
       })
     }
 
-    // Kiro (AWS) supports Claude Sonnet/Opus/Haiku families.
-    if (kiroAvailable && canPublicClaudeModelUseKiro(normalized)) {
+    // Prefer the Kiro provider's discovered model support when available;
+    // fall back to the static Claude-family heuristic during early startup.
+    if (
+      hasExplicitKiroMapping ||
+      (kiroAvailable && canPublicClaudeModelUseKiro(normalized))
+    ) {
       candidates.push({
         backend: "kiro",
         model: normalized,

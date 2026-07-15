@@ -76,6 +76,14 @@ const EN: Record<string, string> = {
     "Agent input dock is already enabled.",
   "patches.agentInputDockDisabled":
     "Agent input dock is disabled. Fully restart Cursor to apply.",
+  "patches.workspaceControlFailed":
+    "Failed to update workspace and Git branch control: {detail}",
+  "patches.workspaceControlApplied":
+    "Workspace and Git branch control is enabled. Fully restart Cursor to apply.",
+  "patches.workspaceControlAlreadyApplied":
+    "Workspace and Git branch control is already enabled.",
+  "patches.workspaceControlDisabled":
+    "Workspace and Git branch control is disabled. Fully restart Cursor to apply.",
   "patches.trafficCaptureFailed":
     "Failed to enable Cursor traffic capture: {detail}",
   "patches.trafficCaptureApplied":
@@ -274,6 +282,12 @@ const ZH: Record<string, string> = {
   "patches.agentInputDockAlreadyApplied": "Agent 输入停靠已经启用。",
   "patches.agentInputDockDisabled":
     "已关闭 Agent 输入停靠。请完整重启 Cursor 以应用。",
+  "patches.workspaceControlFailed": "更新工作区与 Git 分支控制失败：{detail}",
+  "patches.workspaceControlApplied":
+    "已启用工作区与 Git 分支控制。请完整重启 Cursor 以应用。",
+  "patches.workspaceControlAlreadyApplied": "工作区与 Git 分支控制已经启用。",
+  "patches.workspaceControlDisabled":
+    "已关闭工作区与 Git 分支控制。请完整重启 Cursor 以应用。",
   "patches.trafficCaptureFailed": "启用 Cursor 流量抓取失败：{detail}",
   "patches.trafficCaptureApplied":
     "已启用 Cursor 流量抓取。请完整重启 Cursor 后再收集日志。",

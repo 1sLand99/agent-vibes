@@ -9,6 +9,10 @@ import {
   ContextAttachmentSnapshot,
 } from "./context-attachment-builder.service"
 import { ContextProjectionService } from "./context-projection.service"
+import type {
+  ContextModelProfile,
+  ContextTokenizer,
+} from "./context-model-profile"
 import { ContextTelemetryService } from "./context-telemetry.service"
 import { CONTEXT_MICROCOMPACT_CLEARED_MARKER } from "../shared/context-compaction"
 import {
@@ -70,6 +74,7 @@ export interface ContextCompactionCandidate {
   archivedRecords: ContextTranscriptRecord[]
   retainedRecords: ContextTranscriptRecord[]
   summaryBudget: number
+  contextProfile?: ContextModelProfile
   attachmentFingerprint: string
   liveAttachments: ContextProjectionAttachment[]
   sourceTokenCount: number
@@ -177,6 +182,7 @@ export class ContextCompactionService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       autoCompactTokenLimit?: number
       predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"
@@ -190,6 +196,7 @@ export class ContextCompactionService {
       options.maxTokens - options.systemPromptTokens,
       this.MIN_REQUEST_BUDGET
     )
+    const tokenizer = this.resolveTokenizer(options.contextProfile)
     const targetMaxTokens = this.resolvePressureBudget(hardMaxTokens, options)
     const workingState = options.dryRun ? this.cloneState(state) : state
     const attachmentTokenBudget = this.resolveAttachmentBudget(
@@ -211,7 +218,10 @@ export class ContextCompactionService {
       attachmentTokenBudget,
       options
     )
-    const estimated = this.countProjected(projected)
+    const estimated = this.countProjected(
+      projected,
+      this.resolveTokenizer(options.contextProfile)
+    )
     let snipCompaction: ContextSnipCompactionResult | undefined
     let microCompaction: ContextMicroCompactionResult | undefined
 
@@ -278,7 +288,10 @@ export class ContextCompactionService {
     // (~133K -> ~33K). True size reduction still comes from
     // compactIfNeeded; the hard-fit below is the last-resort fit.
     if (this.shouldCompact(estimated, hardMaxTokens, targetMaxTokens)) {
-      const microcompacted = this.microcompactProjectedToolResults(projected)
+      const microcompacted = this.microcompactProjectedToolResults(
+        projected,
+        tokenizer
+      )
       if (microcompacted) {
         projected = microcompacted.projectedMessages
         microCompaction = {
@@ -293,13 +306,18 @@ export class ContextCompactionService {
       pendingToolUseIds: options.pendingToolUseIds,
     })
     let finalMessages = messages
-    let messageTokens = this.tokenCounter.countMessages(finalMessages)
+    let messageTokens = this.tokenCounter.countMessages(
+      finalMessages,
+      true,
+      tokenizer
+    )
     if (messageTokens > hardMaxTokens && !options.dryRun) {
       const hardFit = this.buildHardFitProjection(
         finalMessages,
         hardMaxTokens,
         options.integrityMode,
-        options.pendingToolUseIds
+        options.pendingToolUseIds,
+        tokenizer
       )
       if (hardFit) {
         finalMessages = hardFit.messages
@@ -338,7 +356,8 @@ export class ContextCompactionService {
     messages: UnifiedMessage[],
     hardMaxTokens: number,
     integrityMode?: "strict-adjacent" | "global",
-    _pendingToolUseIds?: Iterable<string>
+    _pendingToolUseIds?: Iterable<string>,
+    tokenizer: ContextTokenizer = "claude"
   ):
     | {
         messages: UnifiedMessage[]
@@ -360,6 +379,7 @@ export class ContextCompactionService {
         targetTokens,
         {
           mode,
+          tokenizer,
         }
       )
     const candidateIndexes = [
@@ -367,7 +387,7 @@ export class ContextCompactionService {
       this.toolIntegrity.findBudgetSafeTruncationPointWithIntegrity(
         messages,
         targetTokens,
-        { mode }
+        { mode, tokenizer }
       ),
     ]
 
@@ -383,7 +403,11 @@ export class ContextCompactionService {
       const candidate = messages.slice(truncationIndex)
       if (candidate.length === 0) continue
 
-      const estimatedTokens = this.tokenCounter.countMessages(candidate)
+      const estimatedTokens = this.tokenCounter.countMessages(
+        candidate,
+        true,
+        tokenizer
+      )
       if (estimatedTokens > hardMaxTokens) continue
 
       return {
@@ -424,6 +448,7 @@ export class ContextCompactionService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       autoCompactTokenLimit?: number
       predictiveCompactTokenLimit?: number
       projectedTokenOverride?: number
@@ -450,7 +475,10 @@ export class ContextCompactionService {
       attachmentTokenBudget,
       options
     )
-    const measuredProjectedTokens = this.countProjected(projected)
+    const measuredProjectedTokens = this.countProjected(
+      projected,
+      this.resolveTokenizer(options.contextProfile)
+    )
     const projectedTokens = Math.max(
       measuredProjectedTokens,
       options.projectedTokenOverride || 0
@@ -472,6 +500,7 @@ export class ContextCompactionService {
       effectiveMaxTokens,
       attachmentTokenBudget,
       options.strategy || "auto",
+      options.contextProfile,
       options.integrityMode
     )
     if (!candidate) {
@@ -550,6 +579,7 @@ export class ContextCompactionService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       strategy?: ContextCompactionCommit["strategy"]
       integrityMode?: "strict-adjacent" | "global"
     }
@@ -570,6 +600,7 @@ export class ContextCompactionService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       strategy?: ContextCompactionCommit["strategy"]
       integrityMode?: "strict-adjacent" | "global"
     }
@@ -591,10 +622,12 @@ export class ContextCompactionService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       strategy?: ContextCompactionCommit["strategy"]
       integrityMode?: "strict-adjacent" | "global"
     }
   ): ContextCompactionCandidate | null {
+    const tokenizer = this.resolveTokenizer(options.contextProfile)
     const hardMaxTokens = Math.max(
       options.maxTokens - options.systemPromptTokens,
       this.MIN_REQUEST_BUDGET
@@ -652,15 +685,19 @@ export class ContextCompactionService {
               sourceRecords.slice(pivotIndex).map((record) => ({
                 role: record.role,
                 content: record.content,
-              })) as UnifiedMessage[]
+              })) as UnifiedMessage[],
+              true,
+              tokenizer
             )
           : this.tokenCounter.countMessages(
               sourceRecords.slice(0, pivotIndex + 1).map((record) => ({
                 role: record.role,
                 content: record.content,
-              })) as UnifiedMessage[]
+              })) as UnifiedMessage[],
+              true,
+              tokenizer
             ),
-        { mode: options.integrityMode }
+        { mode: options.integrityMode, tokenizer }
       )
     if (
       direction === "up_to" &&
@@ -686,13 +723,17 @@ export class ContextCompactionService {
       archivedRecords.map((record) => ({
         role: record.role,
         content: record.content,
-      })) as UnifiedMessage[]
+      })) as UnifiedMessage[],
+      true,
+      tokenizer
     )
     const retainedTokenCount = this.tokenCounter.countMessages(
       retainedRecords.map((record) => ({
         role: record.role,
         content: record.content,
-      })) as UnifiedMessage[]
+      })) as UnifiedMessage[],
+      true,
+      tokenizer
     )
     const summaryBudget = Math.max(
       this.MIN_SUMMARY_TOKENS,
@@ -710,6 +751,7 @@ export class ContextCompactionService {
       archivedRecords,
       retainedRecords,
       summaryBudget,
+      contextProfile: options.contextProfile,
       attachmentFingerprint,
       liveAttachments,
       sourceTokenCount,
@@ -723,9 +765,11 @@ export class ContextCompactionService {
     effectiveMaxTokens: number,
     attachmentTokenBudget: number,
     strategy: ContextCompactionCommit["strategy"],
+    contextProfile?: ContextModelProfile,
     integrityMode?: "strict-adjacent" | "global"
   ): ContextCompactionCandidate | null {
     const commitId = randomUUID()
+    const tokenizer = this.resolveTokenizer(contextProfile)
     const activeSlice = getRecordsAfterCompactBoundary(state.records)
     const sourceRecords = this.compactionSourceRecords(activeSlice)
     const messageRecords = sourceRecords.filter(isMessageRecord)
@@ -748,12 +792,14 @@ export class ContextCompactionService {
       liveAttachments.map((attachment) => ({
         role: "user",
         content: attachment.content,
-      })) as UnifiedMessage[]
+      })) as UnifiedMessage[],
+      true,
+      tokenizer
     )
     const summaryBudgetCap = this.resolveSummaryBudgetCap(effectiveMaxTokens)
     const envelopeTokens =
-      this.estimateBoundaryTokens(commitId) +
-      this.estimateSummaryEnvelopeTokens(commitId) +
+      this.estimateBoundaryTokens(commitId, tokenizer) +
+      this.estimateSummaryEnvelopeTokens(commitId, tokenizer) +
       attachmentTokens
     // Full auto compaction should leave a small active window, not a suffix
     // proportional to the model's full context window. The budget below is
@@ -773,7 +819,8 @@ export class ContextCompactionService {
     // suffix fit targetRecentTokens.
     const budgetTruncationIndex = this.tokenCounter.findTruncationIndex(
       sourceMessages,
-      targetRecentTokens
+      targetRecentTokens,
+      tokenizer
     )
     // Integrity-safe point. Compaction owns the durable transcript boundary,
     // so the retained suffix must already be protocol-valid; send-time repair
@@ -782,7 +829,7 @@ export class ContextCompactionService {
       this.toolIntegrity.findBudgetSafeTruncationPointWithIntegrity(
         sourceMessages,
         targetRecentTokens,
-        { mode: integrityMode }
+        { mode: integrityMode, tokenizer }
       )
     const truncationIndex = integrityTruncationIndex
     if (truncationIndex <= 0 || truncationIndex > sourceRecords.length) {
@@ -819,7 +866,9 @@ export class ContextCompactionService {
             retainedRecords.map((record) => ({
               role: record.role,
               content: record.content,
-            })) as UnifiedMessage[]
+            })) as UnifiedMessage[],
+            true,
+            tokenizer
           )
       )
     )
@@ -827,13 +876,17 @@ export class ContextCompactionService {
       archivedRecords.map((record) => ({
         role: record.role,
         content: record.content,
-      })) as UnifiedMessage[]
+      })) as UnifiedMessage[],
+      true,
+      tokenizer
     )
     const retainedTokenCount = this.tokenCounter.countMessages(
       retainedRecords.map((record) => ({
         role: record.role,
         content: record.content,
-      })) as UnifiedMessage[]
+      })) as UnifiedMessage[],
+      true,
+      tokenizer
     )
 
     return {
@@ -844,6 +897,7 @@ export class ContextCompactionService {
       archivedRecords,
       retainedRecords,
       summaryBudget,
+      contextProfile,
       attachmentFingerprint,
       liveAttachments,
       sourceTokenCount,
@@ -860,7 +914,11 @@ export class ContextCompactionService {
     hookUserMessage?: string
   ): ContextCompactionPlan {
     const summary = summaryText.trim()
-    const summaryTokenCount = this.tokenCounter.countText(summary)
+    const summaryTokenCount = this.tokenCounter.countText(
+      summary,
+      true,
+      this.resolveTokenizer(candidate.contextProfile)
+    )
     const archivedRecords = candidate.archivedRecords
     const retainedRecords = candidate.retainedRecords
     const commitId = candidate.commitId
@@ -931,7 +989,10 @@ export class ContextCompactionService {
       snapshot,
       attachmentTokenBudget
     )
-    commit.projectedTokenCount = this.countProjected(projectedMessages)
+    commit.projectedTokenCount = this.countProjected(
+      projectedMessages,
+      this.resolveTokenizer(candidate.contextProfile)
+    )
 
     return {
       commit,
@@ -1106,7 +1167,8 @@ export class ContextCompactionService {
    * array when something was cleared, otherwise undefined.
    */
   private microcompactProjectedToolResults(
-    projected: ProjectedContextMessage[]
+    projected: ProjectedContextMessage[],
+    tokenizer: ContextTokenizer
   ):
     | {
         projectedMessages: ProjectedContextMessage[]
@@ -1152,7 +1214,7 @@ export class ContextCompactionService {
         const text = this.toolResultBlockText(b.content)
         if (text === this.MICROCOMPACT_CLEARED_MARKER) return
         if (
-          this.tokenCounter.countText(text) <
+          this.tokenCounter.countText(text, true, tokenizer) <
           this.MICROCOMPACT_MIN_RESULT_TOKENS
         ) {
           return
@@ -1207,13 +1269,24 @@ export class ContextCompactionService {
     return ""
   }
 
-  private countProjected(projected: ProjectedContextMessage[]): number {
+  private countProjected(
+    projected: ProjectedContextMessage[],
+    tokenizer: ContextTokenizer = "claude"
+  ): number {
     return this.tokenCounter.countMessages(
       projected.map((message) => ({
         role: message.role,
         content: message.content,
-      })) as UnifiedMessage[]
+      })) as UnifiedMessage[],
+      true,
+      tokenizer
     )
+  }
+
+  private resolveTokenizer(
+    contextProfile: ContextModelProfile | undefined
+  ): ContextTokenizer {
+    return contextProfile?.tokenizer ?? "claude"
   }
 
   private resolvePressureBudget(
@@ -1427,42 +1500,56 @@ export class ContextCompactionService {
     )
   }
 
-  private estimateBoundaryTokens(commitId: string): number {
-    return this.tokenCounter.countMessages([
-      {
-        role: "user",
-        content: this.projection.renderCompactionBoundary({
-          id: commitId,
-          strategy: "auto",
-          createdAt: Date.now(),
-          archivedThroughRecordId: commitId,
-          archivedMessageCount: 0,
-          sourceTokenCount: 0,
-          summary: "",
-          summaryTokenCount: 0,
-          projectedTokenCount: 0,
-        }),
-      },
-    ])
+  private estimateBoundaryTokens(
+    commitId: string,
+    tokenizer: ContextTokenizer
+  ): number {
+    return this.tokenCounter.countMessages(
+      [
+        {
+          role: "user",
+          content: this.projection.renderCompactionBoundary({
+            id: commitId,
+            strategy: "auto",
+            createdAt: Date.now(),
+            archivedThroughRecordId: commitId,
+            archivedMessageCount: 0,
+            sourceTokenCount: 0,
+            summary: "",
+            summaryTokenCount: 0,
+            projectedTokenCount: 0,
+          }),
+        },
+      ],
+      true,
+      tokenizer
+    )
   }
 
-  private estimateSummaryEnvelopeTokens(commitId: string): number {
-    return this.tokenCounter.countMessages([
-      {
-        role: "user",
-        content: this.projection.renderCompactionSummary({
-          id: commitId,
-          strategy: "auto",
-          createdAt: Date.now(),
-          archivedThroughRecordId: commitId,
-          archivedMessageCount: 0,
-          sourceTokenCount: 0,
-          summary: "",
-          summaryTokenCount: 0,
-          projectedTokenCount: 0,
-        }),
-      },
-    ])
+  private estimateSummaryEnvelopeTokens(
+    commitId: string,
+    tokenizer: ContextTokenizer
+  ): number {
+    return this.tokenCounter.countMessages(
+      [
+        {
+          role: "user",
+          content: this.projection.renderCompactionSummary({
+            id: commitId,
+            strategy: "auto",
+            createdAt: Date.now(),
+            archivedThroughRecordId: commitId,
+            archivedMessageCount: 0,
+            sourceTokenCount: 0,
+            summary: "",
+            summaryTokenCount: 0,
+            projectedTokenCount: 0,
+          }),
+        },
+      ],
+      true,
+      tokenizer
+    )
   }
 
   private normalizePositiveInteger(value: unknown): number | undefined {

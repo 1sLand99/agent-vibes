@@ -1,6 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common"
 import { findRoundAlignedTruncationIndex } from "./api-round-grouping"
 import { ContextTelemetryService } from "./context-telemetry.service"
+import type { ContextTokenizer } from "./context-model-profile"
 import { TokenCounterService } from "./token-counter.service"
 import {
   ToolPair,
@@ -244,6 +245,7 @@ export class ToolIntegrityService {
     targetTokens: number,
     options?: {
       mode?: EnforceToolProtocolOptions["mode"]
+      tokenizer?: ContextTokenizer
     }
   ): number {
     if (messages.length === 0) return 0
@@ -253,7 +255,8 @@ export class ToolIntegrityService {
     // Step 1: Find initial truncation point based on tokens
     let truncationIndex = this.tokenCounter.findTruncationIndex(
       messages,
-      targetTokens
+      targetTokens,
+      options?.tokenizer
     )
 
     // Step 2: Build the full tool pair map
@@ -365,13 +368,19 @@ export class ToolIntegrityService {
     targetTokens: number,
     options?: {
       mode?: EnforceToolProtocolOptions["mode"]
+      tokenizer?: ContextTokenizer
     }
   ): number {
     if (messages.length === 0) return 0
     const roundIndex = findRoundAlignedTruncationIndex(
       messages,
       targetTokens,
-      (slice) => this.tokenCounter.countMessages(slice as UnifiedMessage[])
+      (slice) =>
+        this.tokenCounter.countMessages(
+          slice as UnifiedMessage[],
+          true,
+          options?.tokenizer
+        )
     )
     if (roundIndex >= messages.length) {
       return messages.length
@@ -404,6 +413,7 @@ export class ToolIntegrityService {
     targetTokens: number,
     options?: {
       mode?: EnforceToolProtocolOptions["mode"]
+      tokenizer?: ContextTokenizer
     }
   ): number {
     if (messages.length === 0) return 0
@@ -412,13 +422,17 @@ export class ToolIntegrityService {
     let truncationIndex = this.findTruncationPointWithIntegrity(
       messages,
       targetTokens,
-      { mode }
+      { mode, tokenizer: options?.tokenizer }
     )
 
     while (truncationIndex < messages.length) {
       const retainedMessages = messages.slice(truncationIndex)
       const fitsBudget =
-        this.tokenCounter.countMessages(retainedMessages) <= targetTokens
+        this.tokenCounter.countMessages(
+          retainedMessages,
+          true,
+          options?.tokenizer
+        ) <= targetTokens
       const hasValidToolResults = this.retainedMessagesHaveValidToolResults(
         retainedMessages,
         mode
@@ -455,6 +469,7 @@ export class ToolIntegrityService {
     targetTokens: number,
     options?: {
       mode?: EnforceToolProtocolOptions["mode"]
+      tokenizer?: ContextTokenizer
     }
   ): UnifiedMessage[] {
     const truncationIndex = this.findBudgetSafeTruncationPointWithIntegrity(

@@ -9,12 +9,20 @@ import {
 } from "../utils/platform"
 import { CursorChecksumsService } from "./cursor-checksums"
 import {
-  CURSOR_AGENT_INPUT_DOCK_PATCH_MARKERS,
+  CURSOR_AGENT_INPUT_RUNTIME_PATCH_MARKERS,
   getCursorAgentInputDockDetails,
   hasCursorAgentInputDockPatch,
   patchCursorAgentInputDockContent,
   removeCursorAgentInputDockPatchContent,
 } from "./cursor-agent-input-dock"
+import {
+  getCursorWorkspaceControlDetails,
+  hasCursorWorkspaceControlPatch,
+  patchCursorWorkspaceControlContent,
+  readWorkspaceControlRuntimeConfig,
+  removeCursorWorkspaceControlPatchContent,
+  type WorkspaceControlRuntimeConfig,
+} from "./cursor-workspace-control"
 import { CursorPatchBaselineService } from "./cursor-patch-baseline"
 import {
   CURSOR_TRAFFIC_CAPTURE_MARKERS,
@@ -33,6 +41,30 @@ const IDLE_EXTENSION_HOST_KILLER_PATCH_INSERTION = `/*${IDLE_EXTENSION_HOST_KILL
 const BRIDGE_ENDPOINT_PATCH_MARKER = "[AGENT_VIBES_CURSOR_BRIDGE_ENDPOINT]"
 const PLAN_EDITOR_TAB_PATCH_MARKER =
   "[AGENT_VIBES_PRESERVE_CHAT_EDITOR_TAB_FOR_PLAN]"
+const WORKSPACE_CHANGE_AGENT_GATE_TRACK_MARKER =
+  "[AGENT_VIBES_WORKSPACE_CHANGE_AGENT_GATE_TRACK]"
+const WORKSPACE_CHANGE_AGENT_GATE_RELEASE_MARKER =
+  "[AGENT_VIBES_WORKSPACE_CHANGE_AGENT_GATE_RELEASE]"
+const WORKSPACE_CHANGE_AGENT_GATE_INITIALIZE_MARKER =
+  "[AGENT_VIBES_WORKSPACE_CHANGE_AGENT_GATE_INITIALIZE]"
+const WORKSPACE_CHANGE_AGENT_GATE_INITIALIZE_RELEASE_MARKER =
+  "[AGENT_VIBES_WORKSPACE_CHANGE_AGENT_GATE_INITIALIZE_RELEASE]"
+const WORKSPACE_CHANGE_AGENT_GATE_CONFIGURATION_MARKER =
+  "[AGENT_VIBES_WORKSPACE_CHANGE_AGENT_GATE_CONFIGURATION]"
+const WORKSPACE_CHANGE_AGENT_GATE_CONFIGURATION_RELEASE_MARKER =
+  "[AGENT_VIBES_WORKSPACE_CHANGE_AGENT_GATE_CONFIGURATION_RELEASE]"
+const WORKSPACE_CHANGE_AGENT_GATE_MARKERS = [
+  WORKSPACE_CHANGE_AGENT_GATE_TRACK_MARKER,
+  WORKSPACE_CHANGE_AGENT_GATE_RELEASE_MARKER,
+  WORKSPACE_CHANGE_AGENT_GATE_INITIALIZE_MARKER,
+  WORKSPACE_CHANGE_AGENT_GATE_INITIALIZE_RELEASE_MARKER,
+  WORKSPACE_CHANGE_AGENT_GATE_CONFIGURATION_MARKER,
+  WORKSPACE_CHANGE_AGENT_GATE_CONFIGURATION_RELEASE_MARKER,
+]
+const WORKSPACE_CHANGE_AGENT_GATE_STATE_KEY =
+  "__agentVibesWorkspaceChangeAgentGate"
+const WORKSPACE_CHANGE_AGENT_TURN_TRACKED_KEY =
+  "__agentVibesWorkspaceChangeTurnTracked"
 const READ_TODOS_BUBBLE_TRANSLATION_PATCH_MARKER =
   "[AGENT_VIBES_READ_TODOS_BUBBLE_TRANSLATION]"
 const READ_TODOS_RESULT_TRANSLATION_PATCH_MARKER =
@@ -69,6 +101,10 @@ const PLAN_EDITOR_TAB_PATCH = {
   marker: PLAN_EDITOR_TAB_PATCH_MARKER,
 }
 
+const WORKSPACE_CHANGE_AGENT_GATE_PATCH = {
+  name: "Defer Workspace Folder Changes During Agent Turns",
+}
+
 const READ_TODOS_TRANSLATION_PATCH = {
   name: "Cursor Read Todos Translation",
 }
@@ -80,8 +116,9 @@ const CURSOR_ENTITLEMENT_PATCH = {
 const PATCH_MARKERS = [
   IDLE_EXTENSION_HOST_KILLER_MARKER,
   BRIDGE_ENDPOINT_PATCH_MARKER,
-  ...CURSOR_AGENT_INPUT_DOCK_PATCH_MARKERS,
+  ...CURSOR_AGENT_INPUT_RUNTIME_PATCH_MARKERS,
   PLAN_EDITOR_TAB_PATCH_MARKER,
+  ...WORKSPACE_CHANGE_AGENT_GATE_MARKERS,
   READ_TODOS_BUBBLE_TRANSLATION_PATCH_MARKER,
   READ_TODOS_RESULT_TRANSLATION_PATCH_MARKER,
   ...CURSOR_TRAFFIC_CAPTURE_MARKERS,
@@ -226,6 +263,246 @@ export function patchIdleExtensionHostKillerContent(
     IDLE_EXTENSION_HOST_KILLER_PATCH_INSERTION +
     content.slice(location.bodyStart)
   )
+}
+
+type WorkspaceChangeAgentGateLocations = {
+  composerConstructor: MethodLocation
+  composerDispose: MethodLocation
+  workspaceInitialize: MethodLocation
+  workspaceConfiguration: MethodLocation
+}
+
+function locateSemanticMethodByAnchor(
+  content: string,
+  anchor: string,
+  predicate: (body: string) => boolean
+): MethodLocation | null {
+  let anchorIndex = content.indexOf(anchor)
+  while (anchorIndex !== -1) {
+    const method = locateSemanticMethodAt(content, anchorIndex, predicate)
+    if (method) return method
+    anchorIndex = content.indexOf(anchor, anchorIndex + anchor.length)
+  }
+  return null
+}
+
+function locateWorkspaceChangeAgentGateLocations(
+  content: string
+): WorkspaceChangeAgentGateLocations | null {
+  const composerConstructor = locateSemanticMethodByAnchor(
+    content,
+    "this._setupReactiveWatch()",
+    (body) =>
+      body.includes("this._composerHandle=") &&
+      body.includes("this._powerMainService=") &&
+      body.includes('this._acquire("agent-loop")') &&
+      body.includes("this._setupReactiveWatch()")
+  )
+  const composerDispose = locateSemanticMethodByAnchor(
+    content,
+    'this._release("generation-ended")',
+    (body) =>
+      body.includes("this._disposed") &&
+      body.includes('this._release("generation-ended")')
+  )
+  const workspaceInitialize = locateSemanticMethodByAnchor(
+    content,
+    'logWorkspaceFoldersChanged("initializeWorkspace"',
+    (body) =>
+      body.includes('logWorkspaceFoldersChanged("initializeWorkspace"') &&
+      body.includes("this.workspace.update(") &&
+      body.includes("this.initializeConfiguration(") &&
+      body.includes("this._onDidChangeWorkspaceFolders.fire(")
+  )
+  const workspaceConfiguration = locateSemanticMethodByAnchor(
+    content,
+    'logWorkspaceFoldersChanged("updateWorkspaceConfiguration"',
+    (body) =>
+      body.includes(
+        'logWorkspaceFoldersChanged("updateWorkspaceConfiguration"'
+      ) &&
+      body.includes("this.compareFolders(") &&
+      body.includes("this.onFoldersChanged()") &&
+      body.includes("this.handleWillChangeWorkspaceFolders(") &&
+      body.includes("this._onDidChangeWorkspaceFolders.fire(")
+  )
+
+  if (
+    !composerConstructor ||
+    !composerDispose ||
+    !workspaceInitialize ||
+    !workspaceConfiguration
+  ) {
+    return null
+  }
+
+  return {
+    composerConstructor,
+    composerDispose,
+    workspaceInitialize,
+    workspaceConfiguration,
+  }
+}
+
+function getFirstMethodParameter(
+  content: string,
+  location: MethodLocation
+): string | null {
+  const signature = content.slice(location.start, location.bodyStart)
+  return /\(\s*([A-Za-z_$][\w$]*)/u.exec(signature)?.[1] ?? null
+}
+
+function hasAnyWorkspaceChangeAgentGateMarker(content: string): boolean {
+  return WORKSPACE_CHANGE_AGENT_GATE_MARKERS.some((marker) =>
+    content.includes(marker)
+  )
+}
+
+export function isWorkspaceChangeAgentGatePatchApplied(
+  content: string
+): boolean {
+  return WORKSPACE_CHANGE_AGENT_GATE_MARKERS.every((marker) =>
+    content.includes(marker)
+  )
+}
+
+export function canPatchWorkspaceChangeAgentGateContent(
+  content: string
+): boolean {
+  if (isWorkspaceChangeAgentGatePatchApplied(content)) return true
+  if (hasAnyWorkspaceChangeAgentGateMarker(content)) return false
+  return locateWorkspaceChangeAgentGateLocations(content) !== null
+}
+
+function createWorkspaceChangeWaitInsertion(
+  marker: string,
+  nextFoldersExpression: string
+): string {
+  const state = `globalThis[${JSON.stringify(
+    WORKSPACE_CHANGE_AGENT_GATE_STATE_KEY
+  )}]`
+  return (
+    `/*${marker}*/` +
+    "let __agentVibesReleaseWorkspaceChange;" +
+    "let __agentVibesPreviousWorkspaceChange=Promise.resolve();" +
+    "{" +
+    `const __agentVibesWorkspaceChanges=this.workspace?this.compareFolders(this.workspace.folders,${nextFoldersExpression}):null;` +
+    "if(__agentVibesWorkspaceChanges&&(__agentVibesWorkspaceChanges.added.length||__agentVibesWorkspaceChanges.removed.length||__agentVibesWorkspaceChanges.changed.length)){" +
+    `const __agentVibesWorkspaceGateState=(${state}??={activeTurns:0,waiters:[]});` +
+    "__agentVibesWorkspaceGateState.workspaceTail??=Promise.resolve();" +
+    "__agentVibesPreviousWorkspaceChange=__agentVibesWorkspaceGateState.workspaceTail;" +
+    "__agentVibesWorkspaceGateState.workspaceTail=new Promise(__agentVibesResolve=>{__agentVibesReleaseWorkspaceChange=__agentVibesResolve})" +
+    "}}" +
+    "try{" +
+    "if(__agentVibesReleaseWorkspaceChange){" +
+    "await __agentVibesPreviousWorkspaceChange;" +
+    "let __agentVibesWorkspaceChangeDeferred=!1;" +
+    `while(${state}?.activeTurns>0){` +
+    'if(!__agentVibesWorkspaceChangeDeferred){this.logService.info("[Agent Vibes] Deferring workspace folder change until active agent turns finish"),__agentVibesWorkspaceChangeDeferred=!0}' +
+    "await new Promise(__agentVibesResolve=>{" +
+    `const __agentVibesWorkspaceGateState=${state};` +
+    "__agentVibesWorkspaceGateState&&__agentVibesWorkspaceGateState.activeTurns>0?__agentVibesWorkspaceGateState.waiters.push(__agentVibesResolve):__agentVibesResolve()" +
+    "})}" +
+    'if(__agentVibesWorkspaceChangeDeferred)this.logService.info("[Agent Vibes] Applying deferred workspace folder change")' +
+    "}"
+  )
+}
+
+function createWorkspaceChangeQueueReleaseInsertion(marker: string): string {
+  return (
+    `}finally{/*${marker}*/` +
+    "if(__agentVibesReleaseWorkspaceChange)__agentVibesReleaseWorkspaceChange()" +
+    "}"
+  )
+}
+
+export function patchWorkspaceChangeAgentGateContent(
+  content: string
+): string | null {
+  if (isWorkspaceChangeAgentGatePatchApplied(content)) return content
+  if (hasAnyWorkspaceChangeAgentGateMarker(content)) return null
+
+  const locations = locateWorkspaceChangeAgentGateLocations(content)
+  if (!locations) return null
+
+  const initializeWorkspaceParameter = getFirstMethodParameter(
+    content,
+    locations.workspaceInitialize
+  )
+  const configurationFoldersParameter = getFirstMethodParameter(
+    content,
+    locations.workspaceConfiguration
+  )
+  if (!initializeWorkspaceParameter || !configurationFoldersParameter) {
+    return null
+  }
+
+  const state = `globalThis[${JSON.stringify(
+    WORKSPACE_CHANGE_AGENT_GATE_STATE_KEY
+  )}]`
+  const tracked = `this[${JSON.stringify(
+    WORKSPACE_CHANGE_AGENT_TURN_TRACKED_KEY
+  )}]`
+  const insertions = [
+    {
+      index: locations.composerConstructor.end - 1,
+      text:
+        `;/*${WORKSPACE_CHANGE_AGENT_GATE_TRACK_MARKER}*/` +
+        `${tracked}=!0;` +
+        `${state}??={activeTurns:0,waiters:[]};` +
+        `${state}.activeTurns++`,
+    },
+    {
+      index: locations.composerDispose.bodyStart + 1,
+      text:
+        `/*${WORKSPACE_CHANGE_AGENT_GATE_RELEASE_MARKER}*/` +
+        `if(${tracked}){${tracked}=!1;` +
+        `const __agentVibesWorkspaceGateState=${state};` +
+        "if(__agentVibesWorkspaceGateState){" +
+        "__agentVibesWorkspaceGateState.activeTurns=Math.max(0,__agentVibesWorkspaceGateState.activeTurns-1);" +
+        "if(__agentVibesWorkspaceGateState.activeTurns===0){" +
+        "for(const __agentVibesResolve of __agentVibesWorkspaceGateState.waiters.splice(0))__agentVibesResolve()" +
+        "}}};",
+    },
+    {
+      index: locations.workspaceInitialize.bodyStart + 1,
+      text: createWorkspaceChangeWaitInsertion(
+        WORKSPACE_CHANGE_AGENT_GATE_INITIALIZE_MARKER,
+        `${initializeWorkspaceParameter}.folders`
+      ),
+    },
+    {
+      index: locations.workspaceInitialize.end - 1,
+      text: createWorkspaceChangeQueueReleaseInsertion(
+        WORKSPACE_CHANGE_AGENT_GATE_INITIALIZE_RELEASE_MARKER
+      ),
+    },
+    {
+      index: locations.workspaceConfiguration.bodyStart + 1,
+      text: createWorkspaceChangeWaitInsertion(
+        WORKSPACE_CHANGE_AGENT_GATE_CONFIGURATION_MARKER,
+        configurationFoldersParameter
+      ),
+    },
+    {
+      index: locations.workspaceConfiguration.end - 1,
+      text: createWorkspaceChangeQueueReleaseInsertion(
+        WORKSPACE_CHANGE_AGENT_GATE_CONFIGURATION_RELEASE_MARKER
+      ),
+    },
+  ].sort((left, right) => right.index - left.index)
+
+  let nextContent = content
+  for (const insertion of insertions) {
+    nextContent =
+      nextContent.slice(0, insertion.index) +
+      insertion.text +
+      nextContent.slice(insertion.index)
+  }
+
+  return isWorkspaceChangeAgentGatePatchApplied(nextContent)
+    ? nextContent
+    : null
 }
 
 function locatePlanEditorOpenMethod(content: string): MethodLocation | null {
@@ -520,8 +797,23 @@ function rebuildCursorWorkbenchWithActivePatches(
     if (patched === null) return null
     nextContent = patched
   }
+  if (hasCursorWorkspaceControlPatch(currentContent)) {
+    const runtimeConfig = readWorkspaceControlRuntimeConfig(currentContent)
+    if (runtimeConfig === null) return null
+    const patched = patchCursorWorkspaceControlContent(
+      nextContent,
+      runtimeConfig
+    )
+    if (patched === null) return null
+    nextContent = patched
+  }
   if (currentContent.includes(PLAN_EDITOR_TAB_PATCH_MARKER)) {
     const patched = patchPlanEditorTabContent(nextContent)
+    if (patched === null) return null
+    nextContent = patched
+  }
+  if (hasAnyWorkspaceChangeAgentGateMarker(currentContent)) {
+    const patched = patchWorkspaceChangeAgentGateContent(nextContent)
     if (patched === null) return null
     nextContent = patched
   }
@@ -1626,10 +1918,15 @@ export class CursorPatchService {
     null
   private static agentInputDockStatusCache: CursorPatchStatusCache<CursorAgentInputDockPatchStatus> | null =
     null
+  private static workspaceControlStatusCache: CursorPatchStatusCache<CursorAgentInputDockPatchStatus> | null =
+    null
   private static trafficCaptureStatusCache: CursorPatchStatusCache<CursorTrafficCapturePatchStatus> | null =
     null
   private static legacyStatusCache: CursorPatchStatusCache<PatchStatus> | null =
     null
+  private static workspaceControlRuntimeConfig:
+    | WorkspaceControlRuntimeConfig
+    | undefined
 
   private readonly logger: Logger
   private readonly baseline = new CursorPatchBaselineService()
@@ -1639,10 +1936,18 @@ export class CursorPatchService {
     this.logger = logger
   }
 
+  static configureWorkspaceControlRuntime(
+    runtimeConfig: WorkspaceControlRuntimeConfig
+  ): void {
+    CursorPatchService.workspaceControlRuntimeConfig = runtimeConfig
+    CursorPatchService.workspaceControlStatusCache = null
+  }
+
   static invalidateStatusCache(): void {
     CursorPatchService.bridgeEndpointStatusCache = null
     CursorPatchService.idleKillerStatusCache = null
     CursorPatchService.agentInputDockStatusCache = null
+    CursorPatchService.workspaceControlStatusCache = null
     CursorPatchService.trafficCaptureStatusCache = null
     CursorPatchService.legacyStatusCache = null
     CursorChecksumsService.invalidateStatusCache()
@@ -1763,6 +2068,14 @@ export class CursorPatchService {
         : workbenchContents.every(
             (content) => !content.includes("openPlanInEditor(")
           )
+    const workspaceChangeAgentGateTargets = workbenchContents.filter(
+      canPatchWorkspaceChangeAgentGateContent
+    )
+    const workspaceChangeAgentGatePatchApplied =
+      workspaceChangeAgentGateTargets.length > 0 &&
+      workspaceChangeAgentGateTargets.every(
+        isWorkspaceChangeAgentGatePatchApplied
+      )
     const readTodosTranslationPatchApplied = workbenchContents.every(
       isReadTodosTranslationPatchApplied
     )
@@ -1799,12 +2112,16 @@ export class CursorPatchService {
     result.applied =
       workbenchDetails.every((details) => details.applied) &&
       planEditorTabPatchApplied &&
+      workspaceChangeAgentGatePatchApplied &&
       readTodosTranslationPatchApplied &&
       nodeCaDetails.applied
     result.canApply =
       workbenchDetails.some((details) => details.canApply) ||
       planEditorTabTargets.some(
         (content) => !isPlanEditorTabPatchApplied(content)
+      ) ||
+      workspaceChangeAgentGateTargets.some(
+        (content) => !isWorkspaceChangeAgentGatePatchApplied(content)
       ) ||
       workbenchContents.some(
         (content) => !isReadTodosTranslationPatchApplied(content)
@@ -1893,6 +2210,10 @@ export class CursorPatchService {
         status: getBridgeEndpointDetails(content, port),
         hasPlanEditorTabTarget: locatePlanEditorOpenMethod(content) !== null,
         planEditorTabPatchApplied: isPlanEditorTabPatchApplied(content),
+        workspaceChangeAgentGatePatchSupported:
+          canPatchWorkspaceChangeAgentGateContent(content),
+        workspaceChangeAgentGatePatchApplied:
+          isWorkspaceChangeAgentGatePatchApplied(content),
         readTodosTranslationPatchApplied:
           isReadTodosTranslationPatchApplied(content),
       }
@@ -1914,11 +2235,30 @@ export class CursorPatchService {
         errors: [`Pattern not found: ${PLAN_EDITOR_TAB_PATCH.name}`],
       }
     }
+    const workspaceChangeAgentGateStatuses = workbenchStatuses.filter(
+      ({ workspaceChangeAgentGatePatchSupported }) =>
+        workspaceChangeAgentGatePatchSupported
+    )
+    if (workspaceChangeAgentGateStatuses.length === 0) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: [
+          `Pattern not found: ${WORKSPACE_CHANGE_AGENT_GATE_PATCH.name}`,
+        ],
+      }
+    }
     const nodeCaStatus = getCursorNodeCaPatchDetails()
     if (
       workbenchStatuses.every(({ status }) => status.applied) &&
       planEditorTabStatuses.every(
         ({ planEditorTabPatchApplied }) => planEditorTabPatchApplied
+      ) &&
+      workspaceChangeAgentGateStatuses.every(
+        ({ workspaceChangeAgentGatePatchApplied }) =>
+          workspaceChangeAgentGatePatchApplied
       ) &&
       workbenchStatuses.every(
         ({ readTodosTranslationPatchApplied }) =>
@@ -1974,6 +2314,27 @@ export class CursorPatchService {
           }
         }
         nextContent = planEditorPatchedContent
+      }
+
+      if (
+        workbenchStatus.workspaceChangeAgentGatePatchSupported &&
+        !workbenchStatus.workspaceChangeAgentGatePatchApplied
+      ) {
+        const workspaceChangeAgentGatePatchedContent =
+          patchWorkspaceChangeAgentGateContent(nextContent)
+        if (workspaceChangeAgentGatePatchedContent === null) {
+          return {
+            success: false,
+            applied,
+            checksumApplied: false,
+            checksumUpdated: 0,
+            errors: [
+              `Pattern not found: ${WORKSPACE_CHANGE_AGENT_GATE_PATCH.name} (${workbenchStatus.path})`,
+            ],
+            restartRequired,
+          }
+        }
+        nextContent = workspaceChangeAgentGatePatchedContent
       }
 
       if (!workbenchStatus.readTodosTranslationPatchApplied) {
@@ -2072,8 +2433,11 @@ export class CursorPatchService {
       return result
     }
 
-    const details = filePaths.map((filePath) =>
-      getCursorAgentInputDockDetails(fs.readFileSync(filePath, "utf-8"))
+    const contents = filePaths.map((filePath) =>
+      fs.readFileSync(filePath, "utf-8")
+    )
+    const details = contents.map((content) =>
+      getCursorAgentInputDockDetails(content)
     )
     result.applied = details.every((detail) => detail.applied)
     result.partial =
@@ -2232,6 +2596,242 @@ export class CursorPatchService {
     }
     this.logger.info(
       `Disabled patch: Agent Input Dock (${nextFiles.length} workbench file(s))`
+    )
+    return this.finalizePatchApply({
+      applied: nextFiles.length,
+      restartRequired: true,
+    })
+  }
+
+  getWorkspaceControlPatchStatus(
+    options: CursorPatchStatusOptions = {}
+  ): CursorAgentInputDockPatchStatus {
+    const filePaths = getCursorWorkbenchPaths()
+    const runtimeConfigKey = JSON.stringify(
+      CursorPatchService.workspaceControlRuntimeConfig ?? null
+    )
+    const cacheKey =
+      filePaths.length === 0
+        ? `workspace-control:missing:${runtimeConfigKey}`
+        : `workspace-control:${runtimeConfigKey}:${filePaths
+            .map((filePath) => {
+              const stat = fs.statSync(filePath)
+              return `${filePath}:${stat.size}:${stat.mtimeMs}`
+            })
+            .join("|")}`
+    const cached = CursorPatchService.getCachedStatus(
+      CursorPatchService.workspaceControlStatusCache,
+      cacheKey,
+      options.force
+    )
+    if (cached) return cached
+
+    const result: CursorAgentInputDockPatchStatus = {
+      filePath: filePaths[0] ?? getCursorWorkbenchPath(),
+      fileExists: filePaths.length > 0,
+      applied: false,
+      partial: false,
+      canApply: false,
+      managedBaseline: false,
+      workbenchFiles: filePaths.length,
+      legacyFiles: 0,
+    }
+    if (filePaths.length === 0) {
+      CursorPatchService.workspaceControlStatusCache =
+        CursorPatchService.setCachedStatus(cacheKey, result)
+      return result
+    }
+
+    const contents = filePaths.map((filePath) =>
+      fs.readFileSync(filePath, "utf-8")
+    )
+    const details = contents.map((content) =>
+      getCursorWorkspaceControlDetails(content)
+    )
+    const expectedRuntimeConfig =
+      CursorPatchService.workspaceControlRuntimeConfig
+    const runtimeConfigMatches =
+      expectedRuntimeConfig === undefined ||
+      contents.every(
+        (content) =>
+          JSON.stringify(readWorkspaceControlRuntimeConfig(content)) ===
+          JSON.stringify(expectedRuntimeConfig)
+      )
+    result.applied =
+      details.every((detail) => detail.applied) && runtimeConfigMatches
+    result.partial =
+      !result.applied &&
+      details.some((detail) => detail.applied || detail.partial)
+    result.canApply = details.every((detail) => detail.canApply)
+    result.managedBaseline = filePaths.every((filePath) =>
+      this.baseline.hasOriginal(filePath)
+    )
+
+    CursorPatchService.workspaceControlStatusCache =
+      CursorPatchService.setCachedStatus(cacheKey, result)
+    return result
+  }
+
+  applyWorkspaceControlPatch(): CursorPatchApplyResult {
+    this.invalidateStatusCache()
+
+    const runtimeConfig = CursorPatchService.workspaceControlRuntimeConfig
+    if (runtimeConfig === undefined) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: ["Workspace control runtime is not configured"],
+      }
+    }
+
+    const filePaths = getCursorWorkbenchPaths()
+    if (filePaths.length === 0) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: ["Cursor workbench file not found"],
+      }
+    }
+
+    const expectedRuntimeConfigJson = JSON.stringify(runtimeConfig)
+    const plans = filePaths.map((filePath) => {
+      const content = fs.readFileSync(filePath, "utf-8")
+      return {
+        filePath,
+        content,
+        details: getCursorWorkspaceControlDetails(content),
+        runtimeConfigMatches:
+          JSON.stringify(readWorkspaceControlRuntimeConfig(content)) ===
+          expectedRuntimeConfigJson,
+      }
+    })
+    if (
+      plans.every((plan) => plan.details.applied && plan.runtimeConfigMatches)
+    ) {
+      return this.finalizePatchApply({ applied: 0, forceChecksum: true })
+    }
+
+    const nextPlans: Array<{
+      filePath: string
+      content: string
+      nextContent: string
+    }> = []
+    for (const plan of plans) {
+      const nextContent = patchCursorWorkspaceControlContent(
+        plan.content,
+        runtimeConfig
+      )
+      if (nextContent === null) {
+        return {
+          success: false,
+          applied: 0,
+          checksumApplied: false,
+          checksumUpdated: 0,
+          errors: [
+            `Workspace control cannot safely migrate the existing runtime: ${plan.filePath}`,
+          ],
+        }
+      }
+      nextPlans.push({ ...plan, nextContent })
+    }
+
+    const changedPlans = nextPlans.filter(
+      (plan) => plan.nextContent !== plan.content
+    )
+    if (changedPlans.length === 0) {
+      return this.finalizePatchApply({ applied: 0, forceChecksum: true })
+    }
+
+    const unmanagedPlans = changedPlans.filter(
+      (plan) => !this.baseline.hasOriginal(plan.filePath)
+    )
+    const baselineCandidates = unmanagedPlans.map((plan) => ({
+      filePath: plan.filePath,
+      cleanContent: removeCursorWorkspaceControlPatchContent(plan.content),
+    }))
+    if (
+      baselineCandidates.length > 0 &&
+      baselineCandidates.every(
+        (candidate) =>
+          candidate.cleanContent !== null &&
+          !PATCH_MARKERS.some((marker) =>
+            candidate.cleanContent!.includes(marker)
+          )
+      )
+    ) {
+      for (const candidate of baselineCandidates) {
+        this.baseline.captureOriginalContent(
+          candidate.filePath,
+          candidate.cleanContent!
+        )
+      }
+    }
+    for (const plan of changedPlans) {
+      fs.writeFileSync(plan.filePath, plan.nextContent, "utf-8")
+    }
+    this.logger.info(
+      `Applied patch: Workspace Control (${changedPlans.length} workbench file(s))`
+    )
+    return this.finalizePatchApply({
+      applied: changedPlans.length,
+      restartRequired: true,
+    })
+  }
+
+  disableWorkspaceControlPatch(): CursorPatchApplyResult {
+    this.invalidateStatusCache()
+
+    const filePaths = getCursorWorkbenchPaths()
+    if (filePaths.length === 0) {
+      return {
+        success: false,
+        applied: 0,
+        checksumApplied: false,
+        checksumUpdated: 0,
+        errors: ["Cursor workbench file not found"],
+      }
+    }
+
+    const activeFiles = filePaths
+      .map((filePath) => ({
+        filePath,
+        currentContent: fs.readFileSync(filePath, "utf-8"),
+      }))
+      .filter(({ currentContent }) =>
+        hasCursorWorkspaceControlPatch(currentContent)
+      )
+    if (activeFiles.length === 0) {
+      return this.finalizePatchApply({ applied: 0 })
+    }
+
+    const nextFiles: Array<{ filePath: string; nextContent: string }> = []
+    for (const activeFile of activeFiles) {
+      const nextContent = removeCursorWorkspaceControlPatchContent(
+        activeFile.currentContent
+      )
+      if (nextContent === null) {
+        return {
+          success: false,
+          applied: 0,
+          checksumApplied: false,
+          checksumUpdated: 0,
+          errors: [
+            `Workspace control could not be disabled because its owned runtime boundary is incomplete: ${activeFile.filePath}`,
+          ],
+        }
+      }
+      nextFiles.push({ filePath: activeFile.filePath, nextContent })
+    }
+
+    for (const nextFile of nextFiles) {
+      fs.writeFileSync(nextFile.filePath, nextFile.nextContent, "utf-8")
+    }
+    this.logger.info(
+      `Disabled patch: Workspace Control (${nextFiles.length} workbench file(s))`
     )
     return this.finalizePatchApply({
       applied: nextFiles.length,
@@ -2533,6 +3133,10 @@ export class CursorPatchService {
         applied: isPlanEditorTabPatchApplied(content),
       },
       {
+        name: WORKSPACE_CHANGE_AGENT_GATE_PATCH.name,
+        applied: isWorkspaceChangeAgentGatePatchApplied(content),
+      },
+      {
         name: READ_TODOS_TRANSLATION_PATCH.name,
         applied: isReadTodosTranslationPatchApplied(content),
       },
@@ -2613,6 +3217,20 @@ export class CursorPatchService {
       content = planEditorPatchedContent
       applied++
       this.logger.info(`Applied patch: ${PLAN_EDITOR_TAB_PATCH.name}`)
+    }
+
+    const workspaceChangeAgentGatePatchedContent =
+      patchWorkspaceChangeAgentGateContent(content)
+    if (workspaceChangeAgentGatePatchedContent === null) {
+      errors.push(
+        `Pattern not found: ${WORKSPACE_CHANGE_AGENT_GATE_PATCH.name}`
+      )
+    } else if (workspaceChangeAgentGatePatchedContent !== content) {
+      content = workspaceChangeAgentGatePatchedContent
+      applied++
+      this.logger.info(
+        `Applied patch: ${WORKSPACE_CHANGE_AGENT_GATE_PATCH.name}`
+      )
     }
 
     const readTodosPatchedContent = patchReadTodosTranslationContent(content)

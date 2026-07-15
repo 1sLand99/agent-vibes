@@ -601,6 +601,7 @@ function buildVariant(
     displayName: string
     displayNameOutsidePicker?: string
     fastMode?: boolean
+    includeFastModeParameter?: boolean
     isMaxMode: boolean
     isDefaultMaxConfig?: boolean
     isDefaultNonMaxConfig?: boolean
@@ -625,10 +626,14 @@ function buildVariant(
           value: cursorEffort!,
         })
       : null,
-    create(RequestedModel_ModelParameterValueSchema, {
-      id: CURSOR_FAST_PARAMETER_ID,
-      value: fastMode ? CURSOR_FAST_MODE_ENABLED : CURSOR_FAST_MODE_DISABLED,
-    }),
+    options.includeFastModeParameter
+      ? create(RequestedModel_ModelParameterValueSchema, {
+          id: CURSOR_FAST_PARAMETER_ID,
+          value: fastMode
+            ? CURSOR_FAST_MODE_ENABLED
+            : CURSOR_FAST_MODE_DISABLED,
+        })
+      : null,
   ].filter(
     (value): value is RequestedModel_ModelParameterValue => value !== null
   )
@@ -642,7 +647,9 @@ function buildVariant(
   const baseModelName = parseModelRequest(modelName).baseModel
   const variantSegments = [
     cursorEffort,
-    `fast=${fastMode ? "true" : "false"}`,
+    options.includeFastModeParameter
+      ? `fast=${fastMode ? "true" : "false"}`
+      : null,
     `max=${options.isMaxMode ? "true" : "false"}`,
   ].filter((segment): segment is string => Boolean(segment))
 
@@ -737,6 +744,7 @@ function buildReasoningVariants(
           displayName: model.displayName,
           displayNameOutsidePicker: model.shortName,
           fastMode,
+          includeFastModeParameter: options.supportsCursorFastMode,
           isMaxMode: true,
           isDefaultMaxConfig:
             effort === options.defaultMaxEffort && fastMode === false,
@@ -752,6 +760,7 @@ function buildReasoningVariants(
           displayName: model.displayName,
           displayNameOutsidePicker: model.shortName,
           fastMode,
+          includeFastModeParameter: options.supportsCursorFastMode,
           isMaxMode: false,
           isDefaultNonMaxConfig:
             effort === options.standardEffort && fastMode === false,
@@ -766,6 +775,7 @@ function buildReasoningVariants(
         displayName: model.displayName,
         displayNameOutsidePicker: model.shortName,
         fastMode,
+        includeFastModeParameter: options.supportsCursorFastMode,
         isMaxMode: false,
         isDefaultNonMaxConfig:
           effort === options.standardEffort && fastMode === false,

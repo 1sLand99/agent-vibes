@@ -23,6 +23,10 @@ const STOP_FORCE_TIMEOUT_MS = 3000
 const LOG_MAX_BYTES = 10 * 1024 * 1024
 const LOG_MAINTENANCE_INTERVAL_MS = 60_000
 
+// Synthetic composerId used only to verify that an already-running Bridge
+// accepts the current agent-input control token before reconnecting to it.
+const CONTROL_TOKEN_PROBE_COMPOSER_ID = "__agent_vibes_control_token_probe__"
+
 /**
  * Manages the Protocol Bridge process lifecycle (start / stop / restart).
  *
@@ -38,7 +42,8 @@ export class BridgeManager extends EventEmitter {
 
   constructor(
     private readonly config: ConfigManager,
-    private readonly extensionPath: string
+    private readonly extensionPath: string,
+    private readonly agentInputControlToken: string
   ) {
     super()
   }
@@ -62,12 +67,23 @@ export class BridgeManager extends EventEmitter {
     this.setState("starting")
     const alreadyHealthy = await this.waitForHealth(2000)
     if (alreadyHealthy) {
-      this.setState("running")
-      this.startHealthCheck()
-      logger.info(
-        "Bridge already running on port — reconnected via health check"
+      if (await this.acceptsCurrentControlToken()) {
+        this.setState("running")
+        this.startHealthCheck()
+        logger.info(
+          "Bridge already running on port — reconnected via health check"
+        )
+        return
+      }
+      // A Bridge that rejects the current control token is stale: it was
+      // started without (or with a different) AGENT_VIBES_AGENT_INPUT_CONTROL_TOKEN.
+      // Reusing it leaves every /api/agent-input request returning HTTP 401,
+      // silently breaking the project picker and workspace synchronization.
+      // Replace it with a fresh instance that carries the current token.
+      logger.warn(
+        "Existing Bridge rejected the agent-input control token — restarting with a fresh instance"
       )
-      return
+      await this.stop()
     }
 
     // Check if an existing Bridge process is already running (from previous session)
@@ -77,16 +93,17 @@ export class BridgeManager extends EventEmitter {
         `Found existing Bridge process (pid ${existingPid}), reconnecting...`
       )
       const healthy = await this.waitForHealth(5000)
-      if (healthy) {
+      if (healthy && (await this.acceptsCurrentControlToken())) {
         this.setState("running")
         this.startHealthCheck()
         logger.info(`Reconnected to existing Bridge (pid ${existingPid})`)
         return
       } else {
         logger.warn(
-          `Existing Bridge (pid ${existingPid}) not responding, starting new instance...`
+          `Existing Bridge (pid ${existingPid}) not usable, starting new instance...`
         )
         this.killPid(existingPid)
+        await this.waitForProcessExit(existingPid, STOP_GRACE_TIMEOUT_MS)
       }
     }
 
@@ -111,6 +128,7 @@ export class BridgeManager extends EventEmitter {
         PORT: String(this.config.port),
         AGENT_VIBES_DATA_DIR: this.config.dataDir,
         AGENT_VIBES_LOG_DIR: this.config.logsDir,
+        AGENT_VIBES_AGENT_INPUT_CONTROL_TOKEN: this.agentInputControlToken,
         CURSOR_PROTOCOL_TRACE_FILE:
           process.env.CURSOR_PROTOCOL_TRACE_FILE ||
           path.join(this.config.logsDir, "cursor_protocol_trace.jsonl"),
@@ -516,6 +534,52 @@ export class BridgeManager extends EventEmitter {
     }
 
     return false
+  }
+
+  /**
+   * Probe an authenticated agent-input endpoint to confirm a Bridge already
+   * listening on the port accepts the current control token. Used before
+   * reconnecting so a stale Bridge (started without / with a different
+   * AGENT_VIBES_AGENT_INPUT_CONTROL_TOKEN) is replaced instead of reused.
+   *
+   * Resolves true when the token is accepted or the probe is inconclusive
+   * (transient error / missing CA), so a working Bridge is never restarted on
+   * a flaky check. Resolves false only when the Bridge explicitly rejects the
+   * token with HTTP 401/403.
+   */
+  private acceptsCurrentControlToken(): Promise<boolean> {
+    return new Promise((resolve) => {
+      let options: https.RequestOptions
+      try {
+        const ca = fs.readFileSync(this.config.caCertPath)
+        options = {
+          hostname: "localhost",
+          port: this.config.port,
+          path: `/api/agent-input/projects/${encodeURIComponent(
+            CONTROL_TOKEN_PROBE_COMPOSER_ID
+          )}`,
+          method: "GET",
+          headers: { authorization: `Bearer ${this.agentInputControlToken}` },
+          ca,
+        }
+      } catch {
+        // CA cert unavailable — cannot probe; keep prior reconnect behavior.
+        resolve(true)
+        return
+      }
+
+      const req = https.request(options, (res) => {
+        res.resume()
+        const status = res.statusCode ?? 0
+        resolve(status !== 401 && status !== 403)
+      })
+      req.on("error", () => resolve(true))
+      req.setTimeout(3000, () => {
+        req.destroy()
+        resolve(true)
+      })
+      req.end()
+    })
   }
 
   private startHealthCheck(): void {

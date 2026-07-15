@@ -63,6 +63,19 @@ export {
   type PreCompactHookPayload,
 } from "./context-hook-executor.service"
 export { ContextManagerService } from "./context-manager.service"
+export {
+  buildContextProjectionBudgetSignature,
+  isContextAccountingProfileCompatible,
+  resolveContextModelProfile,
+  resolveContextTokenizer,
+} from "./context-model-profile"
+export type {
+  ContextModelFamily,
+  ContextModelProfile,
+  ContextModelProfileInput,
+  ContextProjectionBudgetSignatureInput,
+  ContextTokenizer,
+} from "./context-model-profile"
 export type {
   ReactiveRecoveryOutcome,
   ReactiveRecoveryRequest,

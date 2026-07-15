@@ -437,6 +437,101 @@ export function registerCommands(
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
+      CMD.ENABLE_WORKSPACE_CONTROL_PATCH,
+      async () => {
+        const result = cursorPatch.applyWorkspaceControlPatch()
+        if (!result.success) {
+          const detail = result.errors.join("; ") || t("checksums.unknownError")
+          void vscode.window.showErrorMessage(
+            tFmt("patches.workspaceControlFailed", { detail })
+          )
+          return
+        }
+
+        await vscode.workspace
+          .getConfiguration("agentVibes")
+          .update(
+            "workspaceControlEnabled",
+            true,
+            vscode.ConfigurationTarget.Global
+          )
+
+        let message =
+          result.applied > 0
+            ? t("patches.workspaceControlApplied")
+            : t("patches.workspaceControlAlreadyApplied")
+        if (result.checksumUpdated > 0) {
+          message +=
+            " " +
+            tFmt("patches.checksumsAutoUpdated", {
+              count: result.checksumUpdated,
+            })
+        }
+
+        if (result.restartRequired === true) {
+          const action = await vscode.window.showInformationMessage(
+            message,
+            t("forwarding.action.quit"),
+            t("setup.action.later")
+          )
+          if (action === t("forwarding.action.quit")) {
+            await vscode.commands.executeCommand("workbench.action.quit")
+          }
+        } else {
+          void vscode.window.showInformationMessage(message)
+        }
+      }
+    )
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      CMD.DISABLE_WORKSPACE_CONTROL_PATCH,
+      async () => {
+        const result = cursorPatch.disableWorkspaceControlPatch()
+        if (!result.success) {
+          const detail = result.errors.join("; ") || t("checksums.unknownError")
+          void vscode.window.showErrorMessage(
+            tFmt("patches.workspaceControlFailed", { detail })
+          )
+          return
+        }
+
+        await vscode.workspace
+          .getConfiguration("agentVibes")
+          .update(
+            "workspaceControlEnabled",
+            false,
+            vscode.ConfigurationTarget.Global
+          )
+
+        let message = t("patches.workspaceControlDisabled")
+        if (result.checksumUpdated > 0) {
+          message +=
+            " " +
+            tFmt("patches.checksumsAutoUpdated", {
+              count: result.checksumUpdated,
+            })
+        }
+
+        if (result.restartRequired === true) {
+          const action = await vscode.window.showInformationMessage(
+            message,
+            t("forwarding.action.quit"),
+            t("setup.action.later")
+          )
+          if (action === t("forwarding.action.quit")) {
+            await vscode.commands.executeCommand("workbench.action.quit")
+          }
+        } else {
+          void vscode.window.showInformationMessage(message)
+        }
+      }
+    )
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
       CMD.APPLY_CURSOR_TRAFFIC_CAPTURE_PATCH,
       async () => {
         const result = cursorPatch.applyTrafficCapturePatch()
@@ -524,6 +619,14 @@ export function registerCommands(
         .getConfiguration("agentVibes")
         .update(
           "agentInputDockEnabled",
+          false,
+          vscode.ConfigurationTarget.Global
+        )
+
+      await vscode.workspace
+        .getConfiguration("agentVibes")
+        .update(
+          "workspaceControlEnabled",
           false,
           vscode.ConfigurationTarget.Global
         )

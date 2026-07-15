@@ -5,6 +5,11 @@ import {
   resolvePredictiveCompactTokenLimit,
 } from "./context-auto-compact-policy"
 import {
+  ContextModelFamily,
+  ContextModelProfile,
+  resolveContextModelProfile,
+} from "./context-model-profile"
+import {
   ContextCompactionResult,
   ContextCompactionService,
 } from "./context-compaction.service"
@@ -14,6 +19,8 @@ import { ContextConversationState, UnifiedMessage } from "./types"
 
 export interface ContextRequestBudgetInput {
   backend: string
+  model?: string
+  modelFamily?: ContextModelFamily
   protocolMaxTokens?: number
   backendMaxTokens?: number
   /**
@@ -24,6 +31,7 @@ export interface ContextRequestBudgetInput {
    */
   defaultMaxTokens?: number
   protectedContextTokens?: number
+  protectedContextMessages?: UnifiedMessage[]
   systemPrompt?: string
   systemPromptTokens?: number
   toolDefinitions?: unknown
@@ -52,6 +60,7 @@ export interface ContextRequestBudgetDecision {
   systemPromptTokens: number
   maxOutputTokens: number
   requestedServiceTier?: string
+  contextProfile: ContextModelProfile
   autoCompactTokenLimit?: number
   predictiveCompactTokenLimit?: number
 }
@@ -60,6 +69,7 @@ export interface ContextRequestBudget {
   maxTokens: number
   systemPromptTokens: number
   maxOutputTokens: number
+  contextProfile: ContextModelProfile
   autoCompactTokenLimit?: number
   predictiveCompactTokenLimit?: number
   backendClampedFrom?: number
@@ -81,6 +91,7 @@ export type ContextProjectionBudget = Pick<
   | "systemPromptTokens"
   | "autoCompactTokenLimit"
   | "predictiveCompactTokenLimit"
+  | "contextProfile"
 >
 
 @Injectable()
@@ -132,13 +143,26 @@ export class ContextRequestPlannerService {
       maxTokens = backendMaxTokens
     }
 
+    const contextProfile = resolveContextModelProfile({
+      backend: input.backend,
+      model: input.model,
+      family: input.modelFamily ?? "unknown",
+      maxTokens,
+    })
     const protectedContextTokens =
-      this.normalizePositiveInteger(input.protectedContextTokens) ?? 0
+      this.normalizePositiveInteger(input.protectedContextTokens) ??
+      this.tokenCounter.countMessages(
+        input.protectedContextMessages ?? [],
+        true,
+        contextProfile.tokenizer
+      )
     const promptSystemTokens =
       this.normalizePositiveInteger(input.systemPromptTokens) ??
-      this.countSystemPromptTokens(input.systemPrompt)
+      this.countSystemPromptTokens(input.systemPrompt, contextProfile.tokenizer)
     const toolDefinitionTokens = this.tokenCounter.countJsonValue(
-      input.toolDefinitions
+      input.toolDefinitions,
+      true,
+      contextProfile.tokenizer
     )
     const backendSystemPromptTokens =
       this.normalizePositiveInteger(input.backendSystemPromptTokens) ?? 0
@@ -170,6 +194,7 @@ export class ContextRequestPlannerService {
       maxTokens,
       systemPromptTokens,
       maxOutputTokens,
+      contextProfile,
       autoCompactTokenLimit,
       predictiveCompactTokenLimit,
       backendClampedFrom,
@@ -191,6 +216,7 @@ export class ContextRequestPlannerService {
         systemPromptTokens,
         maxOutputTokens,
         requestedServiceTier: input.requestedServiceTier,
+        contextProfile,
         autoCompactTokenLimit,
         predictiveCompactTokenLimit,
       },
@@ -230,6 +256,7 @@ export class ContextRequestPlannerService {
     return {
       maxTokens: budget.maxTokens,
       systemPromptTokens: budget.systemPromptTokens,
+      contextProfile: budget.contextProfile,
       autoCompactTokenLimit: budget.autoCompactTokenLimit,
       predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
       integrityMode: options?.integrityMode,
@@ -240,16 +267,23 @@ export class ContextRequestPlannerService {
     }
   }
 
-  private countSystemPromptTokens(systemPrompt?: string): number {
+  private countSystemPromptTokens(
+    systemPrompt: string | undefined,
+    tokenizer: ContextModelProfile["tokenizer"]
+  ): number {
     if (!systemPrompt) {
       return 0
     }
-    return this.tokenCounter.countMessages([
-      {
-        role: "user",
-        content: systemPrompt,
-      } as UnifiedMessage,
-    ])
+    return this.tokenCounter.countMessages(
+      [
+        {
+          role: "user",
+          content: systemPrompt,
+        } as UnifiedMessage,
+      ],
+      true,
+      tokenizer
+    )
   }
 
   private normalizePositiveInteger(value: unknown): number | undefined {

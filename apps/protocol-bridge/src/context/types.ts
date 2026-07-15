@@ -341,6 +341,7 @@ export interface ContextUsageLedgerState {
   anchorRecordId?: string
   lastUsage?: ContextUsageSnapshot
   projectedTokenCount?: number
+  accountingProfileKey?: string
   recordedCompactionId?: string
   attachmentFingerprint?: string
 }

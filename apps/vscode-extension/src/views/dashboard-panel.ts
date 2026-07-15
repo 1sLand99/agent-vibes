@@ -1176,6 +1176,8 @@ export class DashboardPanel {
       this.cursorPatchService.getIdleExtensionHostKillerStatus()
     const agentInputDockStatus =
       this.cursorPatchService.getAgentInputDockPatchStatus()
+    const workspaceControlStatus =
+      this.cursorPatchService.getWorkspaceControlPatchStatus()
     const trafficCaptureStatus =
       this.cursorPatchService.getTrafficCapturePatchStatus()
     const bridgeEndpointPatchStatus =
@@ -1314,6 +1316,31 @@ export class DashboardPanel {
               : "This Cursor workbench cannot apply the feature safely."
     const agentInputDockToggleDisabled =
       !agentInputDockStatus.fileExists || !agentInputDockStatus.canApply
+    const workspaceControlHint = !workspaceControlStatus.fileExists
+      ? locale === "zh"
+        ? "未找到 Cursor workbench 文件。"
+        : "Cursor workbench file was not found."
+      : workspaceControlStatus.applied
+        ? locale === "zh"
+          ? `已覆盖 ${workspaceControlStatus.workbenchFiles} 个 Cursor 工作台入口；每个 Agent 对话都可从输入区选择工作区目录，并切换当前项目的 Git 分支。`
+          : `Active in ${workspaceControlStatus.workbenchFiles} Cursor workbench file(s); each Agent chat can choose its workspace folder and switch the project's Git branch from the input.`
+        : workspaceControlStatus.partial
+          ? locale === "zh"
+            ? "检测到旧版或不完整的工作区与 Git 分支控制；重新开启可安全修复。"
+            : "An older or incomplete workspace and Git branch control is present; enable it again to repair."
+          : workspaceControlStatus.canApply
+            ? this.config.workspaceControlEnabled
+              ? locale === "zh"
+                ? "默认开启；每个 Agent 对话都可从输入区选择工作区目录，并切换当前项目的 Git 分支。"
+                : "Enabled by default. Each Agent chat can choose its workspace folder and switch the project's Git branch from the input."
+              : locale === "zh"
+                ? "当前已关闭；开启后需完整重启 Cursor。"
+                : "Currently disabled. Fully restart Cursor after enabling."
+            : locale === "zh"
+              ? "当前 Cursor 工作台无法安全应用此功能。"
+              : "This Cursor workbench cannot apply the feature safely."
+    const workspaceControlToggleDisabled =
+      !workspaceControlStatus.fileExists || !workspaceControlStatus.canApply
     const trafficCaptureMatchedRules =
       trafficCaptureStatus.appliedRules + trafficCaptureStatus.availableRules
     const trafficCaptureHint = !trafficCaptureStatus.fileExists
@@ -1657,6 +1684,16 @@ export class DashboardPanel {
                 onCommand: CMD.ENABLE_AGENT_INPUT_DOCK_PATCH,
                 offCommand: CMD.DISABLE_AGENT_INPUT_DOCK_PATCH,
                 disabled: agentInputDockToggleDisabled,
+              },
+              {
+                label: st.groups.patch.items.workspaceControl.label,
+                desc: st.groups.patch.items.workspaceControl.desc,
+                type: "commandToggle",
+                value: workspaceControlStatus.applied,
+                hint: workspaceControlHint,
+                onCommand: CMD.ENABLE_WORKSPACE_CONTROL_PATCH,
+                offCommand: CMD.DISABLE_WORKSPACE_CONTROL_PATCH,
+                disabled: workspaceControlToggleDisabled,
               },
               {
                 label: st.groups.patch.items.trafficCapture.label,

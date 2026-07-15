@@ -7,6 +7,7 @@ import {
 } from "./codex-context-content-policy"
 import { orderCodexMetaMessagesBeforeTranscript } from "./codex-context-message-policy"
 import { ContextCollapseService } from "./context-collapse.service"
+import type { ContextModelProfile } from "./context-model-profile"
 import {
   ContextCompactionCandidate,
   ContextCompactionPlan,
@@ -252,6 +253,7 @@ export class CodexContextAdapterService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       compactInputMaxTokens?: number
       compactInputSystemPromptTokens?: number
       autoCompactTokenLimit?: number
@@ -284,6 +286,7 @@ export class CodexContextAdapterService {
       {
         maxTokens: options.maxTokens,
         systemPromptTokens: options.systemPromptTokens,
+        contextProfile: options.contextProfile,
         autoCompactTokenLimit: options.autoCompactTokenLimit,
         predictiveCompactTokenLimit: options.predictiveCompactTokenLimit,
         projectedTokenOverride: options.projectedTokenOverride,
@@ -390,6 +393,7 @@ export class CodexContextAdapterService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       compactInputMaxTokens?: number
       compactInputSystemPromptTokens?: number
       autoCompactTokenLimit?: number
@@ -409,6 +413,7 @@ export class CodexContextAdapterService {
       {
         maxTokens: options.maxTokens,
         systemPromptTokens: options.systemPromptTokens,
+        contextProfile: options.contextProfile,
         autoCompactTokenLimit: options.autoCompactTokenLimit,
         predictiveCompactTokenLimit: options.predictiveCompactTokenLimit,
         strategy: options.strategy || "auto",
@@ -537,7 +542,11 @@ export class CodexContextAdapterService {
       256,
       options.maxTokens - options.systemPromptTokens
     )
-    const beforeHardFitTokens = this.tokenCounter.countMessages(messages)
+    const beforeHardFitTokens = this.tokenCounter.countMessages(
+      messages,
+      true,
+      "openai"
+    )
     if (beforeHardFitTokens <= hardMaxTokens) {
       return messages
     }
@@ -547,7 +556,11 @@ export class CodexContextAdapterService {
       hardMaxTokens,
       pendingToolUseIds
     )
-    const afterHardFitTokens = this.tokenCounter.countMessages(fitted)
+    const afterHardFitTokens = this.tokenCounter.countMessages(
+      fitted,
+      true,
+      "openai"
+    )
     this.logger.warn(
       `[codex-compact-input] fitted archived compact input ` +
         `messages=${messages.length}->${fitted.length} ` +
@@ -565,7 +578,8 @@ export class CodexContextAdapterService {
   ): UnifiedMessage[] {
     const startIndex = this.tokenCounter.findTruncationIndex(
       messages,
-      hardMaxTokens
+      hardMaxTokens,
+      "openai"
     )
     for (let index = startIndex; index <= messages.length; index++) {
       const candidate = repairOrphanedToolPairs(messages.slice(index), {
@@ -573,7 +587,8 @@ export class CodexContextAdapterService {
       })
       if (
         candidate.length > 0 &&
-        this.tokenCounter.countMessages(candidate) <= hardMaxTokens
+        this.tokenCounter.countMessages(candidate, true, "openai") <=
+          hardMaxTokens
       ) {
         return candidate
       }
@@ -637,7 +652,11 @@ export class CodexContextAdapterService {
       256,
       options.maxTokens - options.systemPromptTokens
     )
-    const beforeHardFitTokens = this.tokenCounter.countMessages(messages)
+    const beforeHardFitTokens = this.tokenCounter.countMessages(
+      messages,
+      true,
+      "openai"
+    )
     if (
       beforeHardFitTokens <= hardMaxTokens ||
       options.allowHardFit === false
@@ -659,6 +678,7 @@ export class CodexContextAdapterService {
         : repairOrphanedToolPairs(
             this.toolIntegrity.extractWithIntegrity(messages, hardMaxTokens, {
               mode: "global",
+              tokenizer: "openai",
             }),
             {
               pendingToolUseIds: options.pendingToolUseIds,
@@ -686,7 +706,11 @@ export class CodexContextAdapterService {
     )
     const protectedPrefix = messages.slice(0, prefixCount)
     const suffix = messages.slice(prefixCount)
-    const prefixTokens = this.tokenCounter.countMessages(protectedPrefix)
+    const prefixTokens = this.tokenCounter.countMessages(
+      protectedPrefix,
+      true,
+      "openai"
+    )
     if (prefixTokens > hardMaxTokens) {
       throw new Error(
         `Codex replacement history exceeds context window (${prefixTokens} > ${hardMaxTokens})`
@@ -697,6 +721,7 @@ export class CodexContextAdapterService {
       suffixBudget > 0 && suffix.length > 0
         ? this.toolIntegrity.extractWithIntegrity(suffix, suffixBudget, {
             mode: "global",
+            tokenizer: "openai",
           })
         : []
 

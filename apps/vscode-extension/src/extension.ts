@@ -9,6 +9,10 @@ import { CursorPatchService } from "./services/cursor-patch"
 import { CursorPatchManagerService } from "./services/cursor-patch-manager"
 import { ExtensionUpdateService } from "./services/extension-update"
 import { NetworkManager } from "./services/network-manager"
+import {
+  WorkspaceProjectSync,
+  getOrCreateAgentInputControlToken,
+} from "./services/workspace-project-sync"
 import { logger } from "./utils/logger"
 import { executePrivileged } from "./utils/terminal"
 import {
@@ -37,11 +41,29 @@ export async function activate(
 
   // Create core services
   const config = new ConfigManager()
-  bridge = new BridgeManager(config, context.extensionPath)
+  const agentInputControlToken = await getOrCreateAgentInputControlToken(
+    context.secrets
+  )
+  CursorPatchService.configureWorkspaceControlRuntime({
+    bridgePort: config.port,
+    controlToken: agentInputControlToken,
+    useHttps: config.hasCertificates(),
+  })
+  bridge = new BridgeManager(
+    config,
+    context.extensionPath,
+    agentInputControlToken
+  )
   network = new NetworkManager()
   network.setExtensionPath(context.extensionPath)
   network.setPort(config.port)
   const cursorPatch = new CursorPatchService(logger)
+  const workspaceProjectSync = new WorkspaceProjectSync(
+    config,
+    agentInputControlToken
+  )
+  workspaceProjectSync.start()
+  context.subscriptions.push(workspaceProjectSync)
   const cursorPatchManager = new CursorPatchManagerService()
   const cert = new CertManager(config)
   const updater = new ExtensionUpdateService(context)
@@ -140,6 +162,43 @@ export async function activate(
     return restartRequired
   }
 
+  const maybeSyncWorkspaceControlPatch = async (
+    promptForRestart = true
+  ): Promise<boolean> => {
+    const status = cursorPatch.getWorkspaceControlPatchStatus()
+    if (!status.fileExists) return false
+
+    const enabled = config.workspaceControlEnabled
+    if (enabled && status.applied) return false
+    if (!enabled && !status.applied && !status.partial) return false
+    if (enabled && !status.canApply) return false
+
+    const result = enabled
+      ? cursorPatch.applyWorkspaceControlPatch()
+      : cursorPatch.disableWorkspaceControlPatch()
+    if (!result.success) {
+      logger.warn(
+        `Workspace control could not be ${enabled ? "enabled" : "disabled"}: ${result.errors.join("; ")}`
+      )
+      return false
+    }
+
+    logger.info(
+      `Workspace control ${enabled ? "enabled" : "disabled"} from extension settings`
+    )
+    const restartRequired = result.restartRequired === true
+    if (restartRequired && promptForRestart) {
+      await promptForCursorPatchRestart(
+        t(
+          enabled
+            ? "patches.workspaceControlApplied"
+            : "patches.workspaceControlDisabled"
+        )
+      )
+    }
+    return restartRequired
+  }
+
   const maybeApplyCursorDirectPatch = async (
     promptForRestart = true
   ): Promise<boolean> => {
@@ -186,6 +245,8 @@ export async function activate(
 
     const directRestartRequired = await maybeApplyCursorDirectPatch(false)
     const agentInputRestartRequired = await maybeSyncAgentInputDockPatch(false)
+    const workspaceControlRestartRequired =
+      await maybeSyncWorkspaceControlPatch(false)
     const idleRestartRequired = await maybeApplyCursorIdleKillerPatch(false)
     if (
       config.agentInputDockEnabled &&
@@ -204,6 +265,8 @@ export async function activate(
       await promptForCursorPatchRestart(t("patches.bridgeEndpointApplied"))
     } else if (agentInputRestartRequired) {
       await promptForCursorPatchRestart(t("patches.agentInputDockApplied"))
+    } else if (workspaceControlRestartRequired) {
+      await promptForCursorPatchRestart(t("patches.workspaceControlApplied"))
     } else if (idleRestartRequired) {
       await promptForCursorPatchRestart(t("patches.idleKillerApplied"))
     }
@@ -240,6 +303,7 @@ export async function activate(
   // Update status bar when server state changes
   bridge.on("stateChanged", (state: ServerState) => {
     statusIndicator?.update(state)
+    workspaceProjectSync.setBridgeRunning(state === "running")
     if (state === "running") {
       void maybePromptForForwardingRepair()
     }
@@ -258,10 +322,24 @@ export async function activate(
       const agentInputDockChanged = event.affectsConfiguration(
         "agentVibes.agentInputDockEnabled"
       )
-      if (!portChanged && !trafficModeChanged && !agentInputDockChanged) return
+      const workspaceControlChanged = event.affectsConfiguration(
+        "agentVibes.workspaceControlEnabled"
+      )
+      if (
+        !portChanged &&
+        !trafficModeChanged &&
+        !agentInputDockChanged &&
+        !workspaceControlChanged
+      )
+        return
 
-      if (agentInputDockChanged && !portChanged && !trafficModeChanged) {
-        await maybeSyncAgentInputDockPatch()
+      if (
+        (agentInputDockChanged || workspaceControlChanged) &&
+        !portChanged &&
+        !trafficModeChanged
+      ) {
+        if (agentInputDockChanged) await maybeSyncAgentInputDockPatch()
+        if (workspaceControlChanged) await maybeSyncWorkspaceControlPatch()
         return
       }
 
@@ -269,6 +347,9 @@ export async function activate(
         await maybeApplyCursorDirectPatch()
         if (agentInputDockChanged) {
           await maybeSyncAgentInputDockPatch()
+        }
+        if (workspaceControlChanged) {
+          await maybeSyncWorkspaceControlPatch()
         }
         statusIndicator?.update(bridge?.state ?? "stopped")
         return
@@ -283,12 +364,20 @@ export async function activate(
         if (agentInputDockChanged) {
           await maybeSyncAgentInputDockPatch()
         }
+        if (workspaceControlChanged) {
+          await maybeSyncWorkspaceControlPatch()
+        }
         return
       }
 
       const previousPort = currentPort
       currentPort = nextPort
       network?.setPort(nextPort)
+      CursorPatchService.configureWorkspaceControlRuntime({
+        bridgePort: nextPort,
+        controlToken: agentInputControlToken,
+        useHttps: config.hasCertificates(),
+      })
 
       logger.info(`Agent Vibes port changed: ${previousPort} → ${nextPort}`)
 
@@ -317,9 +406,8 @@ export async function activate(
       if (config.trafficMode === "cursorPatch") {
         await maybeApplyCursorDirectPatch()
       }
-      if (agentInputDockChanged) {
-        await maybeSyncAgentInputDockPatch()
-      }
+      await maybeSyncAgentInputDockPatch()
+      await maybeSyncWorkspaceControlPatch()
 
       if (
         config.trafficMode === "systemForwarding" &&

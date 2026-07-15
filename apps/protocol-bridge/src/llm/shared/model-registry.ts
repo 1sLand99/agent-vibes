@@ -1112,13 +1112,22 @@ export function resolveModelThinkingCapability(
   }
 
   if (resolved?.isThinking) {
-    // 只有 GPT / Codex 这类模型在缺少显式 thinking metadata 时，
-    // 才回退为 level-based reasoning capability。
-    // Claude / Gemini 的 isThinking 更接近布尔 thinking toggle，
-    // 不能错误投影成 low / medium / high effort。
+    // GPT / Codex 在缺少显式 thinking metadata 时回退为 low/medium/high。
     if (resolved.family === "gpt") {
       return createLevelThinkingCapability(["low", "medium", "high"])
     }
+    // Claude 思考模型对齐 Cursor 的 effort 档位菜单。三条 Claude 后端
+    // (kiro / google-claude / claude-api) 均消费 output_config.effort：
+    // kiro 透传为原生 effort，google-claude 映射成 thinkingBudget，
+    // claude-api 透传为 Anthropic adaptive effort。上游 effort 只到 max，
+    // 故不含 ultra。
+    if (resolved.family === "claude") {
+      return createLevelThinkingCapability(
+        ["low", "medium", "high", "xhigh", "max"],
+        "medium"
+      )
+    }
+    // Gemini 的 isThinking 更接近布尔 thinking toggle，保持不投影成 effort。
     return null
   }
 

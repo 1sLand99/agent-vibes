@@ -6,6 +6,7 @@ import {
   ContextCompactionService,
 } from "./context-compaction.service"
 import { ContextTelemetryService } from "./context-telemetry.service"
+import type { ContextModelProfile } from "./context-model-profile"
 import { ContextUsageLedgerService } from "./context-usage-ledger.service"
 import { TokenCounterService } from "./token-counter.service"
 import {
@@ -82,6 +83,7 @@ export class ContextManagerService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       autoCompactTokenLimit?: number
       predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"
@@ -100,6 +102,7 @@ export class ContextManagerService {
     options: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       autoCompactTokenLimit?: number
       predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"
@@ -122,6 +125,7 @@ export class ContextManagerService {
     usage: ContextUsageSnapshot | undefined,
     options?: {
       promptTokenCount?: number
+      contextProfile?: ContextModelProfile
       recordedCompactionId?: string
       attachmentFingerprint?: string
       assistantMessage?: UnifiedMessage
@@ -129,7 +133,11 @@ export class ContextManagerService {
   ): void {
     if (!recordId || !usage) return
     const assistantMessageTokens = options?.assistantMessage
-      ? this.tokenCounter.countMessages([options.assistantMessage])
+      ? this.tokenCounter.countMessages(
+          [options.assistantMessage],
+          true,
+          options.contextProfile?.tokenizer ?? "claude"
+        )
       : 0
     this.usageLedger.recordResponseUsage(
       state,
@@ -145,6 +153,7 @@ export class ContextManagerService {
           options?.promptTokenCount != null
             ? options.promptTokenCount + assistantMessageTokens
             : undefined,
+        accountingProfileKey: options?.contextProfile?.key,
         recordedCompactionId: options?.recordedCompactionId,
         attachmentFingerprint: options?.attachmentFingerprint,
       }
@@ -153,13 +162,19 @@ export class ContextManagerService {
 
   buildProjectionLedger(
     state: ContextConversationState,
-    projectedMessages: ProjectedContextMessage[]
+    projectedMessages: ProjectedContextMessage[],
+    contextProfile: ContextModelProfile
   ): {
     projectedTokenCount?: number
+    accountingProfileKey?: string
     recordedCompactionId?: string
     attachmentFingerprint?: string
   } {
-    return this.usageLedger.buildProjectionLedger(state, projectedMessages)
+    return this.usageLedger.buildProjectionLedger(
+      state,
+      projectedMessages,
+      contextProfile
+    )
   }
 
   countMessages(messages: UnifiedMessage[]): number {
@@ -192,6 +207,7 @@ export class ContextManagerService {
     previousOptions: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       autoCompactTokenLimit?: number
       predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"
@@ -254,6 +270,7 @@ export class ContextManagerService {
     const result = this.compaction.ensureWithinBudget(state, snapshot, {
       maxTokens: nextMaxTokens,
       systemPromptTokens: previousOptions.systemPromptTokens,
+      contextProfile: previousOptions.contextProfile,
       autoCompactTokenLimit: previousOptions.autoCompactTokenLimit,
       predictiveCompactTokenLimit: previousOptions.predictiveCompactTokenLimit,
       integrityMode: previousOptions.integrityMode,
@@ -318,6 +335,7 @@ export class ContextManagerService {
     previousOptions: {
       maxTokens: number
       systemPromptTokens: number
+      contextProfile?: ContextModelProfile
       autoCompactTokenLimit?: number
       predictiveCompactTokenLimit?: number
       integrityMode?: "strict-adjacent" | "global"

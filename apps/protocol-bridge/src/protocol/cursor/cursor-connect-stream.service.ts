@@ -13,6 +13,7 @@ import { closeSync, openSync, readFileSync, readSync, statSync } from "fs"
 import * as os from "os"
 import * as path from "path"
 import {
+  buildContextProjectionBudgetSignature,
   buildSubAgentMemorySourceCompactionId,
   CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
   CodexContextAdapterService,
@@ -48,6 +49,7 @@ import {
   type LooseMessageContent,
   type PreCompactHookPayload,
   ReasoningMemoryService,
+  resolveContextTokenizer,
   SessionMemoryCompactionService,
   stripSubAgentUiOnlyPayload,
   type SubAgentMemoryFormatInput,
@@ -180,6 +182,7 @@ import {
 import { normalizeTaskBudgetTotal } from "./session/task-budget-state"
 import { ExecDispatchSerializerService } from "./session/exec-dispatch-serializer.service"
 import { ToolExecutionCoordinatorService } from "./session/tool-execution-coordinator.service"
+import { WorkspacePreferenceService } from "./session/workspace-preference.service"
 import {
   getInterruptedToolRepairContextLabel,
   isToolInterruptionReason,
@@ -1649,6 +1652,7 @@ export class CursorConnectStreamService {
 
   constructor(
     private readonly sessionManager: SessionLifecycleService,
+    private readonly workspacePreferences: WorkspacePreferenceService,
     private readonly toolExecutionCoordinator: ToolExecutionCoordinatorService,
     private readonly execDispatchSerializer: ExecDispatchSerializerService,
     private readonly grpcService: CursorGrpcService,
@@ -2825,6 +2829,10 @@ export class CursorConnectStreamService {
       const manualBudget = {
         maxTokens: MANUAL_SUMMARIZE_BUDGET,
         systemPromptTokens: 0,
+        contextProfile: this.resolveMessageBudget(route.backend, {
+          session,
+          model: route.model || session.model,
+        }).contextProfile,
       }
       if (route.backend === "codex") {
         const systemPrompt = this.buildCodexSystemPrompt(
@@ -3025,7 +3033,11 @@ export class CursorConnectStreamService {
     )
     const route = this.modelRouter.resolveModel(session.model)
     let hookUserMessage: string | undefined
-    const manualBudget = { maxTokens, systemPromptTokens: 0 }
+    const manualBudget = this.resolveMessageBudget(route.backend, {
+      session,
+      model: session.model,
+      budgetOverride: { maxTokens },
+    })
     const compactSignal =
       this.sessionManager.getCurrentTurnAbortSignal(conversationId) ??
       new AbortController().signal
@@ -4367,9 +4379,7 @@ export class CursorConnectStreamService {
       : systemPrompt
     const budget = this.resolveMessageBudget(route.backend, {
       session: options.session,
-      protectedContextTokens: contextMessages.length
-        ? this.tokenCounter.countMessages(contextMessages as UnifiedMessage[])
-        : 0,
+      protectedContextMessages: contextMessages as UnifiedMessage[],
       systemPrompt: effectiveSystemPrompt,
       toolDefinitions: options.toolDefinitions,
       model: options.model,
@@ -4390,10 +4400,18 @@ export class CursorConnectStreamService {
       conversationId: options.conversationId,
     })
     const historyTokens = historyMessages.length
-      ? this.tokenCounter.countMessages(historyMessages as UnifiedMessage[])
+      ? this.tokenCounter.countMessages(
+          historyMessages as UnifiedMessage[],
+          true,
+          budget.contextProfile.tokenizer
+        )
       : 0
     const totalMessageTokens = outgoingMessages.length
-      ? this.tokenCounter.countMessages(outgoingMessages as UnifiedMessage[])
+      ? this.tokenCounter.countMessages(
+          outgoingMessages as UnifiedMessage[],
+          true,
+          budget.contextProfile.tokenizer
+        )
       : 0
 
     const dto: CreateMessageDto = {
@@ -4416,6 +4434,7 @@ export class CursorConnectStreamService {
         messages: outgoingMessages as UnifiedMessage[],
         maxTokens: budget.maxTokens,
         systemPromptTokens: budget.systemPromptTokens,
+        contextProfile: budget.contextProfile,
         autoCompactTokenLimit: budget.autoCompactTokenLimit,
       })
     if (nativeContextManagement) {
@@ -4673,7 +4692,11 @@ export class CursorConnectStreamService {
     // previous_response_id 现在由 CodexService.streamViaWebSocket() 在 transport 层自动注入，
     // 不再在这里管理。
     const historyTokens = historyMessages.length
-      ? this.tokenCounter.countMessages(historyMessages as UnifiedMessage[])
+      ? this.tokenCounter.countMessages(
+          historyMessages as UnifiedMessage[],
+          true,
+          budget.contextProfile.tokenizer
+        )
       : 0
     const codexMessages = this.projectCodexMessagesWithContextLedger(
       options.conversationId,
@@ -4682,7 +4705,9 @@ export class CursorConnectStreamService {
     )
     const totalMessageTokens = codexMessages.messages.length
       ? this.tokenCounter.countMessages(
-          codexMessages.messages as UnifiedMessage[]
+          codexMessages.messages as UnifiedMessage[],
+          true,
+          budget.contextProfile.tokenizer
         )
       : 0
 
@@ -5645,10 +5670,22 @@ export class CursorConnectStreamService {
     const ctx = this.contextState.getContextRecord(session.conversationId)
     if (!ctx) return undefined
 
+    const route = this.resolveSessionRouteForContextAccounting(session)
+    if (!route) return undefined
+    const currentProfile = this.resolveMessageBudget(route.backend, {
+      session,
+      model: route.model || session.model,
+    }).contextProfile
+    const pendingLedger = ctx.pendingRequestContextLedger
     const pendingPromptTokens =
-      ctx.pendingRequestContextLedger?.promptTokenCount
+      pendingLedger?.contextProfile.key === currentProfile.key
+        ? pendingLedger.promptTokenCount
+        : undefined
+    const usageLedger = ctx.contextState.usageLedger
     const ledgerProjectedTokens =
-      ctx.contextState.usageLedger.projectedTokenCount
+      usageLedger.accountingProfileKey === currentProfile.key
+        ? usageLedger.projectedTokenCount
+        : undefined
     const candidates = options?.preferUsageLedger
       ? [ledgerProjectedTokens, pendingPromptTokens]
       : [pendingPromptTokens, ledgerProjectedTokens]
@@ -5713,6 +5750,7 @@ export class CursorConnectStreamService {
       parsed?: ParsedCursorRequest
       session?: SessionRecord
       protectedContextTokens?: number
+      protectedContextMessages?: UnifiedMessage[]
       systemPrompt?: string
       toolDefinitions?: unknown
       model?: string
@@ -5802,11 +5840,16 @@ export class CursorConnectStreamService {
 
     const budget = this.contextRequestPlanner.resolveBudget({
       backend,
+      model: modelForBudget,
+      modelFamily: modelForBudget
+        ? detectModelFamily(modelForBudget)
+        : "unknown",
       protocolMaxTokens: requestedMaxTokens,
       backendMaxTokens: effectiveBackendContextLimit,
       defaultMaxTokens:
         codexDefaultContextLimit || this.DEFAULT_HISTORY_MAX_TOKENS,
       protectedContextTokens,
+      protectedContextMessages: options?.protectedContextMessages,
       systemPrompt: options?.systemPrompt,
       toolDefinitions: options?.toolDefinitions,
       backendSystemPromptTokens,
@@ -8522,7 +8565,7 @@ export class CursorConnectStreamService {
       backend === "codex"
         ? this.buildContextAttachmentSnapshotSignature(attachmentSnapshot)
         : ""
-    const budgetSignature = `${budget.maxTokens}|${budget.systemPromptTokens}|${budget.autoCompactTokenLimit ?? ""}|${budget.predictiveCompactTokenLimit ?? ""}`
+    const budgetSignature = buildContextProjectionBudgetSignature(budget)
     const pendingToolUseIdsKey = options?.pendingToolUseIds?.length
       ? [...options.pendingToolUseIds].sort().join("|")
       : ""
@@ -8666,7 +8709,8 @@ export class CursorConnectStreamService {
       this.updatePendingRequestContextLedger(
         session,
         primary.projectedMessages,
-        modelMessages
+        modelMessages,
+        budget
       )
       return modelMessages
     })()
@@ -8786,7 +8830,9 @@ export class CursorConnectStreamService {
       )
       const projectedTokens = projected.messages.length
         ? this.tokenCounter.countMessages(
-            projected.messages as UnifiedMessage[]
+            projected.messages as UnifiedMessage[],
+            true,
+            budget.contextProfile.tokenizer
           )
         : 0
       this.logger.debug(
@@ -8855,6 +8901,7 @@ export class CursorConnectStreamService {
       {
         maxTokens: budget.maxTokens,
         systemPromptTokens: budget.systemPromptTokens,
+        contextProfile: budget.contextProfile,
         compactInputMaxTokens: compactInputBudget.maxTokens,
         compactInputSystemPromptTokens: compactInputBudget.systemPromptTokens,
         autoCompactTokenLimit: budget.autoCompactTokenLimit,
@@ -9185,6 +9232,7 @@ export class CursorConnectStreamService {
           {
             maxTokens: budget.maxTokens,
             systemPromptTokens: budget.systemPromptTokens,
+            contextProfile: budget.contextProfile,
             autoCompactTokenLimit: budget.autoCompactTokenLimit,
             predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
             projectedTokenOverride,
@@ -9298,6 +9346,7 @@ export class CursorConnectStreamService {
         {
           maxTokens: budget.maxTokens,
           systemPromptTokens: budget.systemPromptTokens,
+          contextProfile: budget.contextProfile,
           autoCompactTokenLimit: budget.autoCompactTokenLimit,
           predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
           strategy: options.strategy,
@@ -9816,13 +9865,15 @@ export class CursorConnectStreamService {
     finalMessages: Array<{
       role: "user" | "assistant"
       content: MessageContent
-    }>
+    }>,
+    budget: ContextProjectionBudget
   ): void {
     const projectionLedger = this.contextManager.buildProjectionLedger(
       this.contextState.getContextRecord(session.conversationId)!.contextState,
       projectedMessages as Parameters<
         ContextManagerService["buildProjectionLedger"]
-      >[1]
+      >[1],
+      budget.contextProfile
     )
 
     this.contextState.setPendingRequestContextLedger(session.conversationId, {
@@ -9830,8 +9881,11 @@ export class CursorConnectStreamService {
         finalMessages.map((message) => ({
           role: message.role,
           content: message.content as UnifiedMessage["content"],
-        })) as UnifiedMessage[]
+        })) as UnifiedMessage[],
+        true,
+        budget.contextProfile.tokenizer
       ),
+      contextProfile: budget.contextProfile,
       recordedCompactionId: projectionLedger.recordedCompactionId,
       attachmentFingerprint: projectionLedger.attachmentFingerprint,
     })
@@ -9851,6 +9905,9 @@ export class CursorConnectStreamService {
         promptTokenCount: this.contextState.getContextRecord(
           session.conversationId
         )!.pendingRequestContextLedger?.promptTokenCount,
+        contextProfile: this.contextState.getContextRecord(
+          session.conversationId
+        )!.pendingRequestContextLedger?.contextProfile,
         recordedCompactionId: this.contextState.getContextRecord(
           session.conversationId
         )!.pendingRequestContextLedger?.recordedCompactionId,
@@ -28480,14 +28537,13 @@ ${raw}
             conversationId,
             codexContextEntries
           )
-        : this.isCloudCodeBackend(route.backend)
-          ? this.tokenCounter.countMessages(
-              this.buildGoogleContextMessages(
-                session,
-                conversationId
-              ) as UnifiedMessage[]
-            )
-          : 0
+        : undefined
+    const protectedContextMessages = this.isCloudCodeBackend(route.backend)
+      ? (this.buildGoogleContextMessages(
+          session,
+          conversationId
+        ) as UnifiedMessage[])
+      : undefined
     const systemPrompt =
       route.backend === "codex"
         ? this.buildCodexSystemPrompt(model)
@@ -28501,6 +28557,7 @@ ${raw}
     const budget = this.resolveMessageBudget(route.backend, {
       session,
       protectedContextTokens,
+      protectedContextMessages,
       systemPrompt,
       toolDefinitions,
       model,
@@ -28517,12 +28574,7 @@ ${raw}
       promptMessages = this.truncateMessagesForBackend(
         session,
         route.backend,
-        {
-          maxTokens: budget.maxTokens,
-          systemPromptTokens: budget.systemPromptTokens,
-          autoCompactTokenLimit: budget.autoCompactTokenLimit,
-          predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
-        },
+        budget,
         {
           contextLabel: `tool continuation preflight: ${conversationId}`,
           model,
@@ -28552,10 +28604,16 @@ ${raw}
               this.peekCodexContextLedger(conversationId),
               promptMessages as CodexExecutionRequest["messages"],
               codexContextEntries
-            ).messages as UnifiedMessage[]
+            ).messages as UnifiedMessage[],
+            true,
+            budget.contextProfile.tokenizer
           )
         : promptMessages.length
-          ? this.tokenCounter.countMessages(promptMessages as UnifiedMessage[])
+          ? this.tokenCounter.countMessages(
+              promptMessages as UnifiedMessage[],
+              true,
+              budget.contextProfile.tokenizer
+            )
           : 0
     return {
       promptTokens,
@@ -28586,8 +28644,10 @@ ${raw}
    * fire on every call regardless of cache hits, which is the only
    * behaviour the budget bookkeeping is correct under.
    */
-  private readonly continuationHistoryTokensCache: WeakMap<object, number> =
-    new WeakMap()
+  private readonly continuationHistoryTokensCache: WeakMap<
+    object,
+    Map<string, number>
+  > = new WeakMap()
 
   private continuationPromptBudgetCache: {
     sessionRef: SessionRecord
@@ -28646,8 +28706,8 @@ ${raw}
    *     swapped wholesale by `post-compact-cleanup`; we read it
    *     because the planner's microcompact decisions consult it.
    *   - `backend`
-   *   - `budgetSignature` — composite of the four `budget` fields
-   *     that affect projection: maxTokens, systemPromptTokens,
+   *   - `budgetSignature` — composite of the model/accounting profile and
+   *     budget fields that affect projection: maxTokens, systemPromptTokens,
    *     autoCompactTokenLimit, predictiveCompactTokenLimit.
    *   - `optionsSignature` — composite of the truncate options
    *     that change behaviour: model, strategy, dryRun,
@@ -28700,21 +28760,29 @@ ${raw}
     // already returns the same array reference across continuation
     // rounds when the upstream view didn't change, so on a steady-
     // state burst this is a single map lookup.
+    const historyTokenizer = resolveContextTokenizer(
+      detectModelFamily(route.model || session.model)
+    )
     let historyTokens: number
     if (normalizedHistory.length === 0) {
       historyTokens = 0
     } else {
-      const cachedHistoryTokens =
+      const cachedByTokenizer =
         this.continuationHistoryTokensCache.get(normalizedHistory)
+      const cachedHistoryTokens = cachedByTokenizer?.get(historyTokenizer)
       if (cachedHistoryTokens !== undefined) {
         historyTokens = cachedHistoryTokens
       } else {
         historyTokens = this.tokenCounter.countMessages(
-          normalizedHistory.map(toLooseShape) as UnifiedMessage[]
+          normalizedHistory.map(toLooseShape) as UnifiedMessage[],
+          true,
+          historyTokenizer
         )
+        const nextCachedByTokenizer = cachedByTokenizer ?? new Map()
+        nextCachedByTokenizer.set(historyTokenizer, historyTokens)
         this.continuationHistoryTokensCache.set(
           normalizedHistory,
-          historyTokens
+          nextCachedByTokenizer
         )
       }
     }
@@ -30156,11 +30224,20 @@ ${raw}
           this.logger.debug(`Received message: ${messageBuffer.length} bytes`)
 
           // Parse the protobuf message
-          const parsed = cursorRequestParser.parseRequest(messageBuffer)
+          let parsed = cursorRequestParser.parseRequest(messageBuffer)
 
           if (!parsed) {
             this.logger.warn("Failed to parse message")
             continue
+          }
+
+          const preferenceConversationId =
+            parsed.conversationId || conversationId
+          if (preferenceConversationId) {
+            parsed = this.workspacePreferences.applyToRequest(
+              preferenceConversationId,
+              parsed
+            )
           }
 
           if (
@@ -30198,6 +30275,12 @@ ${raw}
 
             if (!conversationId && controlConversationId) {
               conversationId = controlConversationId
+              if (preferenceConversationId !== conversationId) {
+                parsed = this.workspacePreferences.applyToRequest(
+                  conversationId,
+                  parsed
+                )
+              }
               this.sessionManager.getOrCreateSession(
                 conversationId,
                 this.sanitizeParsedRequestForSession(parsed)
@@ -30623,6 +30706,12 @@ ${raw}
               this.logger.log(
                 `BiDi stream started for conversation: ${conversationId}`
               )
+              if (preferenceConversationId !== conversationId) {
+                parsed = this.workspacePreferences.applyToRequest(
+                  conversationId,
+                  parsed
+                )
+              }
 
               // CRITICAL: Create session BEFORE sending KV messages
               // This ensures blobIds can be tracked in the session
@@ -32109,11 +32198,8 @@ ${raw}
               conversationId,
               codexContextEntries
             )
-          : contextMessages.length
-            ? this.tokenCounter.countMessages(
-                contextMessages as UnifiedMessage[]
-              )
-            : 0,
+          : undefined,
+      protectedContextMessages: contextMessages as UnifiedMessage[],
       systemPrompt,
       toolDefinitions: apiTools,
       model: session.model,
@@ -32152,12 +32238,7 @@ ${raw}
     const messages = this.truncateMessagesForBackend(
       session,
       route.backend,
-      {
-        maxTokens: budget.maxTokens,
-        systemPromptTokens: budget.systemPromptTokens,
-        autoCompactTokenLimit: budget.autoCompactTokenLimit,
-        predictiveCompactTokenLimit: budget.predictiveCompactTokenLimit,
-      },
+      budget,
       {
         contextLabel: `chat pre-send: ${conversationId}`,
         model: route.model,
@@ -32203,13 +32284,7 @@ ${raw}
           this.truncateMessagesForBackend(
             session,
             streamRoute.backend,
-            {
-              maxTokens: routeBudget.maxTokens,
-              systemPromptTokens: routeBudget.systemPromptTokens,
-              autoCompactTokenLimit: routeBudget.autoCompactTokenLimit,
-              predictiveCompactTokenLimit:
-                routeBudget.predictiveCompactTokenLimit,
-            },
+            routeBudget,
             {
               contextLabel: `chat pre-send: ${conversationId}`,
               model: streamRoute.model,
@@ -32238,13 +32313,7 @@ ${raw}
           this.truncateMessagesForBackend(
             session,
             streamRoute.backend,
-            {
-              maxTokens: routeBudget.maxTokens,
-              systemPromptTokens: routeBudget.systemPromptTokens,
-              autoCompactTokenLimit: routeBudget.autoCompactTokenLimit,
-              predictiveCompactTokenLimit:
-                routeBudget.predictiveCompactTokenLimit,
-            },
+            routeBudget,
             {
               contextLabel: `chat pre-send: ${conversationId}`,
               model: streamRoute.model,
@@ -32307,11 +32376,9 @@ ${raw}
                         conversationId,
                         streamCodexContextEntries
                       )
-                    : streamContextMessages.length
-                      ? this.tokenCounter.countMessages(
-                          streamContextMessages as UnifiedMessage[]
-                        )
-                      : 0,
+                    : undefined,
+                protectedContextMessages:
+                  streamContextMessages as UnifiedMessage[],
                 systemPrompt: streamSystemPrompt,
                 toolDefinitions: apiTools,
                 model: session.model,
@@ -32983,13 +33050,7 @@ ${raw}
           this.truncateMessagesForBackend(
             activeSession,
             streamRoute.backend,
-            {
-              maxTokens: routeBudget.maxTokens,
-              systemPromptTokens: routeBudget.systemPromptTokens,
-              autoCompactTokenLimit: routeBudget.autoCompactTokenLimit,
-              predictiveCompactTokenLimit:
-                routeBudget.predictiveCompactTokenLimit,
-            },
+            routeBudget,
             {
               contextLabel: `${continuationLabel}: ${conversationId}`,
               model: streamRoute.model,
@@ -33019,13 +33080,7 @@ ${raw}
           this.truncateMessagesForBackend(
             activeSession,
             streamRoute.backend,
-            {
-              maxTokens: routeBudget.maxTokens,
-              systemPromptTokens: routeBudget.systemPromptTokens,
-              autoCompactTokenLimit: routeBudget.autoCompactTokenLimit,
-              predictiveCompactTokenLimit:
-                routeBudget.predictiveCompactTokenLimit,
-            },
+            routeBudget,
             {
               contextLabel: `${continuationLabel}: ${conversationId}`,
               model: streamRoute.model,
@@ -33093,11 +33148,8 @@ ${raw}
                     conversationId,
                     codexContextEntries
                   )
-                : contextMessages.length
-                  ? this.tokenCounter.countMessages(
-                      contextMessages as UnifiedMessage[]
-                    )
-                  : 0,
+                : undefined,
+            protectedContextMessages: contextMessages as UnifiedMessage[],
             systemPrompt,
             toolDefinitions: continuationTools,
             model: activeSession.model,
@@ -36898,11 +36950,11 @@ ${raw}
     let tokens = 3
     for (const message of messages) {
       tokens += 4
-      tokens += this.tokenCounter.countText(message.role, false)
+      tokens += this.tokenCounter.countText(message.role, false, "openai")
       tokens +=
         typeof message.content === "string"
-          ? this.tokenCounter.countText(message.content, false)
-          : this.tokenCounter.countJsonValue(message.content, false)
+          ? this.tokenCounter.countText(message.content, false, "openai")
+          : this.tokenCounter.countJsonValue(message.content, false, "openai")
     }
     return tokens
   }

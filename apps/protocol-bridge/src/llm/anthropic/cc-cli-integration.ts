@@ -67,7 +67,7 @@ export interface ClaudeCliEnvSnapshot {
 }
 
 export interface ClaudeCliIntegrationStatus {
-  /** True when the settings file has our sentinel and points at the given Bridge URL. */
+  /** True when the managed URL, auth, and optional CA settings are usable. */
   connected: boolean
   /** Absolute path to the settings file we manage. */
   settingsPath: string
@@ -330,8 +330,24 @@ export async function getClaudeCliIntegrationStatus(
     }
   }
 
+  const settingsBaseUrl =
+    typeof env.ANTHROPIC_BASE_URL === "string"
+      ? env.ANTHROPIC_BASE_URL.trim()
+      : ""
+  const baseUrlMatches = settingsBaseUrl === sentinel.bridgeUrl.trim()
+  const apiKeyReady =
+    settingsApiKey.length > 0 &&
+    (bridgeApiKeyMatch === "match" || bridgeApiKeyMatch === "no-guard")
+  const caCertManaged = sentinel.managedEnvKeys.includes("NODE_EXTRA_CA_CERTS")
+  const caCertPath =
+    typeof env.NODE_EXTRA_CA_CERTS === "string"
+      ? env.NODE_EXTRA_CA_CERTS.trim()
+      : ""
+  const caCertReady =
+    !caCertManaged || (caCertPath.length > 0 && (await pathExists(caCertPath)))
+
   return {
-    connected: true,
+    connected: baseUrlMatches && apiKeyReady && !authConflict && caCertReady,
     settingsPath,
     backupPath,
     backupExists,

@@ -960,6 +960,7 @@ type PatchSettingsItems = {
   bridgeEndpoint: SettingsItemCopy
   idleKiller: SettingsItemCopy
   agentInputDock: SettingsItemCopy
+  workspaceControl: SettingsItemCopy
   trafficCapture: SettingsItemCopy
   resetPatches: SettingsItemCopy
   fixChecksums: SettingsItemCopy
@@ -1119,6 +1120,10 @@ const SETTINGS_EN: SettingsCopy = {
           label: "Agent Input Dock",
           desc: "When a bottom panel view (terminal, etc.) opens, docks the Agent input at the bottom to free the editor, and restores it when the panel hides. Drag the Agent tab to move between the editor, bottom panel, and Chat.",
         },
+        workspaceControl: {
+          label: "Workspace & Git Branch",
+          desc: "Choose the workspace folder for each Agent chat and switch the project's Git branch from the input.",
+        },
         trafficCapture: {
           label: "Cursor Traffic Capture",
           desc: "Capture Cursor transport requests and responses for protocol debugging. Disabled by default.",
@@ -1277,6 +1282,10 @@ const SETTINGS_ZH: SettingsCopy = {
         agentInputDock: {
           label: "Agent 输入停靠",
           desc: "打开底部面板（终端等）时自动把 Agent 输入停靠到底部、腾出编辑区，隐藏面板时还原；拖动 Agent 标签可在编辑区、底部与右侧 Chat 间切换。",
+        },
+        workspaceControl: {
+          label: "工作区与 Git 分支",
+          desc: "在 Agent 输入区为每个对话选择工作区目录，并切换当前项目的 Git 分支。",
         },
         trafficCapture: {
           label: "Cursor 流量抓取",

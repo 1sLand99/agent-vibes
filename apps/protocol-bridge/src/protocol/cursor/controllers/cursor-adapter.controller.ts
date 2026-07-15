@@ -139,6 +139,7 @@ export class CursorAdapterController {
         // getCursorDisplayModels' dedup keeps the first occurrence, so curated
         // static entries still win and dynamic ones only fill the gaps.
         extraModels: [
+          ...this.kiroService.getCursorDisplayModels(),
           ...this.anthropicApiService.getCursorDisplayModels(),
           ...this.googleModelCache.getCursorDisplayModels(),
         ],

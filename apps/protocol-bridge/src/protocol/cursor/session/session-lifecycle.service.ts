@@ -29,6 +29,7 @@ import {
   normalizePathForBoundaryCheck,
   resolveAllowedWorkspaceRoots,
 } from "./workspace-root-resolver"
+import { resolveSessionContextWindowTransition } from "./context-window-transition"
 import type {
   ContextCompactionCommit,
   ContextCollapseCommit,
@@ -63,6 +64,7 @@ import {
   stripInternalContextEvents,
 } from "../../../context/context-transcript-events"
 import { ToolResultStorageService } from "../../../context/tool-result-storage.service"
+import type { ContextModelProfile } from "../../../context/context-model-profile"
 import type {
   BackendType,
   ModelRouteResult,
@@ -837,6 +839,7 @@ export interface ContextStateRecord {
   /** Pending request context ledger projection. */
   pendingRequestContextLedger?: {
     promptTokenCount: number
+    contextProfile: ContextModelProfile
     recordedCompactionId?: string
     attachmentFingerprint?: string
   }
@@ -5688,15 +5691,35 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       const canRefreshProvidedFields = refreshScope !== "control"
       const canClearRequestScopedFields =
         canClearSessionRequestScopedFields(initialRequest)
+      const contextWindowTransition = resolveSessionContextWindowTransition({
+        current: {
+          model: session.model,
+          contextTokenLimit: session.contextTokenLimit,
+          contextMaxMode: session.contextMaxMode,
+        },
+        incoming: {
+          model: initialRequest?.model,
+          contextTokenLimit: initialRequest?.contextTokenLimit,
+          contextTokenLimitSource: initialRequest?.contextTokenLimitSource,
+          contextMaxMode: initialRequest?.contextMaxMode,
+        },
+        canRefreshProvidedFields,
+        canClearRequestScopedFields,
+      })
       session.lastActivityAt = new Date()
+      session.model = contextWindowTransition.model
+      session.contextTokenLimit = contextWindowTransition.contextTokenLimit
+      session.contextMaxMode = contextWindowTransition.contextMaxMode
+      if (contextWindowTransition.modelChanged) {
+        ctx.usedTokens = 0
+        ctx.pendingRequestContextLedger = undefined
+        ctx.contextState.usageLedger = {}
+      }
 
       // Refresh protocol fields only from frames that are authoritative for
       // them. Cursor sends resume / attach / control frames on the same stream;
       // treating those as full turns silently clears the last real request's
       // model parameters, rules, environment, and tool capabilities.
-      if (canRefreshProvidedFields && initialRequest?.model) {
-        session.model = initialRequest.model
-      }
       if (canClearRequestScopedFields && initialRequest) {
         session.subagentModelOverrides =
           initialRequest.subagentModelOverrides ??
@@ -5807,8 +5830,6 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         session.cursorCommands = initialRequest.cursorCommands
         session.customSystemPrompt = initialRequest.customSystemPrompt
         session.explicitContext = initialRequest.explicitContext
-        session.contextTokenLimit = initialRequest.contextTokenLimit
-        session.contextMaxMode = initialRequest.contextMaxMode
         session.requestedMaxOutputTokens =
           initialRequest.requestedMaxOutputTokens
         session.requestedModelParameters =
@@ -5822,12 +5843,6 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         }
         if (initialRequest?.explicitContext !== undefined) {
           session.explicitContext = initialRequest.explicitContext
-        }
-        if (initialRequest?.contextTokenLimit !== undefined) {
-          session.contextTokenLimit = initialRequest.contextTokenLimit
-        }
-        if (initialRequest?.contextMaxMode !== undefined) {
-          session.contextMaxMode = initialRequest.contextMaxMode
         }
         if (initialRequest?.requestedMaxOutputTokens !== undefined) {
           session.requestedMaxOutputTokens =

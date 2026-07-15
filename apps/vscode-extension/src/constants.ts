@@ -44,6 +44,8 @@ export const CMD = {
   APPLY_CURSOR_IDLE_KILLER_PATCH: "agentVibes.applyCursorIdleKillerPatch",
   ENABLE_AGENT_INPUT_DOCK_PATCH: "agentVibes.enableAgentInputDockPatch",
   DISABLE_AGENT_INPUT_DOCK_PATCH: "agentVibes.disableAgentInputDockPatch",
+  ENABLE_WORKSPACE_CONTROL_PATCH: "agentVibes.enableWorkspaceControlPatch",
+  DISABLE_WORKSPACE_CONTROL_PATCH: "agentVibes.disableWorkspaceControlPatch",
   APPLY_CURSOR_TRAFFIC_CAPTURE_PATCH:
     "agentVibes.applyCursorTrafficCapturePatch",
   DISABLE_CURSOR_TRAFFIC_CAPTURE_PATCH:

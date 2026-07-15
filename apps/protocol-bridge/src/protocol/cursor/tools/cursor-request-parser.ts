@@ -33,6 +33,7 @@ import { parseModelRequest } from "../../../llm/shared/model-request"
 import { doesModelSupportThinking } from "../../../llm/shared/model-registry"
 import { normalizeRequestedThinkingEffort } from "../../../llm/shared/thinking-intent"
 import { parseCursorVariantString } from "../cursor-model-protocol"
+import type { ContextTokenLimitSource } from "../session/context-window-transition"
 import {
   getDefaultAgentToolNames,
   isCursorBuiltInToolAllowed,
@@ -356,6 +357,7 @@ export interface ParsedCursorRequest {
 
   // 协议中的 token 预算（用于严格跟随 Cursor 参数）
   contextTokenLimit?: number
+  contextTokenLimitSource?: ContextTokenLimitSource
   contextMaxMode?: boolean
   usedContextTokens?: number
   requestedMaxOutputTokens?: number
@@ -720,7 +722,6 @@ export class CursorRequestParser {
   private readonly logger = new Logger(CursorRequestParser.name)
 
   private readonly textDecoder = new TextDecoder()
-  private readonly normalStateContextTokenLimitCeiling = 250_000
 
   constructor(
     private readonly kvStorageService: KvStorageService = new KvStorageService()
@@ -2233,26 +2234,18 @@ export class CursorRequestParser {
       requestedMaxMode ||
       requestedVariantMaxMode ||
       modelDetailsVariantMaxMode
-    const contextTokenLimitFromState =
-      rawContextTokenLimitFromState &&
-      !requestedContextTokenLimit &&
-      (explicitMaxContextMode ||
-        rawContextTokenLimitFromState <=
-          this.normalStateContextTokenLimitCeiling)
-        ? rawContextTokenLimitFromState
-        : undefined
-    if (
-      rawContextTokenLimitFromState &&
-      !requestedContextTokenLimit &&
-      !contextTokenLimitFromState
-    ) {
-      this.logger.debug(
-        `Ignoring conversationState.tokenDetails.maxTokens=${rawContextTokenLimitFromState} without explicit max-mode signal`
-      )
-    }
+    const contextTokenLimitFromState = requestedContextTokenLimit
+      ? undefined
+      : rawContextTokenLimitFromState
     const contextTokenLimit =
       requestedContextTokenLimit ||
       (explicitMaxContextMode ? undefined : contextTokenLimitFromState)
+    const contextTokenLimitSource: ContextTokenLimitSource | undefined =
+      requestedContextTokenLimit
+        ? "requested"
+        : contextTokenLimitFromState && !explicitMaxContextMode
+          ? "conversation_state"
+          : undefined
 
     if (
       contextTokenLimit ||
@@ -2562,6 +2555,7 @@ export class CursorRequestParser {
             cursorCommands.length > 0 ? cursorCommands : undefined,
           customSystemPrompt: customSystemPrompt || undefined,
           contextTokenLimit,
+          contextTokenLimitSource,
           contextMaxMode: explicitMaxContextMode,
           usedContextTokens,
           requestedMaxOutputTokens,
@@ -2726,6 +2720,7 @@ export class CursorRequestParser {
             cursorCommands.length > 0 ? cursorCommands : undefined,
           customSystemPrompt: customSystemPrompt || undefined,
           contextTokenLimit,
+          contextTokenLimitSource,
           contextMaxMode: explicitMaxContextMode,
           usedContextTokens,
           requestedMaxOutputTokens,
@@ -2777,6 +2772,7 @@ export class CursorRequestParser {
             cursorCommands.length > 0 ? cursorCommands : undefined,
           customSystemPrompt: customSystemPrompt || undefined,
           contextTokenLimit,
+          contextTokenLimitSource,
           contextMaxMode: explicitMaxContextMode,
           usedContextTokens,
           requestedMaxOutputTokens,
@@ -2835,6 +2831,7 @@ export class CursorRequestParser {
       cursorCommands: cursorCommands.length > 0 ? cursorCommands : undefined,
       customSystemPrompt: customSystemPrompt || undefined,
       contextTokenLimit,
+      contextTokenLimitSource,
       contextMaxMode: explicitMaxContextMode,
       usedContextTokens,
       requestedMaxOutputTokens,

@@ -11,6 +11,8 @@ import { AntigravityIdeSyncService } from "./antigravity-ide-sync.service"
 import { AiserverMockController } from "./controllers/aiserver-mock.controller"
 import { AuthController } from "./controllers/auth.controller"
 import { CursorAdapterController } from "./controllers/cursor-adapter.controller"
+import { WorkspaceBranchController } from "./controllers/workspace-branch.controller"
+import { WorkspacePreferenceController } from "./controllers/workspace-preference.controller"
 import { CursorAuthService } from "./cursor-auth.service"
 import { CursorConnectStreamService } from "./cursor-connect-stream.service"
 import { CursorGrpcService } from "./cursor-grpc.service"
@@ -21,6 +23,8 @@ import { SessionLifecycleService } from "./session/session-lifecycle.service"
 import { ExecDispatchSerializerService } from "./session/exec-dispatch-serializer.service"
 import { PendingDeadlineSweeper } from "./session/pending-deadline-sweeper.service"
 import { ToolExecutionCoordinatorService } from "./session/tool-execution-coordinator.service"
+import { WorkspacePreferenceService } from "./session/workspace-preference.service"
+import { GitBranchService } from "./session/git-branch.service"
 import { CursorSkillsManager } from "./skills"
 import { SubagentLoaderService } from "./subagents/subagent-loader.service"
 import { SubagentRegistryService } from "./subagents/subagent-registry.service"
@@ -57,10 +61,14 @@ import { BackgroundJobRegistry } from "./subagents-bridge/background-job-registr
     CursorAdapterController,
     AuthController,
     AiserverMockController,
+    WorkspacePreferenceController,
+    WorkspaceBranchController,
   ],
   providers: [
     SessionLifecycleService,
     ToolExecutionCoordinatorService,
+    WorkspacePreferenceService,
+    GitBranchService,
     ExecDispatchSerializerService,
     ClientSideToolV2ExecutorService,
     AntigravityIdeSyncService,

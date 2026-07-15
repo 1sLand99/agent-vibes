@@ -128,6 +128,14 @@ export class ConfigManager {
     )
   }
 
+  get workspaceControlEnabled(): boolean {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<boolean>("workspaceControlEnabled") ?? true
+    )
+  }
+
   get thinkingBudgetAuto(): boolean {
     return (
       vscode.workspace

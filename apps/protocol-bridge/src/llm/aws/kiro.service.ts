@@ -31,6 +31,7 @@ import {
 import { UsageStatsService } from "../../usage"
 import {
   clearAccountDisablement,
+  disableAccount,
   isAccountAvailableForModel,
   isAccountDisabled,
   markAccountCooldown,
@@ -53,7 +54,12 @@ import {
   BackendPoolEntryState,
   BackendPoolStatus,
 } from "../shared/backend-pool-status"
-import { canPublicClaudeModelUseKiro } from "../shared/model-registry"
+import {
+  CLAUDE_CURSOR_DISPLAY_MODELS,
+  canPublicClaudeModelUseKiro,
+  doesModelSupportThinking,
+  type CursorDisplayModel,
+} from "../shared/model-registry"
 import { resolveThinkingIntentFromDto } from "../shared/thinking-intent"
 import type {
   ThinkingIntent,
@@ -444,15 +450,13 @@ export class KiroService implements OnModuleInit {
 
   supportsModel(model: string): boolean {
     if (!this.isAvailable()) return false
-    // Check dynamic model list first. Cursor-facing Claude aliases use
-    // hyphenated / thinking model IDs, while Kiro discovery reports dotted
-    // backend IDs such as "claude-opus-4.7".
+    // Once discovery succeeds it is authoritative. Cursor-facing Claude
+    // aliases use hyphenated / thinking IDs, while Kiro reports dotted IDs;
+    // findDiscoveredModel() resolves both forms through the shared mapping.
     if (this.discoveredModels.length > 0) {
-      if (this.findDiscoveredModel(model)) {
-        return true
-      }
+      return this.findDiscoveredModel(model) !== undefined
     }
-    // Fallback to static Claude model check.
+    // Before discovery completes, retain the static Claude fallback.
     return canPublicClaudeModelUseKiro(model)
   }
 
@@ -531,6 +535,40 @@ export class KiroService implements OnModuleInit {
         .map((m) => m.modelId)
     }
     return [...FALLBACK_KIRO_MODEL_IDS]
+  }
+
+  getCursorDisplayModels(): CursorDisplayModel[] {
+    return this.discoveredModels
+      .filter((model) => model.modelId.toLowerCase().trim() !== "auto")
+      .map((model) => {
+        const modelId = model.modelId.trim()
+        const mappedModelId = mapKiroModel(modelId).toLowerCase()
+        const curatedModel =
+          CLAUDE_CURSOR_DISPLAY_MODELS.find(
+            (candidate) =>
+              candidate.isThinking &&
+              mapKiroModel(candidate.name).toLowerCase() === mappedModelId
+          ) ||
+          CLAUDE_CURSOR_DISPLAY_MODELS.find(
+            (candidate) =>
+              mapKiroModel(candidate.name).toLowerCase() === mappedModelId
+          )
+
+        if (curatedModel) {
+          return curatedModel
+        }
+
+        const displayName = model.modelName.trim() || modelId
+        return {
+          name: modelId,
+          displayName,
+          shortName: displayName,
+          family: "claude" as const,
+          isThinking:
+            doesModelSupportThinking(modelId) ||
+            /thinking/i.test(`${modelId} ${model.modelName}`),
+        }
+      })
   }
 
   getDiscoveredModels(): KiroModelInfo[] {
@@ -1555,6 +1593,10 @@ export class KiroService implements OnModuleInit {
             `[Kiro] Recovered ${account.authMethod} token from local cache for ${account.label || account.stateKey.slice(0, 12)}`
           )
         } else {
+          // No working fallback. If the provider permanently rejected the
+          // refresh credentials, disable the account so the retry loop fails
+          // over to another one and the background loop stops hammering it.
+          this.disableAccountIfPermanentAuthFailure(account, refreshError)
           throw refreshError
         }
       }
@@ -1904,10 +1946,15 @@ export class KiroService implements OnModuleInit {
         return out
       }
       case "explicit_budget":
-        // Kiro's schema does not accept `budget_tokens` directly; the
-        // closest mapping is enabling adaptive thinking. Effort stays
-        // unset so the backend picks a sensible default.
-        return { thinking: { type: "adaptive", display: "summarized" } }
+        // Kiro accepts effort levels rather than `budget_tokens`. Preserve
+        // Cursor's budget semantics by projecting the token budget onto the
+        // same ordered levels used by its reasoning selector.
+        return {
+          thinking: { type: "adaptive", display: "summarized" },
+          output_config: {
+            effort: this.convertKiroBudgetToEffort(intent.budgetTokens),
+          },
+        }
       default:
         return undefined
     }
@@ -1927,10 +1974,21 @@ export class KiroService implements OnModuleInit {
       case "xhigh":
         return "xhigh"
       case "max":
+      case "ultra":
         return "max"
       default:
         return undefined
     }
+  }
+
+  private convertKiroBudgetToEffort(
+    budgetTokens: number
+  ): "low" | "medium" | "high" | "xhigh" | "max" {
+    if (budgetTokens <= 1024) return "low"
+    if (budgetTokens <= 8192) return "medium"
+    if (budgetTokens <= 24576) return "high"
+    if (budgetTokens <= 32768) return "xhigh"
+    return "max"
   }
 
   /**
@@ -3519,6 +3577,63 @@ export class KiroService implements OnModuleInit {
   }
 
   /**
+   * Classify a token-refresh failure. Returns `permanent: true` only when the
+   * provider rejects the refresh credentials themselves (revoked/expired
+   * refresh token, invalid client) — as opposed to a local precondition
+   * (missing clientId/clientSecret, empty refresh token) or a transient
+   * network/5xx failure. Permanent failures should disable the account so we
+   * stop retrying it every 15 minutes.
+   */
+  private classifyRefreshFailure(error: unknown): {
+    permanent: boolean
+    statusCode?: number
+  } {
+    const message = error instanceof Error ? error.message : String(error)
+    // Local preconditions — never disable. The account may still refresh on
+    // demand from the local Kiro IDE cache (e.g. IDE-mirrored IdC tokens).
+    if (
+      /requires clientId and clientSecret/i.test(message) ||
+      /no refreshToken/i.test(message) ||
+      /refresh token is empty/i.test(message)
+    ) {
+      return { permanent: false }
+    }
+    const httpMatch = message.match(/HTTP (\d{3})/)
+    const statusCode = httpMatch ? Number(httpMatch[1]) : undefined
+    if (statusCode === 401 || statusCode === 403) {
+      return { permanent: true, statusCode }
+    }
+    if (
+      /invalid_grant|invalid_client|access_denied|bad credentials/i.test(
+        message
+      )
+    ) {
+      return { permanent: true, statusCode }
+    }
+    return { permanent: false, statusCode }
+  }
+
+  /**
+   * Permanently disable the account (and persist the state) when a refresh
+   * failure indicates its credentials are irrecoverably rejected. Returns
+   * whether the account was disabled.
+   */
+  private disableAccountIfPermanentAuthFailure(
+    account: KiroAccount,
+    error: unknown
+  ): boolean {
+    const { permanent, statusCode } = this.classifyRefreshFailure(error)
+    if (!permanent) return false
+    disableAccount(account, "refresh_token_rejected", {
+      statusCode,
+      message: error instanceof Error ? error.message : String(error),
+      accountLabel: account.label || account.stateKey.slice(0, 12),
+    })
+    this.persistAccountStates()
+    return true
+  }
+
+  /**
    * Background token refresh loop — runs every 15 minutes.
    * Mirrors Kiro-Go's `backgroundRefresh` goroutine.
    * Refreshes tokens proactively and persists them to disk so the next
@@ -3530,6 +3645,17 @@ export class KiroService implements OnModuleInit {
       for (const account of this.accounts) {
         if (isAccountDisabled(account)) continue
         if (!account.refreshToken) continue
+        // IdC/Builder ID accounts without client credentials cannot be
+        // refreshed against the AWS OIDC endpoint (the call fails its local
+        // precondition every time). They are refreshed on demand from the
+        // local Kiro IDE cache in ensureFreshToken, so skip the doomed
+        // background attempt instead of logging a warning every cycle.
+        if (
+          account.authMethod === "idc" &&
+          (!account.clientId || !account.clientSecret)
+        ) {
+          continue
+        }
         const nowSec = Math.floor(Date.now() / 1000)
         const needsRefresh =
           !account.accessToken ||
@@ -3559,6 +3685,9 @@ export class KiroService implements OnModuleInit {
             `[Kiro] Background refresh OK: ${account.label || account.stateKey.slice(0, 12)} (expires=${new Date(result.expiresAt * 1000).toISOString()})`
           )
         } catch (error) {
+          if (this.disableAccountIfPermanentAuthFailure(account, error)) {
+            continue
+          }
           this.logger.warn(
             `[Kiro] Background refresh failed for ${account.label || account.stateKey.slice(0, 12)}: ${(error as Error).message}`
           )

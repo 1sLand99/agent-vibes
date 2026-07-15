@@ -3,7 +3,7 @@
   "displayName": "Agent Vibes",
   "publisher": "funny-vibes",
   "description": "Unified AI Agent Gateway — Route Antigravity, Claude, and GPT backends through Cursor IDE and Claude Code CLI with protocol-native translation.",
-  "version": "0.1.65",
+  "version": "0.1.66",
   "agentVibes": {
     "cursorVersion": "3.11.13"
   },
@@ -182,6 +182,16 @@
         "category": "Agent Vibes"
       },
       {
+        "command": "agentVibes.enableWorkspaceControlPatch",
+        "title": "Enable Workspace and Git Branch Control",
+        "category": "Agent Vibes"
+      },
+      {
+        "command": "agentVibes.disableWorkspaceControlPatch",
+        "title": "Disable Workspace and Git Branch Control",
+        "category": "Agent Vibes"
+      },
+      {
         "command": "agentVibes.applyCursorTrafficCapturePatch",
         "title": "Enable Cursor Traffic Capture",
         "category": "Agent Vibes"
@@ -301,6 +311,11 @@
           "type": "boolean",
           "default": true,
           "description": "When a bottom panel view (terminal, etc.) opens, dock the Agent input at the bottom to free the editor, and restore it when the panel hides. Drag the Agent tab to move between the editor, bottom panel, and Chat."
+        },
+        "agentVibes.workspaceControlEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the project and Git branch pickers on the Agent input, letting each chat choose its workspace folder and switch the project's Git branch."
         },
         "agentVibes.healthCheckInterval": {
           "type": "number",

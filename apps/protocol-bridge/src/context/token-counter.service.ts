@@ -5,7 +5,9 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from "@nestjs/common"
+import { encoding_for_model } from "tiktoken"
 import type { Tiktoken } from "tiktoken/lite"
+import type { ContextTokenizer } from "./context-model-profile"
 import {
   ContentBlock,
   isCacheEditsBlock,
@@ -58,13 +60,14 @@ interface MessageTokenCacheEntry {
   toolCallsRef: UnifiedMessage["tool_calls"]
   toolCallIdRef: UnifiedMessage["tool_call_id"] | undefined
   roleRef: UnifiedMessage["role"]
-  rawTokens: number
+  rawTokensByTokenizer: Partial<Record<ContextTokenizer, number>>
 }
 
 @Injectable()
 export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TokenCounterService.name)
   private encoder: Tiktoken | null = null
+  private openaiEncoder: Tiktoken | null = null
 
   // Claude tokenizer: exact match — no correction needed
   private readonly CLAUDE_CORRECTION_FACTOR = 1.0
@@ -120,8 +123,10 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
    * cache is automatically invalidated when callers rebuild the tools
    * array.
    */
-  private readonly jsonValueRawTokenCache: WeakMap<object, number> =
-    new WeakMap()
+  private readonly jsonValueRawTokenCache: WeakMap<
+    object,
+    Partial<Record<ContextTokenizer, number>>
+  > = new WeakMap()
 
   private safeJsonStringify(value: unknown): string {
     const seen = new WeakSet<object>()
@@ -163,6 +168,15 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
         `Failed to initialize Claude tokenizer: ${String(error)}. Token counts will be estimated.`
       )
     }
+
+    try {
+      this.openaiEncoder = encoding_for_model("gpt-4o")
+      this.logger.log("TokenCounter initialized with OpenAI o200k tokenizer")
+    } catch (error) {
+      this.logger.warn(
+        `Failed to initialize OpenAI tokenizer: ${String(error)}. GPT token counts will be estimated.`
+      )
+    }
   }
 
   /**
@@ -172,63 +186,78 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
    * shutdown reason.
    */
   onModuleDestroy() {
-    if (!this.encoder) return
-    try {
-      this.encoder.free()
-    } catch (error) {
-      this.logger.debug(
-        `Tokenizer free() failed (likely already released): ${String(error)}`
-      )
-    } finally {
-      this.encoder = null
+    for (const [name, encoder] of [
+      ["Claude", this.encoder],
+      ["OpenAI", this.openaiEncoder],
+    ] as const) {
+      if (!encoder) continue
+      try {
+        encoder.free()
+      } catch (error) {
+        this.logger.debug(
+          `${name} tokenizer free() failed (likely already released): ${String(error)}`
+        )
+      }
     }
+    this.encoder = null
+    this.openaiEncoder = null
   }
 
   /**
    * Count tokens in a text string
    */
-  countText(text: string, applyCorrection = true): number {
+  countText(
+    text: string,
+    applyCorrection = true,
+    tokenizer: ContextTokenizer = "claude"
+  ): number {
     if (!text) return 0
 
+    if (tokenizer === "conservative") {
+      const count = Math.max(
+        this.countText(text, false, "claude"),
+        this.countText(text, false, "openai")
+      )
+      return applyCorrection
+        ? Math.ceil(count * this.CLAUDE_CORRECTION_FACTOR)
+        : count
+    }
+
     const useCache = text.length >= this.LONG_TEXT_CACHE_THRESHOLD_CHARS
+    const cacheKey = `${tokenizer}\u0000${text}`
     if (useCache) {
-      const cached = this.longTextRawTokenCache.get(text)
+      const cached = this.longTextRawTokenCache.get(cacheKey)
       if (cached !== undefined) {
-        // LRU: re-insert moves to most-recently-used position.
-        this.longTextRawTokenCache.delete(text)
-        this.longTextRawTokenCache.set(text, cached)
+        this.longTextRawTokenCache.delete(cacheKey)
+        this.longTextRawTokenCache.set(cacheKey, cached)
         return applyCorrection
           ? Math.ceil(cached * this.CLAUDE_CORRECTION_FACTOR)
           : cached
       }
     }
 
+    const encoder = tokenizer === "openai" ? this.openaiEncoder : this.encoder
     let count: number
 
-    if (this.encoder) {
+    if (encoder) {
       try {
-        const tokens = this.encoder.encode(text)
-        count = tokens.length
+        count = encoder.encode(text).length
       } catch (error) {
-        this.logger.warn(`Token counting failed: ${String(error)}`)
-        // Fallback: estimate ~4 characters per token
+        this.logger.warn(`${tokenizer} token counting failed: ${String(error)}`)
         count = Math.ceil(text.length / 4)
       }
     } else {
-      // Fallback: estimate ~4 characters per token
       count = Math.ceil(text.length / 4)
     }
 
     if (useCache) {
-      // Evict oldest if over bound. Map preserves insertion order, so the
-      // first key returned by .keys() is the least-recently-used entry.
       if (this.longTextRawTokenCache.size >= this.LONG_TEXT_CACHE_MAX_ENTRIES) {
         const oldest = this.longTextRawTokenCache.keys().next().value
         if (oldest !== undefined) {
           this.longTextRawTokenCache.delete(oldest)
         }
       }
-      this.longTextRawTokenCache.set(text, count)
+      this.longTextRawTokenCache.set(cacheKey, count)
     }
 
     return applyCorrection
@@ -239,38 +268,40 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
   /**
    * Count tokens in a content block
    */
-  countContentBlock(block: ContentBlock, applyCorrection = true): number {
+  countContentBlock(
+    block: ContentBlock,
+    applyCorrection = true,
+    tokenizer: ContextTokenizer = "claude"
+  ): number {
     let tokens = 0
 
     if (isTextBlock(block)) {
-      tokens = this.countText(block.text, false)
+      tokens = this.countText(block.text, false, tokenizer)
     } else if (isToolUseBlock(block)) {
-      // Tool name + input JSON
-      tokens = this.countText(block.name, false)
-      tokens += this.countText(JSON.stringify(block.input), false)
+      tokens = this.countText(block.name, false, tokenizer)
+      tokens += this.countText(JSON.stringify(block.input), false, tokenizer)
       tokens += this.TOKENS_PER_TOOL_CALL
     } else if (isToolResultBlock(block)) {
-      // Tool use ID + content
-      tokens = this.countText(block.tool_use_id, false)
+      tokens = this.countText(block.tool_use_id, false, tokenizer)
       let resultTokens = 0
       if (typeof block.content === "string") {
-        resultTokens += this.countText(block.content, false)
+        resultTokens += this.countText(block.content, false, tokenizer)
       } else if (Array.isArray(block.content)) {
         for (const innerBlock of block.content) {
-          resultTokens += this.countContentBlock(innerBlock, false)
+          resultTokens += this.countContentBlock(innerBlock, false, tokenizer)
         }
       }
       const structuredTokens = block.structuredContent
-        ? this.countJsonValue(block.structuredContent, false)
+        ? this.countJsonValue(block.structuredContent, false, tokenizer)
         : 0
       tokens += Math.max(resultTokens, structuredTokens)
       tokens += this.TOKENS_PER_TOOL_RESULT
     } else if (isImageBlock(block)) {
       tokens = this.TOKENS_PER_IMAGE
     } else if (isThinkingBlock(block)) {
-      tokens = this.countText(block.thinking, false)
+      tokens = this.countText(block.thinking, false, tokenizer)
     } else if (isCacheEditsBlock(block)) {
-      tokens = this.countJsonValue(block.edits, false)
+      tokens = this.countJsonValue(block.edits, false, tokenizer)
     }
 
     return applyCorrection
@@ -283,14 +314,14 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
    */
   countContent(
     content: string | ContentBlock[],
-    applyCorrection = true
+    applyCorrection = true,
+    tokenizer: ContextTokenizer = "claude"
   ): number {
-    // Normalize to array format (handles JSON string content)
     const blocks = normalizeContent(content)
 
     let tokens = 0
     for (const block of blocks) {
-      tokens += this.countContentBlock(block, false)
+      tokens += this.countContentBlock(block, false, tokenizer)
     }
 
     return applyCorrection
@@ -310,46 +341,56 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
    * be a latent bug regardless, since it bypasses the persistence/projection
    * pipelines that produce fresh arrays.
    */
-  countMessage(message: UnifiedMessage, applyCorrection = true): number {
-    const rawTokens = this.computeMessageRawTokensCached(message)
+  countMessage(
+    message: UnifiedMessage,
+    applyCorrection = true,
+    tokenizer: ContextTokenizer = "claude"
+  ): number {
+    const rawTokens =
+      tokenizer === "conservative"
+        ? Math.max(
+            this.computeMessageRawTokensCached(message, "claude"),
+            this.computeMessageRawTokensCached(message, "openai")
+          )
+        : this.computeMessageRawTokensCached(message, tokenizer)
     return applyCorrection
       ? Math.ceil(rawTokens * this.CLAUDE_CORRECTION_FACTOR)
       : rawTokens
   }
 
-  private computeMessageRawTokensCached(message: UnifiedMessage): number {
+  private computeMessageRawTokensCached(
+    message: UnifiedMessage,
+    tokenizer: Exclude<ContextTokenizer, "conservative">
+  ): number {
     const cached = this.messageTokenCache.get(message)
-    if (
+    const cacheValid =
       cached &&
       cached.contentRef === message.content &&
       cached.toolCallsRef === message.tool_calls &&
       cached.toolCallIdRef === message.tool_call_id &&
       cached.roleRef === message.role
-    ) {
-      return cached.rawTokens
+    const cachedTokens = cacheValid
+      ? cached.rawTokensByTokenizer[tokenizer]
+      : undefined
+    if (cachedTokens !== undefined) {
+      return cachedTokens
     }
 
     let tokens = this.TOKENS_PER_MESSAGE
+    tokens += this.countText(message.role, false, tokenizer)
+    tokens += this.countContent(message.content, false, tokenizer)
 
-    // Role token
-    tokens += this.countText(message.role, false)
-
-    // Content tokens
-    tokens += this.countContent(message.content, false)
-
-    // Function-call style tool_calls (assistant messages)
     if (message.tool_calls && message.tool_calls.length > 0) {
       for (const toolCall of message.tool_calls) {
-        tokens += this.countText(toolCall.id, false)
-        tokens += this.countText(toolCall.function.name, false)
-        tokens += this.countText(toolCall.function.arguments, false)
+        tokens += this.countText(toolCall.id, false, tokenizer)
+        tokens += this.countText(toolCall.function.name, false, tokenizer)
+        tokens += this.countText(toolCall.function.arguments, false, tokenizer)
         tokens += this.TOKENS_PER_TOOL_CALL
       }
     }
 
-    // Function-call style tool_call_id (tool role messages)
     if (message.tool_call_id) {
-      tokens += this.countText(message.tool_call_id, false)
+      tokens += this.countText(message.tool_call_id, false, tokenizer)
     }
 
     this.messageTokenCache.set(message, {
@@ -357,7 +398,10 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
       toolCallsRef: message.tool_calls,
       toolCallIdRef: message.tool_call_id,
       roleRef: message.role,
-      rawTokens: tokens,
+      rawTokensByTokenizer: {
+        ...(cacheValid ? cached.rawTokensByTokenizer : {}),
+        [tokenizer]: tokens,
+      },
     })
 
     return tokens
@@ -366,14 +410,17 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
   /**
    * Count tokens in multiple messages
    */
-  countMessages(messages: UnifiedMessage[], applyCorrection = true): number {
+  countMessages(
+    messages: UnifiedMessage[],
+    applyCorrection = true,
+    tokenizer: ContextTokenizer = "claude"
+  ): number {
     let tokens = 0
 
     for (const message of messages) {
-      tokens += this.countMessage(message, false)
+      tokens += this.countMessage(message, false, tokenizer)
     }
 
-    // Add tokens for message list overhead
     tokens += 3
 
     return applyCorrection
@@ -396,37 +443,40 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
         parameters?: Record<string, unknown>
       }
     }>,
-    applyCorrection = true
+    applyCorrection = true,
+    tokenizer: ContextTokenizer = "claude"
   ): number {
     if (!tools || tools.length === 0) return 0
 
     let tokens = 0
 
     for (const tool of tools) {
-      // Anthropic format
       if (tool.name) {
-        tokens += this.countText(tool.name, false)
+        tokens += this.countText(tool.name, false, tokenizer)
         if (tool.description) {
-          tokens += this.countText(tool.description, false)
+          tokens += this.countText(tool.description, false, tokenizer)
         }
         if (tool.input_schema) {
-          tokens += this.countText(JSON.stringify(tool.input_schema), false)
+          tokens += this.countText(
+            JSON.stringify(tool.input_schema),
+            false,
+            tokenizer
+          )
         }
-        tokens += 10 // overhead per tool
-      }
-      // Function-call style format
-      else if (tool.function) {
-        tokens += this.countText(tool.function.name, false)
+        tokens += 10
+      } else if (tool.function) {
+        tokens += this.countText(tool.function.name, false, tokenizer)
         if (tool.function.description) {
-          tokens += this.countText(tool.function.description, false)
+          tokens += this.countText(tool.function.description, false, tokenizer)
         }
         if (tool.function.parameters) {
           tokens += this.countText(
             JSON.stringify(tool.function.parameters),
-            false
+            false,
+            tokenizer
           )
         }
-        tokens += 10 // overhead per tool
+        tokens += 10
       }
     }
 
@@ -477,9 +527,14 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
    * and reused), so a single tokenize-the-whole-tool-catalog cost is paid
    * once per array build instead of once per tool round.
    */
-  countJsonValue(value: unknown, applyCorrection = true): number {
+  countJsonValue(
+    value: unknown,
+    applyCorrection = true,
+    tokenizer: ContextTokenizer = "claude"
+  ): number {
     if (value !== null && typeof value === "object") {
-      const cached = this.jsonValueRawTokenCache.get(value)
+      const cachedByTokenizer = this.jsonValueRawTokenCache.get(value)
+      const cached = cachedByTokenizer?.[tokenizer]
       if (cached !== undefined) {
         return applyCorrection
           ? Math.ceil(cached * this.CLAUDE_CORRECTION_FACTOR)
@@ -487,14 +542,17 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
       }
       const json = this.safeJsonStringify(value)
       if (!json) return 0
-      const raw = this.countText(json, false)
-      this.jsonValueRawTokenCache.set(value, raw)
+      const raw = this.countText(json, false, tokenizer)
+      this.jsonValueRawTokenCache.set(value, {
+        ...cachedByTokenizer,
+        [tokenizer]: raw,
+      })
       return applyCorrection
         ? Math.ceil(raw * this.CLAUDE_CORRECTION_FACTOR)
         : raw
     }
     const json = this.safeJsonStringify(value)
-    return json ? this.countText(json, applyCorrection) : 0
+    return json ? this.countText(json, applyCorrection, tokenizer) : 0
   }
 
   /**
@@ -591,8 +649,12 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
   /**
    * Check if messages exceed token limit
    */
-  exceedsLimit(messages: UnifiedMessage[], maxTokens: number): boolean {
-    return this.countMessages(messages) > maxTokens
+  exceedsLimit(
+    messages: UnifiedMessage[],
+    maxTokens: number,
+    tokenizer: ContextTokenizer = "claude"
+  ): boolean {
+    return this.countMessages(messages, true, tokenizer) > maxTokens
   }
 
   /**
@@ -601,13 +663,14 @@ export class TokenCounterService implements OnModuleInit, OnModuleDestroy {
    */
   findTruncationIndex(
     messages: UnifiedMessage[],
-    targetTokens: number
+    targetTokens: number,
+    tokenizer: ContextTokenizer = "claude"
   ): number {
     let accumulatedTokens = 0
 
     // Iterate from the end
     for (let i = messages.length - 1; i >= 0; i--) {
-      const messageTokens = this.countMessage(messages[i]!)
+      const messageTokens = this.countMessage(messages[i]!, true, tokenizer)
       accumulatedTokens += messageTokens
 
       if (accumulatedTokens > targetTokens) {

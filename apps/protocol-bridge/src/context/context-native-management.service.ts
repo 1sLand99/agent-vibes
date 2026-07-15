@@ -1,4 +1,5 @@
 import { Injectable } from "@nestjs/common"
+import type { ContextModelProfile } from "./context-model-profile"
 import { TokenCounterService } from "./token-counter.service"
 import { UnifiedMessage, isToolResultBlock, normalizeContent } from "./types"
 
@@ -34,6 +35,7 @@ export interface AnthropicNativeContextManagementInput {
   messages: UnifiedMessage[]
   maxTokens: number
   systemPromptTokens?: number
+  contextProfile?: ContextModelProfile
   autoCompactTokenLimit?: number
 }
 
@@ -80,8 +82,11 @@ export class ContextNativeManagementService {
 
     if (hasThinking) {
       const estimatedVisibleTokens =
-        this.tokenCounter.countMessages(messages) +
-        Math.max(0, input.systemPromptTokens || 0)
+        this.tokenCounter.countMessages(
+          messages,
+          true,
+          input.contextProfile?.tokenizer ?? "claude"
+        ) + Math.max(0, input.systemPromptTokens || 0)
       edits.push({
         type: "clear_thinking_20251015",
         keep:
