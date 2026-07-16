@@ -15,10 +15,7 @@ import {
 } from "./services/workspace-project-sync"
 import { logger } from "./utils/logger"
 import { executePrivileged } from "./utils/terminal"
-import {
-  registerAgentInputPanel,
-  revealAgentInputPanelForDock,
-} from "./views/agent-input-panel"
+import { registerAgentInputPanel } from "./views/agent-input-panel"
 import {
   StatusIndicator,
   type CursorConnectionState,
@@ -248,19 +245,6 @@ export async function activate(
     const workspaceControlRestartRequired =
       await maybeSyncWorkspaceControlPatch(false)
     const idleRestartRequired = await maybeApplyCursorIdleKillerPatch(false)
-    if (
-      config.agentInputDockEnabled &&
-      !agentInputRestartRequired &&
-      cursorPatch.getAgentInputDockPatchStatus({ force: true }).applied
-    ) {
-      try {
-        await revealAgentInputPanelForDock()
-      } catch (error) {
-        logger.warn(
-          `Agent input dock panel could not be initialized: ${error instanceof Error ? error.message : String(error)}`
-        )
-      }
-    }
     if (directRestartRequired) {
       await promptForCursorPatchRestart(t("patches.bridgeEndpointApplied"))
     } else if (agentInputRestartRequired) {

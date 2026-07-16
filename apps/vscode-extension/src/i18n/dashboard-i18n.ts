@@ -1118,7 +1118,7 @@ const SETTINGS_EN: SettingsCopy = {
         },
         agentInputDock: {
           label: "Agent Input Dock",
-          desc: "When a bottom panel view (terminal, etc.) opens, docks the Agent input at the bottom to free the editor, and restores it when the panel hides. Drag the Agent tab to move between the editor, bottom panel, and Chat.",
+          desc: "Dock the active input only while the bottom Agent view is selected, then restore it to its original Chat or editor surface when another panel view is selected or the panel hides.",
         },
         workspaceControl: {
           label: "Workspace & Git Branch",
@@ -1281,7 +1281,7 @@ const SETTINGS_ZH: SettingsCopy = {
         },
         agentInputDock: {
           label: "Agent 输入停靠",
-          desc: "打开底部面板（终端等）时自动把 Agent 输入停靠到底部、腾出编辑区，隐藏面板时还原；拖动 Agent 标签可在编辑区、底部与右侧 Chat 间切换。",
+          desc: "仅在选中底部 Agent 视图时临时停靠当前输入，切换到终端等其他视图或隐藏面板后原位恢复，不改动右侧 Chat 或编辑模式。",
         },
         workspaceControl: {
           label: "工作区与 Git 分支",

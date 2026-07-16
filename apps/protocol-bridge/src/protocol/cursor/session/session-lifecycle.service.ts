@@ -57,7 +57,6 @@ import {
   createCompactSummaryRecord,
   deriveCompactionHistoryFromTranscript,
   getActiveCompactCommitFromTranscript,
-  resolveCompactSummaryReplacementAnchor,
   isContextCollapseSummaryRecord,
   isMessageRecord,
   isSnipBoundaryRecord,
@@ -4526,8 +4525,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
 
   syncContextRecordsFromMessageRecords(
     state: ContextConversationState,
-    messageRecords: ContextTranscriptRecord[],
-    options?: { repairCodexReplacementHistory?: boolean }
+    messageRecords: ContextTranscriptRecord[]
   ): void {
     const activeCommit = getActiveCompactCommitFromTranscript(state.records)
     if (!activeCommit) {
@@ -4590,127 +4588,6 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       state.records
     )
     state.activeCompactionId = activeCommit.id
-    if (options?.repairCodexReplacementHistory) {
-      this.repairCodexReplacementHistoryState(state)
-    }
-  }
-
-  private repairCodexReplacementHistoryState(
-    state: ContextConversationState
-  ): void {
-    const activeCommit = getActiveCompactCommitFromTranscript(state.records)
-    if (!activeCommit) return
-
-    const replacementAnchor = resolveCompactSummaryReplacementAnchor(
-      state.records,
-      activeCommit.id
-    )
-
-    const normalizeHistory = (
-      history: CodexReplacementHistory | undefined
-    ):
-      | {
-          history: CodexReplacementHistory | undefined
-          changed: boolean
-          droppedItems: number
-        }
-      | undefined => {
-      if (!history) return undefined
-      const originalItemCount = Array.isArray(history.items)
-        ? history.items.length
-        : 0
-      const filteredItems = Array.isArray(history.items)
-        ? history.items.flatMap((item) =>
-            this.normalizeCodexReplacementHistoryItem(item)
-          )
-        : []
-      const summary = this.normalizeCodexReplacementHistorySummary(
-        history.summary,
-        filteredItems
-      )
-      const items = this.buildCodexReplacementProjectionItems(
-        filteredItems,
-        summary
-      )
-      const droppedItems = originalItemCount - items.length
-      if (items.length === 0) {
-        return {
-          history: undefined,
-          changed: true,
-          droppedItems,
-        }
-      }
-      const normalized: CodexReplacementHistory = {
-        ...history,
-        anchorRecordId: replacementAnchor.anchorRecordId,
-        anchorRecordCount: replacementAnchor.anchorRecordCount,
-        items,
-        summary,
-      }
-      const changed =
-        history.anchorRecordId !== normalized.anchorRecordId ||
-        history.anchorRecordCount !== normalized.anchorRecordCount ||
-        !safeJsonEqual(history.items, normalized.items) ||
-        history.summary !== normalized.summary
-      return {
-        history: normalized,
-        changed,
-        droppedItems,
-      }
-    }
-
-    let repaired = false
-    let droppedItems = 0
-    for (const record of state.records) {
-      const commit = record.compactMetadata?.commit
-      if (commit?.id !== activeCommit.id) continue
-      const normalized = normalizeHistory(commit.codexReplacementHistory)
-      if (!normalized) continue
-      droppedItems = Math.max(droppedItems, normalized.droppedItems)
-      if (!normalized.changed) continue
-      record.compactMetadata = {
-        ...record.compactMetadata,
-        commit: {
-          ...commit,
-          codexReplacementHistory: normalized.history,
-        },
-      }
-      repaired = true
-    }
-
-    const activeWindow = state.codexContext?.activeWindow
-    const activeWindowHistory = activeWindow?.replacementHistory
-    if (
-      state.codexContext &&
-      activeWindow &&
-      activeWindowHistory?.compactionId === activeCommit.id
-    ) {
-      const normalized = normalizeHistory(activeWindowHistory)
-      if (normalized) {
-        droppedItems = Math.max(droppedItems, normalized.droppedItems)
-        if (normalized.changed) {
-          state.codexContext = {
-            ...state.codexContext,
-            historyVersion: (state.codexContext.historyVersion || 0) + 1,
-            activeWindow: {
-              ...activeWindow,
-              replacementHistory: normalized.history,
-            },
-          }
-          repaired = true
-        }
-      }
-    }
-
-    if (repaired) {
-      state.compactionHistory = deriveCompactionHistoryFromTranscript(
-        state.records
-      )
-      this.logger.warn(
-        `Repaired Codex replacement history for compaction ${activeCommit.id}: ` +
-          `anchor=${replacementAnchor.anchorRecordId}, droppedItems=${droppedItems}`
-      )
-    }
   }
 
   reconcileMessageRecords(
@@ -5021,9 +4898,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
               : [],
           }
         : this.createContextState(messageRecords)
-    this.syncContextRecordsFromMessageRecords(contextState, messageRecords, {
-      repairCodexReplacementHistory: true,
-    })
+    this.syncContextRecordsFromMessageRecords(contextState, messageRecords)
     if (contextState.lastAppliedCompaction) {
       contextState.lastAppliedCompaction = {
         ...contextState.lastAppliedCompaction,

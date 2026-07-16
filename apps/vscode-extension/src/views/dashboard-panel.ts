@@ -1297,8 +1297,8 @@ export class DashboardPanel {
         : "Cursor workbench file was not found."
       : agentInputDockStatus.applied
         ? locale === "zh"
-          ? `已覆盖 ${agentInputDockStatus.workbenchFiles} 个 Cursor 工作台入口；打开底部面板（终端等）时自动把 Agent 输入停靠到底部、腾出编辑区，隐藏面板时还原；拖动 Agent 标签可在编辑区、底部与右侧 Chat 间切换。`
-          : `Active in ${agentInputDockStatus.workbenchFiles} Cursor workbench file(s); opening a bottom panel view (terminal, etc.) docks the Agent input at the bottom to free the editor and restores it when the panel hides. Drag the Agent tab to move between the editor, bottom panel, and Chat.`
+          ? `已覆盖 ${agentInputDockStatus.workbenchFiles} 个 Cursor 工作台入口；仅在选中底部 Agent 视图时临时停靠当前输入，切换到终端等其他视图或隐藏面板后原位恢复；不会改动右侧 Chat 或编辑模式。`
+          : `Active in ${agentInputDockStatus.workbenchFiles} Cursor workbench file(s); the active input docks only while the bottom Agent view is selected, then returns to its original Chat or editor surface when another panel view is selected or the panel hides.`
         : agentInputDockStatus.partial
           ? locale === "zh"
             ? `检测到旧版或不完整的 Agent 输入停靠（${agentInputDockStatus.legacyFiles} 个旧入口）；重新开启可安全迁移到当前版本。`
@@ -1306,8 +1306,8 @@ export class DashboardPanel {
           : agentInputDockStatus.canApply
             ? this.config.agentInputDockEnabled
               ? locale === "zh"
-                ? "默认开启；打开底部面板（终端等）时自动把 Agent 输入停靠到底部、腾出编辑区，隐藏面板时还原；也可拖动 Agent 标签在编辑区、底部与右侧 Chat 间切换。"
-                : "Enabled by default. Opening a bottom panel view (terminal, etc.) docks the Agent input at the bottom to free the editor and restores it when hidden; drag the Agent tab to move between the editor, bottom panel, and Chat."
+                ? "默认开启；仅在选中底部 Agent 视图时临时停靠当前输入，切换到终端等其他视图或隐藏面板后原位恢复，不改动右侧 Chat 或编辑模式。"
+                : "Enabled by default. The active input docks only while the bottom Agent view is selected and returns to its original Chat or editor surface when another panel view is selected or the panel hides."
               : locale === "zh"
                 ? "当前已关闭；开启后需完整重启 Cursor。"
                 : "Currently disabled. Fully restart Cursor after enabling."

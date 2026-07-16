@@ -1,10 +1,5 @@
 import * as vscode from "vscode"
-import {
-  AGENT_INPUT_CONTAINER_ID,
-  AGENT_INPUT_VIEW_ID,
-} from "../services/cursor-agent-input-dock"
-
-const AGENT_INPUT_CONTAINER_COMMAND_ID = `workbench.view.extension.${AGENT_INPUT_CONTAINER_ID}`
+import { AGENT_INPUT_VIEW_ID } from "../services/cursor-agent-input-dock"
 
 class AgentInputTreeDataProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
@@ -25,8 +20,4 @@ export function registerAgentInputPanel(
       new AgentInputTreeDataProvider()
     )
   )
-}
-
-export async function revealAgentInputPanelForDock(): Promise<void> {
-  await vscode.commands.executeCommand(AGENT_INPUT_CONTAINER_COMMAND_ID)
 }

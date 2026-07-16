@@ -153,6 +153,10 @@ import { buildCodexContextRewriteKey } from "./codex-context-rewrite-key"
 import { CursorGrpcService } from "./cursor-grpc.service"
 import { KnowledgeBaseService } from "./knowledge-base.service"
 import { KvStorageService } from "./kv-storage.service"
+import {
+  decidePendingWorkLog,
+  type PendingWorkLogState,
+} from "./pending-work-log-policy"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
 import {
   parseCursorSseEvent,
@@ -30064,6 +30068,7 @@ ${raw}
     // the writer-stack top. Sealing the controller cascades
     // through the supervisor and cancels every still-active turn
     // for the conversation.
+    let pendingWorkLogState: PendingWorkLogState | undefined
     const bidiId = crypto.randomUUID()
     const bidiIdBranded = BidiId.of(bidiId)
     const provisionalConversationIdBranded =
@@ -30657,9 +30662,20 @@ ${raw}
               )
               return
             } else {
-              this.logger.log(
-                `Still waiting for ${this.describePendingStreamWork(sessionAfterTool)}`
+              const pendingDescription =
+                this.describePendingStreamWork(sessionAfterTool)
+              const pendingLogDecision = decidePendingWorkLog(
+                pendingWorkLogState,
+                pendingDescription,
+                Date.now(),
+                30_000
               )
+              pendingWorkLogState = pendingLogDecision.state
+              if (pendingLogDecision.level === "log") {
+                this.logger.log(`Still waiting for ${pendingDescription}`)
+              } else if (pendingLogDecision.level === "debug") {
+                this.logger.debug(`Still waiting for ${pendingDescription}`)
+              }
             }
           } else if (this.isChatTurn(parsed)) {
             // This is a new chat message (text and/or images) or a resume_action turn.

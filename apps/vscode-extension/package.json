@@ -310,7 +310,7 @@
         "agentVibes.agentInputDockEnabled": {
           "type": "boolean",
           "default": true,
-          "description": "When a bottom panel view (terminal, etc.) opens, dock the Agent input at the bottom to free the editor, and restore it when the panel hides. Drag the Agent tab to move between the editor, bottom panel, and Chat."
+          "description": "When the Agent bottom panel view is selected, temporarily dock the active Cursor Agent input there and restore it to its original Chat or editor surface when the view hides. Other panel views are not changed."
         },
         "agentVibes.workspaceControlEnabled": {
           "type": "boolean",

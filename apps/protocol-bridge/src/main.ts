@@ -19,8 +19,39 @@ import { AppModule } from "./app.module"
 import { ForwardProxyServer } from "./forward-proxy"
 import { ModelRouterService } from "./llm/shared/model-router.service"
 import { registerCursorOfficialPassthroughHook } from "./protocol/cursor/cursor-official-passthrough"
+import { rotateActiveLogFileIfNeeded } from "./shared/active-log-rotation"
 import { registerContentTypeParsers } from "./shared/content-type-parsers"
 import { registerRequestHooks } from "./shared/request-hooks"
+
+const ACTIVE_LOG_MAX_BYTES = 10 * 1024 * 1024
+const ACTIVE_LOG_MAINTENANCE_INTERVAL_MS = 60_000
+
+function startActiveLogMaintenance(logger: Logger): void {
+  const activePath = process.env.AGENT_VIBES_ACTIVE_LOG_FILE?.trim()
+  const previousPath = process.env.AGENT_VIBES_PREVIOUS_LOG_FILE?.trim()
+  if (!activePath || !previousPath) return
+
+  const rotate = () => {
+    try {
+      const rotated = rotateActiveLogFileIfNeeded({
+        activePath,
+        previousPath,
+        maxBytes: ACTIVE_LOG_MAX_BYTES,
+      })
+      if (rotated) {
+        logger.log(
+          `Rotated active bridge log after reaching ${ACTIVE_LOG_MAX_BYTES} bytes`
+        )
+      }
+    } catch (error) {
+      logger.warn(`Failed to rotate active bridge log: ${String(error)}`)
+    }
+  }
+
+  rotate()
+  const timer = setInterval(rotate, ACTIVE_LOG_MAINTENANCE_INTERVAL_MS)
+  timer.unref()
+}
 
 // ── Global crash guards ───────────────────────────────────────────────
 // The bridge is a long-lived daemon spawned detached from the IDE
@@ -147,6 +178,7 @@ async function bootstrap() {
   // ── End File Logging ───────────────────────────────────────────────
 
   const logger = new Logger("Bootstrap")
+  startActiveLogMaintenance(logger)
 
   // Check if SSL certificates exist for HTTP/2
   // Priority: ~/.agent-vibes/certs/ (extension-generated) > apps/protocol-bridge/certs/ (mkcert)
