@@ -3,7 +3,7 @@ export const AGENT_INPUT_CONTAINER_ID = "agentVibesAgentInput"
 
 // Single source of truth for the shared injected runtime version. Dock and
 // Workspace Control remain independent features inside this runtime.
-const AGENT_INPUT_RUNTIME_VERSION = 101
+const AGENT_INPUT_RUNTIME_VERSION = 102
 
 const agentInputRuntimeMarkerFor = (version: number): string =>
   "[AGENT_VIBES_AGENT_INPUT_RUNTIME_V" + version + "]"
@@ -1847,7 +1847,7 @@ function buildCursorAgentInputRuntimePatchInsertion(
     const workspaceControlStyles = workspaceControlEnabled
       ? "[" + pickerDockAttribute + "]{position:static;display:flex;align-items:center;box-sizing:border-box;flex:0 0 auto;width:100%;max-width:100%;min-width:0;margin:0;padding:4px 0 8px;background:transparent}" +
       "[" + projectPickerAttribute + "],[" + branchPickerAttribute + "]{display:flex;align-items:center;box-sizing:border-box;flex:0 1 auto;min-width:0;max-width:100%;margin:0;padding:0}" +
-      "button[" + projectPickerTriggerAttribute + "]{display:inline-flex;align-items:center;box-sizing:border-box;max-width:240px;height:22px;min-width:0;padding:0 6px 0 0;border:none!important;border-radius:6px;background:transparent!important;color:inherit;font:inherit;font-size:12px;line-height:22px;outline:none;box-shadow:none!important;gap:4px;cursor:pointer}" +
+      "button[" + projectPickerTriggerAttribute + "]{display:inline-flex;align-items:center;box-sizing:border-box;max-width:240px;height:22px;min-width:0;padding:0 6px 0 0;border:none!important;border-radius:6px;background:transparent!important;color:var(--vscode-descriptionForeground);font:inherit;font-size:12px;line-height:22px;outline:none;box-shadow:none!important;gap:4px;cursor:pointer}" +
       "button[" + projectPickerTriggerAttribute + "]:hover:not(:disabled),button[" + projectPickerTriggerAttribute + "][aria-expanded='true']{background:var(--vscode-toolbar-hoverBackground)!important}" +
       "button[" + projectPickerTriggerAttribute + "]:disabled{cursor:default;opacity:.68}" +
       "button[" + projectPickerTriggerAttribute + "]:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:1px}" +
@@ -1859,7 +1859,7 @@ function buildCursorAgentInputRuntimePatchInsertion(
       "[" + projectPickerMenuAttribute + "] button[role='option']:disabled{opacity:.55;cursor:default}" +
       "[" + projectPickerMenuAttribute + "] .agent-vibes-project-picker-option-label{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" +
       "[" + projectPickerMenuAttribute + "] .codicon{flex:0 0 auto;font-size:13px}" +
-      "button[" + branchPickerTriggerAttribute + "]{display:inline-flex;align-items:center;box-sizing:border-box;max-width:180px;height:22px;min-width:0;padding:0 6px;border:none!important;border-radius:6px;background:transparent!important;color:inherit;font:inherit;font-size:12px;line-height:22px;outline:none;box-shadow:none!important;gap:4px;cursor:pointer}" +
+      "button[" + branchPickerTriggerAttribute + "]{display:inline-flex;align-items:center;box-sizing:border-box;max-width:180px;height:22px;min-width:0;padding:0 6px;border:none!important;border-radius:6px;background:transparent!important;color:var(--vscode-descriptionForeground);font:inherit;font-size:12px;line-height:22px;outline:none;box-shadow:none!important;gap:4px;cursor:pointer}" +
       "button[" + branchPickerTriggerAttribute + "]:hover:not(:disabled),button[" + branchPickerTriggerAttribute + "][aria-expanded='true']{background:var(--vscode-toolbar-hoverBackground)!important}" +
       "button[" + branchPickerTriggerAttribute + "]:disabled{cursor:default;opacity:.68}" +
       "button[" + branchPickerTriggerAttribute + "]:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:1px}" +
