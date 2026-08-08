@@ -71,7 +71,7 @@ const READ_TODOS_RESULT_TRANSLATION_PATCH_MARKER =
   "[AGENT_VIBES_READ_TODOS_RESULT_TRANSLATION]"
 const BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER =
   "[AGENT_VIBES_CURSOR_CREDENTIALS_GUARD]"
-const BRIDGE_ENDPOINT_MIN_TARGETS = 4
+const BRIDGE_ENDPOINT_GUARD_SCAN_BYTES = 1024
 const SEMANTIC_METHOD_LOCAL_SEARCH_BYTES = 64 * 1024
 const CURSOR_OPEN_AGENTS_WINDOW_ON_STARTUP_KEY =
   "cursor/userOpenAgentsWindowOnStartupPreference"
@@ -765,7 +765,7 @@ export function isReadTodosTranslationPatchApplied(content: string): boolean {
   return !hasUnsupportedReadTodosTranslation(content)
 }
 
-type CursorWorkbenchPatchExclusion = "bridgeEndpoint" | "trafficCapture"
+type CursorWorkbenchPatchExclusion = "trafficCapture"
 
 function rebuildCursorWorkbenchWithActivePatches(
   currentContent: string,
@@ -777,10 +777,7 @@ function rebuildCursorWorkbenchWithActivePatches(
   }
 
   let nextContent = originalContent
-  if (
-    !exclusions.has("bridgeEndpoint") &&
-    currentContent.includes(BRIDGE_ENDPOINT_PATCH_MARKER)
-  ) {
+  if (currentContent.includes(BRIDGE_ENDPOINT_PATCH_MARKER)) {
     const bridgePort = getAppliedBridgeEndpointPort(currentContent)
     if (bridgePort === null) return null
     const patched = patchBridgeEndpointContent(nextContent, bridgePort)
@@ -851,17 +848,6 @@ export function rebuildCursorWorkbenchWithoutTrafficCapture(
   )
 }
 
-function rebuildCursorWorkbenchWithoutBridgeEndpoint(
-  currentContent: string,
-  originalContent: string
-): string | null {
-  return rebuildCursorWorkbenchWithActivePatches(
-    currentContent,
-    originalContent,
-    new Set(["bridgeEndpoint"])
-  )
-}
-
 function normalizeBridgePort(port: number): number {
   return Number.isInteger(port) && port > 0 && port <= 65535 ? port : 2026
 }
@@ -872,9 +858,11 @@ export function getCursorBridgeEndpointUrl(port: number): string {
 
 function getAppliedBridgeEndpointPort(content: string): number | null {
   if (!content.includes(BRIDGE_ENDPOINT_PATCH_MARKER)) return null
-  const match = /https:\/\/localhost:(\d+)/u.exec(content)
-  if (!match?.[1]) return null
-  const port = Number.parseInt(match[1], 10)
+  const endpoints = getBridgeEndpointCredentialsGuardEndpoints(content)
+  if (endpoints.length !== 1) return null
+  const portMatch = /:(\d+)$/u.exec(endpoints[0]!)
+  if (!portMatch?.[1]) return null
+  const port = Number.parseInt(portMatch[1], 10)
   return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null
 }
 
@@ -900,6 +888,44 @@ function isLocalBridgeEndpoint(value: string | null): boolean {
   return value !== null && /^https:\/\/localhost:\d+$/u.test(value)
 }
 
+function getLocalBridgeEndpointLiterals(content: string): string[] {
+  const endpoints: string[] = []
+  const localEndpointLiteralPattern = /(["'`])(https:\/\/localhost:\d+)\1/gu
+  let match: RegExpExecArray | null
+  while ((match = localEndpointLiteralPattern.exec(content)) !== null) {
+    const value = match[2]
+    if (value !== undefined && isLocalBridgeEndpoint(value)) {
+      endpoints.push(value)
+    }
+  }
+  return endpoints
+}
+
+function getBridgeEndpointCredentialsGuardSegment(
+  content: string
+): string | null {
+  const markerIndex = content.indexOf(BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER)
+  if (
+    markerIndex < 0 ||
+    content.indexOf(
+      BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER,
+      markerIndex + BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER.length
+    ) >= 0
+  ) {
+    return null
+  }
+
+  return content.slice(
+    Math.max(0, markerIndex - 128),
+    Math.min(content.length, markerIndex + BRIDGE_ENDPOINT_GUARD_SCAN_BYTES)
+  )
+}
+
+function getBridgeEndpointCredentialsGuardEndpoints(content: string): string[] {
+  const segment = getBridgeEndpointCredentialsGuardSegment(content)
+  return segment === null ? [] : getLocalBridgeEndpointLiterals(segment)
+}
+
 function summarizeLocalBridgeEndpoints(
   content: string,
   bridgeUrl: string
@@ -910,28 +936,15 @@ function summarizeLocalBridgeEndpoints(
     matchingLocalCount: 0,
   }
 
-  const stringLiteralPattern = /"([^"\\]*(?:\\.[^"\\]*)*)"/gu
-  let match: RegExpExecArray | null
-  while ((match = stringLiteralPattern.exec(content)) !== null) {
-    const value = match[1]
-    if (value === undefined) {
-      continue
-    }
-    if (isLocalBridgeEndpoint(value)) {
-      summary.localCount++
-      if (value === bridgeUrl) {
-        summary.matchingLocalCount++
-      }
+  const endpoints = getBridgeEndpointCredentialsGuardEndpoints(content)
+  for (const endpoint of endpoints) {
+    summary.localCount++
+    if (endpoint === bridgeUrl) {
+      summary.matchingLocalCount++
     }
   }
 
   return summary
-}
-
-function needsLegacyStaticEndpointMigration(
-  summary: BridgeEndpointSegmentSummary
-): boolean {
-  return summary.hasMarker && summary.localCount >= BRIDGE_ENDPOINT_MIN_TARGETS
 }
 
 function getBridgeEndpointCredentialsGuard(): string {
@@ -957,14 +970,13 @@ function locateExistingBridgeEndpointCredentialsGuard(
 
 function hasCurrentBridgeEndpointCredentialsGuard(
   content: string,
-  bridgeUrl: string,
-  existingGuard = locateExistingBridgeEndpointCredentialsGuard(content)
+  bridgeUrl: string
 ): boolean {
-  if (existingGuard === null) {
+  const guard = getBridgeEndpointCredentialsGuardSegment(content)
+  if (guard === null) {
     return false
   }
 
-  const guard = content.slice(existingGuard.start, existingGuard.end)
   return (
     guard.includes("agentVibesNormalize") &&
     guard.includes("backend|proxy|agent).*url") &&
@@ -995,6 +1007,13 @@ function locateBridgeEndpointCredentialsMethod(
 }
 
 function canPatchBridgeEndpointCredentialsGuard(content: string): boolean {
+  if (
+    content.includes(BRIDGE_ENDPOINT_PATCH_MARKER) !==
+    content.includes(BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER)
+  ) {
+    return false
+  }
+
   return (
     (content.includes(BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER) &&
       locateExistingBridgeEndpointCredentialsGuard(content) !== null) ||
@@ -1006,6 +1025,10 @@ function patchBridgeEndpointCredentialsGuard(
   content: string,
   bridgeUrl: string
 ): string | null {
+  if (!canPatchBridgeEndpointCredentialsGuard(content)) {
+    return null
+  }
+
   if (content.includes(BRIDGE_ENDPOINT_CREDENTIALS_GUARD_MARKER)) {
     const existingGuard = locateExistingBridgeEndpointCredentialsGuard(content)
     if (existingGuard === null) {
@@ -1042,11 +1065,6 @@ export function patchBridgeEndpointContent(
   port: number
 ): string | null {
   const bridgeUrl = getCursorBridgeEndpointUrl(port)
-  const beforeSummary = summarizeLocalBridgeEndpoints(content, bridgeUrl)
-  if (needsLegacyStaticEndpointMigration(beforeSummary)) {
-    return null
-  }
-
   const contentWithCredentialsGuard = patchBridgeEndpointCredentialsGuard(
     content,
     bridgeUrl
@@ -1083,22 +1101,14 @@ export function getBridgeEndpointDetails(
 } {
   const bridgeUrl = getCursorBridgeEndpointUrl(port)
   const summary = summarizeLocalBridgeEndpoints(content, bridgeUrl)
-  const existingGuard = locateExistingBridgeEndpointCredentialsGuard(content)
   const credentialsGuard = hasCurrentBridgeEndpointCredentialsGuard(
     content,
-    bridgeUrl,
-    existingGuard
+    bridgeUrl
   )
-  const legacyStaticEndpointMigration =
-    needsLegacyStaticEndpointMigration(summary)
-  const canApply =
-    legacyStaticEndpointMigration ||
-    existingGuard !== null ||
-    locateBridgeEndpointCredentialsMethod(content) !== null
+  const canApply = canPatchBridgeEndpointCredentialsGuard(content)
   const applied =
     summary.hasMarker &&
     credentialsGuard &&
-    !legacyStaticEndpointMigration &&
     summary.localCount === 1 &&
     summary.localCount === summary.matchingLocalCount
 
@@ -1106,9 +1116,7 @@ export function getBridgeEndpointDetails(
     currentUrl: summary.matchingLocalCount > 0 ? bridgeUrl : null,
     applied,
     canApply,
-    requiresPortUpdate:
-      legacyStaticEndpointMigration ||
-      (summary.hasMarker && canApply && !applied),
+    requiresPortUpdate: summary.hasMarker && canApply && !applied,
     coverage: {
       apiTargets: 0,
       agentTargets: 0,
@@ -2155,50 +2163,6 @@ export class CursorPatchService {
         checksumApplied: false,
         checksumUpdated: 0,
         errors: ["Cursor workbench file not found"],
-      }
-    }
-
-    const legacyStaticPatchPaths = filePaths.filter((path) => {
-      const content = fs.readFileSync(path, "utf-8")
-      return needsLegacyStaticEndpointMigration(
-        summarizeLocalBridgeEndpoints(content, getCursorBridgeEndpointUrl(port))
-      )
-    })
-    if (legacyStaticPatchPaths.length > 0) {
-      const migrationPlans: Array<{ path: string; content: string }> = []
-      for (const legacyPath of legacyStaticPatchPaths) {
-        const currentContent = fs.readFileSync(legacyPath, "utf-8")
-        const original = this.baseline.readOriginal(legacyPath)
-        if (!original.content) {
-          return {
-            success: false,
-            applied: 0,
-            checksumApplied: false,
-            checksumUpdated: 0,
-            errors: [
-              `Cannot migrate the legacy Cursor direct patch without the managed baseline: ${original.error || legacyPath}`,
-            ],
-          }
-        }
-        const content = rebuildCursorWorkbenchWithoutBridgeEndpoint(
-          currentContent,
-          original.content
-        )
-        if (content === null) {
-          return {
-            success: false,
-            applied: 0,
-            checksumApplied: false,
-            checksumUpdated: 0,
-            errors: [
-              `Cannot migrate the legacy Cursor direct patch without changing other active patches: ${legacyPath}`,
-            ],
-          }
-        }
-        migrationPlans.push({ path: legacyPath, content })
-      }
-      for (const migrationPlan of migrationPlans) {
-        fs.writeFileSync(migrationPlan.path, migrationPlan.content, "utf-8")
       }
     }
 

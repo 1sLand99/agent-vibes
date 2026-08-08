@@ -1,5 +1,7 @@
 import {
   canonicalizeCodexInputItemsForContinuation,
+  getCodexContinuationEligibility,
+  prepareCodexFullContinuationRequest,
   prepareCodexContinuationRequest,
   type CodexContinuationDecision,
   type CodexContinuationState,
@@ -12,6 +14,7 @@ import type { CodexInputItem } from "./codex-native-types"
 export type CodexTurnLedgerState = CodexContinuationState
 export type CodexTurnLedgerResponse = CodexLastResponseSnapshot
 export type { CodexContinuationDecision, CodexInputMismatchItemDetail }
+export { getCodexContinuationEligibility }
 
 export function prepareCodexTurnLedgerRequest(
   request: Record<string, unknown>,
@@ -19,6 +22,13 @@ export function prepareCodexTurnLedgerRequest(
   allowEmptyDelta: boolean
 ): CodexContinuationDecision {
   return prepareCodexContinuationRequest(request, state, allowEmptyDelta)
+}
+
+export function prepareCodexFullTurnLedgerRequest(
+  request: Record<string, unknown>,
+  state: CodexTurnLedgerState
+): Extract<CodexContinuationDecision, { mode: "full" }> {
+  return prepareCodexFullContinuationRequest(request, state)
 }
 
 export function appendCodexResponseOutputItemToLedger(

@@ -15,7 +15,7 @@
  * projection is the `tool_use_id`. So the model references the tool calls
  * whose outputs to snip; the bridge replaces each named `tool_result`'s
  * content with the `reason` summary via the existing tool-result replacement
- * machinery (`rememberToolResultReplacement` / `applyToolResultReplacementMap`).
+ * machinery (`prepareToolResultReplacement` / Claude projection mutation).
  * This keeps the `tool_use`/`tool_result` pair intact (zero orphan risk) and
  * structurally cannot touch the user's task-anchor messages.
  *

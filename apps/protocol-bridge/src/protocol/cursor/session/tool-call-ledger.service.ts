@@ -1,5 +1,9 @@
 import { Injectable, Logger } from "@nestjs/common"
 import type { StatementSync } from "node:sqlite"
+import {
+  requireExactDurableIdentifier,
+  requireOptionalExactDurableIdentifier,
+} from "../../../context/durable-identifier"
 import { PersistenceService } from "../../../persistence"
 import type { ToolResultBlock } from "../../../context/types"
 import type { ConversationId, TurnId } from "../turn/turn.types"
@@ -38,21 +42,46 @@ export const SESSION_TXN_TAG: unique symbol = Symbol("SessionTxn")
  */
 export interface SessionTxnInternal extends SessionTxn {
   readonly persistence: PersistenceService
+  /**
+   * Exact normal tool-result receipts accepted by this transaction. This is
+   * deliberately transaction-local proof, not a durable cache: append-only
+   * projection mutations may only be triggered by one of these receipts.
+   */
+  readonly acceptedToolResultReceipts: Map<
+    string,
+    { readonly recordUuid: string; readonly seq: number }
+  >
 }
 
 export type AbortReason =
   | "bidi_teardown"
   | "turn_superseded"
   | "user_cancelled"
-  | "process_restart"
   | "shutdown"
   | "stream_failed"
-  | "deadline_expired"
+
+/** Runtime calls belong to a bridge turn; imported Cursor history does not. */
+export type ToolCallLedgerOrigin = "runtime" | "cursor_history"
+
+function readLedgerOrigin(value: unknown): ToolCallLedgerOrigin {
+  if (value === "runtime" || value === "cursor_history") {
+    return value
+  }
+  throw new Error(`ToolCallLedger: invalid ledger origin ${String(value)}`)
+}
+
+function requirePositiveSequence(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new Error(`${label} must be a positive integer`)
+  }
+  return value as number
+}
 
 interface OpenLedgerArgs {
   toolUseId: string
   toolName: string
-  turnId: TurnId
+  turnId?: TurnId
+  origin?: ToolCallLedgerOrigin
   /** Sequence id of the tool_use block in session_messages. */
   openMessageSeq: number
 }
@@ -76,24 +105,27 @@ interface AbortAllResult {
   }>
 }
 
+interface AbortOpenToolCallsResult {
+  abortedToolCallIds: OpenEntry[]
+}
+
 interface AbortOpenToolCallsArgs {
   toolUseIds: string[]
   reason: AbortReason
+  /** Defaults to runtime calls so imported Cursor history is never aborted by cleanup. */
+  origin?: ToolCallLedgerOrigin
 }
 
 export interface OpenEntry {
   toolUseId: string
   toolName: string
-  turnId: TurnId
+  turnId?: TurnId
+  origin: ToolCallLedgerOrigin
   openMessageSeq: number
   openedAt: number
 }
 
 export type ToolCallLedgerState = "open" | "closed" | "aborted"
-
-interface AbortConversationResult {
-  abortedToolCallIds: OpenEntry[]
-}
 
 /**
  * ToolCallLedger
@@ -104,12 +136,10 @@ interface AbortConversationResult {
  *   open → closed   (normal tool result received)
  *   open → aborted  (cleanup coordinator drained the turn)
  *
- * `aborted` carries a structured `AbortReason` that is also written into
- * a synthetic `is_error: true` tool_result block on the transcript by
- * the cleanup coordinator (see TurnCleanupCoordinator). Together they
- * guarantee that no orphan tool_use can ever reach a backend request,
- * which is what the deleted sanitize/enforceToolProtocol pipeline used
- * to paper over after the fact.
+ * `aborted` carries a structured `AbortReason`. The canonical transcript
+ * remains untouched; a provider-native projector may deterministically
+ * normalize the incomplete pair for one outbound request. This prevents a
+ * interruption path from fabricating durable user content.
  *
  * All write paths require a `SessionTxn` so the ledger row and the
  * matching `session_messages` row land in the same SQLite transaction.
@@ -124,7 +154,7 @@ export class ToolCallLedger {
   private stmtInsertOpen?: StatementSync
   private stmtClose?: StatementSync
   private stmtAbort?: StatementSync
-  private stmtAbortConversation?: StatementSync
+  private stmtAbortOpenToolCalls?: StatementSync
   private stmtListOpenForTurn?: StatementSync
   private stmtListOpenForConversation?: StatementSync
   private stmtIsOpen?: StatementSync
@@ -138,22 +168,50 @@ export class ToolCallLedger {
    */
   open(txn: SessionTxn, args: OpenLedgerArgs): void {
     this.assertTxn(txn)
+    const toolUseId = requireExactDurableIdentifier(
+      args.toolUseId,
+      "ToolCallLedger.open toolUseId"
+    )
+    const toolName = requireExactDurableIdentifier(
+      args.toolName,
+      "ToolCallLedger.open toolName"
+    )
+    const turnId = requireOptionalExactDurableIdentifier(
+      args.turnId,
+      "ToolCallLedger.open turnId"
+    ) as TurnId | undefined
+    if (!Number.isSafeInteger(args.openMessageSeq) || args.openMessageSeq < 1) {
+      throw new Error("ToolCallLedger.open: openMessageSeq must be positive")
+    }
+    const origin = readLedgerOrigin(args.origin ?? "runtime")
+    if (origin === "runtime" && !turnId) {
+      throw new Error(
+        "ToolCallLedger.open: runtime tool calls require a turnId"
+      )
+    }
+    if (origin === "cursor_history" && turnId !== undefined) {
+      throw new Error(
+        "ToolCallLedger.open: imported Cursor history must not carry a runtime turnId"
+      )
+    }
     const stmt = (this.stmtInsertOpen ??= this.persistence.prepare(
       `INSERT INTO tool_call_ledger (
          conversation_id,
          tool_use_id,
          turn_id,
+         origin,
          tool_name,
          state,
          opened_at,
          open_message_seq
-       ) VALUES (?, ?, ?, ?, 'open', ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?)`
     ))
     stmt.run(
       txn.conversationId,
-      args.toolUseId,
-      args.turnId,
-      args.toolName,
+      toolUseId,
+      turnId ?? null,
+      origin,
+      toolName,
       Date.now(),
       args.openMessageSeq
     )
@@ -165,6 +223,16 @@ export class ToolCallLedger {
    */
   close(txn: SessionTxn, args: CloseLedgerArgs): void {
     this.assertTxn(txn)
+    const toolUseId = requireExactDurableIdentifier(
+      args.toolUseId,
+      "ToolCallLedger.close toolUseId"
+    )
+    if (
+      !Number.isSafeInteger(args.closeMessageSeq) ||
+      args.closeMessageSeq < 1
+    ) {
+      throw new Error("ToolCallLedger.close: closeMessageSeq must be positive")
+    }
     const stmt = (this.stmtClose ??= this.persistence.prepare(
       `UPDATE tool_call_ledger
          SET state = 'closed',
@@ -178,7 +246,7 @@ export class ToolCallLedger {
       Date.now(),
       args.closeMessageSeq,
       txn.conversationId,
-      args.toolUseId
+      toolUseId
     )
     const changes = (result as { changes?: number }).changes ?? 0
     if (changes === 0) {
@@ -189,29 +257,34 @@ export class ToolCallLedger {
       // missing a ledger update.
       throw new Error(
         `ToolCallLedger.close: no open ledger entry for ` +
-          `conversation=${txn.conversationId} toolUseId=${args.toolUseId}`
+          `conversation=${txn.conversationId} toolUseId=${toolUseId}`
       )
     }
   }
 
   /**
    * Drain every open ledger entry for the supplied turn into the
-   * `aborted` state. Returns the metadata each caller needs to write
-   * the matching synthetic tool_result block on the transcript.
+   * `aborted` state. Returns the durable identities a provider projector may
+   * use when constructing its next prompt.
    *
    * Empty result is fine — it just means the turn had no in-flight
    * tools at cleanup time (e.g. it failed before any tool batch).
    */
   abortAll(txn: SessionTxn, args: AbortAllArgs): AbortAllResult {
     this.assertTxn(txn)
+    const turnId = requireExactDurableIdentifier(
+      args.turnId,
+      "ToolCallLedger.abortAll turnId"
+    )
     const list = (this.stmtListOpenForTurn ??= this.persistence.prepare(
       `SELECT tool_use_id, tool_name, open_message_seq
          FROM tool_call_ledger
         WHERE conversation_id = ?
           AND turn_id = ?
+          AND origin = 'runtime'
           AND state = 'open'`
     ))
-    const rows = list.all(txn.conversationId, args.turnId) as unknown as Array<{
+    const rows = list.all(txn.conversationId, turnId) as unknown as Array<{
       tool_use_id: string
       tool_name: string
       open_message_seq: number
@@ -231,79 +304,36 @@ export class ToolCallLedger {
     ))
     const now = Date.now()
     for (const row of rows) {
-      abort.run(now, args.reason, txn.conversationId, row.tool_use_id)
+      abort.run(
+        now,
+        args.reason,
+        txn.conversationId,
+        requireExactDurableIdentifier(
+          row.tool_use_id,
+          "ToolCallLedger stored aborted toolUseId"
+        )
+      )
     }
 
     this.logger.log(
-      `Ledger aborted ${rows.length} tool call(s) for turn=${args.turnId} ` +
+      `Ledger aborted ${rows.length} tool call(s) for turn=${turnId} ` +
         `conversation=${txn.conversationId} reason=${args.reason}`
     )
 
     return {
       abortedToolCallIds: rows.map((row) => ({
-        toolUseId: row.tool_use_id,
-        toolName: row.tool_name,
-        openMessageSeq: row.open_message_seq,
-      })),
-    }
-  }
-
-  /**
-   * Drain every open ledger entry for a restored conversation. Used when the
-   * bridge process starts after tool calls were sent but before their results
-   * arrived. The restored runtime cannot resume those client-side executions,
-   * so the ledger must move them to an explicit process_restart terminal state
-   * before the next model turn is prepared.
-   */
-  abortOpenForConversation(
-    txn: SessionTxn,
-    args: { reason: AbortReason }
-  ): AbortConversationResult {
-    this.assertTxn(txn)
-    const list = (this.stmtListOpenForConversation ??= this.persistence.prepare(
-      `SELECT tool_use_id, tool_name, turn_id, open_message_seq, opened_at
-         FROM tool_call_ledger
-        WHERE conversation_id = ?
-          AND state = 'open'
-        ORDER BY open_message_seq ASC`
-    ))
-    const rows = list.all(txn.conversationId) as unknown as Array<{
-      tool_use_id: string
-      tool_name: string
-      turn_id: string
-      open_message_seq: number
-      opened_at: number
-    }>
-    if (rows.length === 0) {
-      return { abortedToolCallIds: [] }
-    }
-
-    const abort = (this.stmtAbortConversation ??= this.persistence.prepare(
-      `UPDATE tool_call_ledger
-         SET state = 'aborted',
-             closed_at = ?,
-             abort_reason = ?
-       WHERE conversation_id = ?
-         AND tool_use_id = ?
-         AND state = 'open'`
-    ))
-    const now = Date.now()
-    for (const row of rows) {
-      abort.run(now, args.reason, txn.conversationId, row.tool_use_id)
-    }
-
-    this.logger.warn(
-      `Ledger aborted ${rows.length} restored open tool call(s) ` +
-        `conversation=${txn.conversationId} reason=${args.reason}`
-    )
-
-    return {
-      abortedToolCallIds: rows.map((row) => ({
-        toolUseId: row.tool_use_id,
-        toolName: row.tool_name,
-        turnId: row.turn_id as TurnId,
-        openMessageSeq: row.open_message_seq,
-        openedAt: row.opened_at,
+        toolUseId: requireExactDurableIdentifier(
+          row.tool_use_id,
+          "ToolCallLedger stored aborted toolUseId"
+        ),
+        toolName: requireExactDurableIdentifier(
+          row.tool_name,
+          "ToolCallLedger stored aborted toolName"
+        ),
+        openMessageSeq: requirePositiveSequence(
+          row.open_message_seq,
+          "ToolCallLedger stored aborted openMessageSeq"
+        ),
       })),
     }
   }
@@ -311,29 +341,39 @@ export class ToolCallLedger {
   abortOpenToolCalls(
     txn: SessionTxn,
     args: AbortOpenToolCallsArgs
-  ): AbortConversationResult {
+  ): AbortOpenToolCallsResult {
     this.assertTxn(txn)
     const toolUseIds = Array.from(
-      new Set(args.toolUseIds.map((id) => id.trim()).filter(Boolean))
+      new Set(
+        args.toolUseIds.map((id) =>
+          requireExactDurableIdentifier(
+            id,
+            "ToolCallLedger.abortOpenToolCalls toolUseId"
+          )
+        )
+      )
     )
     if (toolUseIds.length === 0) {
       return { abortedToolCallIds: [] }
     }
 
     const placeholders = toolUseIds.map(() => "?").join(", ")
+    const origin = readLedgerOrigin(args.origin ?? "runtime")
     const rows = this.persistence
       .prepare(
-        `SELECT tool_use_id, tool_name, turn_id, open_message_seq, opened_at
+        `SELECT tool_use_id, tool_name, turn_id, origin, open_message_seq, opened_at
            FROM tool_call_ledger
           WHERE conversation_id = ?
             AND state = 'open'
+            AND origin = ?
             AND tool_use_id IN (${placeholders})
           ORDER BY open_message_seq ASC`
       )
-      .all(txn.conversationId, ...toolUseIds) as unknown as Array<{
+      .all(txn.conversationId, origin, ...toolUseIds) as unknown as Array<{
       tool_use_id: string
       tool_name: string
-      turn_id: string
+      turn_id: string | null
+      origin: string
       open_message_seq: number
       opened_at: number
     }>
@@ -341,7 +381,7 @@ export class ToolCallLedger {
       return { abortedToolCallIds: [] }
     }
 
-    const abort = (this.stmtAbortConversation ??= this.persistence.prepare(
+    const abort = (this.stmtAbortOpenToolCalls ??= this.persistence.prepare(
       `UPDATE tool_call_ledger
          SET state = 'aborted',
              closed_at = ?,
@@ -352,7 +392,15 @@ export class ToolCallLedger {
     ))
     const now = Date.now()
     for (const row of rows) {
-      abort.run(now, args.reason, txn.conversationId, row.tool_use_id)
+      abort.run(
+        now,
+        args.reason,
+        txn.conversationId,
+        requireExactDurableIdentifier(
+          row.tool_use_id,
+          "ToolCallLedger stored selected toolUseId"
+        )
+      )
     }
 
     this.logger.warn(
@@ -362,11 +410,27 @@ export class ToolCallLedger {
 
     return {
       abortedToolCallIds: rows.map((row) => ({
-        toolUseId: row.tool_use_id,
-        toolName: row.tool_name,
-        turnId: row.turn_id as TurnId,
-        openMessageSeq: row.open_message_seq,
-        openedAt: row.opened_at,
+        toolUseId: requireExactDurableIdentifier(
+          row.tool_use_id,
+          "ToolCallLedger stored selected toolUseId"
+        ),
+        toolName: requireExactDurableIdentifier(
+          row.tool_name,
+          "ToolCallLedger stored selected toolName"
+        ),
+        turnId: requireOptionalExactDurableIdentifier(
+          row.turn_id ?? undefined,
+          "ToolCallLedger stored selected turnId"
+        ) as TurnId | undefined,
+        origin: readLedgerOrigin(row.origin),
+        openMessageSeq: requirePositiveSequence(
+          row.open_message_seq,
+          "ToolCallLedger stored selected openMessageSeq"
+        ),
+        openedAt: requirePositiveSequence(
+          row.opened_at,
+          "ToolCallLedger stored selected openedAt"
+        ),
       })),
     }
   }
@@ -376,6 +440,10 @@ export class ToolCallLedger {
    * appendToolResultBlock targets a legitimately open ledger entry.
    */
   isOpen(conversationId: ConversationId, toolUseId: string): boolean {
+    const exactToolUseId = requireExactDurableIdentifier(
+      toolUseId,
+      "ToolCallLedger.isOpen toolUseId"
+    )
     const stmt = (this.stmtIsOpen ??= this.persistence.prepare(
       `SELECT 1
          FROM tool_call_ledger
@@ -384,13 +452,17 @@ export class ToolCallLedger {
           AND state = 'open'
         LIMIT 1`
     ))
-    return stmt.get(conversationId, toolUseId) !== undefined
+    return stmt.get(conversationId, exactToolUseId) !== undefined
   }
 
   getState(
     conversationId: ConversationId,
     toolUseId: string
   ): ToolCallLedgerState | undefined {
+    const exactToolUseId = requireExactDurableIdentifier(
+      toolUseId,
+      "ToolCallLedger.getState toolUseId"
+    )
     const stmt = (this.stmtGetState ??= this.persistence.prepare(
       `SELECT state
          FROM tool_call_ledger
@@ -398,14 +470,20 @@ export class ToolCallLedger {
           AND tool_use_id = ?
         LIMIT 1`
     ))
-    const row = stmt.get(conversationId, toolUseId) as
+    const row = stmt.get(conversationId, exactToolUseId) as
       | { state?: string }
       | undefined
-    return row?.state === "open" ||
-      row?.state === "closed" ||
-      row?.state === "aborted"
-      ? row.state
-      : undefined
+    if (!row) return undefined
+    if (
+      row.state === "open" ||
+      row.state === "closed" ||
+      row.state === "aborted"
+    ) {
+      return row.state
+    }
+    throw new Error(
+      `ToolCallLedger.getState: invalid stored state ${String(row.state)}`
+    )
   }
 
   /**
@@ -414,7 +492,7 @@ export class ToolCallLedger {
    */
   listOpen(conversationId: ConversationId): OpenEntry[] {
     const stmt = (this.stmtListOpenForConversation ??= this.persistence.prepare(
-      `SELECT tool_use_id, tool_name, turn_id, open_message_seq, opened_at
+      `SELECT tool_use_id, tool_name, turn_id, origin, open_message_seq, opened_at
            FROM tool_call_ledger
           WHERE conversation_id = ?
             AND state = 'open'
@@ -423,16 +501,33 @@ export class ToolCallLedger {
     const rows = stmt.all(conversationId) as unknown as Array<{
       tool_use_id: string
       tool_name: string
-      turn_id: string
+      turn_id: string | null
+      origin: string
       open_message_seq: number
       opened_at: number
     }>
     return rows.map((row) => ({
-      toolUseId: row.tool_use_id,
-      toolName: row.tool_name,
-      turnId: row.turn_id as TurnId,
-      openMessageSeq: row.open_message_seq,
-      openedAt: row.opened_at,
+      toolUseId: requireExactDurableIdentifier(
+        row.tool_use_id,
+        "ToolCallLedger stored open toolUseId"
+      ),
+      toolName: requireExactDurableIdentifier(
+        row.tool_name,
+        "ToolCallLedger stored open toolName"
+      ),
+      turnId: requireOptionalExactDurableIdentifier(
+        row.turn_id ?? undefined,
+        "ToolCallLedger stored open turnId"
+      ) as TurnId | undefined,
+      origin: readLedgerOrigin(row.origin),
+      openMessageSeq: requirePositiveSequence(
+        row.open_message_seq,
+        "ToolCallLedger stored open openMessageSeq"
+      ),
+      openedAt: requirePositiveSequence(
+        row.opened_at,
+        "ToolCallLedger stored open openedAt"
+      ),
     }))
   }
 
@@ -446,9 +541,13 @@ export class ToolCallLedger {
     toolUseId: string,
     reason: AbortReason
   ): ToolResultBlock {
+    const exactToolUseId = requireExactDurableIdentifier(
+      toolUseId,
+      "ToolCallLedger.buildAbortToolResult toolUseId"
+    )
     return {
       type: "tool_result",
-      tool_use_id: toolUseId,
+      tool_use_id: exactToolUseId,
       content: [{ type: "text", text: `[abort:${reason}]` }],
       is_error: true,
     }

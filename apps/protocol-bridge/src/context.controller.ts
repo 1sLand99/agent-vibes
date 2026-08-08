@@ -10,19 +10,19 @@ import {
   Post,
 } from "@nestjs/common"
 import { ApiOperation, ApiTags } from "@nestjs/swagger"
-import { ContextTelemetryService } from "./context"
+import {
+  ContextTelemetryService,
+  requireExactDurableIdentifier,
+} from "./context"
 import { CursorConnectStreamService } from "./protocol/cursor/cursor-connect-stream.service"
 import { SessionLifecycleService } from "./protocol/cursor/session/session-lifecycle.service"
-import { ContextStateService } from "./protocol/cursor/session/context-state.service"
 
 interface ManualCompactRequestBody {
   /** Cursor session id whose contextState we should compact. */
   conversationId?: string
   /**
-   * Optional override for the synthetic budget pressure used to drive the
-   * compaction planner.  Smaller values force more aggressive compaction.
-   * Defaults to a tight value that produces a boundary commit
-   * when the transcript has enough material.
+   * Optional operator-selected request budget. Manual triggering is
+   * independent from this value; omitting it uses the active model budget.
    */
   maxTokens?: number
 }
@@ -61,7 +61,6 @@ export class ContextController {
   constructor(
     private readonly telemetry: ContextTelemetryService,
     private readonly chatSessions: SessionLifecycleService,
-    private readonly contextState: ContextStateService,
     private readonly cursorStream: CursorConnectStreamService
   ) {}
 
@@ -121,9 +120,7 @@ export class ContextController {
     return {
       ok: true,
       conversationId,
-      allowedRoots: this.chatSessions.listAllowedWorkspaceRoots(conversationId),
-      additionalRoots:
-        this.chatSessions.getAdditionalWorkspaceRoots(conversationId),
+      workspace: this.getWorkspaceDescriptor(conversationId),
     }
   }
 
@@ -146,27 +143,18 @@ export class ContextController {
     if (paths.length === 0) {
       throw new HttpException("paths is required", HttpStatus.BAD_REQUEST)
     }
-    const added = paths.map((rawPath) => {
-      const entry = this.chatSessions.addAdditionalWorkspaceRoot(
-        conversationId,
-        rawPath,
-        "session"
+    const added = this.chatSessions.addWorkspaceGrants(conversationId, paths)
+    if (!added) {
+      throw new HttpException(
+        "Invalid working directories or no declared workspace",
+        HttpStatus.BAD_REQUEST
       )
-      if (!entry) {
-        throw new HttpException(
-          `Invalid working directory: ${rawPath}`,
-          HttpStatus.BAD_REQUEST
-        )
-      }
-      return entry
-    })
+    }
     return {
       ok: true,
       conversationId,
-      added,
-      allowedRoots: this.chatSessions.listAllowedWorkspaceRoots(conversationId),
-      additionalRoots:
-        this.chatSessions.getAdditionalWorkspaceRoots(conversationId),
+      added: added.map((grant) => grant.path),
+      workspace: this.getWorkspaceDescriptor(conversationId),
     }
   }
 
@@ -189,16 +177,21 @@ export class ContextController {
     if (paths.length === 0) {
       throw new HttpException("paths is required", HttpStatus.BAD_REQUEST)
     }
-    const removed = paths.filter((rawPath) =>
-      this.chatSessions.removeAdditionalWorkspaceRoot(conversationId, rawPath)
+    const removed = this.chatSessions.removeWorkspaceGrants(
+      conversationId,
+      paths
     )
+    if (!removed) {
+      throw new HttpException(
+        "Invalid working directories or no declared workspace",
+        HttpStatus.BAD_REQUEST
+      )
+    }
     return {
       ok: true,
       conversationId,
-      removed,
-      allowedRoots: this.chatSessions.listAllowedWorkspaceRoots(conversationId),
-      additionalRoots:
-        this.chatSessions.getAdditionalWorkspaceRoots(conversationId),
+      removed: removed.map((grant) => grant.path),
+      workspace: this.getWorkspaceDescriptor(conversationId),
     }
   }
 
@@ -210,11 +203,15 @@ export class ContextController {
   async manualCompact(
     @Body() body: ManualCompactRequestBody
   ): Promise<ManualCompactResponseBody> {
-    const conversationId =
-      typeof body.conversationId === "string" ? body.conversationId.trim() : ""
-    if (!conversationId) {
+    let conversationId: string
+    try {
+      conversationId = requireExactDurableIdentifier(
+        body.conversationId,
+        "conversationId"
+      )
+    } catch {
       throw new HttpException(
-        "conversationId is required",
+        "conversationId must be an exact non-empty session identifier",
         HttpStatus.BAD_REQUEST
       )
     }
@@ -227,16 +224,12 @@ export class ContextController {
       )
     }
 
-    // The dashboard typically wants "compact now" rather than "fit into
-    // budget X".  Default to a tight budget so the planner produces a
-    // boundary commit even when the transcript is comfortably below the
-    // current request cap.  Operators can pass a custom value to fine-tune.
     const maxTokens =
       typeof body.maxTokens === "number" &&
       Number.isFinite(body.maxTokens) &&
       body.maxTokens > 0
         ? Math.floor(body.maxTokens)
-        : 4_000
+        : undefined
 
     const result = await this.cursorStream.compactConversationNow(
       conversationId,
@@ -271,19 +264,17 @@ export class ContextController {
   @Post(":conversationId/force-snip")
   @ApiOperation({
     summary:
-      "Force-snip the conversation: hide every message older than the most " +
-      "recent N from the model-facing view (default keep_recent=4). Mirrors " +
-      "Claude Code's /force-snip slash command.",
+      "Force-snip the active Claude conversation: replace its current " +
+      "model-facing graph messages with one durable Snip boundary.",
   })
   async forceSnip(
     @Param("conversationId") conversationId: string,
-    @Body() body: { keep_recent?: number; reason?: string } | undefined
+    @Body() body: { reason?: string } | undefined
   ): Promise<{
     ok: boolean
     conversationId: string
     applied: boolean
     snippedCount: number
-    keptCount: number
     totalRecords: number
     boundaryId?: string
     reason?: string
@@ -295,54 +286,21 @@ export class ContextController {
         HttpStatus.NOT_FOUND
       )
     }
-    await this.cursorStream.resolveRestartRecoveryBeforeContextMutation(
+    const result = await this.cursorStream.forceSnipConversation(
       conversationId,
-      "force-snip"
-    )
-
-    const requestedKeep =
-      typeof body?.keep_recent === "number" && Number.isFinite(body.keep_recent)
-        ? Math.max(2, Math.floor(body.keep_recent))
-        : 4
-    const trimmedReason =
-      typeof body?.reason === "string" && body.reason.trim().length > 0
-        ? body.reason.trim().slice(0, 240)
-        : "user-triggered force-snip"
-
-    const targets = this.contextState.resolveSnipTargets(
-      conversationId,
-      requestedKeep
-    )
-    if (targets.removedRecordIds.length === 0) {
-      return {
-        ok: true,
-        conversationId,
-        applied: false,
-        snippedCount: 0,
-        keptCount: targets.keptCount,
-        totalRecords: targets.totalCount,
+      {
+        ...(typeof body?.reason === "string" ? { reason: body.reason } : {}),
       }
-    }
-
-    const boundary = this.contextState.registerSnipBoundary(conversationId, {
-      removedRecordIds: targets.removedRecordIds,
-      trigger: "user",
-      reason: trimmedReason,
-    })
+    )
 
     this.logger.warn(
-      `Force-snip applied for ${conversationId}: removed ${targets.removedRecordIds.length} record(s), kept ${targets.keptCount}, boundary=${boundary?.id}`
+      `Force-snip ${result.applied ? "applied" : "skipped"} for ${conversationId}: removed ${result.snippedCount} record(s), boundary=${result.boundaryId || "(none)"}`
     )
 
     return {
       ok: true,
       conversationId,
-      applied: Boolean(boundary),
-      snippedCount: targets.removedRecordIds.length,
-      keptCount: targets.keptCount,
-      totalRecords: targets.totalCount,
-      boundaryId: boundary?.id,
-      reason: trimmedReason,
+      ...result,
     }
   }
 
@@ -362,5 +320,14 @@ export class ContextController {
       out.push(normalized)
     }
     return out
+  }
+
+  private getWorkspaceDescriptor(conversationId: string) {
+    const snapshot = this.chatSessions.getWorkspaceScopeSnapshot(conversationId)
+    if (!snapshot) return null
+    return {
+      scope: snapshot,
+      roots: this.chatSessions.getWorkspaceRootSources(conversationId),
+    }
   }
 }

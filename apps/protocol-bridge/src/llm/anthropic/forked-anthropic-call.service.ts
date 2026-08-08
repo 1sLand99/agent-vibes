@@ -1,8 +1,7 @@
-import { Injectable, Logger } from "@nestjs/common"
-import {
-  AnthropicApiService,
-  ClaudeApiClientMode,
-} from "./anthropic-api.service"
+import { Injectable } from "@nestjs/common"
+import * as crypto from "crypto"
+import { requireExactDurableIdentifier } from "../../context/durable-identifier"
+import { AnthropicApiService } from "./anthropic-api.service"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicForwardHeaders } from "./anthropic-api.service"
 import type { AnthropicResponse } from "../../shared/anthropic"
@@ -15,6 +14,7 @@ import {
   ModelRouterService,
   type BackendType,
 } from "../shared/model-router.service"
+import { runProviderPhysicalDispatch } from "../shared/provider-physical-dispatch"
 
 /**
  * Cache-safe params copied verbatim from the parent request. Kept in a
@@ -55,10 +55,8 @@ export interface ForkedCallParams {
    * messages so the upstream prompt cache hits.
    */
   promptMessages: CreateMessageDto["messages"]
-  /** Tracking id reused for telemetry attribution. Parent SessionRecord.conversationId. */
-  parentSessionId?: string
-  /** Sub-agent context, if the fork is on behalf of a sub-agent. */
-  agentId?: string
+  /** Exact parent SessionRecord.conversationId used for dispatch ownership. */
+  parentSessionId: string
   /** Linked to the parent's AbortController so user cancellation propagates. */
   abortSignal?: AbortSignal
   /**
@@ -75,18 +73,17 @@ export interface ForkedCallParams {
   /** Optional override for the small-fast-model variant (haiku-class). */
   smallFastModel?: string
   /**
-   * Backend that served the parent turn.  When provided, the fork is
+   * Backend that served the parent turn. The fork is
    * dispatched to the same backend so users who only have one Claude-
    * serving backend configured (e.g. Kiro-only, no Anthropic API key)
-   * still get a usable haiku route.  When omitted, the fork falls
-   * through to Anthropic API — the historical default.
+   * still get a usable inherited route.
    *
    * Backends that cannot serve Claude haiku (`codex`, `openai-compat`)
    * cause the small-fast variant to short-circuit to `null` rather than
    * silently misroute to Claude API and fail when no Claude account is
    * configured.
    */
-  parentBackend?: BackendType
+  parentBackend: BackendType
 }
 
 export interface ForkedCallResult {
@@ -112,10 +109,11 @@ export interface ForkedCallResult {
  *     `runForkedSmallFastCall`.
  *
  * Bridge-specific concerns:
- *   - The fork goes through `AnthropicApiService.sendClaudeMessage` so
- *     the existing cooldown/retry, oauth, rate-limit, and prompt-caching
- *     machinery are reused. The fork is therefore subject to the same
- *     account routing as the parent.
+ *   - Each fork is submitted through the shared physical-dispatch runner
+ *     with one allowed attempt. Provider-specific OAuth, rate-limit,
+ *     account-selection, and prompt-caching behavior remain inside that
+ *     single physical dispatch; a best-effort helper call must not create
+ *     a hidden retry chain alongside its parent turn.
  *   - PromptCacheBreakDetection tracking is intentionally NOT propagated
  *     into the fork: forked calls have their own cache lifetime and
  *     would otherwise inject false-positive break events into the
@@ -126,8 +124,6 @@ export interface ForkedCallResult {
  */
 @Injectable()
 export class ForkedAnthropicCallService {
-  private readonly logger = new Logger(ForkedAnthropicCallService.name)
-
   constructor(
     private readonly anthropicApi: AnthropicApiService,
     private readonly kiro: KiroService,
@@ -143,9 +139,7 @@ export class ForkedAnthropicCallService {
    * prefix as long as the caller passes the parent's projected message
    * history before the new prompt unchanged.
    *
-   * Routes to whichever backend served the parent turn when
-   * `parentBackend` is provided (Kiro, Google, Claude API).  When
-   * absent, falls back to Claude API for backwards compatibility.
+   * Routes to the exact backend that served the parent turn.
    *
    * Returns `null` when the parent backend cannot serve a Claude fork
    * (`codex` / `openai-compat`).  Callers are best-effort and should
@@ -155,14 +149,11 @@ export class ForkedAnthropicCallService {
   async runForkedCall(
     params: ForkedCallParams
   ): Promise<ForkedCallResult | null> {
-    if (!this.canDispatchClaudeFork(params.parentBackend)) {
+    const parentCanDispatchClaudeFork = this.assertExactParentOwnership(params)
+    if (!parentCanDispatchClaudeFork) {
       return null
     }
-    const dto = this.buildForkedDto(
-      params.cacheSafeParams.model,
-      params,
-      params.forwardHeaders ? "generic" : "claude-code-cli"
-    )
+    const dto = this.buildForkedDto(params.cacheSafeParams.model, params)
     const response = await this.dispatchClaudeFork(dto, params)
     return { text: this.extractText(response), raw: response }
   }
@@ -184,37 +175,27 @@ export class ForkedAnthropicCallService {
    *     legacy hard-coded `claude-haiku-4-5` fallback that ignored the
    *     user's parent model selection.
    *
-   * Returns `null` when the resolved backend cannot serve the fork
-   * (e.g. parent ran on `codex` and the inherit branch tries to issue
-   * a Claude DTO call on a GPT backend).  Callers — `ToolUseSummaryService`
-   * — are best-effort and should treat null the same as a thrown error:
-   * skip the helper, keep the parent turn.
+   * Returns `null` only when the inherit branch has no compatible parent
+   * backend (e.g. a Codex parent with an Anthropic-shaped DTO). An explicit
+   * model pin must resolve and dispatch or fail; callers such as
+   * `ToolUseSummaryService` decide whether that optional presentation failure
+   * should suppress the label.
    */
   async runForkedSmallFastCall(
     params: ForkedCallParams
   ): Promise<ForkedCallResult | null> {
+    const parentCanDispatchClaudeFork = this.assertExactParentOwnership(params)
     // Concrete pin path (user selected a specific model in the
     // settings UI). Route via ModelRouterService so we honour their
     // pick across families.
-    if (params.smallFastModel) {
-      const targetModel = params.smallFastModel
-      let route: ReturnType<ModelRouterService["resolveModel"]>
-      try {
-        route = this.modelRouter.resolveModel(targetModel)
-      } catch (error) {
-        this.logger.debug(
-          `[fork] Cannot route small-fast model ${targetModel}; ` +
-            `dropping helper call: ${String(error)}`
-        )
-        return null
-      }
-      const dto = this.buildForkedDto(
-        route.model,
-        params,
-        params.forwardHeaders ? "generic" : "claude-code-cli"
+    if (params.smallFastModel !== undefined) {
+      const targetModel = requireExactDurableIdentifier(
+        params.smallFastModel,
+        "Forked call smallFastModel"
       )
+      const route = this.modelRouter.resolveModel(targetModel)
+      const dto = this.buildForkedDto(route.model, params)
       const response = await this.dispatchByBackend(route.backend, dto, params)
-      if (!response) return null
       return { text: this.extractText(response), raw: response }
     }
 
@@ -222,26 +203,21 @@ export class ForkedAnthropicCallService {
     // Yields a true cache hit because the DTO model field, system
     // prefix, and tools all stay identical to the parent's last
     // outbound shape.
-    if (!this.canDispatchClaudeFork(params.parentBackend)) {
+    if (!parentCanDispatchClaudeFork) {
       // Parent ran on codex / openai-compat (GPT family). The fork
       // shape is Anthropic-DTO-shaped and the cache-safe params come
       // from a Claude prefix, so we have no compatible inherit target.
-      // Returning null lets the caller drop the helper silently —
-      // matching the historical behaviour for that case.
+      // Returning null lets the caller omit this optional UI label.
       return null
     }
     const targetModel = params.cacheSafeParams.model
-    const dto = this.buildForkedDto(
-      targetModel,
-      params,
-      params.forwardHeaders ? "generic" : "claude-code-cli"
-    )
+    const dto = this.buildForkedDto(targetModel, params)
     const response = await this.dispatchClaudeFork(dto, params)
     return { text: this.extractText(response), raw: response }
   }
 
   /**
-   * Whether `parentBackend` (or the Anthropic-API default) can serve a
+   * Whether `parentBackend` can serve a
    * Claude-shaped fork at all.  Used by the inherit-from-parent path
    * of `runForkedSmallFastCall` and by `runForkedCall` (which always
    * sticks to the parent backend, since its purpose is reusing the
@@ -252,9 +228,8 @@ export class ForkedAnthropicCallService {
    * to inherit a Claude DTO into them would synthesize a response
    * shape mismatch.
    */
-  private canDispatchClaudeFork(backend: BackendType | undefined): boolean {
+  private canDispatchClaudeFork(backend: BackendType): boolean {
     switch (backend) {
-      case undefined:
       case "claude-api":
       case "kiro":
       case "google-claude":
@@ -265,22 +240,35 @@ export class ForkedAnthropicCallService {
         return false
       default: {
         // Exhaustiveness check: future BackendType additions force a
-        // compile error here so we do not silently route forks to a new
-        // backend that may not implement Claude haiku.
+        // compile error here. At runtime, fail closed rather than silently
+        // dropping a helper call for an unknown persisted backend value.
         const _exhaustive: never = backend
-        void _exhaustive
-        return false
+        throw new Error(
+          `Unknown parent backend for fork dispatch: ${String(_exhaustive)}`
+        )
       }
     }
   }
 
+  /**
+   * A fork is owned by the exact already-accepted parent session and route.
+   * Validate both before any branch can decide to omit the optional helper;
+   * otherwise malformed persisted state could masquerade as a benign
+   * unsupported-backend no-op.
+   */
+  private assertExactParentOwnership(params: ForkedCallParams): boolean {
+    requireExactDurableIdentifier(
+      params.parentSessionId,
+      "Forked call parentSessionId"
+    )
+    return this.canDispatchClaudeFork(params.parentBackend)
+  }
+
   private buildForkedDto(
     model: string,
-    params: ForkedCallParams,
-    clientMode: ClaudeApiClientMode
+    params: ForkedCallParams
   ): CreateMessageDto {
-    void clientMode
-    const dto: CreateMessageDto = {
+    return {
       model,
       messages: params.promptMessages,
       max_tokens: params.maxOutputTokens,
@@ -292,16 +280,15 @@ export class ForkedAnthropicCallService {
       stream: false,
       betas: params.cacheSafeParams.betas,
     }
-    return dto
   }
 
   /**
    * Inherit-from-parent dispatch path. `parentBackend` is the source
-   * of truth — when omitted we use Claude API for backwards compat.
+   * of truth.
    *
-   * Forks deliberately do NOT pass parent sessionId/agentId so that
-   * their cache-read drops are not attributed to the parent's
-   * PromptCacheBreakDetection key.
+   * The physical scope records local parent ownership, but forks do not pass
+   * that session into provider cache telemetry. Their cache-read drops must
+   * not be attributed to the parent's PromptCacheBreakDetection key.
    */
   private async dispatchClaudeFork(
     dto: CreateMessageDto,
@@ -310,16 +297,46 @@ export class ForkedAnthropicCallService {
     const backend = params.parentBackend
     switch (backend) {
       case "kiro":
-        return this.kiro.sendClaudeMessage(dto)
+        return runProviderPhysicalDispatch({
+          plan: {
+            scope: this.createForkDispatchScope("kiro", params),
+            backend: "kiro",
+            model: dto.model,
+            request: dto,
+          },
+          signal: params.abortSignal,
+          maxAttempts: 1,
+          execute: (dispatch) => this.kiro.sendClaudeMessage(dispatch),
+        })
       case "google":
       case "google-claude":
-        return this.google.sendClaudeMessage(dto)
+        return runProviderPhysicalDispatch({
+          plan: {
+            scope: this.createForkDispatchScope(backend, params),
+            backend,
+            model: dto.model,
+            request: dto,
+          },
+          signal: params.abortSignal,
+          maxAttempts: 1,
+          execute: (dispatch) => this.google.sendClaudeMessage(dispatch),
+        })
       case "claude-api":
-      case undefined:
-        return this.anthropicApi.sendClaudeMessage(dto, {
-          clientMode: "generic",
-          forwardHeaders: params.forwardHeaders,
-          abortSignal: params.abortSignal,
+        return runProviderPhysicalDispatch({
+          plan: {
+            scope: this.createForkDispatchScope("claude-api", params),
+            backend: "claude-api",
+            model: dto.model,
+            request: dto,
+          },
+          signal: params.abortSignal,
+          maxAttempts: 1,
+          execute: (dispatch) =>
+            this.anthropicApi.sendClaudeMessage(dispatch, {
+              clientMode: "generic",
+              forwardHeaders: params.forwardHeaders,
+              abortSignal: params.abortSignal,
+            }),
         })
       case "codex":
       case "openai-compat":
@@ -345,40 +362,96 @@ export class ForkedAnthropicCallService {
    * decided by ModelRouterService rather than by the parent's
    * lastAssistantBackend.
    *
-   * Returns `null` when the resolved backend cannot accept a Claude-
-   * DTO-shaped helper call. In practice all six configured backends
-   * implement `sendClaudeMessage`, so this is purely a guard against a
-   * hypothetical future BackendType that doesn't.
+   * Every declared BackendType has one exact dispatch implementation.
    */
   private async dispatchByBackend(
     backend: BackendType,
     dto: CreateMessageDto,
     params: ForkedCallParams
-  ): Promise<AnthropicResponse | null> {
+  ): Promise<AnthropicResponse> {
     switch (backend) {
       case "kiro":
-        return this.kiro.sendClaudeMessage(dto)
+        return runProviderPhysicalDispatch({
+          plan: {
+            scope: this.createForkDispatchScope("kiro", params),
+            backend: "kiro",
+            model: dto.model,
+            request: dto,
+          },
+          signal: params.abortSignal,
+          maxAttempts: 1,
+          execute: (dispatch) => this.kiro.sendClaudeMessage(dispatch),
+        })
       case "google":
       case "google-claude":
-        return this.google.sendClaudeMessage(dto)
-      case "claude-api":
-        return this.anthropicApi.sendClaudeMessage(dto, {
-          clientMode: "generic",
-          forwardHeaders: params.forwardHeaders,
-          abortSignal: params.abortSignal,
+        return runProviderPhysicalDispatch({
+          plan: {
+            scope: this.createForkDispatchScope(backend, params),
+            backend,
+            model: dto.model,
+            request: dto,
+          },
+          signal: params.abortSignal,
+          maxAttempts: 1,
+          execute: (dispatch) => this.google.sendClaudeMessage(dispatch),
         })
-      case "codex":
-        return this.codex.sendMessage(
+      case "claude-api":
+        return runProviderPhysicalDispatch({
+          plan: {
+            scope: this.createForkDispatchScope("claude-api", params),
+            backend: "claude-api",
+            model: dto.model,
+            request: dto,
+          },
+          signal: params.abortSignal,
+          maxAttempts: 1,
+          execute: (dispatch) =>
+            this.anthropicApi.sendClaudeMessage(dispatch, {
+              clientMode: "generic",
+              forwardHeaders: params.forwardHeaders,
+              abortSignal: params.abortSignal,
+            }),
+        })
+      case "codex": {
+        const request = this.codex.prepareBridgeNativeExecutionRequest(
           adaptAnthropicMessageToCodexExecutionRequest(dto)
         )
+        return runProviderPhysicalDispatch({
+          plan: {
+            scope: this.createForkDispatchScope("codex", params),
+            backend: "codex",
+            model: dto.model,
+            request,
+          },
+          signal: params.abortSignal,
+          maxAttempts: 1,
+          execute: (dispatch) => this.codex.sendMessage(dispatch),
+        })
+      }
       case "openai-compat":
-        return this.openaiCompat.sendClaudeMessage(dto)
+        return runProviderPhysicalDispatch({
+          plan: {
+            scope: this.createForkDispatchScope("openai-compat", params),
+            backend: "openai-compat",
+            model: dto.model,
+            request: dto,
+          },
+          signal: params.abortSignal,
+          maxAttempts: 1,
+          execute: (dispatch) => this.openaiCompat.sendClaudeMessage(dispatch),
+        })
       default: {
         const _exhaustive: never = backend
-        void _exhaustive
-        return null
+        throw new Error(`Unknown fork backend: ${String(_exhaustive)}`)
       }
     }
+  }
+
+  private createForkDispatchScope(
+    backend: BackendType,
+    params: ForkedCallParams
+  ): string {
+    return `forked:${backend}:${params.parentSessionId}:${crypto.randomUUID()}`
   }
 
   private extractText(response: AnthropicResponse): string {

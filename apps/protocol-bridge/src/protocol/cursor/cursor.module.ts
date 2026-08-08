@@ -1,4 +1,4 @@
-import { Module, OnApplicationBootstrap } from "@nestjs/common"
+import { Module } from "@nestjs/common"
 import { ContextModule } from "../../context/context.module"
 import { GoogleModule } from "../../llm/google/google.module"
 import { KiroModule } from "../../llm/aws/kiro.module"
@@ -16,12 +16,14 @@ import { WorkspacePreferenceController } from "./controllers/workspace-preferenc
 import { CursorAuthService } from "./cursor-auth.service"
 import { CursorConnectStreamService } from "./cursor-connect-stream.service"
 import { CursorGrpcService } from "./cursor-grpc.service"
+import { CursorSummaryDeliveryService } from "./cursor-summary-delivery.service"
+import { CursorHookLifecycleService } from "./hooks/cursor-hook-lifecycle.service"
 import { KnowledgeBaseService } from "./knowledge-base.service"
 import { KvStorageService } from "./kv-storage.service"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
 import { SessionLifecycleService } from "./session/session-lifecycle.service"
 import { ExecDispatchSerializerService } from "./session/exec-dispatch-serializer.service"
-import { PendingDeadlineSweeper } from "./session/pending-deadline-sweeper.service"
+import { InteractionQueryDeadlineSweeper } from "./session/interaction-query-deadline-sweeper.service"
 import { ToolExecutionCoordinatorService } from "./session/tool-execution-coordinator.service"
 import { WorkspacePreferenceService } from "./session/workspace-preference.service"
 import { GitBranchService } from "./session/git-branch.service"
@@ -44,7 +46,23 @@ import { SessionPersistenceService } from "./session/session-persistence.service
 import { AssistantToolBatchService } from "./session/assistant-tool-batch.service"
 import { SessionStreamService } from "./session/session-stream.service"
 import { ContextStateService } from "./session/context-state.service"
-import { BackgroundJobRegistry } from "./subagents-bridge/background-job-registry"
+import { CursorWireStore } from "./session/cursor-wire-store.service"
+import { ExecDispatchStore } from "./session/exec-dispatch-store.service"
+import { ProviderActiveHeadStore } from "./session/provider-active-head.store"
+import { ClaudeProjectionStore } from "./session/claude-projection-store.service"
+import { ClaudeProjectionMutationLog } from "./session/claude-projection-mutation-log.service"
+import { ContextProjectionHeadStore } from "./session/context-projection-active-head.store"
+import { ContextProjectionStore } from "./session/context-projection-store.service"
+import { CodexRolloutStore } from "./session/codex-rollout-store.service"
+import { CodexProjectionStore } from "./session/codex-projection-store.service"
+import { SnipBoundaryStore } from "./session/snip-boundary-store.service"
+import { SessionMemoryEventStore } from "./session/session-memory-event-store.service"
+import { SubagentBranchStore } from "./session/subagent-branch-store.service"
+import { SubagentRunStore } from "./session/subagent-run-store.service"
+import { ProjectionAttemptGate } from "./session/projection-attempt-gate.service"
+import { BackgroundCommandStore } from "./session/background-command-store.service"
+import { ConversationContextRuntimeService } from "./session/conversation-context-runtime.service"
+import { AsyncUserInteractionStore } from "./session/async-user-interaction-store.service"
 
 @Module({
   imports: [
@@ -75,6 +93,8 @@ import { BackgroundJobRegistry } from "./subagents-bridge/background-job-registr
     CursorAuthService,
     CursorConnectStreamService,
     CursorGrpcService,
+    CursorSummaryDeliveryService,
+    CursorHookLifecycleService,
     CursorSkillsManager,
     KvStorageService,
     SemanticSearchProviderService,
@@ -88,25 +108,36 @@ import { BackgroundJobRegistry } from "./subagents-bridge/background-job-registr
     ToolUseSummaryService,
     WebSearchAdapterFactory,
     WebSearchService,
-    // Phase H1: new turn architecture providers. These are wired so
-    // CursorConnectStreamService can resolve them from DI; the
-    // legacy generator path still drives behavior, but now does so
-    // under a TurnLifecycle so subsequent phases can swap pieces
-    // in incrementally.
+    // Structured turn ownership and cleanup.
     TurnLifecycle,
     TurnCleanupCoordinator,
     TopLevelAgentTurnRunnerService,
-    // Step 3 additions: ledger + transactional message store + new
-    // sessions/v2 schema persistence. Wired so SessionLifecycleService
-    // (and follow-up callers in step 8) can resolve them from DI.
+    // Durable graph, ledger, provider projections, and normalized sessions.
     MessageStore,
     ToolCallLedger,
     SessionPersistenceService,
     AssistantToolBatchService,
     SessionStreamService,
     ContextStateService,
-    BackgroundJobRegistry,
-    PendingDeadlineSweeper,
+    CursorWireStore,
+    ExecDispatchStore,
+    BackgroundCommandStore,
+    AsyncUserInteractionStore,
+    ConversationContextRuntimeService,
+    CursorSummaryDeliveryService,
+    ProviderActiveHeadStore,
+    SnipBoundaryStore,
+    SessionMemoryEventStore,
+    SubagentBranchStore,
+    SubagentRunStore,
+    ProjectionAttemptGate,
+    ContextProjectionHeadStore,
+    ContextProjectionStore,
+    ClaudeProjectionMutationLog,
+    ClaudeProjectionStore,
+    CodexRolloutStore,
+    CodexProjectionStore,
+    InteractionQueryDeadlineSweeper,
   ],
   exports: [
     CursorAuthService,
@@ -126,25 +157,23 @@ import { BackgroundJobRegistry } from "./subagents-bridge/background-job-registr
     AssistantToolBatchService,
     SessionStreamService,
     ContextStateService,
-    BackgroundJobRegistry,
+    CursorWireStore,
+    ExecDispatchStore,
+    BackgroundCommandStore,
+    AsyncUserInteractionStore,
+    ConversationContextRuntimeService,
+    ProviderActiveHeadStore,
+    SnipBoundaryStore,
+    SessionMemoryEventStore,
+    SubagentBranchStore,
+    SubagentRunStore,
+    ProjectionAttemptGate,
+    ContextProjectionHeadStore,
+    ContextProjectionStore,
+    ClaudeProjectionMutationLog,
+    ClaudeProjectionStore,
+    CodexRolloutStore,
+    CodexProjectionStore,
   ],
 })
-export class CursorModule implements OnApplicationBootstrap {
-  constructor(
-    private readonly sweeper: PendingDeadlineSweeper,
-    private readonly streamService: CursorConnectStreamService
-  ) {}
-
-  /**
-   * Wire the sweeper → streamService cycle after the DI graph is
-   * fully constructed. The sweeper uses the stream service to
-   * synthesize expiry frames; the stream service uses the
-   * sessionManager which the sweeper also depends on, so injecting
-   * the stream service through the sweeper's constructor would
-   * create a cycle. `onApplicationBootstrap` is the standard Nest
-   * hook for this pattern.
-   */
-  onApplicationBootstrap(): void {
-    this.sweeper.setStreamService(this.streamService)
-  }
-}
+export class CursorModule {}

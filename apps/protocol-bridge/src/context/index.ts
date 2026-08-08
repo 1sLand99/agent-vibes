@@ -14,35 +14,35 @@ export {
 } from "./context-auto-compact-policy"
 export { CompactWarningStateService } from "./compact-warning-state.service"
 export { CompactWarningHookService } from "./compact-warning-hook.service"
-export { PostCompactCleanupService } from "./post-compact-cleanup.service"
 export {
-  CodexContextAdapterService,
-  CODEX_HISTORICAL_SUMMARY_NOTICE,
-  CODEX_SUMMARIZATION_PROMPT,
-  CODEX_SUMMARY_PREFIX,
-} from "./codex-context-adapter.service"
-export {
-  buildTopicContinuityGuard,
-  composeCompactHookMessage,
-  extractLatestUserUtterance,
-} from "./context-continuity-guard"
+  ClaudeCheckpointCorruptError,
+  ClaudeConversationProjector,
+  ClaudeToolPairIntegrityError,
+} from "./claude-conversation-projector"
+export type {
+  ClaudeConversationProjection,
+  ClaudeConversationProjectionOptions,
+  ClaudeMicrocompactProjection,
+} from "./claude-conversation-projector"
+export { CodexContextEngineService } from "./codex-context-engine.service"
+export type { CodexGraphDeltaProjectionOptions } from "./codex-context-engine.service"
 export type {
   CodexCompactReferenceInput,
+  CodexContextCompactionCommit,
+  CodexContextCompactionPlan,
   CodexRemoteCompactProvider,
   CodexRemoteCompactRequest,
   CodexRemoteCompactResult,
-} from "./codex-context-adapter.service"
+} from "./codex-context-engine.service"
 export { ContextAttachmentBuilderService } from "./context-attachment-builder.service"
 export type {
   ContextAttachmentSnapshot,
   SessionTodoAttachmentLike,
 } from "./context-attachment-builder.service"
-export { ContextCollapseService } from "./context-collapse.service"
-export type {
-  ContextCollapseApplyInput,
-  ContextCollapseProjectionResult,
-} from "./context-collapse.service"
-export { ContextCompactRunnerService } from "./context-compact-runner.service"
+export {
+  buildContextCompactSummaryMessages,
+  ContextCompactRunnerService,
+} from "./context-compact-runner.service"
 export type {
   ContextCompactRunnerHookProvider,
   ContextCompactRunnerSummaryProvider,
@@ -52,16 +52,25 @@ export type {
 export {
   ContextCompactionService,
   ContextProjectionBudgetExceededError,
+  orderContextCompactionProjectionRecords,
+  rebaseSnipBoundariesIntoCompactProjection,
+  splitContextCompactionRecords,
 } from "./context-compaction.service"
 export type {
   ContextCompactionCandidate,
+  ContextCompactionInstallInput,
+  ContextBudgetEnforcement,
+  ContextProjectionBudgetBoundary,
   ContextCompactionPlan,
   ContextCompactionResult,
+  ContextCompactionSplit,
 } from "./context-compaction.service"
 export {
-  ContextHookExecutorService,
-  type PreCompactHookPayload,
-} from "./context-hook-executor.service"
+  buildContextCompactPrompt,
+  CONTEXT_COMPACT_MAX_OUTPUT_TOKENS,
+  formatContextCompactSummary,
+  type ContextCompactionMode,
+} from "./context-compact-prompt"
 export { ContextManagerService } from "./context-manager.service"
 export {
   buildContextProjectionBudgetSignature,
@@ -76,29 +85,27 @@ export type {
   ContextProjectionBudgetSignatureInput,
   ContextTokenizer,
 } from "./context-model-profile"
-export type {
-  ReactiveRecoveryOutcome,
-  ReactiveRecoveryRequest,
-} from "./context-manager.service"
 export { ContextNativeManagementService } from "./context-native-management.service"
 export type {
   AnthropicNativeContextManagementInput,
   ContextNativeEditStrategy,
   ContextNativeManagementConfig,
 } from "./context-native-management.service"
-export {
-  ContextPipeline,
-  ContextPipelineService,
-} from "./context-pipeline.service"
+export { ContextPipeline } from "./context-pipeline.service"
 export { ContextProjectionService } from "./context-projection.service"
+export type { ContextProjectionResult } from "./context-projection.service"
 export { ContextRequestPlannerService } from "./context-request-planner.service"
-export { ReasoningMemoryService } from "./reasoning-memory.service"
+export {
+  requireExactDurableIdentifier,
+  requireOptionalExactDurableIdentifier,
+} from "./durable-identifier"
+export { ReasoningPreambleProjectorService } from "./reasoning-preamble-projector.service"
 export type {
   ReasoningRecord,
-  ReasoningCapture,
   ReasoningPreamble,
   ReasoningPreambleBudget,
-} from "./reasoning-memory.service"
+  ReasoningPreambleBuildInput,
+} from "./reasoning-preamble-projector.service"
 export type {
   ContextProjectionOptions,
   ContextProjectionBudget,
@@ -118,7 +125,6 @@ export {
   createCompactSummaryRecord,
   createAttachmentRecord,
   createHookResultRecord,
-  createContextCollapseSummaryRecord,
   createMicrocompactBoundaryRecord,
   createSnipBoundaryRecord,
   deriveCompactionHistoryFromTranscript,
@@ -130,27 +136,28 @@ export {
   isAttachmentRecord,
   isCompactBoundaryRecord,
   isCompactSummaryRecord,
-  isContextCollapseSummaryRecord,
   isHookResultRecord,
   isMessageRecord,
   isMicrocompactBoundaryRecord,
   isSnipBoundaryRecord,
   projectSnippedView,
-  renderContextCollapseSummary,
   stripInternalContextEvents,
 } from "./context-transcript-events"
 export { ContextUsageLedgerService } from "./context-usage-ledger.service"
-export { SessionMemoryCompactionService } from "./session-memory-compaction.service"
-export type { SessionMemoryBuildOptions } from "./session-memory-compaction.service"
+export { SessionMemoryService } from "./session-memory.service"
 export { TokenCounterService } from "./token-counter.service"
 export { ToolIntegrityService } from "./tool-integrity.service"
 export type { EnforceToolProtocolOptions } from "./tool-integrity.service"
 export { ToolResultStorageService } from "./tool-result-storage.service"
 export type {
   ToolResultStorageProcessInput,
-  ToolResultStorageReadChunkResult,
-  ToolResultStorageWriteResult,
+  ToolResultStorageProcessResult,
 } from "./tool-result-storage.service"
+export {
+  applyToolResultReplacementMutations,
+  createToolResultReplacementMutation,
+  createToolResultSeenMutation,
+} from "./tool-result-replacement-state"
 
 // Round-aware truncation helpers
 export {
@@ -172,19 +179,17 @@ export type { PromptTooLongDetection } from "./prompt-too-long"
 // Sub-agent session-memory formatting (shared by streaming service
 // and compaction-time extraction so the two entry shapes stay aligned)
 export {
-  buildSubAgentMemorySourceCompactionId,
+  buildSubAgentMemorySourceEventId,
+  createSubAgentCompletionArtifact,
   formatSubAgentMemoryBody,
   formatSubAgentMemoryEntry,
+  renderSubAgentCompletionReport,
+  toSubAgentMemoryPayload,
 } from "./sub-agent-memory-formatter"
-// Strips the UI-only sub-agent transcript payload
-// (structuredContent.taskSuccess.conversationSteps) at the
-// state.records → backend-projection boundary so it never enters the
-// request budget. Shared by ContextProjectionService and the send-time
-// backstop in cursor-connect-stream.
-export { stripSubAgentUiOnlyPayload } from "./subagent-ui-payload"
 
 export type {
   SubAgentMemoryFormatInput,
+  SubAgentCompletionArtifact,
   SubAgentMemoryFormatOptions,
 } from "./sub-agent-memory-formatter"
 

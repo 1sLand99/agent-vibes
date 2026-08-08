@@ -5,44 +5,39 @@ import * as path from "path"
 import { getAgentVibesToolResultsDir } from "../shared/agent-vibes-paths"
 import type {
   ContextStoredToolResultReference,
+  ContextToolResultReplacementMutation,
   ContextToolResultReplacementState,
 } from "./types"
+import {
+  createToolResultReplacementMutation,
+  createToolResultSeenMutation,
+} from "./tool-result-replacement-state"
 
 export interface ToolResultStorageProcessInput {
   conversationId?: string
   toolUseId: string
   toolName: string
   content: string
+  /** Read-only state used only to decide the next immutable mutation. */
   replacementState?: ContextToolResultReplacementState
   force?: boolean
   reason?: "per_tool" | "aggregate"
   thresholdChars?: number
 }
 
-export interface ToolResultStorageWriteResult {
+interface ToolResultStorageWriteResult {
   replacement: string
   reference: ContextStoredToolResultReference
 }
 
-export type ToolResultStorageReadChunkResult =
-  | {
-      status: "success"
-      reference: ContextStoredToolResultReference
-      chunk: string
-      chunkNumber: number
-      chunkCount: number
-      nextPosition?: number
-    }
-  | {
-      status: "not_found"
-      documentId: string
-    }
-  | {
-      status: "position_out_of_range"
-      documentId: string
-      requestedPosition: number
-      chunkCount: number
-    }
+export interface ToolResultStorageProcessResult {
+  content: string
+  /**
+   * Semantic mutations to install after the corresponding graph result is
+   * durable. No returned value aliases or mutates `input.replacementState`.
+   */
+  replacementMutations: readonly ContextToolResultReplacementMutation[]
+}
 
 @Injectable()
 export class ToolResultStorageService {
@@ -68,20 +63,29 @@ export class ToolResultStorageService {
   private readonly AGGREGATE_STORE_MIN_CHARS = 2_000
   private readonly METADATA_SUFFIX = ".metadata.json"
 
-  processToolResultForHistory(input: ToolResultStorageProcessInput): string {
+  processToolResultForHistory(
+    input: ToolResultStorageProcessInput
+  ): ToolResultStorageProcessResult {
+    const result = (
+      content: string,
+      replacementMutations: readonly ContextToolResultReplacementMutation[] = []
+    ): ToolResultStorageProcessResult => ({ content, replacementMutations })
     const normalizedContent =
       input.content.trim().length === 0
         ? `(${input.toolName || "tool"} completed with no output)`
         : input.content
 
+    if (!input.toolUseId) {
+      return result(normalizedContent)
+    }
     if (this.isStoredToolResultReferenceContent(normalizedContent)) {
-      return normalizedContent
+      return result(normalizedContent)
     }
 
     const existingReplacement =
       input.replacementState?.replacementByToolUseId?.[input.toolUseId]
     if (existingReplacement) {
-      return existingReplacement
+      return result(existingReplacement)
     }
 
     const threshold = Math.max(
@@ -96,30 +100,43 @@ export class ToolResultStorageService {
         normalizedContent
       )
     ) {
-      this.markSeen(input.replacementState, input.toolUseId)
-      return normalizedContent
+      return result(normalizedContent, [
+        createToolResultSeenMutation(input.toolUseId),
+      ])
     }
 
     if (!input.conversationId || !input.toolUseId || !normalizedContent) {
-      this.markSeen(input.replacementState, input.toolUseId)
-      return normalizedContent
+      return result(normalizedContent, [
+        createToolResultSeenMutation(input.toolUseId),
+      ])
     }
 
     try {
-      return this.store(
+      const stored = this.store(
         input.conversationId,
         input.toolUseId,
         input.toolName,
-        normalizedContent,
-        input.replacementState,
-        { reason: input.reason || "per_tool" }
-      ).replacement
+        normalizedContent
+      )
+      return result(stored.replacement, [
+        createToolResultReplacementMutation({
+          toolUseId: input.toolUseId,
+          replacement: stored.replacement,
+          projectionVersion: 1,
+          provider: "claude",
+          documentId: stored.reference.documentId,
+          storedReference: stored.reference,
+          reason: input.reason || "per_tool",
+          createdAt: stored.reference.createdAt,
+        }),
+      ])
     } catch (error) {
       this.logger.warn(
         `Failed to store tool result ${input.toolUseId}: ${String(error)}`
       )
-      this.markSeen(input.replacementState, input.toolUseId)
-      return normalizedContent
+      return result(normalizedContent, [
+        createToolResultSeenMutation(input.toolUseId),
+      ])
     }
   }
 
@@ -135,21 +152,51 @@ export class ToolResultStorageService {
     return !!absolutePath && fs.existsSync(absolutePath)
   }
 
-  isToolResultDocumentId(documentId: string): boolean {
-    return documentId.startsWith("tool_result:")
+  /**
+   * Exact archived tool-result content files for one conversation. Metadata
+   * siblings and unrelated directories are never included — read admission is
+   * file-exact, matching Cursor managed plan reads.
+   */
+  listExactReadableArchivePaths(conversationId: string): readonly string[] {
+    if (!conversationId.trim()) return Object.freeze([])
+    const conversationDir = path.join(
+      this.getStorageRoot(),
+      this.sanitizePathSegment(conversationId)
+    )
+    let entries: string[]
+    try {
+      if (!fs.existsSync(conversationDir)) return Object.freeze([])
+      entries = fs.readdirSync(conversationDir)
+    } catch (error) {
+      this.logger.warn(
+        `Failed to enumerate tool-result archives for ${conversationId}: ${String(error)}`
+      )
+      return Object.freeze([])
+    }
+    const paths: string[] = []
+    for (const entry of entries) {
+      if (entry.endsWith(this.METADATA_SUFFIX)) continue
+      if (!entry.endsWith(".txt") && !entry.endsWith(".json")) continue
+      const absolutePath = path.join(conversationDir, entry)
+      try {
+        if (!fs.statSync(absolutePath).isFile()) continue
+      } catch {
+        continue
+      }
+      paths.push(absolutePath)
+    }
+    return Object.freeze(paths)
   }
 
   buildDocumentId(toolUseId: string): string {
     return `tool_result:${toolUseId}`
   }
 
-  store(
+  private store(
     conversationId: string,
     toolUseId: string,
     toolName: string,
-    content: string,
-    replacementState?: ContextToolResultReplacementState,
-    options?: { reason?: "per_tool" | "aggregate" }
+    content: string
   ): ToolResultStorageWriteResult {
     const storageRoot = this.getStorageRoot()
     const safeConversationId = this.sanitizePathSegment(conversationId)
@@ -192,69 +239,7 @@ export class ToolResultStorageService {
       preview,
       hasMore
     )
-    this.recordReplacement(
-      replacementState,
-      toolUseId,
-      replacement,
-      reference,
-      options?.reason
-    )
     return { replacement, reference }
-  }
-
-  readChunk(
-    conversationId: string,
-    documentId: string,
-    requestedPosition: number,
-    storedByToolUseId?: Record<string, ContextStoredToolResultReference>
-  ): ToolResultStorageReadChunkResult {
-    if (!this.isToolResultDocumentId(documentId)) {
-      return { status: "not_found", documentId }
-    }
-
-    const toolUseId = documentId.slice("tool_result:".length)
-    const reference =
-      storedByToolUseId?.[toolUseId] ||
-      this.resolveStoredReference(conversationId, toolUseId)
-    if (!reference) {
-      return { status: "not_found", documentId }
-    }
-
-    const absolutePath = this.pathForReference(reference)
-    if (!absolutePath || !fs.existsSync(absolutePath)) {
-      return { status: "not_found", documentId }
-    }
-
-    const content = fs.readFileSync(absolutePath, "utf8")
-    const chunkSize = Math.max(1, reference.chunkSize || this.CHUNK_SIZE)
-    const chunkCount = Math.max(1, Math.ceil(content.length / chunkSize))
-    const chunkIndex = requestedPosition <= 0 ? 0 : requestedPosition - 1
-    if (chunkIndex < 0 || chunkIndex >= chunkCount) {
-      return {
-        status: "position_out_of_range",
-        documentId,
-        requestedPosition,
-        chunkCount,
-      }
-    }
-
-    const chunkNumber = chunkIndex + 1
-    return {
-      status: "success",
-      reference: {
-        ...reference,
-        chunkCount,
-        originalSizeChars: content.length,
-        originalLineCount: this.countLines(content),
-      },
-      chunk: content.slice(
-        chunkIndex * chunkSize,
-        (chunkIndex + 1) * chunkSize
-      ),
-      chunkNumber,
-      chunkCount,
-      nextPosition: chunkNumber < chunkCount ? chunkNumber + 1 : undefined,
-    }
   }
 
   deleteConversation(conversationId: string): void {
@@ -312,10 +297,6 @@ export class ToolResultStorageService {
     return { clearedDirCount }
   }
 
-  private isStoredToolResultReferenceContent(content: string): boolean {
-    return content.includes("[tool_result stored]")
-  }
-
   private shouldStoreAggregateResult(
     replacementState: ContextToolResultReplacementState | undefined,
     content: string
@@ -324,14 +305,8 @@ export class ToolResultStorageService {
     return seenCount >= 3 && content.length > this.AGGREGATE_STORE_MIN_CHARS
   }
 
-  private markSeen(
-    replacementState: ContextToolResultReplacementState | undefined,
-    toolUseId: string
-  ): void {
-    if (!replacementState || !toolUseId) return
-    const seen = new Set(replacementState.seenToolUseIds || [])
-    seen.add(toolUseId)
-    replacementState.seenToolUseIds = Array.from(seen)
+  private isStoredToolResultReferenceContent(content: string): boolean {
+    return content.includes("[tool_result stored]")
   }
 
   private getStorageRoot(): string {
@@ -512,16 +487,11 @@ export class ToolResultStorageService {
     ]
 
     if (reference.chunkCount > 1) {
-      // The full output was archived to disk; this hint must NOT name a
-      // specific "continue reading" tool. The bridge-internal documentId
-      // (`tool_result:<toolUseId>`) is not addressable by Antigravity's
-      // `view_content_chunk` (which only knows DocumentIds produced by
-      // `read_url_content`), and Cursor's protocol has no chunk-readout
-      // tool at all. Surface the fact ("archived, N chunks") and tell the
-      // model to re-invoke the original tool if it needs to look again —
-      // this is the only continuation that is correct on every backend.
+      // Archived spill files are exact session-readable paths. Prefer the
+      // preview, and only read StoredPath when more of this same archive is
+      // required — never re-issue the same broad tool call.
       lines.push(
-        `Note: this tool's full output (${reference.originalSizeChars} chars, ${reference.chunkCount} chunks) was archived on disk. To re-examine the full content, re-invoke the same tool with the same arguments; the bridge will return a fresh result.`
+        `Note: this tool's full output (${reference.originalSizeChars} chars, ${reference.chunkCount} chunks) was archived. Continue from the preview when possible. If more of this archived output is required, use read_file on StoredPath with a focused range; do not repeat the same broad invocation.`
       )
     }
 
@@ -532,48 +502,5 @@ export class ToolResultStorageService {
       lines.push("...")
     }
     return lines.join("\n")
-  }
-
-  private recordReplacement(
-    replacementState: ContextToolResultReplacementState | undefined,
-    toolUseId: string,
-    replacement: string,
-    reference: ContextStoredToolResultReference,
-    reason: "per_tool" | "aggregate" | undefined
-  ): void {
-    if (!replacementState) return
-
-    const seen = new Set(replacementState.seenToolUseIds || [])
-    seen.add(toolUseId)
-    replacementState.seenToolUseIds = Array.from(seen)
-    replacementState.replacementByToolUseId = {
-      ...(replacementState.replacementByToolUseId || {}),
-      [toolUseId]: replacement,
-    }
-    replacementState.storedByToolUseId = {
-      ...(replacementState.storedByToolUseId || {}),
-      [toolUseId]: reference,
-    }
-    const existingRecords = replacementState.records || []
-    if (
-      !existingRecords.some(
-        (record) =>
-          record.kind === "tool-result" &&
-          record.toolUseId === toolUseId &&
-          record.replacement === replacement
-      )
-    ) {
-      replacementState.records = [
-        ...existingRecords,
-        {
-          kind: "tool-result",
-          toolUseId,
-          replacement,
-          documentId: reference.documentId,
-          reason,
-          createdAt: reference.createdAt,
-        },
-      ]
-    }
   }
 }

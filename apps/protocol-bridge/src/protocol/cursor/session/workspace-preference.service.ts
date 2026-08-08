@@ -1,7 +1,12 @@
 import { Inject, Injectable } from "@nestjs/common"
 import type { StatementSync } from "node:sqlite"
+import { requireExactDurableIdentifier } from "../../../context/durable-identifier"
 import { PersistenceService } from "../../../persistence"
 import type { ParsedCursorRequest } from "../tools/cursor-request-parser"
+import {
+  ConversationId,
+  type ConversationId as ConversationIdType,
+} from "../turn/turn.types"
 import {
   WorkspacePreferenceRegistry,
   type RegisteredWorkspaceFolder,
@@ -28,17 +33,23 @@ export class SqliteWorkspacePreferenceRepository implements WorkspacePreferenceR
 
   constructor(private readonly persistence: WorkspacePreferencePersistence) {}
 
-  get(composerId: string): WorkspacePreferenceRecord | undefined {
+  get(composerId: ConversationIdType): WorkspacePreferenceRecord | undefined {
+    const exactComposerId = ConversationId.of(composerId)
     const statement = (this.getStatement ??= this.persistence.database.prepare(
       `SELECT composer_id, workspace_key, folder_uri, folder_path, updated_at
          FROM workspace_preferences
         WHERE composer_id = ?`
     ))
-    const row = statement.get(composerId) as WorkspacePreferenceRow | undefined
+    const row = statement.get(exactComposerId) as
+      | WorkspacePreferenceRow
+      | undefined
     if (!row) return undefined
     return {
-      composerId: row.composer_id,
-      workspaceKey: row.workspace_key,
+      composerId: ConversationId.of(row.composer_id),
+      workspaceKey: requireExactDurableIdentifier(
+        row.workspace_key,
+        "workspace preference workspaceKey"
+      ),
       folderUri: row.folder_uri,
       folderPath: row.folder_path,
       updatedAt: row.updated_at,
@@ -46,6 +57,11 @@ export class SqliteWorkspacePreferenceRepository implements WorkspacePreferenceR
   }
 
   upsert(record: WorkspacePreferenceRecord): void {
+    const composerId = ConversationId.of(record.composerId)
+    const workspaceKey = requireExactDurableIdentifier(
+      record.workspaceKey,
+      "workspace preference workspaceKey"
+    )
     const statement = (this.upsertStatement ??=
       this.persistence.database.prepare(
         `INSERT INTO workspace_preferences (
@@ -58,8 +74,8 @@ export class SqliteWorkspacePreferenceRepository implements WorkspacePreferenceR
          updated_at = excluded.updated_at`
       ))
     statement.run(
-      record.composerId,
-      record.workspaceKey,
+      composerId,
+      workspaceKey,
       record.folderUri,
       record.folderPath,
       record.updatedAt
@@ -113,6 +129,9 @@ export class WorkspacePreferenceService {
     conversationId: string,
     request: ParsedCursorRequest
   ): ParsedCursorRequest {
-    return this.registry.applyToRequest(conversationId, request)
+    return this.registry.applyToRequest(
+      ConversationId.of(conversationId),
+      request
+    )
   }
 }

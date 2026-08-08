@@ -44,9 +44,20 @@ import {
   BackendApiError,
 } from "../shared/backend-errors"
 import {
+  classifyBackendError,
+  RETRY_POLICY,
+  type BackendErrorClass,
+} from "../shared/backend-error-class"
+import {
   BackendPoolEntryState,
   BackendPoolStatus,
 } from "../shared/backend-pool-status"
+import {
+  assertProviderPhysicalDispatch,
+  isProviderAttemptRetryableError,
+  ProviderAttemptRetryableError,
+  type ProviderPhysicalDispatch,
+} from "../shared/provider-physical-dispatch"
 import { sanitizeOpenAiChatToolCallIntegrity } from "../shared/openai-tool-call-integrity"
 import { resolveThinkingIntentFromDto } from "../shared/thinking-intent"
 import { adaptAnthropicMessageToCodexExecutionRequest } from "../../protocol/anthropic/codex-request-adapter"
@@ -397,6 +408,8 @@ interface OpenaiCompatAccount extends CooldownableAccount {
   stateKey: string
 }
 
+type OpenaiCompatEndpoint = "responses" | "chat-completions"
+
 type PersistedOpenaiCompatAccountState = PersistedBackendAccountState
 
 interface OpenaiCompatAccountFileEntry {
@@ -427,7 +440,8 @@ export class OpenaiCompatService implements OnModuleInit {
 
   /**
    * Responses API routing mode:
-   * - "auto": Try Chat Completions first, fallback to Responses API on 503/provider errors (default)
+   * - "auto": Select Chat Completions by default and learn endpoint health
+   *   for a future physical attempt (default)
    * - "always": Always use Responses API for reasoning models
    * - "never": Only use Chat Completions
    */
@@ -435,8 +449,8 @@ export class OpenaiCompatService implements OnModuleInit {
 
   /**
    * Per-model endpoint preference cache.
-   * When auto mode detects a 503 on Chat Completions and succeeds with Responses API,
-   * it remembers this for subsequent requests to avoid repeated fallback overhead.
+   * When auto mode observes a completed physical attempt, it remembers the
+   * endpoint selection for later attempts.
    * Explicit per-account overrides are not learned into this cache.
    * Key: model name (lowercase), Value: "responses" | "chat-completions"
    */
@@ -463,10 +477,6 @@ export class OpenaiCompatService implements OnModuleInit {
       .update("\0")
       .update(apiKey)
       .digest("hex")
-  }
-
-  private configureAccountStateStore(_configPath?: string | null): void {
-    // No-op: PersistenceService handles the unified DB path.
   }
 
   private normalizeMaxContextTokens(value: unknown): number | undefined {
@@ -714,13 +724,13 @@ export class OpenaiCompatService implements OnModuleInit {
     statusCode: number,
     detail: string,
     model?: string,
-    retryAfterHeader?: string,
-    suppressTemporaryState: boolean = false
+    retryAfterHeader?: string
   ): BackendApiError {
     const permanent = this.shouldDisableAccountPermanently(statusCode, detail)
+    const errorClass = this.classifyOpenAiCompatHttpFailure(statusCode, detail)
     if (permanent) {
       this.disableAccountPermanently(account, statusCode, detail)
-    } else if (!suppressTemporaryState) {
+    } else {
       this.markAccountTemporaryFailure(
         account,
         statusCode,
@@ -735,6 +745,7 @@ export class OpenaiCompatService implements OnModuleInit {
         backend: "openai-compat",
         statusCode,
         permanent,
+        errorClass,
       }
     )
   }
@@ -749,15 +760,28 @@ export class OpenaiCompatService implements OnModuleInit {
     return new BackendApiError(message, {
       backend: "openai-compat",
       statusCode,
+      errorClass: statusCode >= 500 ? "transient_5xx" : "transient_network",
     })
   }
 
-  private parsePositiveTimeoutMs(envName: string, fallbackMs: number): number {
+  private classifyOpenAiCompatHttpFailure(
+    statusCode: number,
+    detail: string
+  ): BackendErrorClass {
+    return classifyBackendError(
+      new BackendApiError(detail, {
+        backend: "openai-compat",
+        statusCode,
+      })
+    )
+  }
+
+  private parsePositiveTimeoutMs(envName: string, defaultMs: number): number {
     const raw = this.configService.get<string>(envName, "").trim()
-    if (!raw) return fallbackMs
+    if (!raw) return defaultMs
 
     const parsed = Number.parseInt(raw, 10)
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackMs
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultMs
   }
 
   private getStreamResponseHeadersTimeoutMs(): number {
@@ -855,7 +879,7 @@ export class OpenaiCompatService implements OnModuleInit {
       this.accounts = fileAccounts
     }
 
-    // 2. Env vars as fallback / additional account
+    // 2. Env vars as an additional account source
     const envApiKey = this.configService
       .get<string>("OPENAI_COMPAT_API_KEY", "")
       .trim()
@@ -888,7 +912,6 @@ export class OpenaiCompatService implements OnModuleInit {
       }
     }
 
-    this.configureAccountStateStore(this.accountsConfigPath)
     const persistedStates = this.loadPersistedAccountStates()
     for (const account of this.accounts) {
       this.applyPersistedAccountState(
@@ -958,7 +981,6 @@ export class OpenaiCompatService implements OnModuleInit {
         ) as OpenaiCompatConfigFile
         if (Array.isArray(data.accounts) && data.accounts.length > 0) {
           this.accountsConfigPath = configPath
-          this.configureAccountStateStore(configPath)
           this.logger.log(
             `Loaded ${data.accounts.length} OpenAI-compat account(s) from ${configPath}`
           )
@@ -1574,144 +1596,6 @@ export class OpenaiCompatService implements OnModuleInit {
     }
   }
 
-  // ── Simple streaming completion (no Anthropic translation) ──────────
-
-  /**
-   * Stream a simple chat completion request directly, yielding text deltas.
-   * Used for non-chat features like diff review that don't need Anthropic translation.
-   */
-  async *streamSimpleCompletion(
-    model: string,
-    messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
-    options?: { temperature?: number; max_tokens?: number }
-  ): AsyncGenerator<string> {
-    if (!this.isAvailable()) {
-      throw new Error("OpenAI-compatible backend not configured")
-    }
-
-    const account = this.nextAccount(model)
-    const url = this.buildUrlForAccount(account)
-    const headers = this.buildHeadersForAccount(account, true)
-    const body: ChatCompletionRequest = {
-      model,
-      messages,
-      stream: true,
-      stream_options: { include_usage: true },
-    }
-    if (options?.temperature != null) body.temperature = options.temperature
-    if (options?.max_tokens != null) body.max_tokens = options.max_tokens
-
-    const fetchOptions: RequestInit & { dispatcher?: unknown } = {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    }
-    const agent = this.buildProxyAgentForAccount(account)
-    if (agent) {
-      fetchOptions.dispatcher = agent
-    }
-
-    this.logger.log(
-      `[SimpleCompletion] Streaming request to ${url} (model=${model})`
-    )
-
-    const responseHeadersTimeoutMs = this.getStreamResponseHeadersTimeoutMs()
-    let response: Response
-    try {
-      response = await this.fetchWithResponseHeadersTimeout(
-        url,
-        fetchOptions,
-        responseHeadersTimeoutMs,
-        `OpenAI-compatible stream timed out waiting for upstream response headers after ${responseHeadersTimeoutMs}ms`
-      )
-    } catch (error) {
-      throw this.buildTransientFailureError(
-        account,
-        504,
-        error instanceof Error ? error.message : String(error),
-        model
-      )
-    }
-
-    if (!response.ok) {
-      const errorBody = await response.text()
-      throw this.buildHttpFailureError(
-        account,
-        response.status,
-        errorBody,
-        model,
-        response.headers.get("retry-after") || undefined
-      )
-    }
-
-    const reader = response.body?.getReader()
-    if (!reader) {
-      throw this.buildTransientFailureError(
-        account,
-        502,
-        "OpenAI-compatible response has no body reader",
-        model
-      )
-    }
-
-    const decoder = new TextDecoder()
-    let buffer = ""
-    const firstChunkTimeoutMs = this.getStreamFirstChunkTimeoutMs()
-    const idleTimeoutMs = this.getStreamIdleTimeoutMs()
-    let receivedChunk = false
-
-    try {
-      while (true) {
-        const { done, value } = await this.readStreamChunkWithTimeout(
-          reader,
-          receivedChunk ? idleTimeoutMs : firstChunkTimeoutMs,
-          receivedChunk
-            ? "OpenAI-compatible stream timed out while waiting for the next SSE chunk"
-            : `OpenAI-compatible stream timed out waiting for the first SSE chunk after ${firstChunkTimeoutMs}ms`
-        )
-        if (done) break
-        receivedChunk = true
-
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split("\n")
-        buffer = lines.pop() || ""
-
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (!trimmed.startsWith("data: ")) continue
-          const data = trimmed.slice(6)
-          if (data === "[DONE]") return
-
-          try {
-            const parsed = JSON.parse(data) as {
-              choices?: Array<{ delta?: { content?: string } }>
-            }
-            const content = parsed.choices?.[0]?.delta?.content
-            if (content) yield content
-          } catch {
-            // skip malformed chunks
-          }
-        }
-      }
-      this.markAccountHealthy(account, model)
-    } catch (error) {
-      if (
-        error instanceof BackendApiError ||
-        error instanceof BackendAccountPoolUnavailableError
-      ) {
-        throw error
-      }
-      throw this.buildTransientFailureError(
-        account,
-        504,
-        error instanceof Error ? error.message : String(error),
-        model
-      )
-    } finally {
-      reader.releaseLock()
-    }
-  }
-
   // ── URL builder ──────────────────────────────────────────────────────
 
   private buildUrlForAccount(account: OpenaiCompatAccount): string {
@@ -1737,7 +1621,7 @@ export class OpenaiCompatService implements OnModuleInit {
   private resolveEndpoint(
     model: string,
     account?: OpenaiCompatAccount
-  ): "responses" | "chat-completions" {
+  ): OpenaiCompatEndpoint {
     const normalizedModel = model.toLowerCase().trim()
 
     // Per-account override: preferResponsesApi takes highest priority
@@ -1767,7 +1651,7 @@ export class OpenaiCompatService implements OnModuleInit {
    */
   private recordEndpointSuccess(
     model: string,
-    endpoint: "responses" | "chat-completions",
+    endpoint: OpenaiCompatEndpoint,
     account?: OpenaiCompatAccount
   ): void {
     if (this.responsesApiMode !== "auto") return
@@ -1784,64 +1668,161 @@ export class OpenaiCompatService implements OnModuleInit {
   }
 
   /**
-   * Check if an error from Chat Completions should trigger Responses API fallback.
+   * Register an endpoint-specific incompatibility for the next physical
+   * attempt. This never sends another request from the current transport.
    */
-  private shouldFallbackToResponsesApi(
-    status: number,
-    errorBody: string,
-    model: string
-  ): boolean {
-    if (this.responsesApiMode === "never") return false
-    if (!this.isResponsesApiEligible(model)) return false
-
-    // 503 with "no_available_providers" is the classic case
-    if (status === 503) return true
-    // 404 could mean endpoint not found for the model
-    if (status === 404) return true
-    // Some providers return 400 for unsupported model on chat/completions
-    if (status === 400 && errorBody.includes("model")) return true
-
-    return false
-  }
-
-  private getBackendErrorStatus(error: unknown): number {
-    if (
-      error instanceof BackendApiError &&
-      typeof error.statusCode === "number"
-    ) {
-      return error.statusCode
-    }
-
-    const errorMsg =
-      error instanceof Error ? error.message || "" : String(error)
-    const statusMatch = errorMsg.match(/API error (\d+)/)
-    return statusMatch ? parseInt(statusMatch[1]!, 10) : 0
-  }
-
-  private shouldFallbackToChatCompletionsApi(
+  private recordEndpointFailure(
     error: unknown,
-    model: string
+    endpoint: OpenaiCompatEndpoint,
+    model: string,
+    account: OpenaiCompatAccount
   ): boolean {
-    if (this.responsesApiMode === "always") return false
+    if (this.responsesApiMode !== "auto") return false
     if (!this.isResponsesApiEligible(model)) return false
+    if (account.preferResponsesApi) return false
     if (error instanceof BackendAccountPoolUnavailableError) return false
     if (error instanceof BackendApiError && error.permanent) return false
 
-    const status = this.getBackendErrorStatus(error)
+    const status =
+      error instanceof BackendApiError && typeof error.statusCode === "number"
+        ? error.statusCode
+        : 0
     const message =
       error instanceof Error ? error.message.toLowerCase() : String(error)
 
-    if (status === 503 || status === 501 || status === 404) return true
-    if (
-      status === 400 &&
-      /model|unsupported|unknown parameter|response format|reasoning/.test(
-        message
+    const incompatible =
+      endpoint === "chat-completions"
+        ? status === 503 ||
+          status === 404 ||
+          (status === 400 && message.includes("model"))
+        : status === 503 ||
+          status === 501 ||
+          status === 404 ||
+          (status === 400 &&
+            /model|unsupported|unknown parameter|response format|reasoning/.test(
+              message
+            ))
+    if (!incompatible) return false
+
+    const nextEndpoint: OpenaiCompatEndpoint =
+      endpoint === "responses" ? "chat-completions" : "responses"
+    const normalizedModel = model.toLowerCase().trim()
+    if (this.endpointPreference.get(normalizedModel) !== nextEndpoint) {
+      this.endpointPreference.set(normalizedModel, nextEndpoint)
+      this.logger.warn(
+        `[OpenAI-Compat] Marked ${endpoint} unsuitable for ${model}; next physical attempt will select ${nextEndpoint}`
       )
-    ) {
-      return true
+    }
+    return true
+  }
+
+  private assertOpenAiCompatPhysicalDispatch(
+    dispatch: ProviderPhysicalDispatch<CreateMessageDto>,
+    label: string
+  ): void {
+    assertProviderPhysicalDispatch({
+      dispatch,
+      backend: "openai-compat",
+      label,
+    })
+    if (dispatch.request.model !== dispatch.attempt.model) {
+      throw new Error(
+        `${label} request model does not match its physical attempt model`
+      )
+    }
+  }
+
+  private toRetryableOpenAiCompatPhysicalFailure(
+    error: unknown,
+    account: OpenaiCompatAccount,
+    endpoint: OpenaiCompatEndpoint,
+    model: string
+  ): ProviderAttemptRetryableError {
+    if (isProviderAttemptRetryableError(error)) {
+      return error
     }
 
-    return false
+    const endpointReplanned = this.recordEndpointFailure(
+      error,
+      endpoint,
+      model,
+      account
+    )
+    const errorClass = this.classifyOpenAiCompatPhysicalFailure(error)
+    const policy = RETRY_POLICY[errorClass]
+    if (
+      !endpointReplanned &&
+      !policy.retryableSameRequest &&
+      !policy.retryableDifferentAccount
+    ) {
+      throw error
+    }
+
+    this.markOpenAiCompatPhysicalFailureIfNeeded(
+      error,
+      account,
+      model,
+      errorClass
+    )
+    const statusCode =
+      error instanceof BackendApiError ? error.statusCode : undefined
+    return new ProviderAttemptRetryableError(
+      `OpenAI-compatible ${endpoint} physical dispatch failed before acceptance: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      {
+        backend: "openai-compat",
+        errorClass,
+        statusCode,
+        retryAfterMs: this.getOpenAiCompatRetryAfterMs(account, error),
+        maxRetries: endpointReplanned
+          ? Math.max(1, policy.maxRetries)
+          : policy.maxRetries,
+      }
+    )
+  }
+
+  private classifyOpenAiCompatPhysicalFailure(
+    error: unknown
+  ): BackendErrorClass {
+    if (error instanceof BackendApiError && error.errorClass) {
+      return error.errorClass
+    }
+    return classifyBackendError(error)
+  }
+
+  private markOpenAiCompatPhysicalFailureIfNeeded(
+    error: unknown,
+    account: OpenaiCompatAccount,
+    model: string,
+    errorClass: BackendErrorClass = this.classifyOpenAiCompatPhysicalFailure(
+      error
+    )
+  ): void {
+    if (error instanceof BackendApiError || errorClass === "client_aborted") {
+      return
+    }
+    if (errorClass === "transient_network" || errorClass === "transient_5xx") {
+      this.markAccountTemporaryFailure(
+        account,
+        errorClass === "transient_network" ? 504 : 502,
+        model
+      )
+    }
+  }
+
+  private getOpenAiCompatRetryAfterMs(
+    account: OpenaiCompatAccount,
+    error: unknown
+  ): number | undefined {
+    const fromError =
+      error instanceof BackendApiError &&
+      typeof error.retryAfterSeconds === "number"
+        ? Math.max(0, Math.ceil(error.retryAfterSeconds * 1_000))
+        : undefined
+    const fromCooldown = Math.max(0, account.cooldownUntil - Date.now())
+    const retryAfterMs = Math.max(fromError ?? 0, fromCooldown)
+    return retryAfterMs > 0 ? retryAfterMs : undefined
   }
 
   // ── Headers ──────────────────────────────────────────────────────────
@@ -1861,64 +1842,37 @@ export class OpenaiCompatService implements OnModuleInit {
 
   // ── Non-streaming ────────────────────────────────────────────────────
 
-  /**
-   * Send a non-streaming message through the OpenAI-compatible backend.
-   */
-  async sendClaudeMessage(dto: CreateMessageDto): Promise<AnthropicResponse> {
+  /** Send one immutable physical request through one selected endpoint. */
+  async sendClaudeMessage(
+    dispatch: ProviderPhysicalDispatch<CreateMessageDto>
+  ): Promise<AnthropicResponse> {
+    this.assertOpenAiCompatPhysicalDispatch(
+      dispatch,
+      "OpenAI-compatible message dispatch"
+    )
     if (!this.isAvailable()) {
       throw new Error(
         "OpenAI-compatible backend not configured: missing API key or base URL"
       )
     }
 
-    const account = this.nextAccount(dto.model)
-    const endpoint = this.resolveEndpoint(dto.model, account)
-
-    if (endpoint === "responses") {
-      try {
-        const result = await this.sendClaudeMessageViaResponses(
-          dto,
-          account,
-          this.responsesApiMode !== "always"
-        )
-        this.recordEndpointSuccess(dto.model, "responses", account)
-        return result
-      } catch (e) {
-        if (!this.shouldFallbackToChatCompletionsApi(e, dto.model)) {
-          throw e
-        }
-        this.logger.warn(
-          `[OpenAI-Compat] Responses API failed for ${dto.model}, trying Chat Completions: ${(e as Error).message?.slice(0, 100)}`
-        )
-      }
-    }
-
-    // Try Chat Completions
+    const dto = dispatch.request
+    const account = this.nextAccount(dispatch.attempt.model)
+    const endpoint = this.resolveEndpoint(dispatch.attempt.model, account)
     try {
-      const result = await this.sendClaudeMessageViaChatCompletions(
-        dto,
-        account,
-        endpoint !== "responses"
-      )
-      this.recordEndpointSuccess(dto.model, "chat-completions", account)
+      const result =
+        endpoint === "responses"
+          ? await this.sendClaudeMessageViaResponses(dto, account)
+          : await this.sendClaudeMessageViaChatCompletions(dto, account)
+      this.recordEndpointSuccess(dto.model, endpoint, account)
       return result
-    } catch (e) {
-      // Check if we should fallback to Responses API
-      const errorMsg = (e as Error).message || ""
-      const status = this.getBackendErrorStatus(e)
-
-      if (
-        endpoint !== "responses" &&
-        this.shouldFallbackToResponsesApi(status, errorMsg, dto.model)
-      ) {
-        this.logger.warn(
-          `[OpenAI-Compat] Chat Completions returned ${status} for ${dto.model}, falling back to Responses API`
-        )
-        const result = await this.sendClaudeMessageViaResponses(dto, account)
-        this.recordEndpointSuccess(dto.model, "responses", account)
-        return result
-      }
-      throw e
+    } catch (error) {
+      throw this.toRetryableOpenAiCompatPhysicalFailure(
+        error,
+        account,
+        endpoint,
+        dto.model
+      )
     }
   }
 
@@ -1927,8 +1881,7 @@ export class OpenaiCompatService implements OnModuleInit {
    */
   private async sendClaudeMessageViaChatCompletions(
     dto: CreateMessageDto,
-    account: OpenaiCompatAccount = this.nextAccount(dto.model),
-    suppressCooldownForResponsesFallback: boolean = false
+    account: OpenaiCompatAccount
   ): Promise<AnthropicResponse> {
     const requestStartedAt = Date.now()
     const request = this.translateRequest(dto, false)
@@ -1973,13 +1926,7 @@ export class OpenaiCompatService implements OnModuleInit {
         response.status,
         errorBody,
         request.model,
-        response.headers.get("retry-after") || undefined,
-        suppressCooldownForResponsesFallback &&
-          this.shouldFallbackToResponsesApi(
-            response.status,
-            errorBody,
-            request.model
-          )
+        response.headers.get("retry-after") || undefined
       )
     }
 
@@ -2087,97 +2034,56 @@ export class OpenaiCompatService implements OnModuleInit {
    * Returns an async generator yielding Claude SSE event strings.
    */
   async *sendClaudeMessageStream(
-    dto: CreateMessageDto,
+    dispatch: ProviderPhysicalDispatch<CreateMessageDto>,
     abortSignal?: AbortSignal
   ): AsyncGenerator<string, void, unknown> {
+    this.assertOpenAiCompatPhysicalDispatch(
+      dispatch,
+      "OpenAI-compatible stream dispatch"
+    )
     if (!this.isAvailable()) {
       throw new Error(
         "OpenAI-compatible backend not configured: missing API key or base URL"
       )
     }
 
-    const account = this.nextAccount(dto.model)
-    const endpoint = this.resolveEndpoint(dto.model, account)
-
-    if (endpoint === "responses") {
-      let emittedResponsesEvents = false
-      try {
-        for await (const event of this.sendClaudeMessageStreamViaResponses(
-          dto,
-          account,
-          this.responsesApiMode !== "always",
-          abortSignal
-        )) {
-          emittedResponsesEvents = true
-          yield event
-        }
-        this.recordEndpointSuccess(dto.model, "responses", account)
-        return
-      } catch (e) {
-        const abortedError = toUpstreamRequestAbortedError(
-          e,
-          abortSignal,
-          "OpenAI-compatible stream aborted"
-        )
-        if (abortedError) {
-          throw abortedError
-        }
-        if (
-          emittedResponsesEvents ||
-          !this.shouldFallbackToChatCompletionsApi(e, dto.model)
-        ) {
-          throw e
-        }
-        this.logger.warn(
-          `[OpenAI-Compat] Responses API stream failed for ${dto.model}, trying Chat Completions: ${(e as Error).message?.slice(0, 100)}`
-        )
-      }
-    }
-
-    // Try Chat Completions with fallback
-    let emittedChatEvents = false
+    const dto = dispatch.request
+    const account = this.nextAccount(dispatch.attempt.model)
+    const endpoint = this.resolveEndpoint(dispatch.attempt.model, account)
     try {
-      for await (const event of this.sendClaudeMessageStreamViaChatCompletions(
-        dto,
-        account,
-        endpoint !== "responses",
-        abortSignal
-      )) {
-        emittedChatEvents = true
+      const stream =
+        endpoint === "responses"
+          ? this.sendClaudeMessageStreamViaResponses(dto, account, abortSignal)
+          : this.sendClaudeMessageStreamViaChatCompletions(
+              dto,
+              account,
+              abortSignal
+            )
+      for await (const event of stream) {
         yield event
       }
-      this.recordEndpointSuccess(dto.model, "chat-completions", account)
-    } catch (e) {
+      if (!dispatch.lifecycle.acceptanceStarted) {
+        throw new BackendApiError(
+          "OpenAI-compatible stream completed before its semantic response boundary",
+          { backend: "openai-compat", statusCode: 502 }
+        )
+      }
+      this.recordEndpointSuccess(dto.model, endpoint, account)
+    } catch (error) {
       const abortedError = toUpstreamRequestAbortedError(
-        e,
+        error,
         abortSignal,
         "OpenAI-compatible stream aborted"
       )
       if (abortedError) {
         throw abortedError
       }
-
-      const errorMsg = (e as Error).message || ""
-      const status = this.getBackendErrorStatus(e)
-
-      if (
-        !emittedChatEvents &&
-        endpoint !== "responses" &&
-        this.shouldFallbackToResponsesApi(status, errorMsg, dto.model)
-      ) {
-        this.logger.warn(
-          `[OpenAI-Compat] Chat Completions stream returned ${status} for ${dto.model}, falling back to Responses API`
-        )
-        yield* this.sendClaudeMessageStreamViaResponses(
-          dto,
-          account,
-          false,
-          abortSignal
-        )
-        this.recordEndpointSuccess(dto.model, "responses", account)
-        return
-      }
-      throw e
+      throw this.toRetryableOpenAiCompatPhysicalFailure(
+        error,
+        account,
+        endpoint,
+        dto.model
+      )
     }
   }
 
@@ -2186,8 +2092,7 @@ export class OpenaiCompatService implements OnModuleInit {
    */
   private async *sendClaudeMessageStreamViaChatCompletions(
     dto: CreateMessageDto,
-    account: OpenaiCompatAccount = this.nextAccount(dto.model),
-    suppressCooldownForResponsesFallback: boolean = false,
+    account: OpenaiCompatAccount,
     abortSignal?: AbortSignal
   ): AsyncGenerator<string, void, unknown> {
     const requestStartedAt = Date.now()
@@ -2248,13 +2153,7 @@ export class OpenaiCompatService implements OnModuleInit {
         response.status,
         errorBody,
         request.model,
-        response.headers.get("retry-after") || undefined,
-        suppressCooldownForResponsesFallback &&
-          this.shouldFallbackToResponsesApi(
-            response.status,
-            errorBody,
-            request.model
-          )
+        response.headers.get("retry-after") || undefined
       )
     }
 
@@ -2841,7 +2740,7 @@ export class OpenaiCompatService implements OnModuleInit {
   }
 
   /**
-   * Emit final stream end events (fallback if finish_reason was missed).
+   * Emit final stream end events when the upstream omitted finish_reason.
    */
   private *emitStreamEnd(state: StreamState): Generator<string, void, unknown> {
     const pendingTaggedContent = this.flushPendingTaggedContent(state)
@@ -2881,8 +2780,7 @@ export class OpenaiCompatService implements OnModuleInit {
    */
   private async *sendClaudeMessageStreamViaResponses(
     dto: CreateMessageDto,
-    account: OpenaiCompatAccount = this.nextAccount(dto.model),
-    suppressCooldownForChatFallback: boolean = false,
+    account: OpenaiCompatAccount,
     abortSignal?: AbortSignal
   ): AsyncGenerator<string, void, unknown> {
     const requestStartedAt = Date.now()
@@ -2953,8 +2851,7 @@ export class OpenaiCompatService implements OnModuleInit {
         response.status,
         errorBody,
         modelName,
-        response.headers.get("retry-after") || undefined,
-        suppressCooldownForChatFallback
+        response.headers.get("retry-after") || undefined
       )
     }
 
@@ -3115,8 +3012,7 @@ export class OpenaiCompatService implements OnModuleInit {
    */
   private async sendClaudeMessageViaResponses(
     dto: CreateMessageDto,
-    account: OpenaiCompatAccount = this.nextAccount(dto.model),
-    suppressCooldownForChatFallback: boolean = false
+    account: OpenaiCompatAccount
   ): Promise<AnthropicResponse> {
     const requestStartedAt = Date.now()
     const modelName = dto.model
@@ -3171,8 +3067,7 @@ export class OpenaiCompatService implements OnModuleInit {
         response.status,
         errorBody,
         modelName,
-        response.headers.get("retry-after") || undefined,
-        suppressCooldownForChatFallback
+        response.headers.get("retry-after") || undefined
       )
     }
 

@@ -88,6 +88,16 @@ function detectStatusCode(error: unknown): number | undefined {
  * a recognisable signature simply return `{ matched: false }`.
  */
 export function detectPromptTooLong(error: unknown): PromptTooLongDetection {
+  if (
+    error &&
+    typeof error === "object" &&
+    (error as { errorClass?: unknown }).errorClass === "context_length_exceeded"
+  ) {
+    return {
+      matched: true,
+      ...extractStructuredTokenDetails(error),
+    }
+  }
   const messageBlob = extractMessageString(error)
   const status = detectStatusCode(error)
   const matchedByStatus = status === 413
@@ -113,4 +123,25 @@ export function detectPromptTooLong(error: unknown): PromptTooLongDetection {
   }
 
   return { matched: true, actualTokens, maxTokens }
+}
+
+function extractStructuredTokenDetails(error: unknown): {
+  actualTokens?: number
+  maxTokens?: number
+} {
+  if (!error || typeof error !== "object") return {}
+  const record = error as Record<string, unknown>
+  const actualTokens =
+    typeof record.actualTokens === "number" &&
+    Number.isFinite(record.actualTokens)
+      ? record.actualTokens
+      : undefined
+  const maxTokens =
+    typeof record.maxTokens === "number" && Number.isFinite(record.maxTokens)
+      ? record.maxTokens
+      : undefined
+  return {
+    ...(actualTokens === undefined ? {} : { actualTokens }),
+    ...(maxTokens === undefined ? {} : { maxTokens }),
+  }
 }

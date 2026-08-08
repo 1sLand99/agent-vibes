@@ -1,5 +1,5 @@
 /**
- * Append-only transcript + result store for background sub-agents.
+ * Append-only diagnostic export for sub-agents.
  *
  * Layout (mirrors what claude-code's SDK uses for `~/.claude/sub-agents/`):
  *
@@ -12,13 +12,14 @@
  *                        for live progress reading
  *     result.txt       — the final assistant text (set on success)
  *
- * The store is purely a sink; lifecycle is owned by SubagentTaskRegistry.
+ * The store is purely a sink. Durable lifecycle and delivery state live in
+ * `session_subagent_runs`; these files are never read to decide whether a run
+ * exists, is running, or completed.
  * All writes are atomic at the record level (no locks required because the
  * bridge process is single-writer per subagentId).
  *
- * Why files instead of a database: parent agent's `read_file` tool can
- * point straight at `~/.cursor/subagents/<id>/transcript.jsonl` to "peek"
- * at progress without any new tool surface. Same trick claude-code uses.
+ * Files remain useful for operator inspection and Cursor's transcript link,
+ * while `await_task` is the only supported programmatic result surface.
  */
 
 import { Injectable, Logger } from "@nestjs/common"
@@ -31,6 +32,7 @@ import {
 } from "fs"
 import { homedir } from "os"
 import { join } from "path"
+import { requireExactDurableIdentifier } from "../../../context/durable-identifier"
 import type { ToolInterruptionReason } from "../session/tool-interruption"
 
 export type SubagentTaskStatus =
@@ -89,11 +91,27 @@ export interface SubagentTranscriptRecord {
 @Injectable()
 export class SubagentTranscriptStore {
   private readonly logger = new Logger(SubagentTranscriptStore.name)
+  private static readonly AGENT_ID =
+    /^subagent-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
-  /** Resolve the directory we write a given background sub-agent's
-   * artefacts into. Created on demand. */
+  private requireAgentId(agentId: string): string {
+    const exactAgentId = requireExactDurableIdentifier(
+      agentId,
+      "sub-agent transcript agentId"
+    )
+    if (!SubagentTranscriptStore.AGENT_ID.test(exactAgentId)) {
+      throw new Error(`Invalid sub-agent id: ${agentId}`)
+    }
+    return exactAgentId
+  }
+
+  /** Resolve a diagnostic path without mutating the filesystem. */
   getAgentDir(agentId: string): string {
-    const dir = join(homedir(), ".cursor", "subagents", agentId)
+    return join(homedir(), ".cursor", "subagents", this.requireAgentId(agentId))
+  }
+
+  private ensureAgentDir(agentId: string): string {
+    const dir = this.getAgentDir(agentId)
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true })
     }
@@ -106,10 +124,6 @@ export class SubagentTranscriptStore {
 
   getMetadataPath(agentId: string): string {
     return join(this.getAgentDir(agentId), "metadata.json")
-  }
-
-  getResultPath(agentId: string): string {
-    return join(this.getAgentDir(agentId), "result.txt")
   }
 
   /**
@@ -135,9 +149,10 @@ export class SubagentTranscriptStore {
    * for this id (collisions shouldn't happen because agentId is
    * timestamp+random). */
   initMetadata(metadata: SubagentTaskMetadata): void {
+    const agentId = this.requireAgentId(metadata.agentId)
     try {
       writeFileSync(
-        this.getMetadataPath(metadata.agentId),
+        join(this.ensureAgentDir(agentId), "metadata.json"),
         `${SubagentTranscriptStore.stringifyMetadata(metadata)}\n`,
         "utf8"
       )
@@ -148,15 +163,19 @@ export class SubagentTranscriptStore {
     }
   }
 
-  /** Read current metadata for an agent. Returns undefined if the agent
-   * directory doesn't exist or metadata is corrupted (we don't try to
-   * recover — registry should treat missing metadata as "no such task"). */
+  /** Read a diagnostic snapshot. Callers must not use it as lifecycle truth. */
   readMetadata(agentId: string): SubagentTaskMetadata | undefined {
-    const path = this.getMetadataPath(agentId)
+    const exactAgentId = this.requireAgentId(agentId)
+    const path = this.getMetadataPath(exactAgentId)
     if (!existsSync(path)) return undefined
     try {
       const raw = readFileSync(path, "utf8")
       const parsed = JSON.parse(raw) as SubagentTaskMetadata
+      if (this.requireAgentId(parsed.agentId) !== exactAgentId) {
+        throw new Error(
+          `Sub-agent metadata identity mismatch: expected ${exactAgentId}, got ${parsed.agentId}`
+        )
+      }
       return parsed
     } catch (error) {
       this.logger.warn(
@@ -172,12 +191,18 @@ export class SubagentTranscriptStore {
     agentId: string,
     mutator: (current: SubagentTaskMetadata) => SubagentTaskMetadata
   ): SubagentTaskMetadata | undefined {
-    const current = this.readMetadata(agentId)
+    const exactAgentId = this.requireAgentId(agentId)
+    const current = this.readMetadata(exactAgentId)
     if (!current) return undefined
     const next = mutator(current)
     try {
+      if (this.requireAgentId(next.agentId) !== exactAgentId) {
+        throw new Error(
+          `Sub-agent metadata identity mismatch: expected ${exactAgentId}, got ${next.agentId}`
+        )
+      }
       writeFileSync(
-        this.getMetadataPath(agentId),
+        join(this.ensureAgentDir(exactAgentId), "metadata.json"),
         `${SubagentTranscriptStore.stringifyMetadata(next)}\n`,
         "utf8"
       )
@@ -192,9 +217,10 @@ export class SubagentTranscriptStore {
 
   /** Append a record to the transcript JSONL. */
   appendTranscript(agentId: string, record: SubagentTranscriptRecord): void {
+    const exactAgentId = this.requireAgentId(agentId)
     try {
       appendFileSync(
-        this.getTranscriptPath(agentId),
+        join(this.ensureAgentDir(exactAgentId), "transcript.jsonl"),
         `${JSON.stringify(record)}\n`,
         "utf8"
       )
@@ -209,8 +235,13 @@ export class SubagentTranscriptStore {
    * previously there (background sub-agent has exactly one final
    * answer). */
   writeResult(agentId: string, text: string): void {
+    const exactAgentId = this.requireAgentId(agentId)
     try {
-      writeFileSync(this.getResultPath(agentId), text, "utf8")
+      writeFileSync(
+        join(this.ensureAgentDir(exactAgentId), "result.txt"),
+        text,
+        "utf8"
+      )
     } catch (error) {
       this.logger.error(
         `Failed to write result for ${agentId}: ${String(error)}`

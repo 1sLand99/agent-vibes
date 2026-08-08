@@ -15,10 +15,8 @@ import type { WebSearchAdapter, WebSearchAdapterName } from "./types"
 
 /**
  * Adapter selection follows claude-code's WebSearchTool model at the
- * primary routing layer: pick one adapter from backend/env state, not
- * from quota-error fingerprint matching. The service may still perform
- * one bounded recovery retry for empty/timeout responses so transient
- * search-provider gaps do not surface as model-visible failures.
+ * routing layer: pick exactly one adapter from backend/env state, not from
+ * quota-error fingerprint matching or error-time provider fallback.
  *
  * The factory is deterministic and side-effect free — its only
  * inputs are the active session's backend and the operator's env
@@ -142,30 +140,6 @@ export class WebSearchAdapterFactory {
       default:
         return undefined
     }
-  }
-
-  /**
-   * Walk the keyless chain in priority order and return the first
-   * adapter that reports as available. The chain is:
-   *
-   *   1. `brave-llm`        — preferred when an API key is configured
-   *                           (TOS-clean for agentic use)
-   *   2. `exa-mcp`          — keyless, free, public MCP endpoint
-   *   3. `duckduckgo-html`  — keyless HTML scrape, always available
-   *
-   * `duckduckgo-html.isAvailable()` always returns true, so this
-   * function is total — it never throws "no adapter available".
-   */
-  selectRecoveryAdapter(
-    failedAdapter: WebSearchAdapterName
-  ): WebSearchAdapter | undefined {
-    const candidates = [
-      this.braveAdapter,
-      this.exaAdapter,
-      this.duckduckgoAdapter,
-    ].filter((adapter) => adapter.name !== failedAdapter)
-
-    return candidates.find((adapter) => adapter.isAvailable())
   }
 
   private firstAvailableKeylessAdapter(): WebSearchAdapter {

@@ -2,14 +2,16 @@ import { Logger } from "@nestjs/common"
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify"
 import * as dns from "dns"
 import * as https from "https"
-import type { IncomingHttpHeaders } from "http"
+import type { IncomingMessage } from "http"
 import type { LookupFunction } from "net"
 
 const DEFAULT_OFFICIAL_API_BASE_URL = "https://api2.cursor.sh"
 const DEFAULT_OFFICIAL_AGENT_BASE_URL = "https://agentn.api5.cursor.sh"
-const DEFAULT_TIMEOUT_MS = 15_000
 const DNS_CACHE_TTL_MS = 60_000
 
+// Local allowlist is the core Composer/AgentService surface only.
+// AgentHostService (Agents Window / Glass) must remain absent so
+// agent.v1.AgentHost* RPCs keep falling through to official passthrough.
 const LOCAL_CURSOR_RPC_PATHS = new Set<string>([
   "agent.v1.AgentService/Run",
   "agent.v1.AgentService/NameAgent",
@@ -19,8 +21,7 @@ const LOCAL_CURSOR_RPC_PATHS = new Set<string>([
   "agent.v1.AgentService/GetAllowedModelIntents",
   "agent.v1.AgentService/GetNewChatNudgeLegacyModelPicker",
   "agent.v1.AgentService/GetNewChatNudgeParameterizedModelPicker",
-  "aiserver.v1.AiService/ListPendingFollowups",
-  "aiserver.v1.AiService/DeletePendingFollowup",
+  "aiserver.v1.AiService/RunGenerateImage",
   "aiserver.v1.AiService/AvailableModels",
   "aiserver.v1.AiService/GetDefaultModelNudgeData",
   "aiserver.v1.AiService/CheckFeatureStatus",
@@ -35,13 +36,11 @@ const LOCAL_CURSOR_RPC_PATHS = new Set<string>([
   "aiserver.v1.AiService/GetModelLabels",
   "aiserver.v1.AiService/TestBidi",
   "aiserver.v1.AiService/KnowledgeBaseAdd",
-  "aiserver.v1.AiService/KnowledgeBaseGet",
   "aiserver.v1.AiService/KnowledgeBaseList",
   "aiserver.v1.AiService/KnowledgeBaseUpdate",
   "aiserver.v1.AiService/KnowledgeBaseRemove",
   "aiserver.v1.AnalyticsService/BootstrapStatsig",
   "aiserver.v1.ServerConfigService/GetServerConfig",
-  "aiserver.v1.CppService/AvailableModels",
   "aiserver.v1.BackgroundComposerService/ListBackgroundComposers",
   "aiserver.v1.BackgroundComposerService/ListPersonalEnvironments",
   "aiserver.v1.BackgroundComposerService/ListTeamEnvironments",
@@ -84,6 +83,23 @@ export type CursorOfficialPassthroughTarget = {
   baseUrl: string
   normalizedPath: string
   family: "api" | "agent"
+}
+
+export type CursorOfficialPassthroughFailureDisposition =
+  | "client_cancelled"
+  | "replyable_upstream_failure"
+  | "unreplyable_upstream_failure"
+
+export function classifyCursorOfficialPassthroughFailure(input: {
+  readonly clientAbortSignaled: boolean
+  readonly replySent: boolean
+  readonly replyDestroyed: boolean
+}): CursorOfficialPassthroughFailureDisposition {
+  if (input.clientAbortSignaled) return "client_cancelled"
+  if (input.replySent || input.replyDestroyed) {
+    return "unreplyable_upstream_failure"
+  }
+  return "replyable_upstream_failure"
 }
 
 const dnsCache = new Map<string, DnsCacheEntry>()
@@ -282,14 +298,24 @@ async function proxyCursorOfficialRequest(
   const upstreamUrl = buildUpstreamUrl(req.url, target)
   const body = getRequestBodyBuffer(req)
   const headers = sanitizeRequestHeaders(req, upstreamUrl, body)
+  const abortController = new AbortController()
+  const abortUpstream = () => abortController.abort()
+  const cleanupClientAbortListeners = () => {
+    req.raw.removeListener("aborted", abortUpstream)
+    reply.raw.removeListener("close", abortUpstream)
+  }
+  req.raw.once("aborted", abortUpstream)
+  reply.raw.once("close", abortUpstream)
 
   try {
-    const upstreamResponse = await sendOfficialRequest(
+    const upstreamResponse = await openOfficialRequest(
       upstreamUrl,
       req.method,
       headers,
-      body
+      body,
+      abortController.signal
     )
+    upstreamResponse.once("close", cleanupClientAbortListeners)
 
     for (const [header, value] of Object.entries(upstreamResponse.headers)) {
       if (value === undefined || shouldStripResponseHeader(header)) {
@@ -298,29 +324,44 @@ async function proxyCursorOfficialRequest(
       reply.header(header, value)
     }
 
-    reply.status(upstreamResponse.statusCode).send(upstreamResponse.body)
+    // Send the IncomingMessage itself so Connect streaming RPCs retain their
+    // chunk boundaries and backpressure. Buffering the complete body would
+    // turn endpoints such as StreamAiCursorHelp into pseudo-unary calls and
+    // can trip Cursor's stream liveness deadline.
+    reply.status(upstreamResponse.statusCode || 502).send(upstreamResponse)
   } catch (error) {
+    cleanupClientAbortListeners()
     const detail = error instanceof Error ? error.message : String(error)
+    const disposition = classifyCursorOfficialPassthroughFailure({
+      clientAbortSignaled: abortController.signal.aborted,
+      replySent: reply.sent,
+      replyDestroyed: reply.raw.destroyed,
+    })
+    if (disposition === "client_cancelled") {
+      logger.debug(
+        `Cursor official passthrough cancelled by client for ${target.normalizedPath} (${target.family})`
+      )
+      return
+    }
     logger.warn(
       `Cursor official passthrough failed for ${target.normalizedPath} (${target.family}): ${detail}`
     )
-    reply.status(502).send({
-      error: "cursor_official_passthrough_failed",
-      message: detail,
-    })
+    if (disposition === "replyable_upstream_failure") {
+      reply.status(502).send({
+        error: "cursor_official_passthrough_failed",
+        message: detail,
+      })
+    }
   }
 }
 
-function sendOfficialRequest(
+function openOfficialRequest(
   url: URL,
   method: string,
   headers: Record<string, string | string[]>,
-  body: Buffer | null
-): Promise<{
-  statusCode: number
-  headers: IncomingHttpHeaders
-  body: Buffer
-}> {
+  body: Buffer | null,
+  signal: AbortSignal
+): Promise<IncomingMessage> {
   return new Promise((resolve, reject) => {
     const req = https.request(
       {
@@ -331,29 +372,20 @@ function sendOfficialRequest(
         headers,
         servername: url.hostname,
         lookup: lookupOfficialCursorHost,
-        timeout: Number.parseInt(
-          process.env.CURSOR_OFFICIAL_PASSTHROUGH_TIMEOUT_MS ||
-            String(DEFAULT_TIMEOUT_MS),
-          10
-        ),
       },
-      (res) => {
-        const chunks: Buffer[] = []
-        res.on("data", (chunk: Buffer) => chunks.push(chunk))
-        res.on("end", () => {
-          resolve({
-            statusCode: res.statusCode || 502,
-            headers: res.headers,
-            body: Buffer.concat(chunks),
-          })
-        })
-      }
+      resolve
     )
 
-    req.on("timeout", () => {
-      req.destroy(new Error(`upstream timeout for ${url.hostname}`))
-    })
     req.on("error", reject)
+    const abort = () => {
+      req.destroy(new Error(`client disconnected from ${url.hostname}`))
+    }
+    signal.addEventListener("abort", abort, { once: true })
+    req.once("close", () => signal.removeEventListener("abort", abort))
+    if (signal.aborted) {
+      abort()
+      return
+    }
 
     if (body !== null && body.length > 0) {
       req.write(body)

@@ -39,9 +39,9 @@ const ORIGINATOR = "codex_cli_rs"
 /**
  * Last-resort version when both env override and CLI detection miss. Bump in
  * lockstep with whatever the latest upstream stable codex tag is at the time
- * of release. As of 2026-05 the latest stable is rust-v0.133.0.
+ * of release. As of 2026-08 the latest stable is rust-v0.147.0.
  */
-const FALLBACK_VERSION = "0.133.0"
+const FALLBACK_VERSION = "0.147.0"
 const DETECTION_TIMEOUT_MS = 3_000
 const ENV_OVERRIDE_KEY = "AGENT_VIBES_CODEX_VERSION"
 
@@ -145,7 +145,7 @@ export class CodexClientIdentityService implements OnModuleInit {
 
   /**
    * Run `codex --version` on the host. Resolves to the parsed semver string
-   * (e.g. `"0.133.0"` or `"0.134.0-alpha.3"`) or `undefined` if the CLI is
+   * (e.g. `"0.147.0"` or `"0.148.0-alpha.5"`) or `undefined` if the CLI is
    * not installed / errored / timed out.
    *
    * Implementation notes:
@@ -220,9 +220,9 @@ export class CodexClientIdentityService implements OnModuleInit {
           return
         }
         // Output formats observed in the wild:
-        //   "codex-cli 0.133.0\n"
-        //   "codex 0.133.0\n"
-        //   "0.134.0-alpha.3\n"
+        //   "codex-cli 0.147.0\n"
+        //   "codex 0.147.0\n"
+        //   "0.148.0-alpha.5\n"
         // Match the first semver-shaped token, optionally followed by a
         // pre-release tag.
         const match = stdout.trim().match(/(\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?)/)

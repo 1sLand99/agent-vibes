@@ -87,16 +87,6 @@ function candidateExecutables(): string[] {
 }
 
 /**
- * @deprecated Prefer `getDefaultCcVersion()`. Kept for callers that need
- * a literal `string` at module-import time (e.g. interpolated into other
- * default strings before the cache is warm). Returns the result of the
- * first resolution attempt on first read.
- */
-export function getDefaultCcVersionSync(): string {
-  return getDefaultCcVersion()
-}
-
-/**
  * Whether the current process should suppress `x-anthropic-billing-header`
  * entirely. Mirrors the v2.1.142 binary's `Ci_` short-circuit:
  *

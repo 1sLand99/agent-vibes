@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
+import * as crypto from "crypto"
 import { type ContextAttachmentSnapshot } from "../../context"
 import { AnthropicApiService } from "../../llm/anthropic/anthropic-api.service"
 import { KiroService } from "../../llm/aws/kiro.service"
@@ -13,6 +14,10 @@ import { CodexService } from "../../llm/openai/codex.service"
 import { OpenaiCompatService } from "../../llm/openai/openai-compat.service"
 import { getBackendCapability } from "../../llm/shared/backend-capability"
 import { BackendApiError } from "../../llm/shared/backend-errors"
+import {
+  runProviderPhysicalDispatch,
+  runProviderPhysicalDispatchStream,
+} from "../../llm/shared/provider-physical-dispatch"
 import {
   canPublicClaudeModelUseGoogle,
   canPublicClaudeModelUseKiro,
@@ -264,38 +269,6 @@ export class MessagesService implements OnModuleInit {
   }
 
   /**
-   * Transparent passthrough — no context compaction.
-   *
-   * Earlier this method ran a stateless `createEphemeralState(messages) →
-   * snip → microcompact → buildAnthropicContextManagement` pipeline on
-   * every Anthropic-protocol request. The intent was anti-OOM, but the
-   * pipeline silently dropped 70%+ of the message array (1450→390
-   * records) and replaced the dropped span with a single "Context
-   * snipped" placeholder containing no summary. The CLI client never
-   * learned its history had been mutated, so its own auto-compact /
-   * `/compact` heuristics — which are the authoritative context
-   * managers for Claude Code — operated on a different message array
-   * than the backend ever saw.
-   *
-   * The CLIProxyAPI reference implementation does the right thing here:
-   * accept the client's raw body, forward it to the backend, and let
-   * the backend's `context_too_large` errors flow back to the client.
-   * Claude Code, Codex, and Gemini CLI all ship their own /compact
-   * pipelines; the proxy is not the right layer to second-guess them.
-   *
-   * This method is preserved as the single chokepoint where any future
-   * **non-destructive** pre-processing could land (model rename, prompt
-   * injection, etc.). It now returns the dto unchanged.
-   */
-  private applyContextCompaction(
-    dto: CreateMessageDto,
-    route: ModelRouteResult
-  ): CreateMessageDto {
-    void route
-    return dto
-  }
-
-  /**
    * CC CLI's compaction summary preamble. Both code paths
    * (runForkedAgent fork — claude-code/src/services/compact/compact.ts:1222
    * and streamCompactSummary streaming fallback — same file:1326) build
@@ -514,11 +487,10 @@ export class MessagesService implements OnModuleInit {
       model: route.model,
       _requestedModel: dto._requestedModel || dto.model,
     }
-    const compactedDto = this.applyContextCompaction(routedDto, route)
 
     return this.isGoogleBackend(route)
-      ? this.prepareForGoogle(compactedDto)
-      : compactedDto
+      ? this.prepareForGoogle(routedDto)
+      : routedDto
   }
 
   /**
@@ -577,41 +549,79 @@ export class MessagesService implements OnModuleInit {
   ): Promise<AnthropicResponse> {
     if (route.backend === "claude-api") {
       this.logger.log(`[ROUTE] Claude API backend | model: ${route.model}`)
-      return await this.anthropicApiService.sendClaudeMessage(dto, {
-        clientMode: "claude-code-cli",
-        forwardHeaders,
+      return runProviderPhysicalDispatch({
+        plan: {
+          scope: `cc:messages:${crypto.randomUUID()}`,
+          backend: "claude-api",
+          model: route.model,
+          request: dto,
+        },
+        execute: (dispatch) =>
+          this.anthropicApiService.sendClaudeMessage(dispatch, {
+            clientMode: "claude-code-cli",
+            forwardHeaders,
+          }),
       })
     }
 
     if (route.backend === "kiro") {
       this.logger.log(`[ROUTE] Kiro backend | model: ${route.model}`)
-      return await this.kiroService.sendClaudeMessage(
-        this.prepareKiroDtoForClaudeCli(dto)
-      )
+      const request = this.prepareKiroDtoForClaudeCli(dto)
+      return runProviderPhysicalDispatch({
+        plan: {
+          scope: `cc:messages:${crypto.randomUUID()}`,
+          backend: "kiro",
+          model: route.model,
+          request,
+        },
+        execute: (dispatch) => this.kiroService.sendClaudeMessage(dispatch),
+      })
     }
 
     if (route.backend === "openai-compat") {
       this.logger.log(`[ROUTE] OpenAI-compat backend | model: ${route.model}`)
-      return await this.openaiCompatService.sendClaudeMessage(dto)
+      return runProviderPhysicalDispatch({
+        plan: {
+          scope: `cc:messages:${crypto.randomUUID()}`,
+          backend: "openai-compat",
+          model: route.model,
+          request: dto,
+        },
+        execute: (dispatch) =>
+          this.openaiCompatService.sendClaudeMessage(dispatch),
+      })
     }
 
     if (route.backend === "codex") {
       this.logger.log(`[ROUTE] Codex backend | model: ${route.model}`)
-      return await this.codexService.sendMessage(
-        adaptAnthropicMessageToCodexExecutionRequest(dto),
-        codexForwardHeaders
+      const request = this.codexService.prepareBridgeNativeExecutionRequest(
+        adaptAnthropicMessageToCodexExecutionRequest(dto)
       )
+      return runProviderPhysicalDispatch({
+        plan: {
+          scope: `cc:messages:${crypto.randomUUID()}`,
+          backend: "codex",
+          model: route.model,
+          request,
+        },
+        execute: (dispatch) =>
+          this.codexService.sendMessage(dispatch, {
+            forwardHeaders: codexForwardHeaders,
+          }),
+      })
     }
 
     this.logger.log(`[ROUTE] Google backend | model: ${route.model}`)
-    return await this.googleService.sendClaudeMessage(dto)
+    return runProviderPhysicalDispatch({
+      plan: {
+        scope: `cc:messages:${crypto.randomUUID()}`,
+        backend: route.backend,
+        model: route.model,
+        request: dto,
+      },
+      execute: (dispatch) => this.googleService.sendClaudeMessage(dispatch),
+    })
   }
-
-  // `buildReactiveRecoveryKey` was removed alongside the reactive
-  // prompt-too-long recovery path. It used to key the
-  // `ContextManagerService` circuit breaker that decided whether to
-  // retry a context-too-large request after silently snipping the
-  // history. We no longer snip-and-retry, so the key has no callers.
 
   private async executeRoutedMessage(
     dto: CreateMessageDto,
@@ -715,15 +725,33 @@ export class MessagesService implements OnModuleInit {
     dto: CreateMessageDto,
     route: ModelRouteResult,
     forwardHeaders?: Record<string, string>,
-    codexForwardHeaders?: CodexForwardHeaders
+    codexForwardHeaders?: CodexForwardHeaders,
+    onResponseBoundary?: () => void
   ): AsyncGenerator<string, void, unknown> {
+    const acceptanceForValue = (_dispatch: unknown, event: string) => {
+      const acceptance = this.acceptanceForRoutedStreamEvent(event)
+      if (acceptance !== undefined) {
+        onResponseBoundary?.()
+      }
+      return acceptance
+    }
     if (route.backend === "claude-api") {
       this.logger.log(
         `[ROUTE] Claude API backend | model: ${route.model} | stream: true`
       )
-      yield* this.anthropicApiService.sendClaudeMessageStream(dto, {
-        clientMode: "claude-code-cli",
-        forwardHeaders,
+      yield* runProviderPhysicalDispatchStream({
+        plan: {
+          scope: `cc:messages:${crypto.randomUUID()}`,
+          backend: "claude-api",
+          model: route.model,
+          request: dto,
+        },
+        execute: (dispatch) =>
+          this.anthropicApiService.sendClaudeMessageStream(dispatch, {
+            clientMode: "claude-code-cli",
+            forwardHeaders,
+          }),
+        acceptanceForValue,
       })
       return
     }
@@ -731,32 +759,103 @@ export class MessagesService implements OnModuleInit {
       this.logger.log(
         `[ROUTE] Kiro backend | model: ${route.model} | stream: true`
       )
-      yield* this.kiroService.sendClaudeMessageStream(
-        this.prepareKiroDtoForClaudeCli(dto)
-      )
+      const request = this.prepareKiroDtoForClaudeCli(dto)
+      yield* runProviderPhysicalDispatchStream({
+        plan: {
+          scope: `cc:messages:${crypto.randomUUID()}`,
+          backend: "kiro",
+          model: route.model,
+          request,
+        },
+        execute: (dispatch) =>
+          this.kiroService.sendClaudeMessageStream(dispatch),
+        acceptanceForValue,
+      })
       return
     }
     if (route.backend === "openai-compat") {
       this.logger.log(
         `[ROUTE] OpenAI-compat backend | model: ${route.model} | stream: true`
       )
-      yield* this.openaiCompatService.sendClaudeMessageStream(dto)
+      yield* runProviderPhysicalDispatchStream({
+        plan: {
+          scope: `cc:messages:${crypto.randomUUID()}`,
+          backend: "openai-compat",
+          model: route.model,
+          request: dto,
+        },
+        execute: (dispatch) =>
+          this.openaiCompatService.sendClaudeMessageStream(dispatch),
+        acceptanceForValue,
+      })
       return
     }
     if (route.backend === "codex") {
       this.logger.log(
         `[ROUTE] Codex backend | model: ${route.model} | stream: true`
       )
-      yield* this.codexService.sendMessageStream(
-        adaptAnthropicMessageToCodexExecutionRequest(dto),
-        codexForwardHeaders
+      const request = this.codexService.prepareBridgeNativeExecutionRequest(
+        adaptAnthropicMessageToCodexExecutionRequest(dto)
       )
+      yield* runProviderPhysicalDispatchStream({
+        plan: {
+          scope: `cc:messages:${crypto.randomUUID()}`,
+          backend: "codex",
+          model: route.model,
+          request,
+        },
+        execute: (dispatch) =>
+          this.codexService.sendMessageStream(dispatch, {
+            forwardHeaders: codexForwardHeaders,
+          }),
+        acceptanceForValue,
+      })
       return
     }
     this.logger.log(
       `[ROUTE] Google backend | model: ${route.model} | stream: true`
     )
-    yield* this.googleService.sendClaudeMessageStream(dto)
+    yield* runProviderPhysicalDispatchStream({
+      plan: {
+        scope: `cc:messages:${crypto.randomUUID()}`,
+        backend: route.backend,
+        model: route.model,
+        request: dto,
+      },
+      execute: (dispatch) =>
+        this.googleService.sendClaudeMessageStream(dispatch),
+      acceptanceForValue,
+    })
+  }
+
+  private acceptanceForRoutedStreamEvent(
+    event: string
+  ): Record<string, never> | undefined {
+    const type = this.readAnthropicSseFrameType(event)
+    return type === "message_start" ||
+      type === "ping" ||
+      type === "content_block_start" ||
+      type === "content_block_stop"
+      ? undefined
+      : {}
+  }
+
+  private readAnthropicSseFrameType(event: string): string | undefined {
+    const data = event
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice("data:".length).trimStart())
+      .join("\n")
+    if (!data || data === "[DONE]") {
+      return undefined
+    }
+
+    try {
+      const payload = JSON.parse(data) as { type?: unknown }
+      return typeof payload.type === "string" ? payload.type : undefined
+    } catch {
+      return undefined
+    }
   }
 
   private async *executeRoutedMessageStream(
@@ -767,28 +866,7 @@ export class MessagesService implements OnModuleInit {
     attemptedBackends: Set<string> = new Set()
   ): AsyncGenerator<string, void, unknown> {
     attemptedBackends.add(route.backend)
-    let emittedAny = false
-    let buffer: string[] = []
-
-    const handleEvent = function* (event: string) {
-      if (!emittedAny) {
-        if (
-          event.includes('"type":"message_start"') ||
-          event.includes('"type":"ping"') ||
-          event.includes('"type":"content_block_start"') ||
-          event.includes('"type":"content_block_stop"')
-        ) {
-          buffer.push(event)
-        } else {
-          emittedAny = true
-          for (const b of buffer) yield b
-          buffer = []
-          yield event
-        }
-      } else {
-        yield event
-      }
-    }
+    let responseBoundaryCrossed = false
 
     try {
       if (
@@ -817,12 +895,12 @@ export class MessagesService implements OnModuleInit {
         routedDto,
         route,
         forwardHeaders,
-        codexForwardHeaders
+        codexForwardHeaders,
+        () => {
+          responseBoundaryCrossed = true
+        }
       )) {
-        yield* handleEvent(event)
-      }
-      if (!emittedAny) {
-        for (const b of buffer) yield b
+        yield event
       }
       return
     } catch (error) {
@@ -831,7 +909,7 @@ export class MessagesService implements OnModuleInit {
         route.backend
       )
       const canFallback =
-        !emittedAny &&
+        !responseBoundaryCrossed &&
         !!fallback &&
         !attemptedBackends.has(fallback.backend) &&
         this.modelRouter.shouldFallbackFromBackend(

@@ -1,3 +1,4 @@
+import { requireExactDurableIdentifier } from "../../context/durable-identifier"
 import type { BackendType } from "./model-router.service"
 
 export interface ToolContinuationMessage {
@@ -18,11 +19,17 @@ export function findPendingToolUseIdsInMessages(
   messages: ToolContinuationMessage[],
   pendingToolUseIds?: Iterable<string>
 ): string[] {
-  const pendingIds = new Set(
-    Array.from(pendingToolUseIds ?? [])
-      .map((id) => (typeof id === "string" ? id.trim() : ""))
-      .filter(Boolean)
-  )
+  const pendingIds = new Set<string>()
+  let pendingIndex = 0
+  for (const pendingToolUseId of pendingToolUseIds ?? []) {
+    pendingIds.add(
+      requireExactDurableIdentifier(
+        pendingToolUseId,
+        `pending tool_use id at index ${pendingIndex}`
+      )
+    )
+    pendingIndex += 1
+  }
   if (pendingIds.size === 0) {
     return []
   }
@@ -40,11 +47,12 @@ export function findPendingToolUseIdsInMessages(
         type?: unknown
         id?: unknown
       }
-      if (block.type !== "tool_use" || typeof block.id !== "string") {
-        continue
-      }
-      const toolUseId = block.id.trim()
-      if (toolUseId && pendingIds.has(toolUseId)) {
+      if (block.type !== "tool_use") continue
+      const toolUseId = requireExactDurableIdentifier(
+        block.id,
+        "assistant tool_use id"
+      )
+      if (pendingIds.has(toolUseId)) {
         blocking.add(toolUseId)
       }
     }

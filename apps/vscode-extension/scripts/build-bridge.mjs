@@ -14,16 +14,13 @@ if (process.platform === "win32") {
   const script = [
     `Set-Location "${bridgeDir}"`,
     "node sea/esbuild.js",
-    '$srcMigrations = "src\\persistence\\migrations"',
-    '$dstMigrations = "dist\\persistence\\migrations"',
-    "New-Item -ItemType Directory -Force -Path $dstMigrations | Out-Null",
-    'Copy-Item "$srcMigrations\\*.sql" $dstMigrations -Force',
     "node sea/generate-config.mjs",
     "node --experimental-sea-config dist/sea-config.generated.json",
     "$nodeBin = (Get-Command node).Source",
     '$binaryName = "agent-vibes-bridge-win32-x64.exe"',
     'Copy-Item $nodeBin "dist\\$binaryName"',
     'npx -y postject "dist\\$binaryName" NODE_SEA_BLOB dist\\sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2',
+    'node sea\\smoke.mjs "dist\\$binaryName"',
     '$size = [math]::Round((Get-Item "dist\\$binaryName").Length / 1MB)',
     'Write-Host "SEA binary ready: dist\\$binaryName (${size}MB)"',
   ].join("; ")

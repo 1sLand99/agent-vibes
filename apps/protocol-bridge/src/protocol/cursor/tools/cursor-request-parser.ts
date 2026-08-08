@@ -1,6 +1,8 @@
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf"
+import { create, toBinary } from "@bufbuild/protobuf"
 import { Logger } from "@nestjs/common"
-import * as zlib from "zlib"
+import type { ContentBlock } from "../../../context/types"
+import type { SubagentTerminalDeliveryCommit } from "../subagents/subagent-terminal-delivery"
+import type { CursorToolResultStatus } from "./tool-result-status"
 
 import {
   buildBuiltInKarpathyRule,
@@ -10,12 +12,11 @@ import {
 
 import {
   AgentClientMessage,
-  AgentClientMessageSchema,
   AgentRunRequest,
-  AssistantMessageSchema,
-  ConversationStepSchema,
-  ConversationStateStructure,
-  ConversationTurnStructureSchema,
+  BackgroundTaskCompletionReason,
+  BackgroundTaskStatus,
+  type ConversationAction,
+  type ConversationStep,
   type CursorRule,
   ExecClientControlMessage,
   ExecClientMessage,
@@ -23,9 +24,9 @@ import {
   InteractionResponse,
   type ResumeAction,
   type RequestedModel_ModelParameterValue,
+  type SandboxPolicy,
   UserMessage,
   UserMessageAction,
-  UserMessageSchema,
   type SkillOptions,
   SkillOptionsSchema,
 } from "../../../gen/agent/v1_pb"
@@ -34,26 +35,63 @@ import { doesModelSupportThinking } from "../../../llm/shared/model-registry"
 import { normalizeRequestedThinkingEffort } from "../../../llm/shared/thinking-intent"
 import { parseCursorVariantString } from "../cursor-model-protocol"
 import type { ContextTokenLimitSource } from "../session/context-window-transition"
+import type { CursorManagedReadResource } from "../session/cursor-managed-read-resource"
+import type { BackgroundShellCompletionIdentity } from "../session/background-command-store.service"
 import {
   getDefaultAgentToolNames,
   isCursorBuiltInToolAllowed,
 } from "./cursor-tool-mapper"
+import { type BridgeGoalState, fromProtoGoalState } from "./goal-state"
 import {
   parseSubagentModelOverrides,
   type SubagentModelOverridesMap,
 } from "../subagents/subagent-model-override"
 import {
+  parseSelectedSubagentModels,
+  type SelectedSubagentModelCatalog,
+} from "../subagents/subagent-model-selection"
+import {
   getCursorSkillMetadata,
   normalizeSkillName,
   normalizePathForMatch,
 } from "../skills"
-import { KvStorageService } from "../kv-storage.service"
-import { extractWorkspaceFoldersWithPrimary } from "./workspace-folders"
+import {
+  deriveProjectContextPresentation,
+  parseCursorWorkspaceState,
+  type ConversationStateWorkspaceInput,
+  type ParsedResumeWorkspaceReference,
+  type ParsedWorkspaceDeclaration,
+  type WorkspaceFolderExtractionInput,
+} from "./workspace-declaration"
 import { CursorProtocolTraceService } from "../cursor-protocol-trace.service"
 import { safeJsonStringify } from "../safe-json"
+import {
+  createCursorRequestWireState,
+  CursorInterruptedPendingToolCallResolutionCodecError,
+  decodeCursorAgentClientFrame,
+  extractCursorInterruptedPendingToolCallResolutions,
+  type CursorAgentClientFrame,
+  type CursorConversationEntry,
+  type CursorInterruptedPendingToolCallResolutionsWire,
+  type CursorProtocolReferenceResolver,
+  type CursorRequestWireState,
+} from "../codec/cursor-conversation-codec"
+import {
+  createCursorExecResultRecord,
+  type CursorExecResultRecord,
+} from "../exec-dispatch-contract"
+import { cursorBlobIdToKey } from "../codec/cursor-blob-id"
+import type { ChatTurnExecutionIntent } from "../turn/chat-turn-execution-intent"
+import { requireExactDurableIdentifier } from "../../../context/durable-identifier"
+import {
+  parseCursorHookAdditionalContextReceipts,
+  selectCursorAgentHookSteps,
+  type CursorAgentHookStep,
+  type CursorHookAdditionalContextReceipt,
+} from "../hooks/cursor-hook-contract"
+import { getEffectiveCursorUserMessageAction } from "./subscription-notification-action"
 
-// GZIP 魔数
-const GZIP_MAGIC = Buffer.from([0x1f, 0x8b])
+const CURSOR_UINT32_MAX = 0xffff_ffff
 
 function mergeSkillOptions(
   ...options: Array<SkillOptions | undefined>
@@ -82,39 +120,55 @@ function mergeSkillOptions(
   return create(SkillOptionsSchema, { skillDescriptors: descriptors })
 }
 
+/** The only Cursor thinking levels represented by the Agent v1 protocol. */
+export type CursorThinkingLevel = 0 | 1 | 2
+
 // 已解析的 tool 结果
 export interface ParsedToolResult {
-  toolCallId: string
+  /**
+   * Runtime tool-call identity for bridge-created inline results. A real
+   * Cursor ExecClientMessage must use `execIdentity` instead.
+   */
+  runtimeToolCallId?: string
   toolType: number
   resultCase: string
   resultData: Buffer
+  /**
+   * The IDs actually carried by the client result frame. Synthetic bridge
+   * results do not have a Cursor ExecClientMessage and therefore omit it.
+   */
+  execIdentity?: CursorExecResultRecord
   // Optional synthetic result content injected by server-side inline tools.
   inlineContent?: string
-  // Optional history payload override for inline tools that need richer
-  // function_call_output bodies than plain text, such as view_image.
-  inlineHistoryContent?: string | Array<Record<string, unknown>>
+  /**
+   * Optional provider-neutral graph content for synthetic inline tools.
+   * Provider-native response items are reconstructed by the owning projector
+   * and must never enter this durable content-block boundary.
+   */
+  inlineGraphContent?: string | ContentBlock[]
+  /** Structured graph data used to reconstruct an owning provider's item. */
+  inlineGraphStructuredContent?: Record<string, unknown>
+  /**
+   * Protocol audit metadata persisted with the durable graph fragment, never
+   * treated as model-facing tool-result content.
+   */
+  inlineGraphMetadata?: Record<string, unknown>
   inlineState?: {
-    status:
-      | "success"
-      | "failure"
-      | "error"
-      | "rejected"
-      | "timeout"
-      | "file_busy"
-      | "permission_denied"
-      | "spawn_error"
-      | "file_not_found"
-      | "invalid_file"
-      | "aborted"
+    status: CursorToolResultStatus
     message?: string
   }
+  /** Hook context already executed by Cursor around a client-owned tool. */
+  hookAdditionalContexts?: readonly CursorHookAdditionalContextReceipt[]
   inlineProjection?: {
     taskSuccess?: {
-      conversationSteps?: Array<Record<string, unknown>>
+      conversationSteps?: ReadonlyArray<
+        ConversationStep | Record<string, unknown>
+      >
       agentId?: string
       isBackground?: boolean
       durationMs?: bigint | number
       resultSuffix?: string
+      backgroundReason?: number
       transcriptPath?: string
     }
     askQuestionResult?: {
@@ -144,9 +198,13 @@ export interface ParsedToolResult {
   }
   inlineExtraData?: {
     shellResult?: {
+      command?: string
+      workingDirectory?: string
       stdout?: string
       stderr?: string
       exitCode?: number
+      signal?: string
+      executionTime?: number
       shellId?: number
       pid?: number
       msToWait?: number
@@ -154,7 +212,23 @@ export interface ParsedToolResult {
       backgroundReason?: number
       isBackground?: boolean
       aborted?: boolean
+      abortReason?: number
+      localExecutionTimeMs?: number
+      interleavedOutput?: string
+      outputHead?: string
+      outputTail?: string
+      elidedChars?: number
+      outputLocation?: {
+        filePath?: string
+        sizeBytes?: bigint | number
+        lineCount?: bigint | number
+      }
+      timeoutMs?: number
+      isReadonly?: boolean
+      terminalMessage?: string
+      requestedSandboxPolicy?: SandboxPolicy | Record<string, unknown> | null
     }
+    taskError?: string
     writeShellStdinSuccess?: {
       shellId?: number
       terminalFileLengthBeforeInputWritten?: number
@@ -162,6 +236,64 @@ export interface ParsedToolResult {
     generateImageSuccess?: {
       filePath?: string
       imageData?: string
+    }
+    replaceEnvResult?:
+      | { case: "success"; setupLogs?: string }
+      | { case: "failure"; errorMessage?: string; setupLogs?: string }
+    prManagementResult?:
+      | {
+          case: "success"
+          prUrl?: string
+          prNumber?: number
+          message?: string
+        }
+      | { case: "error"; error?: string }
+      | { case: "rejected"; reason?: string }
+      | {
+          case: "registered"
+          message?: string
+          title?: string
+          body?: string
+          baseBranch?: string
+          draft?: boolean
+          branchName?: string
+        }
+      | {
+          case: "needsConfirmation"
+          message?: string
+          discoveredPrUrl?: string
+          discoveredPrNumber?: number
+          discoveredPrTitle?: string
+          branchName?: string
+        }
+    diagnosticsSuccess?: {
+      path?: string
+      diagnostics?: Array<Record<string, unknown>>
+      totalDiagnostics?: number
+      files?: Array<{
+        path: string
+        diagnostics: Array<Record<string, unknown>>
+        totalDiagnostics: number
+      }>
+    }
+    conversationSearchSuccess?: {
+      hits: Array<{
+        conversationId: string
+        title: string
+        updatedAtMs: number
+        snippet: string
+      }>
+      truncated: boolean
+      partial: boolean
+    }
+    awaitResult?: {
+      complete: boolean
+      runtimeMs: number
+      outputFilePath: string
+      outputLength: number
+      exitCode?: number
+      regexRequested: boolean
+      regexMatch?: string
     }
   }
 }
@@ -248,8 +380,37 @@ export interface AttachedImage {
   height?: number
 }
 
-// 已解析的请求结构（保持与旧版相同的接口约定）
+/**
+ * A concrete blob body carried by a Cursor AgentRunRequest. These bodies are
+ * persisted only after the transport has bound them to a conversation id.
+ */
+export interface CursorInboundBlobPayload {
+  id: Uint8Array
+  payload: Uint8Array
+  kind: "pre_fetched" | "selected_image"
+}
+
+/**
+ * Durable identity of the inbound frame that carried a parsed request. The
+ * payload itself remains exclusively in CursorWireStore; graph metadata may
+ * retain this locator when a derived transcript fact needs auditability.
+ */
+export interface CursorWireFrameRef {
+  streamEpoch: string
+  seq: number
+  direction: "inbound" | "outbound"
+  frameKind: string
+}
+
+// 已解析的请求结构。
 export interface ParsedCursorRequest {
+  /**
+   * Bridge execution ownership for a chat entry. It is intentionally absent
+   * on protocol-control and tool-result frames; `handleChatMessage` rejects a
+   * chat entry without an explicit value instead of guessing from text.
+   */
+  chatTurnExecutionIntent?: ChatTurnExecutionIntent
+
   /**
    * How authoritative this frame is for refreshing session-level request
    * configuration. Full AgentRunRequest user turns may replace request-scoped
@@ -258,18 +419,73 @@ export interface ParsedCursorRequest {
    */
   sessionUpdateScope?: "full" | "partial" | "control"
 
-  // 对话历史
-  conversation: Array<{
-    role: "user" | "assistant"
-    content: string
-  }>
+  /**
+   * Authoritative Cursor protocol envelope. It retains raw frame bytes,
+   * unknown protobuf fields, typed AgentRunRequest/ConversationState and the
+   * full ordered state/history records.
+   */
+  cursorWire?: CursorRequestWireState
+
+  /** Assigned by the transport only after the raw inbound frame is durable. */
+  cursorWireFrameRef?: CursorWireFrameRef
+
+  /** Ordered generic history from UserMessageAction.conversation_history. */
+  cursorConversationHistory?: CursorConversationEntry[]
+
+  /**
+   * Official terminal records carried alongside a new user turn or cancel.
+   * Each item retains its typed protobuf value and exact inbound wire bytes.
+   */
+  interruptedPendingToolCallResolutions?: CursorInterruptedPendingToolCallResolutionsWire
+
+  /**
+   * Bridge-originated continuations never reconstruct a text conversation.
+   * They either append one explicit typed current-user fragment or continue
+   * from the already durable graph without appending anything.
+   */
+  syntheticGraphInput?:
+    | {
+        kind: "current_user"
+        content: ContentBlock[]
+        metadata?: Record<string, unknown>
+        /** Terminal background sub-agent notifications claimed by this row. */
+        subagentTerminalDeliveries?: SubagentTerminalDeliveryCommit[]
+        /** Terminal background shell notifications claimed by this row. */
+        backgroundShellTerminalDeliveries?: BackgroundShellCompletionIdentity[]
+      }
+    | {
+        kind: "control_notification"
+        content: ContentBlock[]
+        isMeta: boolean
+        executionPolicy: "resume_active_task" | "terminal_reconciliation"
+        metadata: Record<string, unknown>
+        /** Terminal background sub-agent notifications claimed by this row. */
+        subagentTerminalDeliveries?: SubagentTerminalDeliveryCommit[]
+        /** Terminal background shell notifications claimed by this row. */
+        backgroundShellTerminalDeliveries?: BackgroundShellCompletionIdentity[]
+        /** Durable queued-interaction resolution claimed by this row. */
+        asyncUserInteractionContinuationClaim?: {
+          toolCallId: string
+          resolutionFingerprint: string
+        }
+      }
+    | {
+        kind: "continue_existing_graph"
+      }
+
+  /**
+   * The user action carries a blob reference for its primary input. The
+   * parser preserves this fact before a conversation-scoped blob store can
+   * be bound; it is not an in-memory cache hint.
+   */
+  hasBlobReferencedUserInput?: boolean
 
   // 新消息
   newMessage: string
 
   // 模型信息
   model: string
-  thinkingLevel: number
+  thinkingLevel: CursorThinkingLevel
   thinkingDetailsRequested?: boolean
 
   /**
@@ -286,6 +502,14 @@ export interface ParsedCursorRequest {
    */
   subagentModelOverrides?: SubagentModelOverridesMap
 
+  /**
+   * Exact invocation-level model allow-list from
+   * `AgentRunRequest.selected_subagent_models`. An empty catalog means the
+   * task tool must omit `model` and inherit through Cursor's normal
+   * per-subagent selection policy.
+   */
+  selectedSubagentModels?: SelectedSubagentModelCatalog
+
   // 模式和能力
   unifiedMode: "CHAT" | "AGENT" | "EDIT" | "CUSTOM"
   isAgentic: boolean
@@ -298,37 +522,35 @@ export interface ParsedCursorRequest {
   conversationId?: string
   bubbleId?: string
 
-  // 项目上下文
+  /**
+   * BiDi attachment that delivered this frame. Assigned by the transport
+   * boundary after parsing; it is required for stream-scoped exec control
+   * correlation and is never inferred from a "latest" controller.
+   */
+  cursorStreamEpoch?: string
+
+  /**
+   * The protocol-authoritative workspace declaration. Its WorkspaceScope is
+   * the only parser-owned root authority; no downstream consumer may rebuild
+   * it from projectContext, git metadata, or prior-resume URIs.
+   */
+  workspaceDeclaration?: ParsedWorkspaceDeclaration
+
+  /**
+   * Non-authoritative local references carried by conversation resume state.
+   * They intentionally never create or extend workspaceDeclaration.
+   */
+  resumeWorkspaceReferences?: readonly ParsedResumeWorkspaceReference[]
+
+  /** Exact read-only files registered by Cursor conversation state. */
+  cursorManagedReadResources?: readonly CursorManagedReadResource[]
+
+  // 项目上下文（仅为旧下游派生的 presentation，不承担 workspace authority）
   projectContext?: {
     rootPath: string
     directories: string[]
     files: string[]
-    /**
-     * Multi-root workspace folders synced from the IDE.
-     *
-     * Cursor 协议层有三个数据源都会带 multi-root workspace 信息，按
-     * 完整度从高到低：
-     *   1. `StreamUnifiedChatRequest.workspace_folders` (field 81)
-     *      → `repeated WorkspaceFolder { uri, name }`，优先级最高（带显示名）
-     *   2. `ConversationMessage.workspace_uris` (field 87)
-     *      → `repeated string` (file:// URIs)
-     *   3. `ConversationMessage.workspace_project_dir` (field 84)
-     *      → `optional string`（单个主项目目录）
-     *
-     * 我们 parser 内部把三处统一成下面这个数组形状，让上层代码只
-     * 跟一个字段打交道。`uri` 保留协议原文（含 file:// 前缀），
-     * `path` 是解析后的本地绝对路径，`name` 优先取 IDE 显示名，
-     * 缺失时落到目录尾段。
-     *
-     * 当 IDE 是单 root 工作区时，这里通常只会有一个条目且和
-     * `rootPath` 重合 — 这是预期行为，去重交给 session 层 +
-     * isPathWithinAllowedRoots 处理（依赖路径归一化）。
-     *
-     * Optional 是为了兼容老的持久化 session（JSON on disk 里没有
-     * 这个字段时 load 后是 undefined），所有消费方都要能 fallback
-     * 到 `[{ path: rootPath, ... }]`。
-     */
-    workspaceFolders?: Array<{
+    workspaceFolders: Array<{
       uri: string
       path: string
       name: string
@@ -362,6 +584,19 @@ export interface ParsedCursorRequest {
   usedContextTokens?: number
   requestedMaxOutputTokens?: number
   requestedModelParameters?: Record<string, string>
+
+  /** Agent-runtime hook steps selected from RequestContext.hooks_config. */
+  hookConfiguredSteps?: readonly CursorAgentHookStep[]
+  /** SessionStart hook context carried by Cursor's RequestContext. */
+  hooksAdditionalContext?: string
+  /** Durable goal restored from ConversationStateStructure.goal_state. */
+  goalState?: BridgeGoalState
+  /** ConversationStateStructure.is_root_project_conversation when present. */
+  isRootProjectConversation?: boolean
+
+  /** Exact optional response-comparison request identity from UserMessage. */
+  bestOfNGroupId?: string
+  tryUseBestOfNPromotion?: boolean
 
   // 显式上下文
   explicitContext?: string
@@ -404,6 +639,8 @@ export interface ParsedCursorRequest {
     | "backgroundTaskCompletionAction"
     | "backgroundShellAction"
     | "backgroundSubagentAction"
+    | "goalContinuationAction"
+    | "injectContextAction"
     | "other"
   agentControlExecId?: number
   agentControlError?: string
@@ -420,6 +657,17 @@ export interface ParsedCursorRequest {
   agentControlAsyncAskCompletion?: {
     originalToolCallId: string
     originalQuestionText?: string
+    originalArgs?: {
+      title: string
+      questions: Array<{
+        id: string
+        prompt: string
+        options: Array<{ id: string; label: string }>
+        allowMultiple: boolean
+      }>
+      runAsync: boolean
+      asyncOriginalToolCallId: string
+    }
     resultCase: "success" | "rejected" | "error" | "async" | "unknown"
     answers?: Array<{
       questionId: string
@@ -438,7 +686,37 @@ export interface ParsedCursorRequest {
     outputPath?: string
     threadId?: string
     reason?: number
+    /** Official BackgroundTaskCompletion.subagent_id. */
+    subagentId?: string
+    /** Official BackgroundTaskCompletion.tool_call_id. */
+    toolCallId?: string
+    /** Official BackgroundTaskCompletion.notification_context. */
+    notificationContext?: number
   }>
+  /** Official ConversationAction.inject_context_action payload. */
+  agentControlContextInjection?: {
+    injectionId: string
+    expectedRunId: string
+    kind: "userContext" | "systemContext" | "unknown"
+    producer?: string
+    systemContent?: string
+    userMessageText?: string
+  }
+  /** Official ConversationAction.request_context_parts. */
+  requestContextParts?: {
+    rulesBlobId?: Uint8Array
+    rulesByteLength?: number
+    skillsBlobId?: Uint8Array
+    skillsByteLength?: number
+    subagentsBlobId?: Uint8Array
+    subagentsByteLength?: number
+    mcpsBlobId?: Uint8Array
+    mcpsByteLength?: number
+    dynamicContext?: {
+      sendMessageEnabled?: boolean
+      adminCommandDenylist?: string[]
+    }
+  }
 
   // InteractionQuery 响应（客户端回复服务器查询）
   interactionResponse?: {
@@ -450,8 +728,8 @@ export interface ParsedCursorRequest {
 
   // ConversationAction.resume_action
   isResumeAction?: boolean
-  resumePendingToolCallIds?: string[]
-  statePendingToolCallIds?: string[]
+  /** Resume is a stream reattachment signal, never a request to replay work. */
+  resumeMode?: "reattach"
 
   // MCP 工具定义（从 Cursor 协议 McpToolDefinition 解析，含完整 input_schema）
   mcpToolDefs?: McpToolDef[]
@@ -507,17 +785,45 @@ const EXEC_RESULT_CASE_MAP: Record<string, string> = {
   shellAllowlistPrecheckResult: "shell_allowlist_precheck_result",
   mcpAllowlistPrecheckResult: "mcp_allowlist_precheck_result",
   webFetchAllowlistPrecheckResult: "web_fetch_allowlist_precheck_result",
+  gitDiffResponse: "git_diff_response",
+  piReadResult: "pi_read_result",
+  piBashResult: "pi_bash_result",
+  piEditResult: "pi_edit_result",
+  piWriteResult: "pi_write_result",
+  piGrepResult: "pi_grep_result",
+  piFindResult: "pi_find_result",
+  piLsResult: "pi_ls_result",
+  conversationSearchResult: "conversation_search_result",
 }
 
-type ParsedBackgroundTaskCompletion = NonNullable<
+export type ParsedBackgroundTaskCompletion = NonNullable<
   ParsedCursorRequest["agentControlBackgroundTaskCompletions"]
 >[number]
+
+/**
+ * Cursor emits progress and terminal updates through the same background-task
+ * completion action. A progress frame must never claim a pending terminal
+ * delivery, even when a client also populates a status field.
+ */
+export function isTerminalBackgroundTaskCompletion(
+  completion: ParsedBackgroundTaskCompletion
+): boolean {
+  if (completion.reason === BackgroundTaskCompletionReason.TASK_PROGRESS) {
+    return false
+  }
+  return (
+    completion.reason === BackgroundTaskCompletionReason.TASK_FINISHED ||
+    completion.status === BackgroundTaskStatus.SUCCESS ||
+    completion.status === BackgroundTaskStatus.ERROR ||
+    completion.status === BackgroundTaskStatus.ABORTED
+  )
+}
 
 type ParsedAsyncAskCompletion = NonNullable<
   ParsedCursorRequest["agentControlAsyncAskCompletion"]
 >
 
-function normalizeBackgroundTaskCompletions(
+export function normalizeBackgroundTaskCompletions(
   raw: unknown
 ): ParsedBackgroundTaskCompletion[] {
   if (!Array.isArray(raw)) return []
@@ -542,6 +848,9 @@ function normalizeBackgroundTaskCompletions(
       outputPath: maybeString(record.outputPath),
       threadId: maybeString(record.threadId),
       reason: maybeNumber(record.reason),
+      subagentId: maybeString(record.subagentId),
+      toolCallId: maybeString(record.toolCallId),
+      notificationContext: maybeNumber(record.notificationContext),
     })
   }
   return completions
@@ -561,6 +870,8 @@ function summarizeBackgroundTaskCompletionsForLog(
         completion.detail ? `detail=${completion.detail}` : "",
         completion.outputPath ? `outputPath=${completion.outputPath}` : "",
         completion.threadId ? `threadId=${completion.threadId}` : "",
+        completion.subagentId ? `subagentId=${completion.subagentId}` : "",
+        completion.toolCallId ? `toolCallId=${completion.toolCallId}` : "",
       ].filter(Boolean)
       return `{${fields.join(", ")}}`
     })
@@ -568,7 +879,7 @@ function summarizeBackgroundTaskCompletionsForLog(
   return rendered.length > 800 ? `${rendered.slice(0, 800)}…` : rendered
 }
 
-function normalizeAsyncAskQuestionCompletionAction(
+export function normalizeAsyncAskQuestionCompletionAction(
   raw: unknown
 ): ParsedAsyncAskCompletion | undefined {
   if (!raw || typeof raw !== "object") return undefined
@@ -580,8 +891,12 @@ function normalizeAsyncAskQuestionCompletionAction(
         prompt?: string
         question?: string
         text?: string
+        options?: Array<{ id?: string; label?: string }>
+        allowMultiple?: boolean
       }>
       title?: string
+      runAsync?: boolean
+      asyncOriginalToolCallId?: string
     }
     result?: {
       result?: {
@@ -661,6 +976,31 @@ function normalizeAsyncAskQuestionCompletionAction(
   return {
     originalToolCallId: asyncAction.originalToolCallId || "",
     originalQuestionText,
+    originalArgs: asyncAction.originalArgs
+      ? {
+          title: asyncAction.originalArgs.title || "",
+          questions: Array.isArray(asyncAction.originalArgs.questions)
+            ? asyncAction.originalArgs.questions.map((question, index) => ({
+                id: question.id || `q${index + 1}`,
+                prompt:
+                  question.prompt ||
+                  question.question ||
+                  question.text ||
+                  `Question ${index + 1}`,
+                options: Array.isArray(question.options)
+                  ? question.options.map((option, optionIndex) => ({
+                      id: option.id || `opt_${index + 1}_${optionIndex + 1}`,
+                      label: option.label || option.id || "",
+                    }))
+                  : [],
+                allowMultiple: question.allowMultiple === true,
+              }))
+            : [],
+          runAsync: asyncAction.originalArgs.runAsync === true,
+          asyncOriginalToolCallId:
+            asyncAction.originalArgs.asyncOriginalToolCallId || "",
+        }
+      : undefined,
     resultCase,
     answers,
     rejectedReason,
@@ -690,11 +1030,12 @@ function makeControlMessage(
     triggeringUserId?: number
     asyncAskCompletion?: ParsedCursorRequest["agentControlAsyncAskCompletion"]
     backgroundTaskCompletions?: ParsedCursorRequest["agentControlBackgroundTaskCompletions"]
+    contextInjection?: ParsedCursorRequest["agentControlContextInjection"]
+    requestContextParts?: ParsedCursorRequest["requestContextParts"]
   }
 ): ParsedCursorRequest {
   return {
     sessionUpdateScope: "control",
-    conversation: [],
     newMessage: "",
     model: options?.model || "",
     thinkingLevel: 0,
@@ -715,118 +1056,110 @@ function makeControlMessage(
     agentControlTriggeringUserId: options?.triggeringUserId,
     agentControlAsyncAskCompletion: options?.asyncAskCompletion,
     agentControlBackgroundTaskCompletions: options?.backgroundTaskCompletions,
+    agentControlContextInjection: options?.contextInjection,
+    requestContextParts: options?.requestContextParts,
+  }
+}
+
+function normalizeRequestContextParts(
+  parts: ConversationAction["requestContextParts"] | undefined
+): ParsedCursorRequest["requestContextParts"] | undefined {
+  if (!parts) return undefined
+  return {
+    rulesBlobId: parts.rulesBlobId?.length
+      ? new Uint8Array(parts.rulesBlobId)
+      : undefined,
+    rulesByteLength: parts.rulesByteLength || undefined,
+    skillsBlobId: parts.skillsBlobId?.length
+      ? new Uint8Array(parts.skillsBlobId)
+      : undefined,
+    skillsByteLength: parts.skillsByteLength || undefined,
+    subagentsBlobId: parts.subagentsBlobId?.length
+      ? new Uint8Array(parts.subagentsBlobId)
+      : undefined,
+    subagentsByteLength: parts.subagentsByteLength || undefined,
+    mcpsBlobId: parts.mcpsBlobId?.length
+      ? new Uint8Array(parts.mcpsBlobId)
+      : undefined,
+    mcpsByteLength: parts.mcpsByteLength || undefined,
+    dynamicContext: parts.dynamicContext
+      ? {
+          sendMessageEnabled: parts.dynamicContext.sendMessageEnabled,
+          adminCommandDenylist: [...parts.dynamicContext.adminCommandDenylist],
+        }
+      : undefined,
+  }
+}
+
+function normalizeInjectContextAction(
+  value: unknown
+): NonNullable<ParsedCursorRequest["agentControlContextInjection"]> {
+  const action = (value || {}) as {
+    injectionId?: string
+    expectedRunId?: string
+    payload?: {
+      case?: string
+      value?: {
+        producer?: string
+        content?: string
+        userMessage?: { text?: string }
+      }
+    }
+  }
+  const payloadCase = action.payload?.case
+  if (payloadCase === "systemContext") {
+    return {
+      injectionId: action.injectionId || "",
+      expectedRunId: action.expectedRunId || "",
+      kind: "systemContext",
+      producer: action.payload?.value?.producer || undefined,
+      systemContent: action.payload?.value?.content || undefined,
+    }
+  }
+  if (payloadCase === "userContext") {
+    return {
+      injectionId: action.injectionId || "",
+      expectedRunId: action.expectedRunId || "",
+      kind: "userContext",
+      userMessageText: action.payload?.value?.userMessage?.text || undefined,
+    }
+  }
+  return {
+    injectionId: action.injectionId || "",
+    expectedRunId: action.expectedRunId || "",
+    kind: "unknown",
   }
 }
 
 export class CursorRequestParser {
   private readonly logger = new Logger(CursorRequestParser.name)
 
-  private readonly textDecoder = new TextDecoder()
-
-  constructor(
-    private readonly kvStorageService: KvStorageService = new KvStorageService()
-  ) {}
-
-  private decodeBlobId(blobId: Uint8Array): string {
-    return this.textDecoder.decode(blobId)
-  }
-
-  private getStoredBlobBytes(blobId: string): Buffer | null {
-    if (!blobId) return null
-    const blobData = this.kvStorageService.getBlob(blobId)
-    if (!blobData) return null
-
-    try {
-      return Buffer.from(blobData, "base64")
-    } catch {
-      return null
-    }
-  }
-
-  private resolveStoredBlobBytes(blobIdBytes?: Uint8Array): Buffer | null {
-    if (!blobIdBytes || blobIdBytes.length === 0) return null
-    const blobId = this.decodeBlobId(blobIdBytes)
-    return this.getStoredBlobBytes(blobId)
-  }
-
-  private resolveProtocolReferenceBytes(ref?: Uint8Array): Buffer | null {
-    if (!ref || ref.length === 0) return null
-    return this.resolveStoredBlobBytes(ref) || Buffer.from(ref)
-  }
-
-  private extractTextFromStructuredPayload(payload: string): string {
-    if (!payload) return ""
-
-    try {
-      const parsed = JSON.parse(payload) as unknown
-      if (typeof parsed === "string") return parsed
-
-      if (parsed && typeof parsed === "object") {
-        const direct = parsed as Record<string, unknown>
-        for (const key of ["text", "content", "query", "message"]) {
-          const value = direct[key]
-          if (typeof value === "string" && value.trim()) {
-            return value
-          }
-        }
-      }
-
-      const parts: string[] = []
-      const visit = (value: unknown, depth: number) => {
-        if (depth > 8 || value == null) return
-        if (typeof value === "string") return
-        if (Array.isArray(value)) {
-          for (const item of value) visit(item, depth + 1)
-          return
-        }
-        if (typeof value !== "object") return
-
-        const record = value as Record<string, unknown>
-        if (typeof record.text === "string" && record.text.trim()) {
-          parts.push(record.text)
-        }
-        for (const nested of Object.values(record)) {
-          visit(nested, depth + 1)
-        }
-      }
-      visit(parsed, 0)
-
-      const joined = parts.join("").trim()
-      return joined || payload
-    } catch {
-      return payload
-    }
-  }
-
-  private decodeStoredTextBlob(blobIdBytes?: Uint8Array): string {
-    const bytes = this.resolveStoredBlobBytes(blobIdBytes)
-    if (!bytes || bytes.length === 0) return ""
-
-    return this.extractTextFromStructuredPayload(bytes.toString("utf8"))
-  }
-
-  private extractUserMessagePrompt(userMsg?: UserMessage): string {
+  private extractUserMessagePrompt(
+    userMsg: UserMessage | undefined,
+    resolver?: CursorProtocolReferenceResolver
+  ): string {
     if (!userMsg) return ""
 
-    if (userMsg.text?.trim()) {
+    if (userMsg.text.length > 0) {
       return userMsg.text
     }
+    if (!userMsg.textBlobId?.length || !resolver) return ""
 
-    const textBlob = this.decodeStoredTextBlob(userMsg.textBlobId)
-    if (textBlob.trim()) {
-      return textBlob
+    const blob = resolver.resolveBlob(userMsg.textBlobId)
+    if (!blob) return ""
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(blob)
+    } catch {
+      // The graph projector owns the authoritative error with placement and
+      // frame context. This convenience field must never reinterpret a blob
+      // as JSON or rich text merely to manufacture a prompt.
+      return ""
     }
-
-    const richTextBlob = this.decodeStoredTextBlob(userMsg.richTextBlobId)
-    if (richTextBlob.trim()) {
-      return richTextBlob
-    }
-
-    return ""
   }
 
   private extractAttachedImagesFromUserMessage(
-    userMsg?: UserMessage
+    userMsg: UserMessage | undefined,
+    resolver?: CursorProtocolReferenceResolver
   ): AttachedImage[] {
     const attachedImages: AttachedImage[] = []
     if (!userMsg?.selectedContext?.selectedImages?.length) {
@@ -842,18 +1175,15 @@ export class CursorRequestParser {
           base64Data = Buffer.from(img.dataOrBlobId.value).toString("base64")
           break
         case "blobIdWithData": {
-          const blobId = this.decodeBlobId(img.dataOrBlobId.value.blobId)
           base64Data = Buffer.from(img.dataOrBlobId.value.data).toString(
             "base64"
           )
-          if (blobId) {
-            this.kvStorageService.storeBlob(blobId, base64Data)
-          }
           break
         }
         case "blobId": {
-          const blobId = this.decodeBlobId(img.dataOrBlobId.value)
-          base64Data = this.kvStorageService.getBlob(blobId)
+          const blobId = cursorBlobIdToKey(img.dataOrBlobId.value)
+          const blob = resolver?.resolveBlob(img.dataOrBlobId.value)
+          base64Data = blob ? Buffer.from(blob).toString("base64") : undefined
           if (!base64Data) {
             this.logger.error(
               `Image blob not found for selected image (uuid=${img.uuid}, blobId=${blobId})`
@@ -880,6 +1210,21 @@ export class CursorRequestParser {
     }
 
     return attachedImages
+  }
+
+  private hasBlobReferencedUserInput(userMsg?: UserMessage): boolean {
+    if (!userMsg) return false
+    if (
+      (userMsg.textBlobId && userMsg.textBlobId.length > 0) ||
+      (userMsg.richTextBlobId && userMsg.richTextBlobId.length > 0)
+    ) {
+      return true
+    }
+    return Boolean(
+      userMsg.selectedContext?.selectedImages.some(
+        (image) => image.dataOrBlobId.case === "blobId"
+      )
+    )
   }
 
   /**
@@ -929,8 +1274,25 @@ export class CursorRequestParser {
     if (!match?.[0]) return undefined
 
     const parsed = Number.parseInt(match[0], 10)
-    if (!Number.isFinite(parsed) || parsed <= 0) return undefined
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) return undefined
     return parsed
+  }
+
+  /**
+   * Agent v1 token details are protobuf uint32 fields. Keep their wire domain
+   * exact at the parser boundary: malformed runtime input must reject the
+   * request rather than be rounded, clamped, or persisted differently.
+   */
+  private requireCursorUint32(value: unknown, label: string): number {
+    if (
+      typeof value !== "number" ||
+      !Number.isSafeInteger(value) ||
+      value < 0 ||
+      value > CURSOR_UINT32_MAX
+    ) {
+      throw new Error(`${label} must be an exact uint32`)
+    }
+    return value
   }
 
   private extractRequestedModelParameters(
@@ -1139,277 +1501,110 @@ export class CursorRequestParser {
     })
   }
 
-  private decodeStateBytes(bytes: Uint8Array): string | null {
-    if (!bytes || bytes.length === 0) return null
-    try {
-      return this.textDecoder.decode(bytes)
-    } catch {
-      return null
-    }
-  }
+  /**
+   * Return only concrete blob bodies carried by this request. References are
+   * deliberately not resolved here: the connection layer is the first place
+   * that knows the authoritative Cursor conversation id.
+   */
+  getInboundBlobPayloads(
+    parsed: ParsedCursorRequest
+  ): CursorInboundBlobPayload[] {
+    const runRequest = parsed.cursorWire?.agentRunRequest
+    if (!runRequest) return []
 
-  private normalizeConversationRole(raw: unknown): "user" | "assistant" | null {
-    if (typeof raw !== "string") return null
-    const normalized = raw.trim().toLowerCase()
-    if (
-      normalized === "assistant" ||
-      normalized === "model" ||
-      normalized === "bot"
-    ) {
-      return "assistant"
-    }
-    if (normalized === "user" || normalized === "human") {
-      return "user"
-    }
-    return null
-  }
-
-  private extractMessageText(content: unknown): string {
-    if (typeof content === "string") return content
-    if (!Array.isArray(content)) return ""
-
-    const textParts: string[] = []
-    for (const part of content) {
-      if (!part || typeof part !== "object") continue
-      const block = part as {
-        type?: unknown
-        text?: unknown
-        content?: unknown
-      }
-      if (block.type === "text" && typeof block.text === "string") {
-        textParts.push(block.text)
-        continue
-      }
-      if (typeof block.content === "string") {
-        textParts.push(block.content)
-      }
-    }
-
-    return textParts.join("\n")
-  }
-
-  private parseConversationMessageCandidate(
-    candidate: unknown
-  ): { role: "user" | "assistant"; content: string } | null {
-    if (!candidate || typeof candidate !== "object") return null
-    const record = candidate as {
-      role?: unknown
-      author?: unknown
-      type?: unknown
-      content?: unknown
-      text?: unknown
-      message?: unknown
-      messageText?: unknown
-    }
-
-    const role =
-      this.normalizeConversationRole(record.role) ||
-      this.normalizeConversationRole(record.author) ||
-      this.normalizeConversationRole(record.type)
-    if (!role) return null
-
-    const content =
-      (typeof record.content === "string" && record.content) ||
-      this.extractMessageText(record.content) ||
-      (typeof record.text === "string" ? record.text : "") ||
-      (typeof record.message === "string" ? record.message : "") ||
-      (typeof record.messageText === "string" ? record.messageText : "")
-
-    if (!content) return null
-    return { role, content }
-  }
-
-  private extractUserMessageFromReference(ref?: Uint8Array): string {
-    const bytes = this.resolveProtocolReferenceBytes(ref)
-    if (!bytes || bytes.length === 0) return ""
-
-    try {
-      const userMsg = fromBinary(UserMessageSchema, bytes)
-      const prompt = this.extractUserMessagePrompt(userMsg)
-      if (prompt.trim()) return prompt
-    } catch {
-      // Not a UserMessage protobuf.
-    }
-
-    return this.extractTextFromStructuredPayload(bytes.toString("utf8"))
-  }
-
-  private extractConversationStepMessageFromReference(
-    ref?: Uint8Array
-  ): { role: "assistant"; content: string } | null {
-    const bytes = this.resolveProtocolReferenceBytes(ref)
-    if (!bytes || bytes.length === 0) return null
-
-    try {
-      const step = fromBinary(ConversationStepSchema, bytes)
-      if (step.message.case === "assistantMessage") {
-        const content = step.message.value.text || ""
-        return content ? { role: "assistant", content } : null
-      }
-    } catch {
-      // Not a ConversationStep protobuf.
-    }
-
-    try {
-      const assistant = fromBinary(AssistantMessageSchema, bytes)
-      if (assistant.text) {
-        return { role: "assistant", content: assistant.text }
-      }
-    } catch {
-      // Not an AssistantMessage protobuf.
-    }
-
-    const candidate = this.parseConversationMessageCandidate(
-      this.extractTextFromStructuredPayload(bytes.toString("utf8"))
+    const blobs: CursorInboundBlobPayload[] = runRequest.preFetchedBlobs.map(
+      (blob) => ({
+        id: Uint8Array.from(blob.id),
+        payload: Uint8Array.from(blob.value),
+        kind: "pre_fetched",
+      })
     )
-    return candidate?.role === "assistant"
-      ? { role: "assistant", content: candidate.content }
-      : null
+    const userMessage = getEffectiveCursorUserMessageAction(
+      runRequest.action?.action
+    )?.userMessage
+    for (const image of userMessage?.selectedContext?.selectedImages || []) {
+      if (image.dataOrBlobId.case !== "blobIdWithData") continue
+      blobs.push({
+        id: Uint8Array.from(image.dataOrBlobId.value.blobId),
+        payload: Uint8Array.from(image.dataOrBlobId.value.data),
+        kind: "selected_image",
+      })
+    }
+    return blobs
   }
 
-  private extractMessagesFromConversationTurnReference(
-    ref?: Uint8Array
-  ): Array<{ role: "user" | "assistant"; content: string }> {
-    const bytes = this.resolveProtocolReferenceBytes(ref)
-    if (!bytes || bytes.length === 0) return []
+  /**
+   * Re-project a parsed frame after the connection has durably bound its
+   * opaque blob references to one Cursor conversation. No process-global KV
+   * lookup is permitted on this path.
+   */
+  resolveConversationReferences(
+    parsed: ParsedCursorRequest,
+    resolver: CursorProtocolReferenceResolver
+  ): ParsedCursorRequest {
+    const frame = parsed.cursorWire?.frame
+    if (!frame) return parsed
 
-    try {
-      const turnStructure = fromBinary(ConversationTurnStructureSchema, bytes)
-      if (turnStructure.turn.case !== "agentConversationTurn") {
-        return []
-      }
-
-      const messages: Array<{
-        role: "user" | "assistant"
-        content: string
-      }> = []
-      const agentTurn = turnStructure.turn.value
-      const userText = this.extractUserMessageFromReference(
-        agentTurn.userMessage
-      )
-      if (userText.trim()) {
-        messages.push({ role: "user", content: userText })
-      }
-
-      for (const stepRef of agentTurn.steps) {
-        const msg = this.extractConversationStepMessageFromReference(stepRef)
-        if (msg) messages.push(msg)
-      }
-
-      return messages
-    } catch {
-      return []
+    const cursorWire = createCursorRequestWireState(frame, resolver)
+    const resolved: ParsedCursorRequest = {
+      ...parsed,
+      cursorWire,
+      cursorConversationHistory: cursorWire.userMessageActionHistory,
     }
-  }
-
-  private extractConversationHistoryFromState(
-    state?: ConversationStateStructure
-  ): Array<{ role: "user" | "assistant"; content: string }> {
-    if (!state) return []
-
-    const messages: Array<{ role: "user" | "assistant"; content: string }> = []
-
-    const pushDedup = (msg: {
-      role: "user" | "assistant"
-      content: string
-    }) => {
-      const last = messages[messages.length - 1]
-      if (last && last.role === msg.role && last.content === msg.content) return
-      messages.push(msg)
+    const runUserAction = getEffectiveCursorUserMessageAction(
+      cursorWire.agentRunRequest?.action?.action
+    )
+    const conversationAction = cursorWire.clientMessage.message
+    const conversationUserAction =
+      conversationAction.case === "conversationAction"
+        ? getEffectiveCursorUserMessageAction(conversationAction.value.action)
+        : undefined
+    const userMessage =
+      runUserAction?.userMessage ?? conversationUserAction?.userMessage
+    if (!userMessage || parsed.isAgentControlMessage || parsed.isResumeAction) {
+      return resolved
     }
 
-    const parseDecodedPayload = (decoded: string) => {
-      if (!decoded || decoded.trim() === "") return
-      try {
-        const parsed = JSON.parse(decoded) as unknown
-        if (Array.isArray(parsed)) {
-          for (const entry of parsed) {
-            const msg = this.parseConversationMessageCandidate(entry)
-            if (msg) pushDedup(msg)
-          }
-          return
-        }
-        const msg = this.parseConversationMessageCandidate(parsed)
-        if (msg) pushDedup(msg)
-      } catch {
-        // Some state blobs are protobuf-encoded turn structures; skip if not JSON.
-      }
-    }
+    const prompt = this.extractUserMessagePrompt(userMessage, resolver)
+    const attachedImages = this.extractAttachedImagesFromUserMessage(
+      userMessage,
+      resolver
+    )
 
-    const parsePayloadOrReferencedBlob = (payload: Uint8Array) => {
-      const decoded = this.decodeStateBytes(payload)
-      if (decoded) {
-        parseDecodedPayload(decoded)
-        const blobBytes = this.getStoredBlobBytes(decoded)
-        if (blobBytes) {
-          parseDecodedPayload(blobBytes.toString("utf8"))
-        }
-      }
+    return {
+      ...resolved,
+      newMessage: prompt,
+      attachedImages: attachedImages.length > 0 ? attachedImages : undefined,
     }
-
-    if (state.rootPromptMessagesJson?.length) {
-      for (const payload of state.rootPromptMessagesJson) {
-        parsePayloadOrReferencedBlob(payload)
-      }
-    }
-
-    if (state.turns?.length) {
-      for (const turn of state.turns) {
-        const turnMessages =
-          this.extractMessagesFromConversationTurnReference(turn)
-        if (turnMessages.length > 0) {
-          for (const msg of turnMessages) {
-            pushDedup(msg)
-          }
-          continue
-        }
-        parsePayloadOrReferencedBlob(turn)
-      }
-    }
-
-    if (messages.length > 0) {
-      this.logger.log(
-        `Rehydrated ${messages.length} message(s) from conversation_state`
-      )
-    }
-    return messages
   }
 
   /**
    * 从 raw buffer 解析 Cursor 请求
    * 使用 @bufbuild/protobuf 的 fromBinary 替代手写 varint 解析
    */
-  parseRequest(buffer: Buffer): ParsedCursorRequest | null {
+  parseRequest(
+    buffer: Buffer,
+    traceScope?: {
+      readonly conversationId?: string
+      readonly streamEpoch?: string
+    }
+  ): ParsedCursorRequest | null {
     this.logger.debug(
       `parseRequest: buffer length=${buffer.length}, first 20 bytes: ${buffer.subarray(0, 20).toString("hex")}`
     )
 
-    // 解压 GZIP
-    let workingBuffer = buffer
-    if (
-      buffer.length >= 2 &&
-      buffer[0] === GZIP_MAGIC[0] &&
-      buffer[1] === GZIP_MAGIC[1]
-    ) {
-      this.logger.log("检测到 GZIP 压缩，解压中...")
-      try {
-        workingBuffer = zlib.gunzipSync(buffer)
-        this.logger.log(`解压 ${buffer.length} → ${workingBuffer.length} bytes`)
-      } catch (error) {
-        this.logger.error("GZIP 解压失败", error)
-        return null
-      }
-    }
-
-    // 使用 fromBinary 解析 AgentClientMessage
     try {
-      const msg = fromBinary(AgentClientMessageSchema, workingBuffer)
+      const frame = decodeCursorAgentClientFrame(buffer)
+      const msg = frame.message
       CursorProtocolTraceService.recordClientMessage(msg, {
-        bytes: workingBuffer.length,
-        compressedBytes: workingBuffer === buffer ? undefined : buffer.length,
+        bytes: frame.protobufBytes.length,
+        compressedBytes:
+          frame.compression === "gzip" ? frame.receivedBytes.length : undefined,
         context: "parseRequest",
+        conversationId: traceScope?.conversationId,
+        streamEpoch: traceScope?.streamEpoch,
       })
-      const result = this.parseAgentClientMessage(msg)
+      const result = this.parseAgentClientMessage(msg, frame)
       if (result) {
         this.logger.log(
           `解析成功: case=${msg.message.case}, mode=${result.unifiedMode}`
@@ -1417,6 +1612,11 @@ export class CursorRequestParser {
         return result
       }
     } catch (error) {
+      if (
+        error instanceof CursorInterruptedPendingToolCallResolutionCodecError
+      ) {
+        throw error
+      }
       this.logger.debug(
         `AgentClientMessage 解析失败: ${error instanceof Error ? error.message : String(error)}`
       )
@@ -1427,9 +1627,41 @@ export class CursorRequestParser {
   }
 
   /**
-   * 从已解析的 AgentClientMessage 提取 ParsedCursorRequest
+   * Attach the raw protocol-owned envelope. Blob references remain unresolved
+   * until the connection has bound the frame to a conversation-scoped durable
+   * store.
    */
   private parseAgentClientMessage(
+    msg: AgentClientMessage,
+    frame: CursorAgentClientFrame
+  ): ParsedCursorRequest | null {
+    const parsed = this.parseAgentClientMessageBody(msg)
+    if (!parsed) return null
+
+    const cursorWire = createCursorRequestWireState(frame)
+    const exactExecResultBytes = cursorWire.execClientMessageBytes
+    const interruptedPendingToolCallResolutions =
+      extractCursorInterruptedPendingToolCallResolutions(frame)
+    return {
+      ...parsed,
+      toolResults:
+        exactExecResultBytes && parsed.toolResults?.length
+          ? parsed.toolResults.map((toolResult) => ({
+              ...toolResult,
+              // The ExecClientMessage payload is protocol data. Keep the
+              // exact nested bytes from the frame instead of replacing them
+              // with a convenience re-encoding.
+              resultData: Buffer.from(exactExecResultBytes),
+            }))
+          : parsed.toolResults,
+      cursorWire,
+      cursorConversationHistory: cursorWire.userMessageActionHistory,
+      interruptedPendingToolCallResolutions,
+    }
+  }
+
+  /** 从已解析的 AgentClientMessage 提取便利字段。 */
+  private parseAgentClientMessageBody(
     msg: AgentClientMessage
   ): ParsedCursorRequest | null {
     const { message } = msg
@@ -1472,12 +1704,23 @@ export class CursorRequestParser {
           )
         }
 
-        if (message.value.action.case === "userMessageAction") {
-          this.logger.log("收到 conversationAction.userMessageAction")
+        const effectiveUserAction = getEffectiveCursorUserMessageAction(
+          message.value.action
+        )
+        if (effectiveUserAction) {
+          this.logger.log(
+            `收到 conversationAction.${message.value.action.case}`
+          )
           return this.parseConversationUserMessageAction(
-            message.value.action.value,
+            effectiveUserAction,
             triggeringFields
           )
+        }
+        if (message.value.action.case === "subscriptionNotificationAction") {
+          this.logger.warn(
+            "收到无 notifications 的 conversationAction.subscriptionNotificationAction"
+          )
+          return null
         }
 
         if (message.value.action.case === "resumeAction") {
@@ -1589,11 +1832,40 @@ export class CursorRequestParser {
             toolCallId: bgSub.toolCallId || "",
           })
         }
+        if (message.value.action.case === "goalContinuationAction") {
+          this.logger.log("收到 conversationAction.goalContinuationAction")
+          return makeControlMessage("goalContinuationAction", {
+            ...triggeringFields,
+            requestContextParts: normalizeRequestContextParts(
+              message.value.requestContextParts
+            ),
+          })
+        }
+        if (message.value.action.case === "injectContextAction") {
+          const injection = normalizeInjectContextAction(
+            message.value.action.value
+          )
+          this.logger.log(
+            `收到 conversationAction.injectContextAction injectionId=${injection.injectionId || "(none)"} kind=${injection.kind}`
+          )
+          return makeControlMessage("injectContextAction", {
+            ...triggeringFields,
+            contextInjection: injection,
+            requestContextParts: normalizeRequestContextParts(
+              message.value.requestContextParts
+            ),
+          })
+        }
 
         this.logger.debug(
           `收到 conversationAction（未识别） action=${message.value.action.case || "(none)"}`
         )
-        return makeControlMessage("unknownConversationAction", triggeringFields)
+        return makeControlMessage("unknownConversationAction", {
+          ...triggeringFields,
+          requestContextParts: normalizeRequestContextParts(
+            message.value.requestContextParts
+          ),
+        })
       }
 
       case "kvClientMessage":
@@ -1648,7 +1920,6 @@ export class CursorRequestParser {
           }
         }
         return {
-          conversation: [],
           newMessage: "",
           model: "",
           thinkingLevel: 0,
@@ -1671,6 +1942,8 @@ export class CursorRequestParser {
           requestedModel?: { modelId?: string }
           modelDetails?: { modelId?: string }
           conversationId?: string
+          bestOfNGroupId?: string
+          tryUseBestOfNPromotion?: boolean
         }
         const requestedModelId =
           prewarm.requestedModel?.modelId?.trim() || undefined
@@ -1684,10 +1957,14 @@ export class CursorRequestParser {
         this.logger.debug(
           `收到 prewarmRequest conversation=${prewarm.conversationId || "(none)"} model=${model || "(empty)"}`
         )
-        return makeControlMessage("prewarm", {
-          conversationId: prewarm.conversationId || undefined,
-          model,
-        })
+        return {
+          ...makeControlMessage("prewarm", {
+            conversationId: prewarm.conversationId || undefined,
+            model,
+          }),
+          bestOfNGroupId: prewarm.bestOfNGroupId,
+          tryUseBestOfNPromotion: prewarm.tryUseBestOfNPromotion,
+        }
       }
 
       case undefined:
@@ -1738,6 +2015,79 @@ export class CursorRequestParser {
     }
   }
 
+  /**
+   * Resolve every parser entry through the same protocol authority boundary.
+   * The derived projectContext remains presentation-only; all root authority
+   * stays on workspaceDeclaration.scope.
+   */
+  private parseWorkspaceContext(
+    requestContext: WorkspaceFolderExtractionInput | undefined,
+    conversationState?: ConversationStateWorkspaceInput
+  ): Pick<
+    ParsedCursorRequest,
+    | "workspaceDeclaration"
+    | "resumeWorkspaceReferences"
+    | "cursorManagedReadResources"
+    | "projectContext"
+  > {
+    const workspaceState = parseCursorWorkspaceState(
+      requestContext,
+      conversationState
+    )
+    const declaration = workspaceState.declaration
+    return {
+      ...(declaration
+        ? {
+            workspaceDeclaration: declaration,
+            projectContext: deriveProjectContextPresentation(declaration),
+          }
+        : {}),
+      ...(workspaceState.resumeReferences.length > 0
+        ? { resumeWorkspaceReferences: workspaceState.resumeReferences }
+        : {}),
+      ...(workspaceState.managedReadResources !== undefined
+        ? { cursorManagedReadResources: workspaceState.managedReadResources }
+        : {}),
+    }
+  }
+
+  /**
+   * RequestContext environment folders are filesystem paths, not display
+   * labels. Keep their exact bytes so a valid whitespace-bearing directory
+   * is not rewritten before downstream workspace admission. Shell and time
+   * zone remain textual metadata and retain their existing normalization.
+   */
+  private parseRequestContextEnv(
+    env:
+      | {
+          terminalsFolder?: string
+          projectFolder?: string
+          shell?: string
+          timeZone?: string
+          agentTranscriptsFolder?: string
+          artifactsFolder?: string
+        }
+      | undefined
+  ): ParsedCursorRequest["requestContextEnv"] {
+    if (!env) return undefined
+    const pathValue = (value: unknown): string | undefined =>
+      typeof value === "string" && value.length > 0 && !value.includes("\u0000")
+        ? value
+        : undefined
+    const textValue = (value: unknown): string | undefined =>
+      typeof value === "string" && value.trim().length > 0
+        ? value.trim()
+        : undefined
+    return {
+      terminalsFolder: pathValue(env.terminalsFolder),
+      projectFolder: pathValue(env.projectFolder),
+      shell: textValue(env.shell),
+      timeZone: textValue(env.timeZone),
+      agentTranscriptsFolder: pathValue(env.agentTranscriptsFolder),
+      artifactsFolder: pathValue(env.artifactsFolder),
+    }
+  }
+
   private parseConversationUserMessageAction(
     action: UserMessageAction,
     triggeringFields?: {
@@ -1751,37 +2101,26 @@ export class CursorRequestParser {
     const attachedImages = this.extractAttachedImagesFromUserMessage(
       action.userMessage
     )
+    const hasBlobReferencedUserInput = this.hasBlobReferencedUserInput(
+      action.userMessage
+    )
 
-    if (!prompt.trim() && attachedImages.length === 0) {
+    if (
+      !prompt.trim() &&
+      attachedImages.length === 0 &&
+      !hasBlobReferencedUserInput
+    ) {
+      if (action.interruptedPendingToolCallResolutions) {
+        // A resolution-only user action is protocol control, not an empty
+        // upstream model turn. Its raw envelope is attached after parsing.
+        return makeControlMessage("other", triggeringFields)
+      }
       this.logger.debug("conversationAction.userMessageAction 中无有效 prompt")
       return null
     }
 
-    const conversation: Array<{
-      role: "user" | "assistant"
-      content: string
-    }> = []
-
-    for (const prepended of action.prependUserMessages || []) {
-      const text = this.extractUserMessagePrompt(prepended)
-      if (text.trim()) {
-        conversation.push({ role: "user", content: text })
-      }
-    }
-    if (prompt.trim()) {
-      conversation.push({ role: "user", content: prompt })
-    }
-
     const requestContext = action.requestContext
-    // Multi-root workspace extraction. See workspace-folders.ts for
-    // the data flow — this single helper supersedes the previous
-    // ad-hoc loops over repositoryInfo / gitRepos / previousWorkspaceUris
-    // that were duplicated across every parser entry point.
-    const { rootPath, workspaceFolders } = extractWorkspaceFoldersWithPrimary(
-      requestContext,
-      undefined
-    )
-    const directories = workspaceFolders.map((f) => f.path)
+    const workspaceContext = this.parseWorkspaceContext(requestContext)
 
     const builtInToolCapabilityOptions = {
       webSearchEnabled: requestContext?.webSearchEnabled,
@@ -1791,18 +2130,21 @@ export class CursorRequestParser {
     const supportedTools = getDefaultAgentToolNames(
       builtInToolCapabilityOptions
     )
+    if (requestContext?.searchConversationsEnabled === true) {
+      supportedTools.push("search_conversations")
+    }
     const useWeb =
       requestContext?.webSearchEnabled === true ||
       requestContext?.webFetchEnabled === true
 
     this.logger.log(
       `conversationAction.userMessageAction: prompt="${prompt.substring(0, 100)}...", ` +
-        `workspace=${rootPath || "(none)"} folders=${workspaceFolders.length}, tools=${supportedTools.length}, useWeb=${useWeb}`
+        `workspace=${workspaceContext.projectContext?.rootPath || "(none)"} folders=${workspaceContext.projectContext?.workspaceFolders.length || 0}, tools=${supportedTools.length}, useWeb=${useWeb}`
     )
 
     return {
+      chatTurnExecutionIntent: "new_top_level",
       sessionUpdateScope: "partial",
-      conversation,
       newMessage: prompt,
       model: "",
       thinkingLevel: 0,
@@ -1810,24 +2152,16 @@ export class CursorRequestParser {
       isAgentic: true,
       supportedTools,
       useWeb,
-      projectContext: rootPath
-        ? { rootPath, directories, files: [], workspaceFolders }
-        : undefined,
-      requestContextEnv: requestContext?.env
-        ? {
-            terminalsFolder:
-              requestContext.env.terminalsFolder?.trim() || undefined,
-            projectFolder:
-              requestContext.env.projectFolder?.trim() || undefined,
-            shell: requestContext.env.shell?.trim() || undefined,
-            timeZone: requestContext.env.timeZone?.trim() || undefined,
-            agentTranscriptsFolder:
-              requestContext.env.agentTranscriptsFolder?.trim() || undefined,
-            artifactsFolder:
-              requestContext.env.artifactsFolder?.trim() || undefined,
-          }
-        : undefined,
+      ...workspaceContext,
+      hookConfiguredSteps: selectCursorAgentHookSteps(
+        requestContext?.hooksConfig?.configuredSteps
+      ),
+      hooksAdditionalContext: requestContext?.hooksAdditionalContext,
+      bestOfNGroupId: action.userMessage?.bestOfNGroupId,
+      tryUseBestOfNPromotion: action.userMessage?.tryUseBestOfNPromotion,
+      requestContextEnv: this.parseRequestContextEnv(requestContext?.env),
       attachedImages: attachedImages.length > 0 ? attachedImages : undefined,
+      hasBlobReferencedUserInput,
     }
   }
 
@@ -1835,11 +2169,7 @@ export class CursorRequestParser {
     action: ResumeAction
   ): ParsedCursorRequest {
     const requestContext = action.requestContext
-    const { rootPath, workspaceFolders } = extractWorkspaceFoldersWithPrimary(
-      requestContext,
-      undefined
-    )
-    const directories = workspaceFolders.map((f) => f.path)
+    const workspaceContext = this.parseWorkspaceContext(requestContext)
     const builtInToolCapabilityOptions = {
       webSearchEnabled: requestContext?.webSearchEnabled,
       webFetchEnabled: requestContext?.webFetchEnabled,
@@ -1848,13 +2178,15 @@ export class CursorRequestParser {
     const supportedTools = getDefaultAgentToolNames(
       builtInToolCapabilityOptions
     )
+    if (requestContext?.searchConversationsEnabled === true) {
+      supportedTools.push("search_conversations")
+    }
     const useWeb =
       requestContext?.webSearchEnabled === true ||
       requestContext?.webFetchEnabled === true
 
     return {
       sessionUpdateScope: "control",
-      conversation: [],
       newMessage: "",
       model: "",
       thinkingLevel: 0,
@@ -1862,24 +2194,14 @@ export class CursorRequestParser {
       isAgentic: true,
       supportedTools,
       useWeb,
-      projectContext: rootPath
-        ? { rootPath, directories, files: [], workspaceFolders }
-        : undefined,
-      requestContextEnv: requestContext?.env
-        ? {
-            terminalsFolder:
-              requestContext.env.terminalsFolder?.trim() || undefined,
-            projectFolder:
-              requestContext.env.projectFolder?.trim() || undefined,
-            shell: requestContext.env.shell?.trim() || undefined,
-            timeZone: requestContext.env.timeZone?.trim() || undefined,
-            agentTranscriptsFolder:
-              requestContext.env.agentTranscriptsFolder?.trim() || undefined,
-            artifactsFolder:
-              requestContext.env.artifactsFolder?.trim() || undefined,
-          }
-        : undefined,
+      ...workspaceContext,
+      hookConfiguredSteps: selectCursorAgentHookSteps(
+        requestContext?.hooksConfig?.configuredSteps
+      ),
+      hooksAdditionalContext: requestContext?.hooksAdditionalContext,
+      requestContextEnv: this.parseRequestContextEnv(requestContext?.env),
       isResumeAction: true,
+      resumeMode: "reattach",
     }
   }
 
@@ -1891,41 +2213,34 @@ export class CursorRequestParser {
     let prompt = ""
     const action = req.action
     const actionCase = action?.action.case
+    const effectiveUserAction = getEffectiveCursorUserMessageAction(
+      action?.action
+    )
     let requestContext:
       | import("../../../gen/agent/v1_pb").RequestContext
       | undefined
-    const statePendingToolCallIds =
-      req.conversationState?.pendingToolCalls || []
-
-    if (req.preFetchedBlobs?.length) {
-      for (const blob of req.preFetchedBlobs) {
-        const blobId = this.decodeBlobId(blob.id)
-        if (blobId && blob.value?.length) {
-          this.kvStorageService.storeBinaryBlob(blobId, blob.value)
-        }
-      }
-      this.logger.debug(
-        `Stored ${req.preFetchedBlobs.length} preFetchedBlob(s) from AgentRunRequest`
-      )
-    }
-
-    const stateHistory = this.extractConversationHistoryFromState(
-      req.conversationState
-    )
+    let userMessage: UserMessage | undefined
+    // Blob payloads and references are intentionally not resolved here. This
+    // parser has no conversation ownership; the connection binds them to the
+    // durable conversation store before the typed graph projector consumes
+    // them.
 
     // 附加图片
     const attachedImages: AttachedImage[] = []
+    let hasBlobReferencedUserInput = false
 
-    if (action && actionCase === "userMessageAction") {
-      const userMsg: UserMessage | undefined = action.action.value.userMessage
+    if (effectiveUserAction) {
+      const userMsg: UserMessage | undefined = effectiveUserAction.userMessage
+      userMessage = userMsg
       if (userMsg) {
         prompt = this.extractUserMessagePrompt(userMsg)
         attachedImages.push(
           ...this.extractAttachedImagesFromUserMessage(userMsg)
         )
+        hasBlobReferencedUserInput = this.hasBlobReferencedUserInput(userMsg)
       }
       // 提取 requestContext（包含 workspace、rules 等信息）
-      requestContext = action.action.value.requestContext
+      requestContext = effectiveUserAction.requestContext
     } else if (action && actionCase === "resumeAction") {
       // Resume turns may not contain a new prompt, but still carry requestContext.
       requestContext = action.action.value.requestContext
@@ -1952,6 +2267,7 @@ export class CursorRequestParser {
     // refresh `model` / `thinkingLevel`). Empty result means "no overrides
     // declared" — every consumer treats that as inherit-from-parent.
     const subagentModelOverrides = parseSubagentModelOverrides(req)
+    const selectedSubagentModels = parseSelectedSubagentModels(req)
     if (!subagentModelOverrides.isEmpty()) {
       this.logger.debug(
         `AgentRunRequest subagent_model_overrides: ${subagentModelOverrides
@@ -1972,9 +2288,21 @@ export class CursorRequestParser {
           .join(", ")}`
       )
     }
+    if (!selectedSubagentModels.isEmpty()) {
+      this.logger.debug(
+        `AgentRunRequest selected_subagent_models: ${selectedSubagentModels
+          .ids()
+          .join(", ")}`
+      )
+    }
 
     // 提取 conversationId
-    const conversationId = req.conversationId || undefined
+    const conversationId = req.conversationId
+      ? requireExactDurableIdentifier(
+          req.conversationId,
+          "AgentRunRequest conversationId"
+        )
+      : undefined
 
     // 提取 workspace 路径（从 repositoryInfo 或 conversationState）
     // DEBUG: dump requestContext 关键字段
@@ -2027,8 +2355,8 @@ export class CursorRequestParser {
       this.logger.debug("[DEBUG] requestContext is undefined")
     }
     // DEBUG: dump selectedContext.cursorRules
-    if (action && actionCase === "userMessageAction") {
-      const _userMsg = action.action.value.userMessage
+    if (effectiveUserAction) {
+      const _userMsg = effectiveUserAction.userMessage
       const _selRules = _userMsg?.selectedContext?.cursorRules
       this.logger.debug(
         `[DEBUG] selectedContext.cursorRules: ${_selRules?.length ?? "undefined"} item(s)`
@@ -2071,15 +2399,12 @@ export class CursorRequestParser {
         )
       }
     }
-    // Multi-root workspace extraction (parseRunRequest path).
-    // Same helper as the conversationAction.userMessageAction path,
-    // but with conversationState available so previousWorkspaceUris
-    // is consulted as a resume-time fallback. See workspace-folders.ts.
-    const { rootPath, workspaceFolders } = extractWorkspaceFoldersWithPrimary(
+    // The direct Agent v1 workspace declaration is parsed once here. Prior
+    // workspace URIs remain resume references and never become root authority.
+    const workspaceContext = this.parseWorkspaceContext(
       requestContext,
       req.conversationState
     )
-    const directories = workspaceFolders.map((f) => f.path)
 
     // 提取 Cursor Rules
     // 规则来自两个来源：
@@ -2099,8 +2424,8 @@ export class CursorRequestParser {
     const selectedCursorRuleNames = new Set<string>()
 
     // 收集 selectedContext.cursorRules（SelectedCursorRule 包装了 CursorRule）
-    if (action && actionCase === "userMessageAction") {
-      const userMsg = action.action.value.userMessage
+    if (effectiveUserAction) {
+      const userMsg = effectiveUserAction.userMessage
       const selectedRules = userMsg?.selectedContext?.cursorRules
       if (selectedRules && selectedRules.length > 0) {
         // 用 fullPath 集合去重，避免同一条规则重复注入
@@ -2182,8 +2507,8 @@ export class CursorRequestParser {
 
     // 提取 Cursor Commands (/ 命令)
     const cursorCommands: Array<{ name: string; content: string }> = []
-    if (action && actionCase === "userMessageAction") {
-      const userMsg = action.action.value.userMessage
+    if (effectiveUserAction) {
+      const userMsg = effectiveUserAction.userMessage
       const cmds = userMsg?.selectedContext?.cursorCommands
       if (cmds && cmds.length > 0) {
         for (const cmd of cmds) {
@@ -2219,15 +2544,22 @@ export class CursorRequestParser {
     const requestedContextTokenLimit = this.extractRequestedContextTokenLimit(
       req.requestedModel?.parameters || []
     )
-    const usedContextTokens =
-      req.conversationState?.tokenDetails &&
-      req.conversationState.tokenDetails.usedTokens > 0
-        ? req.conversationState.tokenDetails.usedTokens
-        : undefined
+    const tokenDetails = req.conversationState?.tokenDetails
+    const usedContextTokens = tokenDetails
+      ? this.requireCursorUint32(
+          tokenDetails.usedTokens,
+          "conversationState.tokenDetails.usedTokens"
+        )
+      : undefined
+    const rawContextTokenLimit = tokenDetails
+      ? this.requireCursorUint32(
+          tokenDetails.maxTokens,
+          "conversationState.tokenDetails.maxTokens"
+        )
+      : undefined
     const rawContextTokenLimitFromState =
-      req.conversationState?.tokenDetails &&
-      req.conversationState.tokenDetails.maxTokens > 0
-        ? req.conversationState.tokenDetails.maxTokens
+      rawContextTokenLimit !== undefined && rawContextTokenLimit > 0
+        ? rawContextTokenLimit
         : undefined
     const explicitMaxContextMode =
       modelMaxMode ||
@@ -2254,7 +2586,7 @@ export class CursorRequestParser {
     ) {
       this.logger.log(
         `Token budget from protocol: contextLimit=${contextTokenLimit || "(none)"}, ` +
-          `usedContext=${usedContextTokens || "(none)"}, maxOutput=${requestedMaxOutputTokens || "(none)"}, ` +
+          `usedContext=${usedContextTokens ?? "(none)"}, maxOutput=${requestedMaxOutputTokens || "(none)"}, ` +
           `maxMode=${explicitMaxContextMode}`
       )
     }
@@ -2351,6 +2683,10 @@ export class CursorRequestParser {
       }
     }
 
+    if (requestContext?.searchConversationsEnabled === true) {
+      supportedToolsSet.add("search_conversations")
+    }
+
     const supportedTools = Array.from(supportedToolsSet)
 
     // 提取 MCP 工具完整定义（含 input_schema）
@@ -2361,6 +2697,7 @@ export class CursorRequestParser {
       providerIdentifier?: string
       description?: string
       inputSchema?: unknown
+      inputSchemaJson?: string
     }) => {
       const name = tool.name || tool.toolName
       if (!name || mcpToolDefsByName.has(name)) return
@@ -2377,12 +2714,22 @@ export class CursorRequestParser {
       }
       if (tool.inputSchema) {
         try {
-          def.inputSchema = this.protoValueToJs(tool.inputSchema) as Record<
-            string,
-            unknown
-          >
+          const parsed = this.protoValueToJs(tool.inputSchema)
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            def.inputSchema = parsed as Record<string, unknown>
+          }
         } catch {
           // inputSchema 解析失败则跳过
+        }
+      }
+      if (!def.inputSchema && tool.inputSchemaJson?.trim()) {
+        try {
+          const parsed = JSON.parse(tool.inputSchemaJson) as unknown
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            def.inputSchema = parsed as Record<string, unknown>
+          }
+        } catch {
+          this.logger.warn(`Invalid MCP input_schema_json for ${name}`)
         }
       }
       mcpToolDefsByName.set(name, def)
@@ -2409,24 +2756,21 @@ export class CursorRequestParser {
     const useWeb =
       requestContext?.webSearchEnabled === true ||
       requestContext?.webFetchEnabled === true
-    const requestContextEnv = requestContext?.env
-      ? {
-          terminalsFolder:
-            requestContext.env.terminalsFolder?.trim() || undefined,
-          projectFolder: requestContext.env.projectFolder?.trim() || undefined,
-          shell: requestContext.env.shell?.trim() || undefined,
-          timeZone: requestContext.env.timeZone?.trim() || undefined,
-          agentTranscriptsFolder:
-            requestContext.env.agentTranscriptsFolder?.trim() || undefined,
-          artifactsFolder:
-            requestContext.env.artifactsFolder?.trim() || undefined,
-        }
+    const requestContextEnv = this.parseRequestContextEnv(requestContext?.env)
+    const hookConfiguredSteps = selectCursorAgentHookSteps(
+      requestContext?.hooksConfig?.configuredSteps
+    )
+    const hooksAdditionalContext = requestContext?.hooksAdditionalContext
+    const goalState = req.conversationState?.goalState
+      ? fromProtoGoalState(req.conversationState.goalState)
       : undefined
+    const isRootProjectConversation =
+      req.conversationState?.isRootProjectConversation
 
     if (prompt) {
       this.logger.log(
         `AgentRunRequest: prompt="${prompt.substring(0, 100)}...", model=${model}, ` +
-          `workspace=${rootPath || "(none)"}, rules=${cursorRules?.length || 0}, ` +
+          `workspace=${workspaceContext.projectContext?.rootPath || "(none)"}, rules=${cursorRules?.length || 0}, ` +
           `customPrompt=${customSystemPrompt ? customSystemPrompt.length + " chars" : "none"}, ` +
           `tools=${supportedTools.length}, useWeb=${useWeb}`
       )
@@ -2450,7 +2794,7 @@ export class CursorRequestParser {
     const registryDeclaresThinking = modelIdForCapability
       ? doesModelSupportThinking(modelIdForCapability)
       : false
-    let thinkingLevel = 0
+    let thinkingLevel: CursorThinkingLevel = 0
     if (
       modelMaxMode ||
       requestedMaxMode ||
@@ -2495,17 +2839,10 @@ export class CursorRequestParser {
       )
     }
 
-    if (!prompt.trim() && attachedImages.length === 0 && !actionCase) {
-      const stateTail = stateHistory[stateHistory.length - 1]
-      if (stateTail?.role === "user" && stateTail.content.trim()) {
-        prompt = stateTail.content
-        this.logger.log(
-          `AgentRunRequest inferred prompt from conversation_state tail (${prompt.length} chars)`
-        )
-      }
-    }
-
-    const hasUserInput = prompt.length > 0 || attachedImages.length > 0
+    const hasUserInput =
+      prompt.length > 0 ||
+      attachedImages.length > 0 ||
+      hasBlobReferencedUserInput
 
     if (!hasUserInput) {
       if (actionCase === "cancelAction") {
@@ -2528,7 +2865,8 @@ export class CursorRequestParser {
         )
         return {
           sessionUpdateScope: "control",
-          conversation: stateHistory,
+          // Resume attaches to the existing graph and must not create a
+          // model turn or replay inbound state.
           newMessage: "",
           model,
           thinkingLevel,
@@ -2538,9 +2876,7 @@ export class CursorRequestParser {
           supportedTools,
           useWeb,
           conversationId,
-          projectContext: rootPath
-            ? { rootPath, directories, files: [], workspaceFolders }
-            : undefined,
+          ...workspaceContext,
           cursorRules,
           skillOptions,
           selectedCursorRulePaths:
@@ -2560,16 +2896,34 @@ export class CursorRequestParser {
           usedContextTokens,
           requestedMaxOutputTokens,
           requestedModelParameters,
+          hookConfiguredSteps,
+          hooksAdditionalContext,
+          goalState,
+          isRootProjectConversation,
           requestContextEnv,
           isResumeAction: true,
-          resumePendingToolCallIds: statePendingToolCallIds,
-          statePendingToolCallIds,
+          resumeMode: "reattach",
           mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
           subagentModelOverrides,
+          selectedSubagentModels,
         }
       }
 
-      if (action && actionCase && actionCase !== "userMessageAction") {
+      if (
+        actionCase === "userMessageAction" &&
+        action?.action.case === "userMessageAction" &&
+        action.action.value.interruptedPendingToolCallResolutions
+      ) {
+        // The IDE can deliver official terminal records on a reconnect with
+        // no user text. Do not start an empty model turn; the raw records are
+        // retained by parseAgentClientMessage for the control loop.
+        return makeControlMessage("other", {
+          conversationId,
+          model,
+        })
+      }
+
+      if (action && actionCase && !effectiveUserAction) {
         const controlActionName: string = actionCase
         const control = (() => {
           switch (actionCase) {
@@ -2682,6 +3036,33 @@ export class CursorRequestParser {
                 toolCallId: bgSub.toolCallId || "",
               })
             }
+            case "goalContinuationAction":
+              this.logger.log(
+                `AgentRunRequest goalContinuationAction: conversationId=${conversationId || "(none)"}`
+              )
+              return makeControlMessage("goalContinuationAction", {
+                conversationId,
+                model,
+                requestContextParts: normalizeRequestContextParts(
+                  action.requestContextParts
+                ),
+              })
+            case "injectContextAction": {
+              const injection = normalizeInjectContextAction(
+                action.action.value
+              )
+              this.logger.log(
+                `AgentRunRequest injectContextAction: conversationId=${conversationId || "(none)"} injectionId=${injection.injectionId || "(none)"} kind=${injection.kind}`
+              )
+              return makeControlMessage("injectContextAction", {
+                conversationId,
+                model,
+                contextInjection: injection,
+                requestContextParts: normalizeRequestContextParts(
+                  action.requestContextParts
+                ),
+              })
+            }
             default:
               this.logger.log(
                 `AgentRunRequest unknown control action: conversationId=${conversationId || "(none)"} action=${controlActionName || "(none)"}`
@@ -2689,6 +3070,9 @@ export class CursorRequestParser {
               return makeControlMessage("unknownConversationAction", {
                 conversationId,
                 model,
+                requestContextParts: normalizeRequestContextParts(
+                  action.requestContextParts
+                ),
               })
           }
         })()
@@ -2696,16 +3080,13 @@ export class CursorRequestParser {
         return {
           ...control,
           sessionUpdateScope: "control",
-          conversation: stateHistory,
           model: control.model || model,
           thinkingLevel,
           thinkingDetailsRequested,
           supportedTools,
           useWeb,
           conversationId,
-          projectContext: rootPath
-            ? { rootPath, directories, files: [], workspaceFolders }
-            : undefined,
+          ...workspaceContext,
           cursorRules,
           skillOptions,
           selectedCursorRulePaths:
@@ -2725,10 +3106,14 @@ export class CursorRequestParser {
           usedContextTokens,
           requestedMaxOutputTokens,
           requestedModelParameters,
+          hookConfiguredSteps,
+          hooksAdditionalContext,
+          goalState,
+          isRootProjectConversation,
           requestContextEnv,
-          statePendingToolCallIds,
           mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
           subagentModelOverrides,
+          selectedSubagentModels,
         }
       }
 
@@ -2741,11 +3126,10 @@ export class CursorRequestParser {
       ) {
         this.logger.log(
           `AgentRunRequest attach-only: conversationId=${conversationId || "(none)"}, model=${model}, ` +
-            `history=${stateHistory.length}, tools=${supportedTools.length}`
+            `tools=${supportedTools.length}`
         )
         return {
           sessionUpdateScope: "control",
-          conversation: stateHistory,
           newMessage: "",
           model,
           thinkingLevel,
@@ -2755,9 +3139,7 @@ export class CursorRequestParser {
           supportedTools,
           useWeb,
           conversationId,
-          projectContext: rootPath
-            ? { rootPath, directories, files: [], workspaceFolders }
-            : undefined,
+          ...workspaceContext,
           cursorRules,
           skillOptions,
           selectedCursorRulePaths:
@@ -2777,12 +3159,16 @@ export class CursorRequestParser {
           usedContextTokens,
           requestedMaxOutputTokens,
           requestedModelParameters,
+          hookConfiguredSteps,
+          hooksAdditionalContext,
+          goalState,
+          isRootProjectConversation,
           requestContextEnv,
           isAgentControlMessage: true,
           agentControlType: "attachOnly",
-          statePendingToolCallIds,
           mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
           subagentModelOverrides,
+          selectedSubagentModels,
         }
       }
 
@@ -2790,22 +3176,9 @@ export class CursorRequestParser {
       return null
     }
 
-    const conversation = [...stateHistory]
-    const tail = conversation[conversation.length - 1]
-    if (
-      !(
-        tail &&
-        tail.role === "user" &&
-        tail.content === prompt &&
-        !(prompt.length === 0 && attachedImages.length > 0)
-      )
-    ) {
-      conversation.push({ role: "user", content: prompt })
-    }
-
     return {
+      chatTurnExecutionIntent: "new_top_level",
       sessionUpdateScope: "full",
-      conversation,
       newMessage: prompt,
       model,
       thinkingLevel,
@@ -2815,9 +3188,7 @@ export class CursorRequestParser {
       supportedTools,
       useWeb,
       conversationId,
-      projectContext: rootPath
-        ? { rootPath, directories, files: [], workspaceFolders }
-        : undefined,
+      ...workspaceContext,
       cursorRules,
       skillOptions,
       selectedCursorRulePaths:
@@ -2836,11 +3207,18 @@ export class CursorRequestParser {
       usedContextTokens,
       requestedMaxOutputTokens,
       requestedModelParameters,
+      hookConfiguredSteps,
+      hooksAdditionalContext,
+      goalState,
+      isRootProjectConversation,
+      bestOfNGroupId: userMessage?.bestOfNGroupId,
+      tryUseBestOfNPromotion: userMessage?.tryUseBestOfNPromotion,
       requestContextEnv,
-      statePendingToolCallIds,
       mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
       attachedImages: attachedImages.length > 0 ? attachedImages : undefined,
+      hasBlobReferencedUserInput,
       subagentModelOverrides,
+      selectedSubagentModels,
     }
   }
 
@@ -2867,15 +3245,23 @@ export class CursorRequestParser {
       `ExecClientMessage: id=${numericId}, exec_id=${execId}, case=${resultCase}`
     )
 
-    // 将整个 ExecClientMessage 重新序列化为 Buffer 传递给下游
-    // 下游会用 fromBinary 读取具体的 result 字段
-    const resultData = Buffer.from(toBinary(ExecClientMessageSchema, msg))
+    // This is a canonical convenience encoding only. parseAgentClientMessage
+    // replaces it with exact nested frame bytes when this came through the
+    // AgentClientMessage transport envelope.
+    const resultData = Buffer.from(
+      toBinary(ExecClientMessageSchema, msg, { writeUnknownFields: true })
+    )
+    const execIdentity = createCursorExecResultRecord({
+      numericId,
+      execId,
+      resultCase,
+    })
+    const hookAdditionalContexts = parseCursorHookAdditionalContextReceipts(
+      msg.hookAdditionalContexts
+    )
 
-    // 使用 execId 作为 toolCallId（与 ExecServerMessage.execId 配对）
-    // numericId 用于 ExecServerMessage.id ↔ ExecClientMessage.id 的请求/响应匹配
     return {
       sessionUpdateScope: "control",
-      conversation: [],
       newMessage: "",
       model: "",
       thinkingLevel: 0,
@@ -2885,45 +3271,15 @@ export class CursorRequestParser {
       useWeb: false,
       toolResults: [
         {
-          toolCallId: execId,
           toolType: numericId, // 存储 numeric id 用于配对
           resultCase,
           resultData,
+          execIdentity,
+          ...(hookAdditionalContexts.length > 0
+            ? { hookAdditionalContexts }
+            : {}),
         },
       ],
-    }
-  }
-
-  /**
-   * 解析 tool 结果（兼容旧接口）
-   * 现在直接使用 fromBinary 解析 ExecClientMessage
-   */
-  public parseToolResult(buffer: Buffer): ParsedToolResult | null {
-    try {
-      const msg = fromBinary(ExecClientMessageSchema, buffer)
-      const execId = msg.execId || ""
-      const messageCase = msg.message.case
-
-      if (!messageCase) {
-        this.logger.debug("parseToolResult: ExecClientMessage.message 未设置")
-        return null
-      }
-
-      const resultCase = EXEC_RESULT_CASE_MAP[messageCase] || messageCase
-
-      this.logger.log(`parseToolResult: exec_id=${execId}, case=${resultCase}`)
-
-      // 重新序列化为 buffer 传递给下游
-      const data = Buffer.from(toBinary(ExecClientMessageSchema, msg))
-      return {
-        toolCallId: execId,
-        toolType: msg.id,
-        resultCase,
-        resultData: data,
-      }
-    } catch (error) {
-      this.logger.error("parseToolResult 失败", error)
-      return null
     }
   }
 }

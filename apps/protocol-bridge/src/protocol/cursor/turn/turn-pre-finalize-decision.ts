@@ -10,7 +10,7 @@ export type TurnPreFinalizeDecision =
   | { action: "recover_thinking_only"; nextRound: number }
   | {
       action: "finalize"
-      dropPersistedTurnAssistantMessages: boolean
+      excludeTurnAssistantMessagesFromProviderProjection: boolean
       skipDurableAssistantRecord: boolean
       reason: "normal" | "thinking_only_exhausted"
     }
@@ -53,7 +53,7 @@ export function decideTurnPreFinalize(
     }
     return {
       action: "finalize",
-      dropPersistedTurnAssistantMessages: true,
+      excludeTurnAssistantMessagesFromProviderProjection: true,
       skipDurableAssistantRecord: true,
       reason: "thinking_only_exhausted",
     }
@@ -61,7 +61,7 @@ export function decideTurnPreFinalize(
 
   return {
     action: "finalize",
-    dropPersistedTurnAssistantMessages: false,
+    excludeTurnAssistantMessagesFromProviderProjection: false,
     skipDurableAssistantRecord: false,
     reason: "normal",
   }

@@ -1,5 +1,6 @@
 import { Logger } from "@nestjs/common"
 import type { TurnOutbound } from "../bidi/bidi-outbound"
+import type { ProjectionOwner } from "../session/projection-owner"
 import type {
   CancelReason,
   ConversationId,
@@ -21,16 +22,23 @@ import type { TurnHandle } from "./turn-handle"
  * throws and never half-applied.
  */
 export class TurnHandleImpl implements TurnHandle {
-  private readonly logger = new Logger(TurnHandleImpl.name)
   readonly turnId: TurnId
   readonly turnKind: TurnKind
   readonly conversationId: ConversationId
+  readonly projectionOwner: ProjectionOwner
   readonly streamId: StreamId
   readonly outbound: TurnOutbound | undefined
 
   private readonly abortController: AbortController
   private cancelReason: CancelReason | undefined
-  private terminalResult: TurnTerminalResult | undefined
+  /**
+   * A runner may nominate its terminal result before its owning lifecycle has
+   * committed the graph/session finalization. This is intentionally separate
+   * from `committedTerminalResult`: observers and awaiters must never see a
+   * completed turn before its required finalization succeeds.
+   */
+  private reportedTerminalResult: TurnTerminalResult | undefined
+  private committedTerminalResult: TurnTerminalResult | undefined
   private readonly phaseLog: Array<{
     phase: TurnPhase
     detail: string | undefined
@@ -42,6 +50,7 @@ export class TurnHandleImpl implements TurnHandle {
     turnId: TurnId
     turnKind: TurnKind
     conversationId: ConversationId
+    projectionOwner: ProjectionOwner
     streamId: StreamId
     outbound: TurnOutbound | undefined
     onTerminal: (result: TurnTerminalResult) => void
@@ -50,6 +59,7 @@ export class TurnHandleImpl implements TurnHandle {
     this.turnId = args.turnId
     this.turnKind = args.turnKind
     this.conversationId = args.conversationId
+    this.projectionOwner = args.projectionOwner
     this.streamId = args.streamId
     this.outbound = args.outbound
     this.onTerminal = args.onTerminal
@@ -86,13 +96,13 @@ export class TurnHandleImpl implements TurnHandle {
   }
 
   reportTerminal(result: TurnTerminalResult): void {
-    if (this.terminalResult) {
+    if (this.reportedTerminalResult || this.committedTerminalResult) {
       throw new Error(
-        `TurnHandle.reportTerminal called twice for turn ${this.turnId} (existing=${this.terminalResult.status})`
+        `TurnHandle.reportTerminal called twice for turn ${this.turnId} ` +
+          `(existing=${(this.reportedTerminalResult ?? this.committedTerminalResult)!.status})`
       )
     }
-    this.terminalResult = result
-    this.onTerminal(result)
+    this.reportedTerminalResult = result
   }
 
   cancellationReason(): CancelReason | undefined {
@@ -113,21 +123,26 @@ export class TurnHandleImpl implements TurnHandle {
   }
 
   /**
-   * Supervisor-only: returns whether terminal has been reported.
-   * Used by the supervisor to decide whether to synthesize a
-   * cancellation result on the awaitTerminal path.
+   * Supervisor-only: return the result a runner reported, if any.
    */
-  hasTerminal(): boolean {
-    return this.terminalResult !== undefined
+  reportedTerminal(): TurnTerminalResult | undefined {
+    return this.reportedTerminalResult
   }
 
   /**
-   * Supervisor-only: synthesize a terminal result on behalf of a
-   * runner that did not call `reportTerminal()` before exiting.
+   * Supervisor-only: publish the terminal result after the lifecycle has
+   * completed required finalization. The final result may differ from the
+   * runner's reported result when finalization fails; in that case the
+   * lifecycle publishes `failed`, never a false `completed` outcome.
    */
-  forceTerminal(result: TurnTerminalResult): void {
-    if (this.terminalResult) return
-    this.terminalResult = result
+  commitTerminal(result: TurnTerminalResult): void {
+    if (this.committedTerminalResult) {
+      throw new Error(
+        `TurnHandle.commitTerminal called twice for turn ${this.turnId} ` +
+          `(existing=${this.committedTerminalResult.status})`
+      )
+    }
+    this.committedTerminalResult = result
     this.onTerminal(result)
   }
 
@@ -150,6 +165,12 @@ export class TurnHandleImpl implements TurnHandle {
       case "parent-cancelled":
         return new Error(
           `turn cancelled: parent-cancelled by ${reason.ancestor}`
+        )
+      case "subagent-killed":
+        return new Error(`turn cancelled: subagent-killed(${reason.agentId})`)
+      case "subagent-backgrounded":
+        return new Error(
+          `turn cancelled: subagent-backgrounded(${reason.agentId}, successor=${reason.successor})`
         )
       case "shutdown":
         return new Error("turn cancelled: shutdown")
@@ -177,31 +198,35 @@ export async function withWriter<T>(
   if (!outbound) return body()
   outbound.pushWriter(turnId)
   let bodyError: unknown
+  let bodyThrew = false
+  let bodyResult!: T
   try {
-    return await body()
+    bodyResult = await body()
   } catch (err) {
+    bodyThrew = true
     bodyError = err
-    throw err
-  } finally {
-    try {
-      outbound.popWriter(turnId)
-    } catch (popErr) {
-      // popWriter throws if the stack is not in the expected state.
-      // The body's error (if any) takes precedence — losing the
-      // original error to a pop mismatch would mask the real bug.
-      // If there is no body error, the popWriter mismatch is itself
-      // the failure — we log loudly and let the body's normal
-      // return prevail; the test suite catches mismatches because
-      // a stale stack will trip the next push.
-      const log = new Logger("withWriter")
-      const detail = (popErr as Error).message
-      if (bodyError) {
-        log.error(
-          `popWriter mismatch for turn=${turnId} (suppressed in favour of body error): ${detail}`
-        )
-      } else {
-        log.error(`popWriter mismatch for turn=${turnId}: ${detail}`)
-      }
+  }
+
+  try {
+    outbound.popWriter(turnId)
+  } catch (popErr) {
+    // popWriter throws if the stack is not in the expected state. A body
+    // error remains the primary failure when one already exists, but a pop
+    // mismatch after an otherwise successful body is a terminal failure in
+    // its own right. Letting the body return normally would report a healthy
+    // turn while leaking writer ownership into the next turn.
+    const log = new Logger("withWriter")
+    const detail = (popErr as Error).message
+    if (bodyThrew) {
+      log.error(
+        `popWriter mismatch for turn=${turnId} (suppressed in favour of body error): ${detail}`
+      )
+    } else {
+      log.error(`popWriter mismatch for turn=${turnId}: ${detail}`)
+      throw popErr
     }
   }
+
+  if (bodyThrew) throw bodyError
+  return bodyResult
 }

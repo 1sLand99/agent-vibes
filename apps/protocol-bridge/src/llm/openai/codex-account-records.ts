@@ -1,5 +1,5 @@
 import type { CodexTokenData } from "./codex-auth.service"
-import { buildCodexNormalizedReloadKey } from "./codex-slot-identity"
+import { buildCodexReloadKey, type CodexReloadKey } from "./codex-slot-identity"
 import {
   type CodexModelTier,
   normalizeCodexModelTier,
@@ -311,9 +311,9 @@ export function buildCodexLoadedRecordReloadKey(
   fallbackBaseUrl: string,
   defaultBaseUrl: string,
   index: number
-): string {
+): CodexReloadKey {
   const baseUrl = (account.baseUrl || fallbackBaseUrl).trim() || defaultBaseUrl
-  return buildCodexNormalizedReloadKey(
+  return buildCodexReloadKey(
     {
       apiKey: account.apiKey,
       email: account.email,
@@ -331,8 +331,8 @@ export function buildCodexLoadedRecordReloadKey(
 export function buildCodexFileSlotReloadKey(
   slot: CodexFileSlotReloadIdentity,
   defaultBaseUrl: string
-): string {
-  return buildCodexNormalizedReloadKey(
+): CodexReloadKey {
+  return buildCodexReloadKey(
     {
       apiKey: slot.apiKey,
       email: slot.email,

@@ -34,6 +34,18 @@ export function registerContentTypeParsers(
   fastify: FastifyInstance,
   logger: Logger
 ): void {
+  fastify.addContentTypeParser(
+    /^application\/sdp(?:\s*;.*)?$/i,
+    { parseAs: "string", bodyLimit: 1_000_000 },
+    (_request, body, done) => done(null, body)
+  )
+
+  fastify.addContentTypeParser(
+    /^multipart\/form-data(?:\s*;.*)?$/i,
+    { parseAs: "buffer", bodyLimit: 1_100_000 },
+    (_request, body, done) => done(null, body)
+  )
+
   // application/connect+proto — bidirectional streaming (HTTP/2)
   fastify.addContentTypeParser(
     "application/connect+proto",

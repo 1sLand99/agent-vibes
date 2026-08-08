@@ -3,6 +3,11 @@ import type { StatementSync } from "node:sqlite"
 import { PersistenceService } from "../../../persistence"
 import type { ConversationId } from "../turn/turn.types"
 import {
+  SESSION_TXN_TAG,
+  type SessionTxn,
+  type SessionTxnInternal,
+} from "./tool-call-ledger.service"
+import {
   describeSessionFileStateLimit,
   isSessionFileStateWithinLimit,
   SESSION_FILE_STATE_CONTENT_LIMIT_BYTES,
@@ -29,6 +34,15 @@ export interface SessionRow {
   config: Record<string, unknown>
 }
 
+export const SESSION_TODO_STATUSES = [
+  "pending",
+  "in_progress",
+  "completed",
+  "cancelled",
+] as const
+
+export type SessionTodoStatus = (typeof SESSION_TODO_STATUSES)[number]
+
 export interface SessionFileState {
   conversationId: ConversationId
   path: string
@@ -47,7 +61,7 @@ export interface SessionTodo {
   conversationId: ConversationId
   id: string
   content: string
-  status: string
+  status: SessionTodoStatus
   createdAt: number
   updatedAt: number
   dependencies: string[]
@@ -65,10 +79,17 @@ export interface SessionReadPath {
   readAt: number
 }
 
-export interface SessionContextStateRow {
-  conversationId: ConversationId
-  updatedAt: number
-  state: Record<string, unknown>
+/**
+ * The complete mutable session-owned snapshot. The durable message graph is
+ * intentionally absent: MessageStore owns graph rows and supplies the shared
+ * transaction token used to commit both stores together.
+ */
+export interface SessionPersistenceSnapshot {
+  row: SessionRow
+  fileStates: SessionFileState[]
+  todos: SessionTodo[]
+  messageBlobs: SessionMessageBlob[]
+  readPaths: SessionReadPath[]
 }
 
 export interface PersistedSessionActivitySummary {
@@ -76,26 +97,23 @@ export interface PersistedSessionActivitySummary {
   lastActivityAt: number
   model: string
   openToolCallCount: number
-  contextStateUpdatedAt?: number
-  hasRestartRecovery: boolean
-  restartRecoveryToolCallCount: number
-  restartRecoveryInteractionQueryCount: number
+  providerProjectionUpdatedAt?: number
 }
 
 /**
  * SessionPersistenceService
  *
- * Owns the `sessions`, `session_file_states`, `session_todos`,
- * `session_message_blobs`, `session_read_paths` tables. Each method is
- * a thin DB layer; semantic concerns (when to persist, how to merge a
- * partial config update, etc.) are owned by SessionLifecycleService
- * (added in step 4).
+ * Sole SQL owner of `sessions`, `session_file_states`, `session_todos`,
+ * `session_message_blobs`, and `session_read_paths`. Domain services decide
+ * when state changes; this repository defines the normalized persistence
+ * contract and row reconstruction.
  *
  * The previous design serialised the entire session into a single
  * `cursor_sessions.state_json` blob and rewrote it on every dirty
  * flush. The split lets each domain service only touch the rows it
- * cares about, and lets SQLite enforce foreign-key cascade on
- * conversation delete.
+ * cares about. Most related tables use foreign-key cascade; the Cursor wire
+ * stores are conversation-scoped and can exist before a local session, so
+ * their deletion is explicit in `deleteSession`.
  */
 @Injectable()
 export class SessionPersistenceService {
@@ -106,7 +124,6 @@ export class SessionPersistenceService {
   private stmtSelectSession?: StatementSync
   private stmtListSessions?: StatementSync
   private stmtTouchSession?: StatementSync
-  private stmtDeleteSession?: StatementSync
 
   // related
   private stmtUpsertFileState?: StatementSync
@@ -115,7 +132,6 @@ export class SessionPersistenceService {
 
   private stmtUpsertTodo?: StatementSync
   private stmtListTodos?: StatementSync
-  private stmtDeleteTodo?: StatementSync
   private stmtDeleteTodosForConversation?: StatementSync
 
   private stmtInsertMessageBlob?: StatementSync
@@ -125,8 +141,6 @@ export class SessionPersistenceService {
   private stmtListReadPaths?: StatementSync
   private stmtDeleteReadPathsForConversation?: StatementSync
 
-  private stmtUpsertContextState?: StatementSync
-  private stmtSelectContextState?: StatementSync
   private stmtListSessionActivitySummaries?: StatementSync
 
   private stmtDeleteFileStatesForConversation?: StatementSync
@@ -136,7 +150,53 @@ export class SessionPersistenceService {
 
   // ── sessions ─────────────────────────────────────────────────────
 
-  upsertSession(row: SessionRow): void {
+  /**
+   * Persist every session-owned normalized table inside a transaction created
+   * by MessageStore. Mounted snapshot saves use this complete command;
+   * bootstrap uses the explicit parent-row and domain-state commands below to
+   * place its durable graph between them without opening a nested transaction.
+   */
+  persistSnapshotInTransaction(
+    txn: SessionTxn,
+    snapshot: SessionPersistenceSnapshot
+  ): void {
+    this.upsertSessionInTransaction(txn, snapshot.row)
+    this.replaceDomainStateInTransaction(txn, snapshot)
+  }
+
+  /**
+   * Write the parent row before a graph owner appends child records in the
+   * same transaction. Kept public only for the lifecycle bootstrap boundary;
+   * regular mounted writes use persistSnapshotInTransaction above.
+   */
+  upsertSessionInTransaction(txn: SessionTxn, row: SessionRow): void {
+    this.assertTransactionForConversation(txn, row.conversationId)
+    this.upsertSessionUnsafe(row)
+  }
+
+  /**
+   * Replace the mutable normalized session state after the graph owner has
+   * accepted its records under the same transaction token.
+   */
+  replaceDomainStateInTransaction(
+    txn: SessionTxn,
+    snapshot: SessionPersistenceSnapshot
+  ): void {
+    this.assertTransactionForConversation(txn, snapshot.row.conversationId)
+    this.assertSnapshotConversation(snapshot)
+    this.replaceFileStatesUnsafe(
+      snapshot.row.conversationId,
+      snapshot.fileStates
+    )
+    this.replaceReadPathsUnsafe(snapshot.row.conversationId, snapshot.readPaths)
+    this.replaceMessageBlobsUnsafe(
+      snapshot.row.conversationId,
+      snapshot.messageBlobs
+    )
+    this.replaceTodosUnsafe(snapshot.row.conversationId, snapshot.todos)
+  }
+
+  private upsertSessionUnsafe(row: SessionRow): void {
     const stmt = (this.stmtUpsertSession ??= this.persistence.prepare(
       `INSERT INTO sessions (
          conversation_id, created_at, last_activity_at, model, config_json
@@ -170,21 +230,29 @@ export class SessionPersistenceService {
         }
       | undefined
     if (!row) return undefined
-    let config: Record<string, unknown>
+    let configValue: unknown
     try {
-      config = JSON.parse(row.config_json) as Record<string, unknown>
+      configValue = JSON.parse(row.config_json)
     } catch (err) {
-      this.logger.warn(
-        `loadSession(${conversationId}): bad config_json: ${(err as Error).message}`
+      throw new Error(
+        `loadSession(${conversationId}): invalid config_json: ${(err as Error).message}`
       )
-      config = {}
+    }
+    if (
+      !configValue ||
+      typeof configValue !== "object" ||
+      Array.isArray(configValue)
+    ) {
+      throw new Error(
+        `loadSession(${conversationId}): invalid config_json: expected object`
+      )
     }
     return {
       conversationId,
       createdAt: row.created_at,
       lastActivityAt: row.last_activity_at,
       model: row.model,
-      config,
+      config: configValue as Record<string, unknown>,
     }
   }
 
@@ -220,15 +288,20 @@ export class SessionPersistenceService {
   }
 
   deleteSession(conversationId: ConversationId): void {
-    // Cascade FKs handle the related tables.
-    const stmt = (this.stmtDeleteSession ??= this.persistence.prepare(
-      `DELETE FROM sessions WHERE conversation_id = ?`
-    ))
-    stmt.run(conversationId)
+    // Exact Cursor frames and blob uploads can precede the local session row,
+    // so their tables intentionally have no sessions FK. Delete conversation-
+    // owned stores explicitly; never rely on CASCADE through ON DELETE RESTRICT
+    // edges (background commands, projection heads, subagent provenance, …).
+    this.persistence.runInTransaction(() => {
+      // Sidechain messages ↔ subagent runs/executions form a RESTRICT cycle.
+      // Defer checks until COMMIT so the ordered deletes can clear the cycle.
+      this.persistence.exec("PRAGMA defer_foreign_keys = ON")
+      this.deleteConversationOwnedRows(conversationId)
+    })
   }
 
   /**
-   * Wipe every row in the v2 session schema. Cache clear is an
+   * Wipe every conversation-owned row in the current session graph schema. Cache clear is an
    * operator-level reset, so it truncates every session-owned domain
    * table explicitly instead of relying on parent-table cascade.
    *
@@ -237,24 +310,87 @@ export class SessionPersistenceService {
    */
   deleteAllSessions(): number {
     // Re-assert FK handling on this connection. The cache-clear command is
-    // an operator action, so clear every v2 domain table explicitly instead
+    // an operator action, so clear every conversation-owned domain table explicitly instead
     // of depending on cascade side effects to catch all persisted state.
     this.persistence.exec("PRAGMA foreign_keys = ON")
     const before = this.persistence
       .prepare(`SELECT COUNT(*) AS n FROM sessions`)
       .get() as { n: number } | undefined
     this.persistence.runInTransaction(() => {
-      this.persistence.exec(`DELETE FROM tool_call_ledger`)
-      this.persistence.exec(`DELETE FROM session_messages`)
-      this.persistence.exec(`DELETE FROM turn_events`)
-      this.persistence.exec(`DELETE FROM session_file_states`)
-      this.persistence.exec(`DELETE FROM session_todos`)
-      this.persistence.exec(`DELETE FROM session_message_blobs`)
-      this.persistence.exec(`DELETE FROM session_read_paths`)
-      this.persistence.exec(`DELETE FROM session_context_state`)
-      this.persistence.exec(`DELETE FROM sessions`)
+      this.persistence.exec("PRAGMA defer_foreign_keys = ON")
+      this.deleteConversationOwnedRows(undefined)
     })
     return before?.n ?? 0
+  }
+
+  /**
+   * Ordered delete of session-graph tables for one conversation, or every
+   * conversation when `conversationId` is omitted.
+   *
+   * Order matters: several children use ON DELETE RESTRICT against
+   * `session_messages` / `tool_call_ledger`, so a bare `DELETE FROM sessions`
+   * (CASCADE) fails with FOREIGN KEY constraint failed. Callers must enable
+   * `PRAGMA defer_foreign_keys = ON` for the surrounding transaction because
+   * sidechain messages and subagent run/execution rows form a RESTRICT cycle
+   * that no single delete order can break under immediate FK checks.
+   */
+  private deleteConversationOwnedRows(
+    conversationId: ConversationId | undefined
+  ): void {
+    // Children that RESTRICT parents, then dependents, then the session row.
+    // `session_subagent_run_executions` is listed explicitly (not only via
+    // CASCADE from runs) so deferred cleanup does not leave historical leases
+    // behind if a run row is already gone.
+    const tables = [
+      "session_context_projection_heads",
+      "session_context_summary_deliveries",
+      "session_context_runtime_events",
+      "session_context_runtime_operations",
+      "session_async_user_interactions",
+      "session_background_commands",
+      "session_claude_projection_mutations",
+      "session_subagent_branch_heads",
+      "session_memory_events",
+      "session_snip_boundaries",
+      "session_message_revisions",
+      "session_subagent_run_executions",
+      "session_subagent_runs",
+      "session_context_projection_records",
+      "session_exec_dispatches",
+      "turn_events",
+      "tool_call_ledger",
+      "session_claude_projection_records",
+      "session_codex_rollout_items",
+      "session_provider_active_heads",
+      "session_cursor_wire_frames",
+      "session_cursor_wire_blobs",
+      "session_messages",
+      "session_file_states",
+      "session_todos",
+      "session_message_blobs",
+      "session_read_paths",
+      "sessions",
+    ] as const
+
+    for (const table of tables) {
+      if (!this.conversationOwnedTableExists(table)) continue
+      if (conversationId === undefined) {
+        this.persistence.prepare(`DELETE FROM ${table}`).run()
+      } else {
+        this.persistence
+          .prepare(`DELETE FROM ${table} WHERE conversation_id = ?`)
+          .run(conversationId)
+      }
+    }
+  }
+
+  private conversationOwnedTableExists(table: string): boolean {
+    const row = this.persistence
+      .prepare(
+        `SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1`
+      )
+      .get(table) as { ok: number } | undefined
+    return row?.ok === 1
   }
 
   listSessionActivitySummaries(): PersistedSessionActivitySummary[] {
@@ -264,8 +400,7 @@ export class SessionPersistenceService {
                 s.last_activity_at,
                 s.model,
                 COALESCE(open_ledger.open_tool_call_count, 0) AS open_tool_call_count,
-                state.updated_at AS context_state_updated_at,
-                state.state_json AS context_state_json
+                projection.updated_at AS provider_projection_updated_at
            FROM sessions s
            LEFT JOIN (
              SELECT conversation_id, COUNT(*) AS open_tool_call_count
@@ -273,8 +408,11 @@ export class SessionPersistenceService {
               WHERE state = 'open'
               GROUP BY conversation_id
            ) open_ledger ON open_ledger.conversation_id = s.conversation_id
-           LEFT JOIN session_context_state state
-             ON state.conversation_id = s.conversation_id
+           LEFT JOIN (
+             SELECT conversation_id, MAX(updated_at) AS updated_at
+               FROM session_provider_active_heads
+              GROUP BY conversation_id
+           ) projection ON projection.conversation_id = s.conversation_id
           ORDER BY s.last_activity_at DESC`
       ))
     const rows = stmt.all() as unknown as Array<{
@@ -282,29 +420,24 @@ export class SessionPersistenceService {
       last_activity_at: number
       model: string
       open_tool_call_count: number
-      context_state_updated_at: number | null
-      context_state_json: string | null
+      provider_projection_updated_at: number | null
     }>
 
     return rows.map((row) => {
-      const recovery = this.parseRestartRecoveryActivity(
-        row.conversation_id,
-        row.context_state_json
-      )
       return {
         conversationId: row.conversation_id as ConversationId,
         lastActivityAt: row.last_activity_at,
         model: row.model,
         openToolCallCount: row.open_tool_call_count || 0,
-        contextStateUpdatedAt: row.context_state_updated_at ?? undefined,
-        ...recovery,
+        providerProjectionUpdatedAt:
+          row.provider_projection_updated_at ?? undefined,
       }
     })
   }
 
   // ── file states ──────────────────────────────────────────────────
 
-  upsertFileState(state: SessionFileState): void {
+  private upsertFileState(state: SessionFileState): void {
     if (
       !isSessionFileStateWithinLimit(state.beforeContent, state.afterContent)
     ) {
@@ -364,7 +497,7 @@ export class SessionPersistenceService {
     }))
   }
 
-  deleteFileState(conversationId: ConversationId, path: string): void {
+  private deleteFileState(conversationId: ConversationId, path: string): void {
     const stmt = (this.stmtDeleteFileState ??= this.persistence.prepare(
       `DELETE FROM session_file_states
         WHERE conversation_id = ?
@@ -373,26 +506,24 @@ export class SessionPersistenceService {
     stmt.run(conversationId, path)
   }
 
-  replaceFileStates(
+  private replaceFileStatesUnsafe(
     conversationId: ConversationId,
     states: SessionFileState[]
   ): void {
-    this.persistence.runInTransaction(() => {
-      const deleteStmt = (this.stmtDeleteFileStatesForConversation ??=
-        this.persistence.prepare(
-          `DELETE FROM session_file_states
-            WHERE conversation_id = ?`
-        ))
-      deleteStmt.run(conversationId)
-      for (const state of states) {
-        this.upsertFileState(state)
-      }
-    })
+    const deleteStmt = (this.stmtDeleteFileStatesForConversation ??=
+      this.persistence.prepare(
+        `DELETE FROM session_file_states
+          WHERE conversation_id = ?`
+      ))
+    deleteStmt.run(conversationId)
+    for (const state of states) {
+      this.upsertFileState(state)
+    }
   }
 
   // ── todos ────────────────────────────────────────────────────────
 
-  upsertTodo(todo: SessionTodo): void {
+  private upsertTodo(todo: SessionTodo): void {
     const stmt = (this.stmtUpsertTodo ??= this.persistence.prepare(
       `INSERT INTO session_todos (
          conversation_id, id, content, status,
@@ -431,17 +562,53 @@ export class SessionPersistenceService {
       dependencies_json: string
     }>
     return rows.map((row) => {
-      let dependencies: string[]
-      try {
-        dependencies = JSON.parse(row.dependencies_json) as string[]
-      } catch {
-        dependencies = []
+      assertPersistedTodoText(row.id, `listTodos(${conversationId}): id`)
+      assertPersistedTodoText(
+        row.content,
+        `listTodos(${conversationId}): content for ${row.id}`
+      )
+      const status = parsePersistedTodoStatus(
+        row.status,
+        `listTodos(${conversationId}): status for ${row.id}`
+      )
+      assertPersistedTodoTimestamp(
+        row.created_at,
+        `listTodos(${conversationId}): created_at for ${row.id}`
+      )
+      assertPersistedTodoTimestamp(
+        row.updated_at,
+        `listTodos(${conversationId}): updated_at for ${row.id}`
+      )
+      if (row.updated_at < row.created_at) {
+        throw new Error(
+          `listTodos(${conversationId}): updated_at precedes created_at for ${row.id}`
+        )
       }
+      let dependenciesValue: unknown
+      try {
+        dependenciesValue = JSON.parse(row.dependencies_json)
+      } catch (err) {
+        throw new Error(
+          `listTodos(${conversationId}): invalid dependencies_json for ${row.id}: ${(err as Error).message}`
+        )
+      }
+      if (
+        !Array.isArray(dependenciesValue) ||
+        dependenciesValue.some(
+          (dependency) =>
+            typeof dependency !== "string" || dependency.trim().length === 0
+        )
+      ) {
+        throw new Error(
+          `listTodos(${conversationId}): invalid dependencies_json for ${row.id}`
+        )
+      }
+      const dependencies = dependenciesValue as string[]
       return {
         conversationId,
         id: row.id,
         content: row.content,
-        status: row.status,
+        status,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         dependencies,
@@ -449,32 +616,30 @@ export class SessionPersistenceService {
     })
   }
 
-  deleteTodo(conversationId: ConversationId, id: string): void {
-    const stmt = (this.stmtDeleteTodo ??= this.persistence.prepare(
-      `DELETE FROM session_todos
-        WHERE conversation_id = ?
-          AND id = ?`
-    ))
-    stmt.run(conversationId, id)
-  }
-
   replaceTodos(conversationId: ConversationId, todos: SessionTodo[]): void {
     this.persistence.runInTransaction(() => {
-      const deleteStmt = (this.stmtDeleteTodosForConversation ??=
-        this.persistence.prepare(
-          `DELETE FROM session_todos
-            WHERE conversation_id = ?`
-        ))
-      deleteStmt.run(conversationId)
-      for (const todo of todos) {
-        this.upsertTodo(todo)
-      }
+      this.replaceTodosUnsafe(conversationId, todos)
     })
+  }
+
+  private replaceTodosUnsafe(
+    conversationId: ConversationId,
+    todos: SessionTodo[]
+  ): void {
+    const deleteStmt = (this.stmtDeleteTodosForConversation ??=
+      this.persistence.prepare(
+        `DELETE FROM session_todos
+          WHERE conversation_id = ?`
+      ))
+    deleteStmt.run(conversationId)
+    for (const todo of todos) {
+      this.upsertTodo(todo)
+    }
   }
 
   // ── message blobs ────────────────────────────────────────────────
 
-  insertMessageBlob(blob: SessionMessageBlob): void {
+  private insertMessageBlob(blob: SessionMessageBlob): void {
     const stmt = (this.stmtInsertMessageBlob ??= this.persistence.prepare(
       `INSERT INTO session_message_blobs (
          conversation_id, blob_id, added_at
@@ -502,26 +667,24 @@ export class SessionPersistenceService {
     }))
   }
 
-  replaceMessageBlobs(
+  private replaceMessageBlobsUnsafe(
     conversationId: ConversationId,
     blobs: SessionMessageBlob[]
   ): void {
-    this.persistence.runInTransaction(() => {
-      const deleteStmt = (this.stmtDeleteMessageBlobsForConversation ??=
-        this.persistence.prepare(
-          `DELETE FROM session_message_blobs
-            WHERE conversation_id = ?`
-        ))
-      deleteStmt.run(conversationId)
-      for (const blob of blobs) {
-        this.insertMessageBlob(blob)
-      }
-    })
+    const deleteStmt = (this.stmtDeleteMessageBlobsForConversation ??=
+      this.persistence.prepare(
+        `DELETE FROM session_message_blobs
+          WHERE conversation_id = ?`
+      ))
+    deleteStmt.run(conversationId)
+    for (const blob of blobs) {
+      this.insertMessageBlob(blob)
+    }
   }
 
   // ── read paths ───────────────────────────────────────────────────
 
-  upsertReadPath(record: SessionReadPath): void {
+  private upsertReadPath(record: SessionReadPath): void {
     const stmt = (this.stmtUpsertReadPath ??= this.persistence.prepare(
       `INSERT INTO session_read_paths (
          conversation_id, path, read_at
@@ -550,152 +713,87 @@ export class SessionPersistenceService {
     }))
   }
 
-  replaceReadPaths(
+  private replaceReadPathsUnsafe(
     conversationId: ConversationId,
     records: SessionReadPath[]
   ): void {
-    this.persistence.runInTransaction(() => {
-      const deleteStmt = (this.stmtDeleteReadPathsForConversation ??=
-        this.persistence.prepare(
-          `DELETE FROM session_read_paths
-            WHERE conversation_id = ?`
-        ))
-      deleteStmt.run(conversationId)
-      for (const record of records) {
-        this.upsertReadPath(record)
-      }
-    })
+    const deleteStmt = (this.stmtDeleteReadPathsForConversation ??=
+      this.persistence.prepare(
+        `DELETE FROM session_read_paths
+          WHERE conversation_id = ?`
+      ))
+    deleteStmt.run(conversationId)
+    for (const record of records) {
+      this.upsertReadPath(record)
+    }
   }
 
-  // ── context state ────────────────────────────────────────────────
-
-  upsertContextState(row: SessionContextStateRow): void {
-    const stmt = (this.stmtUpsertContextState ??= this.persistence.prepare(
-      `INSERT INTO session_context_state (
-         conversation_id, updated_at, state_json
-       ) VALUES (?, ?, ?)
-       ON CONFLICT(conversation_id) DO UPDATE SET
-         updated_at = excluded.updated_at,
-         state_json = excluded.state_json`
-    ))
-    stmt.run(row.conversationId, row.updatedAt, JSON.stringify(row.state))
-  }
-
-  loadContextState(
+  private assertTransactionForConversation(
+    txn: SessionTxn,
     conversationId: ConversationId
-  ): SessionContextStateRow | undefined {
-    const stmt = (this.stmtSelectContextState ??= this.persistence.prepare(
-      `SELECT updated_at, state_json
-         FROM session_context_state
-        WHERE conversation_id = ?`
-    ))
-    const row = stmt.get(conversationId) as
-      | { updated_at: number; state_json: string }
-      | undefined
-    if (!row) return undefined
-    let state: Record<string, unknown>
-    try {
-      state = JSON.parse(row.state_json) as Record<string, unknown>
-    } catch (err) {
-      this.logger.warn(
-        `loadContextState(${conversationId}): bad state_json: ${(err as Error).message}`
+  ): void {
+    if (!txn || txn.tag !== SESSION_TXN_TAG) {
+      throw new Error(
+        "SessionPersistenceService: snapshot writes require a SessionTxn from MessageStore.runInTransaction()"
       )
-      state = {}
     }
-    state = this.scrubLegacyCodexContextState(state)
-    return {
-      conversationId,
-      updatedAt: row.updated_at,
-      state,
+    if ((txn as SessionTxnInternal).persistence !== this.persistence) {
+      throw new Error(
+        "SessionPersistenceService: snapshot transaction belongs to another persistence connection"
+      )
+    }
+    if (txn.conversationId !== conversationId) {
+      throw new Error(
+        `SessionPersistenceService: transaction conversation mismatch: txn=${txn.conversationId} row=${conversationId}`
+      )
     }
   }
 
-  private scrubLegacyCodexContextState(
-    state: Record<string, unknown>
-  ): Record<string, unknown> {
-    const scrubHolder = (value: unknown): boolean => {
-      if (!value || typeof value !== "object" || Array.isArray(value)) {
-        return false
-      }
-      const holder = value as { codexContext?: unknown }
-      const codexContext = holder.codexContext
-      if (
-        !codexContext ||
-        typeof codexContext !== "object" ||
-        Array.isArray(codexContext)
-      ) {
-        return false
-      }
-      const codex = codexContext as { metaMessageLedger?: unknown }
-      if (!("metaMessageLedger" in codex)) {
-        return false
-      }
-      delete codex.metaMessageLedger
-      return true
-    }
-
-    const rootChanged = scrubHolder(state)
-    const nestedChanged = scrubHolder(
-      (state as { contextState?: unknown }).contextState
-    )
-    const changed = rootChanged || nestedChanged
-    return changed ? { ...state } : state
-  }
-
-  private parseRestartRecoveryActivity(
-    conversationId: string,
-    stateJson: string | null
-  ): Pick<
-    PersistedSessionActivitySummary,
-    | "hasRestartRecovery"
-    | "restartRecoveryToolCallCount"
-    | "restartRecoveryInteractionQueryCount"
-  > {
-    if (!stateJson) {
-      return {
-        hasRestartRecovery: false,
-        restartRecoveryToolCallCount: 0,
-        restartRecoveryInteractionQueryCount: 0,
-      }
-    }
-
-    let state: Record<string, unknown>
-    try {
-      state = JSON.parse(stateJson) as Record<string, unknown>
-    } catch (err) {
-      this.logger.warn(
-        `listSessionActivitySummaries(${conversationId}): bad state_json: ${(err as Error).message}`
+  private assertSnapshotConversation(
+    snapshot: SessionPersistenceSnapshot
+  ): void {
+    const conversationId = snapshot.row.conversationId
+    const entries = [
+      ...snapshot.fileStates,
+      ...snapshot.todos,
+      ...snapshot.messageBlobs,
+      ...snapshot.readPaths,
+    ]
+    if (entries.some((entry) => entry.conversationId !== conversationId)) {
+      throw new Error(
+        `SessionPersistenceService: snapshot contains a row for another conversation than ${conversationId}`
       )
-      return {
-        hasRestartRecovery: false,
-        restartRecoveryToolCallCount: 0,
-        restartRecoveryInteractionQueryCount: 0,
-      }
     }
+  }
+}
 
-    const restartRecovery = state.restartRecovery
-    if (!restartRecovery || typeof restartRecovery !== "object") {
-      return {
-        hasRestartRecovery: false,
-        restartRecoveryToolCallCount: 0,
-        restartRecoveryInteractionQueryCount: 0,
-      }
-    }
+function parsePersistedTodoStatus(
+  value: unknown,
+  label: string
+): SessionTodoStatus {
+  if (
+    typeof value === "string" &&
+    (SESSION_TODO_STATUSES as readonly string[]).includes(value)
+  ) {
+    return value as SessionTodoStatus
+  }
+  throw new Error(`${label} is invalid`)
+}
 
-    const recovery = restartRecovery as {
-      interruptedToolCalls?: unknown
-      interruptedInteractionQueryCount?: unknown
-    }
-    return {
-      hasRestartRecovery: true,
-      restartRecoveryToolCallCount: Array.isArray(recovery.interruptedToolCalls)
-        ? recovery.interruptedToolCalls.length
-        : 0,
-      restartRecoveryInteractionQueryCount:
-        typeof recovery.interruptedInteractionQueryCount === "number" &&
-        Number.isFinite(recovery.interruptedInteractionQueryCount)
-          ? Math.max(0, Math.floor(recovery.interruptedInteractionQueryCount))
-          : 0,
-    }
+function assertPersistedTodoText(
+  value: unknown,
+  label: string
+): asserts value is string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`${label} must be a non-empty string`)
+  }
+}
+
+function assertPersistedTodoTimestamp(
+  value: unknown,
+  label: string
+): asserts value is number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive safe integer`)
   }
 }

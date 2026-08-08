@@ -18,14 +18,14 @@
  *     agent and a `code-mod` agent to differ — claude-code's
  *     `resolveAgentTools()` is exactly this mechanism.
  *
- * The bridge's runtime constraint is stricter than claude-code's: a
- * sub-agent does NOT have a private ExecServerMessage channel back to the
- * IDE, so any tool requiring arbitrary filesystem / shell access (read_file,
- * list_directory, run_terminal_command, edit_file, delete_file, ...) is
- * unconditionally excluded from the sub-agent surface regardless of what
- * frontmatter says. See `subagent-tool-resolver.ts` for the hard exclusion
- * list.
+ * The bridge distinguishes foreground and detached execution. Foreground
+ * sub-agents can use the Exec bridge where the IDE owns the result path;
+ * detached workers receive only tools whose complete execution is owned by
+ * the bridge itself. The mode-specific decision is centralized in
+ * `subagent-tool-resolver.ts`, not inferred from an agent name.
  */
+
+import type { BuiltInSubagentType } from "./subagent-identity"
 
 export type SubagentSource = "built-in" | "user" | "project"
 
@@ -49,8 +49,20 @@ export interface BaseSubagentDefinition {
    * agent, for example). */
   disallowedTools?: string[]
 
-  /** Optional per-agent max turn override. When omitted the bridge uses the
-   * top-level default (currently 20). */
+  /** Parent-mounted MCP servers whose concrete tools may be inherited when
+   * `tools` contains `mcp_tool`. Omitted means every mounted MCP server, which
+   * matches Claude Code's normal parent-tool inheritance. Cursor built-ins
+   * with a protocol-defined capability boundary use an exact server allowlist
+   * so unrelated MCP tools cannot enter the child contract. */
+  inheritedMcpServers?: string[]
+
+  /** MCP server name patterns that must be mounted for this agent to be
+   * advertised. Every pattern must match at least one mounted server name,
+   * case-insensitively, matching Claude Code's `requiredMcpServers` field. */
+  requiredMcpServers?: string[]
+
+  /** Optional per-agent max turn override. When omitted the agent remains
+   * unbounded until it reaches a normal terminal state or is cancelled. */
   maxTurns?: number
 
   /** Optional model override. Special value `"inherit"` means use the
@@ -63,6 +75,8 @@ export interface BaseSubagentDefinition {
 }
 
 export interface BuiltInSubagentDefinition extends BaseSubagentDefinition {
+  /** Built-ins may only use an identity declared in subagent-identity.ts. */
+  agentType: BuiltInSubagentType
   source: "built-in"
   /** Built-in agents compute their system prompt at spawn time so they can
    * react to runtime configuration (model selection, embedded search tools,
@@ -106,4 +120,21 @@ export function getSubagentSystemPrompt(
     return definition.getSystemPrompt()
   }
   return definition.systemPrompt
+}
+
+/** Match Claude Code's requiredMcpServers availability rule. Requirement
+ * entries are case-insensitive server-name patterns; every pattern must match
+ * at least one mounted provider or IDE registry name. */
+export function hasRequiredSubagentMcpServers(
+  definition: Pick<SubagentDefinition, "requiredMcpServers">,
+  availableServerNames: readonly string[]
+): boolean {
+  if (!definition.requiredMcpServers?.length) return true
+  const available = availableServerNames.map((name) => name.toLowerCase())
+  return definition.requiredMcpServers.every((rawPattern) => {
+    const pattern = rawPattern.trim().toLowerCase()
+    return (
+      pattern.length > 0 && available.some((name) => name.includes(pattern))
+    )
+  })
 }

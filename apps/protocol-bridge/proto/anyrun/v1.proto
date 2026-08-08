@@ -10,6 +10,7 @@ enum BlobStorageFormat {
   BLOB_STORAGE_FORMAT_V2 = 3;
   BLOB_STORAGE_FORMAT_V2_LAYERED = 4;
   BLOB_STORAGE_FORMAT_V3 = 5;
+  BLOB_STORAGE_FORMAT_VM_SNAPSHOT_V2 = 6;
 }
 
 enum ClonePurpose {
@@ -21,6 +22,7 @@ enum ClonePurpose {
 enum ContainerRuntime {
   CONTAINER_RUNTIME_DOCKERD_UNSPECIFIED = 0;
   CONTAINER_RUNTIME_ISOD_RUNC = 1;
+  CONTAINER_RUNTIME_WINDOWS_GUEST = 2;
 }
 
 enum DrainingReason {
@@ -29,6 +31,7 @@ enum DrainingReason {
   DRAINING_REASON_UPGRADE = 2;
   DRAINING_REASON_MANUAL = 3;
   DRAINING_REASON_HEALTH = 4;
+  DRAINING_REASON_RETIREMENT = 5;
 }
 
 enum EntryType {
@@ -36,6 +39,12 @@ enum EntryType {
   ENTRY_TYPE_FILE = 1;
   ENTRY_TYPE_DIRECTORY = 2;
   ENTRY_TYPE_SYMLINK = 3;
+}
+
+enum FirecrackerVersion {
+  FIRECRACKER_VERSION_UNSPECIFIED = 0;
+  FIRECRACKER_VERSION_V1_12_1 = 1;
+  FIRECRACKER_VERSION_V1_16_1 = 2;
 }
 
 enum GitCloneFailureCategory {
@@ -48,6 +57,15 @@ enum GitCloneFailureCategory {
   GIT_CLONE_FAILURE_CATEGORY_TRANSPORT_INTERRUPTED = 6;
   GIT_CLONE_FAILURE_CATEGORY_REMOTE_FORBIDDEN = 7;
   GIT_CLONE_FAILURE_CATEGORY_UPSTREAM_BAD_GATEWAY = 8;
+}
+
+enum ImagePullFailureCategory {
+  IMAGE_PULL_FAILURE_CATEGORY_UNSPECIFIED = 0;
+  IMAGE_PULL_FAILURE_CATEGORY_DENIED = 1;
+  IMAGE_PULL_FAILURE_CATEGORY_UNAUTHORIZED = 2;
+  IMAGE_PULL_FAILURE_CATEGORY_NOT_FOUND = 3;
+  IMAGE_PULL_FAILURE_CATEGORY_RATE_LIMITED = 4;
+  IMAGE_PULL_FAILURE_CATEGORY_UPSTREAM = 5;
 }
 
 enum IsoEnvExtraDrivePurpose {
@@ -92,26 +110,40 @@ enum RestartReason {
   RESTART_REASON_HEALTH_CHECK_FAILED = 2;
 }
 
+enum SnapshotMemoryHashAlgorithm {
+  SNAPSHOT_MEMORY_HASH_ALGORITHM_UNSPECIFIED = 0;
+  SNAPSHOT_MEMORY_HASH_ALGORITHM_SHA256 = 1;
+  SNAPSHOT_MEMORY_HASH_ALGORITHM_BLAKE3 = 2;
+}
+
 enum SnapshotState {
   SNAPSHOT_STATE_UNSPECIFIED = 0;
   SNAPSHOT_STATE_CREATING = 1;
   SNAPSHOT_STATE_READY = 2;
   SNAPSHOT_STATE_FAILED = 3;
+  SNAPSHOT_STATE_FINALIZING = 4;
+}
+
+enum UploadPriority {
+  UPLOAD_PRIORITY_UNSPECIFIED = 0;
+  UPLOAD_PRIORITY_P0 = 1;
+  UPLOAD_PRIORITY_P1 = 2;
+  UPLOAD_PRIORITY_P2 = 3;
+}
+
+enum WarmForkMode {
+  WARM_FORK_MODE_UNSPECIFIED = 0;
+  WARM_FORK_MODE_NONE = 1;
+  WARM_FORK_MODE_FORKED = 2;
+  WARM_FORK_MODE_COLD_FALLBACK = 3;
+  WARM_FORK_MODE_LAZY_LOAD = 4;
+  WARM_FORK_MODE_COLD_FALLBACK_LAZY_LOAD = 5;
 }
 
 enum WorkspaceGitSetupMode {
   WORKSPACE_GIT_SETUP_MODE_UNSPECIFIED = 0;
   WORKSPACE_GIT_SETUP_MODE_REUSE = 1;
-}
-
-message AgentStoreConfig {
-  bool enabled = 1;
-  string self_store_id = 2;
-  repeated string additional_store_ids = 3;
-  PodAgentStoreGrant pod_grant = 4;
-  string bcs_endpoint = 6;
-  uint32 vsock_port = 7;
-  string mount_root = 8;
+  WORKSPACE_GIT_SETUP_MODE_REUSE_THEN_CHECKOUT = 2;
 }
 
 message AllowedDomain {
@@ -121,6 +153,10 @@ message AllowedDomain {
 message AllowedTcpDestination {
   string cidr = 1;
   uint32 port = 2;
+}
+
+message AntiAffinityTags {
+  repeated string tags = 1;
 }
 
 message AnygressLocalPodDenyRules {
@@ -241,6 +277,7 @@ message DevContainerConfig {
     string checkpoint_group_id = 28;
     DevContainerConfig.RegistryReferenceAlias registry_reference_alias = 32;
     InlineBuild inline_build = 33;
+    DockerArchiveImage docker_archive = 38;
   }
   oneof workspace {
     string workspace_path = 7;
@@ -267,6 +304,7 @@ message DevContainerConfig {
   optional bool blob_client_resilience_enabled = 35;
   optional bool skip_workspace_source_checkout = 36;
   ContainerRuntime container_runtime = 37;
+  FirecrackerVersion firecracker_version = 39;
 }
 
 message DevContainerEnv {
@@ -288,6 +326,7 @@ message DevContainerExecCommand {
   repeated string depends_on = 7;
   bool depends_on_git_checkout = 8;
   optional ProcessSupervision supervision = 9;
+  bool ignore_failure_for_install_health = 10;
 }
 
 message DevContainerSpec {
@@ -313,7 +352,8 @@ message DevContainerSpec {
   optional EgressPolicy egress_policy = 26;
   repeated string low_cardinality_pod_labels = 27;
   optional AnygressPerPodDenyRules anygress_per_pod_deny_rules = 28;
-  optional AgentStoreConfig agent_store_config = 30;
+  optional AntiAffinityTags anti_affinity_tags = 32;
+  optional bool enable_lazy_v3_squashfs_snapshot_load = 34;
 }
 
 message DirectoryEntry {
@@ -328,6 +368,11 @@ message DiskUsage {
   uint64 bytes_used = 1;
   uint64 bytes_total = 2;
   optional double busy_percentage = 3;
+}
+
+message DockerArchiveImage {
+  string url = 1;
+  string registry_reference = 2;
 }
 
 message DockerBuildConfig {
@@ -378,6 +423,7 @@ message DockerDevContainerPersistentState {
   uint32 daemon_port = 8;
   WorkspaceConfig workspace = 9;
   bool v2_hydrated = 10;
+  optional string pod_daemon_auth_token = 11;
 }
 
 message DockerImageBuildEvent {
@@ -413,12 +459,22 @@ message EgressRestricted {
   repeated AllowedTcpDestination allowed_tcp_destinations = 2;
 }
 
+message EnvironmentBuildBootInfo {
+  string build_id = 1;
+  string snapshot_id = 2;
+  WorkspaceGitSetupMode workspace_git_setup_mode = 3;
+  WarmForkMode warm_fork_mode = 4;
+  bool fast_forward_default_branch = 5;
+}
+
 message ExternalSnapshot {
   string snapshot_id = 1;
   string presigned_url = 2;
   ImageMetadata image_metadata = 3;
   BlobStorageFormat blob_storage_format = 4;
   optional string node_machine_type = 5;
+  optional string cpu_baseline_id = 6;
+  optional SnapshotUsageStats usage_stats = 7;
 }
 
 message FeatureExitCode {
@@ -498,6 +554,13 @@ message ImagePullCompleted {
   string pull_id = 2;
 }
 
+message ImagePullFailure {
+  ImagePullFailureCategory category = 1;
+  bool retryable = 2;
+  optional int32 http_status = 3;
+  optional string repository = 4;
+}
+
 message ImagePullLayerUpdate {
   oneof status {
     bool pulling_fs_layer = 4;
@@ -551,6 +614,7 @@ message IsoDevContainerMetadata {
   string name = 1;
   DockerDevContainerPersistentState persistent_state = 2;
   IsoEnvConfig env_config = 3;
+  repeated PersistedDriveDescriptor drive_descriptors = 4;
 }
 
 message IsoEnvBalloonConfig {
@@ -566,6 +630,7 @@ message IsoEnvConfig {
   optional uint32 rootfs_size_mib = 4;
   repeated IsoEnvExtraDriveConfig extra_drives = 5;
   optional IsoEnvBalloonConfig balloon = 6;
+  FirecrackerVersion firecracker_version = 7;
 }
 
 message IsoEnvExtraDriveConfig {
@@ -611,6 +676,12 @@ message ListProcessesResponse {
 
 message LocalDirectoryReference {
   string path = 1;
+}
+
+message MemoryUsage {
+  uint64 bytes_used = 1;
+  uint64 bytes_total = 2;
+  uint64 collected_at_timestamp = 3;
 }
 
 message MultiSourceEntry {
@@ -669,6 +740,15 @@ message PersistedDevContainerConfig {
   optional bool enable_checkpoint_scratch_drive = 25;
   optional bool blob_client_resilience_enabled = 26;
   ContainerRuntime container_runtime = 27;
+  FirecrackerVersion firecracker_version = 28;
+  optional bool enable_lazy_v3_squashfs_snapshot_load = 29;
+}
+
+message PersistedDriveDescriptor {
+  oneof descriptor {
+    PersistedFileDriveDescriptor file_v1 = 1;
+    PersistedLazySquashfsDriveDescriptor lazy_squashfs_v1 = 2;
+  }
 }
 
 message PersistedEnvVar {
@@ -678,11 +758,40 @@ message PersistedEnvVar {
 
 message PersistedExternalSnapshot {
   string snapshot_id = 1;
+  optional string cpu_baseline_id = 2;
+}
+
+message PersistedFileDriveDescriptor {
+  string artifact_reference = 1;
+  string drive_id = 2;
+  string guest_path = 3;
+  bool is_root_device = 4;
+  optional uint32 size_mib = 5;
 }
 
 message PersistedGitRepoSource {
   string cache_uri = 1;
   bytes commit_hash = 2;
+}
+
+message PersistedLazyCheckpointSource {
+  string tenant_id = 1;
+  string checkpoint_id = 2;
+}
+
+message PersistedLazySnapshotSource {
+  string tenant_id = 1;
+  string snapshot_id = 2;
+}
+
+message PersistedLazySquashfsDriveDescriptor {
+  oneof source {
+    PersistedLazySnapshotSource snapshot = 3;
+    PersistedLazyCheckpointSource checkpoint = 5;
+  }
+  string drive_id = 1;
+  string guest_path = 2;
+  uint64 chunk_size = 4;
 }
 
 message PersistedLocalRepoSource {
@@ -745,16 +854,9 @@ message Pod {
   optional PodStartCacheSource started_from_cache_source = 28;
   optional uint64 started_from_checkpoint_creation_timestamp = 29;
   optional string started_from_checkpoint_id = 30;
-}
-
-message PodAgentStoreGrant {
-  string pod_id = 1;
-  string self_store_id = 2;
-  int64 team_id = 3;
-  int64 issued_at_ms = 4;
-  int64 expires_at_ms = 5;
-  string grant_id = 6;
-  string token = 7;
+  optional AntiAffinityTags anti_affinity_tags = 31;
+  optional bool collect_metrics = 32;
+  repeated string mesh_link_target_pod_ids = 33;
 }
 
 message PodCollection {
@@ -850,6 +952,7 @@ message PodFailureDetails {
     GitCloneFailure git_clone_failure = 3;
     GitCheckoutFailure git_checkout_failure = 4;
     ContainerWaitFailure container_wait_failure = 5;
+    ImagePullFailure image_pull_failure = 6;
   }
 }
 
@@ -861,6 +964,14 @@ message PodFilter {
 message PodIdentity {
   string tenant_id = 1;
   string pod_id = 2;
+}
+
+message PodMemoryBreakdown {
+  uint64 all_process_rss_bytes = 1;
+  uint64 process_rss_count = 2;
+  optional uint64 cgroup_anon_bytes = 3;
+  optional uint64 cgroup_file_bytes = 4;
+  optional uint64 cgroup_kernel_bytes = 5;
 }
 
 message PodMetricsSample {
@@ -884,6 +995,9 @@ message PodMetricsSample {
   string oom_victim_comm = 19;
   uint64 oom_victim_rss_kb = 20;
   repeated PodDiskUsage disk_usage_by_device = 21;
+  uint64 event_stream_subscribers_fell_behind_total = 22;
+  double cpu_psi_some_avg10 = 23;
+  PodMemoryBreakdown memory_breakdown = 24;
 }
 
 message PodPorts {
@@ -1010,6 +1124,7 @@ message ResourceRequests {
   uint64 cpu_mcores = 1;
   uint64 memory_mb = 2;
   uint64 disk_mb = 3;
+  uint64 gpu_count = 4;
 }
 
 message RestartBackoff {
@@ -1055,6 +1170,9 @@ message Snapshot {
   optional string node_machine_type = 16;
   optional ResourceRequests resource_requests = 17;
   optional ResourceLimits resource_limits = 18;
+  optional string cpu_baseline_id = 19;
+  optional SnapshotUsageStats usage_stats = 20;
+  optional uint64 object_size_bytes = 21;
 }
 
 message SnapshotCollection {
@@ -1076,6 +1194,30 @@ message SnapshotFileChunk {
   string hash = 5;
 }
 
+message SnapshotMemoryCell {
+  uint64 blob_begin = 1;
+  uint64 blob_end = 2;
+}
+
+message SnapshotMemoryCellAttributes {
+  uint64 chunk_index = 1;
+  optional bytes hash = 2;
+}
+
+message SnapshotMemoryPrefetchHint {
+  uint32 version = 1;
+  bytes payload = 2;
+}
+
+message SnapshotUsageStats {
+  uint64 max_memory_bytes = 1;
+  uint64 avg_cpu_mcores = 2;
+  uint32 sample_count = 3;
+  uint64 last_updated_timestamp = 4;
+  optional uint64 max_cache_adjusted_memory_bytes = 5;
+  uint32 cache_adjusted_sample_count = 6;
+}
+
 message SnapshotVmSnapshotV1Metadata {
   repeated SnapshotFileChunk rootfs_file_chunks = 1;
   uint64 rootfs_file_size = 2;
@@ -1084,6 +1226,21 @@ message SnapshotVmSnapshotV1Metadata {
   SnapshotFileChunk kernel_file_chunk = 5;
   IsoDevContainerMetadata dev_container_metadata = 6;
   repeated SnapshotExtraDriveFile extra_drive_files = 7;
+}
+
+message SnapshotVmSnapshotV2Metadata {
+  repeated SnapshotFileChunk rootfs_file_chunks = 1;
+  uint64 rootfs_file_size = 2;
+  repeated SnapshotMemoryCell memory_cells = 3;
+  uint64 memory_file_size = 4;
+  uint64 memory_cell_size = 5;
+  SnapshotFileChunk state_file_chunk = 6;
+  SnapshotFileChunk kernel_file_chunk = 7;
+  IsoDevContainerMetadata dev_container_metadata = 8;
+  repeated SnapshotExtraDriveFile extra_drive_files = 9;
+  optional SnapshotMemoryPrefetchHint memory_prefetch_hint = 10;
+  SnapshotMemoryHashAlgorithm memory_hash_algorithm = 11;
+  repeated SnapshotMemoryCellAttributes memory_cell_attrs = 12;
 }
 
 message SpanEnded {

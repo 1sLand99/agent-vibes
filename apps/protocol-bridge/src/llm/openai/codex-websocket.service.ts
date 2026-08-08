@@ -25,9 +25,11 @@ import { HttpProxyAgent } from "http-proxy-agent"
 import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
 import WebSocket from "ws"
+import { requireExactDurableIdentifier } from "../../context/durable-identifier"
 import {
+  buildCodexBridgeNativeWebSocketHeaders,
   buildCodexWebSocketRequestBody,
-  buildCodexWebSocketHeaders,
+  type CodexBridgeNativeTransportScope,
   type CodexForwardHeaders,
 } from "./codex-header-utils"
 import { CodexClientIdentityService } from "./codex-client-identity.service"
@@ -131,36 +133,30 @@ export class CodexWebSocketService implements OnModuleDestroy {
 
   // ── Header Building ────────────────────────────────────────────────
 
-  /**
-   * Build WebSocket connection headers.
-   * Ported from: codex_websockets_executor.go applyCodexWebsocketHeaders()
-   */
-  buildWebSocketHeaders(
+  buildBridgeNativeWebSocketHeaders(
     token: string,
     isApiKey: boolean,
-    conversationId?: string,
+    scope: CodexBridgeNativeTransportScope,
     accountId?: string,
     workspaceId?: string,
     forwardHeaders?: CodexForwardHeaders,
     omitAccountId: boolean = false,
-    useResponsesLite: boolean = false,
-    clientMetadata?: CodexForwardHeaders
+    useResponsesLite: boolean = false
   ): Record<string, string> {
-    return buildCodexWebSocketHeaders({
+    return buildCodexBridgeNativeWebSocketHeaders({
       token,
       isApiKey,
-      identity: {
-        version: this.identity.version(),
-        userAgent: this.identity.userAgent(),
-        originator: this.identity.originator(),
-      },
-      conversationId,
-      clientMetadata,
+      ...scope,
       accountId,
       workspaceId,
       forwardHeaders,
       omitAccountId,
       useResponsesLite,
+      identity: {
+        version: this.identity.version(),
+        userAgent: this.identity.userAgent(),
+        originator: this.identity.originator(),
+      },
     })
   }
 
@@ -603,18 +599,22 @@ export class CodexWebSocketService implements OnModuleDestroy {
    * Get or create a session for connection reuse.
    */
   getOrCreateSession(sessionId: string): WebSocketSession {
-    const existing = this.sessions.get(sessionId)
+    const exactSessionId = requireExactDurableIdentifier(
+      sessionId,
+      "Codex WebSocket sessionId"
+    )
+    const existing = this.sessions.get(exactSessionId)
     if (existing) return existing
 
     const session: WebSocketSession = {
-      sessionId,
+      sessionId: exactSessionId,
       conn: null,
       wsUrl: "",
       requestTail: Promise.resolve(),
       readerConn: null,
       activeStream: null,
     }
-    this.sessions.set(sessionId, session)
+    this.sessions.set(exactSessionId, session)
     return session
   }
 
@@ -664,7 +664,7 @@ export class CodexWebSocketService implements OnModuleDestroy {
     }
 
     this.invalidateSessionConnection(
-      sessionId,
+      session.sessionId,
       current,
       current
         ? current.readyState === WebSocket.OPEN
@@ -681,12 +681,11 @@ export class CodexWebSocketService implements OnModuleDestroy {
   }
 
   hasOpenSessionConnection(sessionId: string, wsUrl?: string): boolean {
-    const normalizedSessionId = sessionId.trim()
-    if (!normalizedSessionId) {
-      return false
-    }
-
-    const session = this.sessions.get(normalizedSessionId)
+    const exactSessionId = requireExactDurableIdentifier(
+      sessionId,
+      "Codex WebSocket sessionId"
+    )
+    const session = this.sessions.get(exactSessionId)
     if (!session?.conn || session.conn.readyState !== WebSocket.OPEN) {
       return false
     }
@@ -698,18 +697,16 @@ export class CodexWebSocketService implements OnModuleDestroy {
     return true
   }
 
-  /**
-   * @deprecated 已被 CodexTurnContext 架构取代。
-   * 新架构中不再有 warm pool promotion 机制，
-   * 一个 turn 只操作一个连接，不做连接替换。
-   */
-
   invalidateSessionConnection(
     sessionId: string,
     conn?: WebSocket | null,
     reason: string = "invalidate_session_connection"
   ): void {
-    const session = this.sessions.get(sessionId)
+    const exactSessionId = requireExactDurableIdentifier(
+      sessionId,
+      "Codex WebSocket sessionId"
+    )
+    const session = this.sessions.get(exactSessionId)
     if (!session) {
       return
     }
@@ -1097,12 +1094,18 @@ export class CodexWebSocketService implements OnModuleDestroy {
    * Close a session and its WebSocket connection.
    */
   closeSession(sessionId: string, reason: string = "close_session"): void {
-    const session = this.sessions.get(sessionId)
+    const exactSessionId = requireExactDurableIdentifier(
+      sessionId,
+      "Codex WebSocket sessionId"
+    )
+    const session = this.sessions.get(exactSessionId)
     if (!session) return
 
-    this.invalidateSessionConnection(sessionId, session.conn, reason)
-    this.sessions.delete(sessionId)
-    this.logger.log(`WebSocket session closed: ${sessionId} reason=${reason}`)
+    this.invalidateSessionConnection(exactSessionId, session.conn, reason)
+    this.sessions.delete(exactSessionId)
+    this.logger.log(
+      `WebSocket session closed: ${exactSessionId} reason=${reason}`
+    )
   }
 
   /**

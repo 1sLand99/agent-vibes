@@ -1,10 +1,16 @@
 import { Injectable, Logger } from "@nestjs/common"
 import { readdir, readFile, stat } from "fs/promises"
 import * as path from "path"
+import {
+  WorkspaceScope,
+  type WorkspaceScopeRoot,
+  type WorkspaceTarget,
+} from "./session/workspace-scope"
 
 export type SemanticSearchFamily = "semantic_search" | "deep_search"
 
 export interface SemanticSearchHit {
+  /** Canonical absolute path so multi-root hits remain unambiguous. */
   path: string
   score: number
   snippet?: string
@@ -14,7 +20,12 @@ export interface SemanticSearchRequest {
   conversationId: string
   family: SemanticSearchFamily
   query: string
-  rootPath: string
+  /**
+   * The sole filesystem authority. Parent sessions and child projection
+   * requests both pass a validated `WorkspaceScope`; consumers never decode
+   * durable JSON or infer a root from process state.
+   */
+  workspaceScope: WorkspaceScope
   targetDirectories: string[]
   maxResults: number
 }
@@ -27,15 +38,27 @@ export interface SemanticSearchResponse {
 }
 
 interface IndexedDocument {
-  path: string
-  normalizedPath: string
-  content: string
-  normalizedContent: string
+  readonly path: string
+  readonly rootPath: string
+  readonly relativePath: string
+  readonly normalizedPath: string
+  readonly content: string
+  readonly normalizedContent: string
 }
 
 interface IndexCacheEntry {
-  builtAt: number
-  documents: IndexedDocument[]
+  readonly builtAt: number
+  readonly documents: readonly IndexedDocument[]
+}
+
+interface SearchDirectoryTarget {
+  readonly root: WorkspaceScopeRoot
+  readonly target: WorkspaceTarget
+}
+
+interface CollectedWorkspaceFile {
+  readonly absolutePath: string
+  readonly relativePath: string
 }
 
 @Injectable()
@@ -61,7 +84,6 @@ export class SemanticSearchProviderService {
   async search(
     request: SemanticSearchRequest
   ): Promise<SemanticSearchResponse> {
-    const normalizedRoot = path.resolve(request.rootPath || process.cwd())
     const queryTokens = this.tokenizeQuery(request.query)
 
     if (queryTokens.length === 0) {
@@ -74,8 +96,11 @@ export class SemanticSearchProviderService {
     }
 
     try {
+      if (!(request.workspaceScope instanceof WorkspaceScope)) {
+        throw new Error("semantic search requires a WorkspaceScope")
+      }
       const documents = await this.getIndexedDocuments(
-        normalizedRoot,
+        request.workspaceScope,
         request.family,
         request.targetDirectories
       )
@@ -117,116 +142,143 @@ export class SemanticSearchProviderService {
     return Array.from(new Set(tokens))
   }
 
-  private normalizeRelativeDirectory(
-    rootPath: string,
-    value: string
-  ): string | undefined {
-    const trimmed = value.trim()
-    if (!trimmed) return undefined
-    const asUnix = trimmed.replace(/\\/g, "/").replace(/\/+$/g, "")
-    if (!asUnix) return undefined
+  private resolveSearchDirectoryTargets(
+    scope: WorkspaceScope,
+    targetDirectories: readonly string[]
+  ): readonly SearchDirectoryTarget[] {
+    const requestedDirectories = targetDirectories.map((value, index) => {
+      if (typeof value !== "string") {
+        throw new Error(
+          `semantic search targetDirectories[${index}] must be a string`
+        )
+      }
+      // Directory names are filesystem input, not normalized identifiers.
+      // Preserve their exact spelling and let WorkspaceScope resolve/reject
+      // empty, NUL-bearing, non-canonical, or out-of-scope targets.
+      return value
+    })
+    const targets =
+      requestedDirectories.length === 0
+        ? scope.roots.map((root) => scope.resolveTarget(root.path))
+        : requestedDirectories.map((directory) =>
+            scope.resolveTarget(directory)
+          )
 
-    if (path.isAbsolute(asUnix)) {
-      const relative = path.relative(rootPath, asUnix).replace(/\\/g, "/")
-      if (relative.startsWith("..")) return undefined
-      return relative.replace(/^\.\/+/g, "").replace(/\/+$/g, "")
+    const seen = new Set<string>()
+    const resolved: SearchDirectoryTarget[] = []
+    for (const target of targets) {
+      if (seen.has(target.absolutePath)) continue
+      seen.add(target.absolutePath)
+      resolved.push(Object.freeze({ root: target.root, target }))
     }
-
-    return asUnix.replace(/^\.\/+/g, "").replace(/^\/+/g, "")
+    return Object.freeze(resolved)
   }
 
   private buildCacheKey(
-    rootPath: string,
+    scope: WorkspaceScope,
     family: SemanticSearchFamily,
-    targetDirectories: string[]
+    targets: readonly SearchDirectoryTarget[]
   ): string {
-    const normalizedTargets = targetDirectories
-      .map((entry) => this.normalizeRelativeDirectory(rootPath, entry))
-      .filter((entry): entry is string => Boolean(entry))
+    const targetIdentity = targets
+      .map((entry) => entry.target.absolutePath)
       .sort()
-    return `${rootPath}::${family}::${normalizedTargets.join("|")}`
+      .join("|")
+    return `${scope.scopeFingerprint}::${family}::${targetIdentity}`
   }
 
   private async getIndexedDocuments(
-    rootPath: string,
+    scope: WorkspaceScope,
     family: SemanticSearchFamily,
-    targetDirectories: string[]
-  ): Promise<IndexedDocument[]> {
-    const cacheKey = this.buildCacheKey(rootPath, family, targetDirectories)
+    targetDirectories: readonly string[]
+  ): Promise<readonly IndexedDocument[]> {
+    const targets = this.resolveSearchDirectoryTargets(scope, targetDirectories)
+    const cacheKey = this.buildCacheKey(scope, family, targets)
     const cached = this.cache.get(cacheKey)
     const now = Date.now()
     if (cached && now - cached.builtAt < this.cacheTtlMs) {
       return cached.documents
     }
 
-    const maxFiles = family === "deep_search" ? 7_000 : 2_500
+    const maxFilesPerRoot = family === "deep_search" ? 7_000 : 2_500
     const maxDepth = family === "deep_search" ? 12 : 8
-    const discovered = await this.collectWorkspaceFiles(
-      rootPath,
-      maxFiles,
-      maxDepth
-    )
-    const normalizedTargets = targetDirectories
-      .map((entry) => this.normalizeRelativeDirectory(rootPath, entry))
-      .filter((entry): entry is string => Boolean(entry))
-
-    const candidateFiles =
-      normalizedTargets.length > 0
-        ? discovered.filter((file) => {
-            const normalized = file.replace(/\\/g, "/")
-            return normalizedTargets.some(
-              (target) =>
-                normalized === target || normalized.startsWith(`${target}/`)
-            )
-          })
-        : discovered
-
-    const documents: IndexedDocument[] = []
-    for (const relativeFile of candidateFiles) {
-      const abs = path.join(rootPath, relativeFile)
-      let fileStats
-      try {
-        fileStats = await stat(abs)
-      } catch {
-        continue
-      }
-      if (!fileStats.isFile()) continue
-      if (fileStats.size <= 0 || fileStats.size > this.maxFileBytes) continue
-
-      let content = ""
-      try {
-        content = await readFile(abs, "utf8")
-      } catch {
-        continue
-      }
-
-      if (!this.looksTextual(content)) continue
-      const trimmedContent =
-        content.length > 32_000 ? content.slice(0, 32_000) : content
-      documents.push({
-        path: relativeFile.replace(/\\/g, "/"),
-        normalizedPath: relativeFile.replace(/\\/g, "/").toLowerCase(),
-        content: trimmedContent,
-        normalizedContent: trimmedContent.toLowerCase(),
-      })
+    const targetsByRoot = new Map<string, SearchDirectoryTarget[]>()
+    for (const target of targets) {
+      const rootTargets = targetsByRoot.get(target.root.path) ?? []
+      rootTargets.push(target)
+      targetsByRoot.set(target.root.path, rootTargets)
     }
 
-    this.cache.set(cacheKey, {
+    const documents: IndexedDocument[] = []
+    for (const root of scope.roots) {
+      const rootTargets = targetsByRoot.get(root.path)
+      if (!rootTargets || rootTargets.length === 0) continue
+      const discovered = await this.collectWorkspaceFiles(
+        scope,
+        root,
+        rootTargets,
+        maxFilesPerRoot,
+        maxDepth
+      )
+      for (const file of discovered) {
+        let fileStats
+        try {
+          fileStats = await stat(file.absolutePath)
+        } catch {
+          continue
+        }
+        if (!fileStats.isFile()) continue
+        if (fileStats.size <= 0 || fileStats.size > this.maxFileBytes) continue
+
+        let content = ""
+        try {
+          content = await readFile(file.absolutePath, "utf8")
+        } catch {
+          continue
+        }
+
+        if (!this.looksTextual(content)) continue
+        const trimmedContent =
+          content.length > 32_000 ? content.slice(0, 32_000) : content
+        documents.push({
+          path: file.absolutePath,
+          rootPath: root.path,
+          relativePath: file.relativePath.replace(/\\/g, "/"),
+          normalizedPath: file.relativePath.replace(/\\/g, "/").toLowerCase(),
+          content: trimmedContent,
+          normalizedContent: trimmedContent.toLowerCase(),
+        })
+      }
+    }
+
+    const entry: IndexCacheEntry = Object.freeze({
       builtAt: now,
-      documents,
+      documents: Object.freeze(documents),
     })
-    return documents
+    this.cache.set(cacheKey, entry)
+    return entry.documents
   }
 
   private async collectWorkspaceFiles(
-    rootPath: string,
+    scope: WorkspaceScope,
+    root: WorkspaceScopeRoot,
+    targets: readonly SearchDirectoryTarget[],
     maxFiles: number,
     maxDepth: number
-  ): Promise<string[]> {
-    const files: string[] = []
-    const queue: Array<{ abs: string; rel: string; depth: number }> = [
-      { abs: rootPath, rel: "", depth: 0 },
-    ]
+  ): Promise<readonly CollectedWorkspaceFile[]> {
+    const files: CollectedWorkspaceFile[] = []
+    const seenDirectories = new Set<string>()
+    const seenFiles = new Set<string>()
+    const queue: Array<{ abs: string; rel: string; depth: number }> = []
+    for (const target of targets) {
+      if (target.root.path !== root.path) continue
+      if (seenDirectories.has(target.target.absolutePath)) continue
+      seenDirectories.add(target.target.absolutePath)
+      queue.push({
+        abs: target.target.absolutePath,
+        rel: target.target.relativePath,
+        depth: 0,
+      })
+    }
 
     while (queue.length > 0 && files.length < maxFiles) {
       const current = queue.pop()
@@ -249,25 +301,44 @@ export class SemanticSearchProviderService {
       }
 
       for (const entry of entries) {
-        const rel = current.rel
+        const relativePath = current.rel
           ? path.join(current.rel, entry.name)
           : entry.name
-        const abs = path.join(current.abs, entry.name)
+        const absolutePath = path.join(current.abs, entry.name)
 
         if (entry.isDirectory()) {
           if (current.depth >= maxDepth) continue
           if (this.skipDirs.has(entry.name)) continue
-          queue.push({ abs, rel, depth: current.depth + 1 })
+          // A nested declared root is indexed by its own root-local pass.
+          // Do not let a broader root absorb it merely because the filesystem
+          // hierarchy overlaps.
+          if (
+            scope.roots.some(
+              (declaredRoot) =>
+                declaredRoot.path !== root.path &&
+                declaredRoot.path === absolutePath
+            )
+          ) {
+            continue
+          }
+          if (seenDirectories.has(absolutePath)) continue
+          seenDirectories.add(absolutePath)
+          queue.push({
+            abs: absolutePath,
+            rel: relativePath,
+            depth: current.depth + 1,
+          })
           continue
         }
 
-        if (!entry.isFile()) continue
-        files.push(rel)
+        if (!entry.isFile() || seenFiles.has(absolutePath)) continue
+        seenFiles.add(absolutePath)
+        files.push(Object.freeze({ absolutePath, relativePath }))
         if (files.length >= maxFiles) break
       }
     }
 
-    return files
+    return Object.freeze(files)
   }
 
   private looksTextual(content: string): boolean {
@@ -322,7 +393,7 @@ export class SemanticSearchProviderService {
   private rankDocuments(
     query: string,
     queryTokens: string[],
-    documents: IndexedDocument[]
+    documents: readonly IndexedDocument[]
   ): SemanticSearchHit[] {
     const phrase = query.trim().toLowerCase()
     const compactPhrase = phrase.replace(/\s+/g, "")

@@ -63,10 +63,9 @@ export class WebSearchService {
     }
 
     const adapter = this.factory.selectAdapter(backend)
-    let selectedAdapter = adapter
     let results: WebSearchResult[]
     try {
-      results = await selectedAdapter.search(trimmed, baseOptions)
+      results = await adapter.search(trimmed, baseOptions)
     } catch (err) {
       if (err instanceof WebSearchAbortError) {
         // Caller aborted; surface the abort verbatim so connect-stream
@@ -74,52 +73,24 @@ export class WebSearchService {
         // a "search failed" frame.
         throw err
       }
-      if (err instanceof WebSearchEmptyResultError) {
-        const recoveryAdapter = this.factory.selectRecoveryAdapter(err.adapter)
-        if (!recoveryAdapter) {
-          throw err
-        }
-        this.logger.warn(
-          `[web-search] adapter=${err.adapter} returned empty results; ` +
-            `retrying once with ${recoveryAdapter.name}`
-        )
-        selectedAdapter = recoveryAdapter
-        results = await selectedAdapter.search(trimmed, baseOptions)
-      } else {
-        const message = err instanceof Error ? err.message : String(err)
-        const isTimeout =
-          message.includes("timeout") || message.includes("aborted due to")
-        const recoveryAdapter = isTimeout
-          ? this.factory.selectRecoveryAdapter(adapter.name)
-          : undefined
-        if (recoveryAdapter) {
-          this.logger.warn(
-            `[web-search] adapter=${adapter.name} timed out; ` +
-              `retrying once with ${recoveryAdapter.name}`
-          )
-          selectedAdapter = recoveryAdapter
-          results = await selectedAdapter.search(trimmed, baseOptions)
-        } else {
-          this.logger.warn(
-            `[web-search] adapter=${adapter.name} failed: ${message.slice(0, 240)}`
-          )
-          // Re-throw with a stable prefix so the connect-stream layer can
-          // attribute the failure to a specific provider in trace + UI.
-          throw new Error(`web_search via ${adapter.name} failed: ${message}`)
-        }
-      }
+      if (err instanceof WebSearchEmptyResultError) throw err
+      const message = err instanceof Error ? err.message : String(err)
+      this.logger.warn(
+        `[web-search] adapter=${adapter.name} failed: ${message.slice(0, 240)}`
+      )
+      throw new Error(`web_search via ${adapter.name} failed: ${message}`)
     }
 
     if (results.length === 0) {
       throw new WebSearchEmptyResultError(
-        selectedAdapter.name,
+        adapter.name,
         trimmed,
-        `web_search via ${selectedAdapter.name} returned no results for query "${trimmed.slice(0, 80)}"`
+        `web_search via ${adapter.name} returned no results for query "${trimmed.slice(0, 80)}"`
       )
     }
 
     return {
-      adapter: selectedAdapter.name,
+      adapter: adapter.name,
       query: trimmed,
       results,
     }

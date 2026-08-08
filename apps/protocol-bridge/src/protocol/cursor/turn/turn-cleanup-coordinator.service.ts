@@ -1,14 +1,18 @@
 import { Injectable, Logger } from "@nestjs/common"
-import { MessageStore } from "../session/message-store.service"
+import { ContextStateService } from "../session/context-state.service"
+import { AssistantToolBatchService } from "../session/assistant-tool-batch.service"
 import {
-  ToolCallLedger,
-  type AbortReason,
-} from "../session/tool-call-ledger.service"
+  SessionLifecycleService,
+  type PendingToolCall,
+} from "../session/session-lifecycle.service"
+import { SubagentExecBridgeService } from "../subagents/subagent-exec-bridge.service"
+import { TopLevelAgentTurnRunnerService } from "./top-level-agent-turn-runner.service"
+import type { AbortReason } from "../session/tool-call-ledger.service"
 import {
   OutboundSealViolationError,
   type TurnOutbound,
 } from "../bidi/bidi-outbound"
-import { TurnLifecycle } from "./turn-lifecycle.service"
+import { TurnFinalizationError, TurnLifecycle } from "./turn-lifecycle.service"
 import {
   type BidiId,
   type CancelReason,
@@ -27,7 +31,7 @@ import {
  *      message lands while the previous turn is still in-flight)
  *   4. `cursor-connect-stream` inbound `abort-stream` dispatcher
  *      (user-cancel via `cancelTurnAndAwait`)
- *   5. `PendingDeadlineSweeper` expiry
+ *   5. explicit lifecycle cleanup requests
  *
  * Each site reimplemented its own ordering: some called
  * `outbound.beginSeal+finishSeal` directly, some cancelled the
@@ -45,17 +49,16 @@ import {
  *      — fire AbortSignal, wait for every runner's `finally` to run.
  *   4. `outbound.awaitWritersDrained({ timeout })` — guarantee no
  *      writer remains active before closing the channel.
- *   5. `messageStore.runInTransaction(cid, txn => {
- *        ledger.abortAll(...);
- *        for (const id of aborted) messageStore.appendAbortToolResultBlock(...)
- *      })` — atomically transition open ledger entries to aborted
- *      and emit the structured `[abort:{reason}]` tool_results.
+ *   5. `contextState.abortOpenGraphToolCalls(...)` — atomically transition
+ *      open ledger entries to aborted, append structured tool_results, and
+ *      advance the mounted graph projection from those committed UUIDs.
  *   6. `outbound.finishSeal()` (or `forceFinishSeal()` on timeout) —
  *      close the channel, emit `onSealed` to the controller.
  *
- * The function returns synchronously to the caller; failures inside
- * any individual step are logged and folded into the
- * `CleanupReport` rather than rethrown.
+ * The function resolves only after every required cleanup step has completed.
+ * A report containing errors is rejected as `TurnCleanupError`; callers that
+ * would start replacement work must not proceed from a partially unwound
+ * ownership boundary.
  */
 export type CleanupInput =
   | { kind: "bidi-closed"; bidiId: BidiId; outbound: TurnOutbound }
@@ -78,12 +81,6 @@ export type CleanupInput =
       reason: string
     }
   | { kind: "shutdown" }
-  | {
-      kind: "deadline-expired"
-      conversationId: ConversationId
-      turnId: TurnId
-      toolCallIds: string[]
-    }
 
 export interface CleanupReport {
   kind: CleanupInput["kind"]
@@ -94,6 +91,21 @@ export interface CleanupReport {
   errors: string[]
 }
 
+/**
+ * A cleanup report with errors is not a successful unwind. Callers that are
+ * about to install a replacement turn must stop rather than treating a
+ * partially-cleared graph as safe ownership for the next turn.
+ */
+export class TurnCleanupError extends Error {
+  readonly report: CleanupReport
+
+  constructor(report: CleanupReport) {
+    super(`turn cleanup failed for ${report.kind}: ${report.errors.join("; ")}`)
+    this.name = TurnCleanupError.name
+    this.report = report
+  }
+}
+
 const DEFAULT_DRAIN_TIMEOUT_MS = 5_000
 
 @Injectable()
@@ -102,8 +114,11 @@ export class TurnCleanupCoordinator {
 
   constructor(
     private readonly lifecycle: TurnLifecycle,
-    private readonly messageStore: MessageStore,
-    private readonly ledger: ToolCallLedger
+    private readonly contextState: ContextStateService,
+    private readonly sessionLifecycle: SessionLifecycleService,
+    private readonly subagentExecBridge: SubagentExecBridgeService,
+    private readonly assistantToolBatch: AssistantToolBatchService,
+    private readonly topLevelAgentTurnRunner: TopLevelAgentTurnRunnerService
   ) {}
 
   async cleanup(
@@ -169,19 +184,18 @@ export class TurnCleanupCoordinator {
           // with kind=bidi-closed).
           break
         }
-        case "deadline-expired": {
-          const result = await this.unwindDeadline(
-            input.conversationId,
-            input.turnId,
-            input.toolCallIds,
-            errors
-          )
-          abortedToolCallCount = result.abortedToolCalls
-          break
-        }
       }
     } catch (err) {
       errors.push(`cleanup(${input.kind}): ${(err as Error).message}`)
+    }
+
+    const report: CleanupReport = {
+      kind: input.kind,
+      cancelledTurnCount,
+      drained,
+      abortedToolCallCount,
+      forced,
+      errors,
     }
 
     this.logger.log(
@@ -191,14 +205,14 @@ export class TurnCleanupCoordinator {
         (errors.length > 0 ? ` errors=${errors.length}` : "")
     )
 
-    return {
-      kind: input.kind,
-      cancelledTurnCount,
-      drained,
-      abortedToolCallCount,
-      forced,
-      errors,
+    if (errors.length > 0) {
+      this.logger.error(
+        `[cleanup] failed kind=${input.kind}: ${errors.join("; ")}`
+      )
+      throw new TurnCleanupError(report)
     }
+
+    return report
   }
 
   // ── internal: bidi unwind ────────────────────────────────────────
@@ -207,7 +221,7 @@ export class TurnCleanupCoordinator {
     bidiId: BidiId,
     outbound: TurnOutbound,
     cancelReason: CancelReason,
-    abortReason: AbortReason,
+    abortReason: AbortReason | undefined,
     drainTimeoutMs: number,
     errors: string[]
   ): Promise<{
@@ -233,15 +247,29 @@ export class TurnCleanupCoordinator {
     // detaches the records.
     const snapshot = this.lifecycle.listTurnsForBidi(bidiId)
 
-    // Step 3: cancel and await every runner's terminal.
+    // Step 3: cancel and await every lifecycle-committed terminal.
     let cancelled = 0
+    let turnsSettled = true
+    let terminalFinalizationFailed = false
     try {
       const terminals = await this.lifecycle.cancelBidiAndAwait(
         bidiId,
         cancelReason
       )
       cancelled = terminals.length
+      const failedTerminal = terminals.find(
+        (terminal) =>
+          terminal.status === "failed" &&
+          terminal.error instanceof TurnFinalizationError
+      )
+      if (failedTerminal?.status === "failed") {
+        terminalFinalizationFailed = true
+        errors.push(
+          `cancelBidiAndAwait terminal failed: ${failedTerminal.error.message}`
+        )
+      }
     } catch (err) {
+      turnsSettled = false
       errors.push(`cancelBidiAndAwait: ${(err as Error).message}`)
     }
 
@@ -254,6 +282,9 @@ export class TurnCleanupCoordinator {
       })
       drained = result.drained
       if (!drained) {
+        errors.push(
+          `awaitWritersDrained: timeout after ${drainTimeoutMs}ms for bidi=${bidiId}`
+        )
         this.logger.error(
           `outbound writers did not drain in ${drainTimeoutMs}ms ` +
             `bidi=${bidiId.substring(0, 8)} remaining=${result.remaining.length}`
@@ -264,22 +295,42 @@ export class TurnCleanupCoordinator {
       errors.push(`awaitWritersDrained: ${(err as Error).message}`)
     }
 
-    // Step 5: ledger sweep + structured abort tool_results in one txn
-    // per conversation. Multiple turns may share a conversationId
-    // (parent + foreground-subagent); de-dup to avoid double-sweeping.
+    // Step 5: an explicit supersede terminates graph edges and then clears
+    // their runtime waiters. A plain BiDi close is only a transport detach:
+    // Cursor may reconnect with resumeAction, so graph, pending state, batch
+    // barriers and durable outbox bytes must remain intact.
     let abortedToolCalls = 0
-    const sweptConversations = new Set<ConversationId>()
-    for (const { turnId, conversationId } of snapshot) {
-      if (sweptConversations.has(conversationId)) continue
-      sweptConversations.add(conversationId)
-      try {
-        abortedToolCalls += this.sweepConversation(
-          conversationId,
-          turnId,
-          abortReason
-        )
-      } catch (err) {
-        errors.push(`sweep(${conversationId}): ${(err as Error).message}`)
+    if (abortReason && turnsSettled && !terminalFinalizationFailed) {
+      const sweptTurns = new Set<string>()
+      for (const { turnId, conversationId } of snapshot) {
+        const sweepKey = `${conversationId}\u0000${turnId}`
+        if (sweptTurns.has(sweepKey)) continue
+        sweptTurns.add(sweepKey)
+        let graphAbortCommitted = false
+        try {
+          abortedToolCalls += this.sweepConversation(
+            conversationId,
+            turnId,
+            abortReason
+          )
+          this.clearCommittedRuntimeToolCalls(
+            conversationId,
+            turnId,
+            abortReason
+          )
+          graphAbortCommitted = true
+        } catch (err) {
+          errors.push(`sweep(${conversationId}): ${(err as Error).message}`)
+        }
+        if (!graphAbortCommitted) continue
+        try {
+          this.assistantToolBatch.abortGraphTurn(conversationId, turnId)
+          this.topLevelAgentTurnRunner.abortGraphTurn(conversationId, turnId)
+        } catch (err) {
+          errors.push(
+            `clear runtime graph state(${conversationId}): ${(err as Error).message}`
+          )
+        }
       }
     }
 
@@ -323,57 +374,95 @@ export class TurnCleanupCoordinator {
         turnId,
         cancelReason
       )
-      if (result) cancelled = 1
+      if (result) {
+        cancelled = 1
+        if (
+          result.status === "failed" &&
+          result.error instanceof TurnFinalizationError
+        ) {
+          errors.push(
+            `cancelTurnAndAwait terminal failed: ${result.error.message}`
+          )
+          return { cancelled, abortedToolCalls: 0 }
+        }
+      }
     } catch (err) {
       errors.push(`cancelTurnAndAwait: ${(err as Error).message}`)
+      return { cancelled, abortedToolCalls: 0 }
     }
 
     let abortedToolCalls = 0
+    let graphAbortCommitted = false
     try {
       abortedToolCalls += this.sweepConversation(
         conversationId,
         turnId,
         abortReason
       )
+      this.clearCommittedRuntimeToolCalls(conversationId, turnId, abortReason)
+      graphAbortCommitted = true
     } catch (err) {
       errors.push(`sweep(${conversationId}): ${(err as Error).message}`)
+    }
+    if (!graphAbortCommitted) return { cancelled, abortedToolCalls }
+    try {
+      this.assistantToolBatch.abortGraphTurn(conversationId, turnId)
+      this.topLevelAgentTurnRunner.abortGraphTurn(conversationId, turnId)
+    } catch (err) {
+      errors.push(
+        `clear runtime graph state(${conversationId}): ${(err as Error).message}`
+      )
     }
     return { cancelled, abortedToolCalls }
   }
 
-  // ── internal: deadline-expired path ──────────────────────────────
-
-  private async unwindDeadline(
+  /**
+   * Clear process-local pending entries only after ContextState has committed
+   * the canonical graph/ledger/outbox terminal facts. Sub-agent waiters are
+   * rejected by exact tool id so sibling branches remain isolated.
+   */
+  private clearCommittedRuntimeToolCalls(
     conversationId: ConversationId,
     turnId: TurnId,
-    toolCallIds: string[],
-    errors: string[]
-  ): Promise<{ abortedToolCalls: number }> {
-    if (toolCallIds.length === 0) {
-      return { abortedToolCalls: 0 }
+    reason: AbortReason,
+    selectedToolCallIds?: ReadonlySet<string>
+  ): number {
+    const entries = this.sessionLifecycle
+      .pendingToolListForTurn<PendingToolCall>(conversationId, turnId)
+      .filter(
+        (entry) =>
+          !selectedToolCallIds || selectedToolCallIds.has(entry.toolCallId)
+      )
+    for (const entry of entries) {
+      if (entry.payload?.sidechainOwner) {
+        this.subagentExecBridge.rejectToolCall(
+          String(conversationId),
+          entry.payload.sidechainOwner,
+          entry.toolCallId,
+          new Error(reason)
+        )
+      }
     }
-    let abortedToolCalls = 0
-    try {
-      this.messageStore.runInTransaction(conversationId, (txn) => {
-        const result = this.ledger.abortAll(txn, {
-          turnId,
-          reason: "deadline_expired",
-        })
-        abortedToolCalls = result.abortedToolCallIds.length
-        for (const entry of result.abortedToolCallIds) {
-          const block = ToolCallLedger.buildAbortToolResult(
-            entry.toolUseId,
-            "deadline_expired"
-          )
-          this.messageStore.appendAbortToolResultBlock(txn, block, {
-            turnId,
-          })
-        }
-      })
-    } catch (err) {
-      errors.push(`deadline sweep: ${(err as Error).message}`)
+    if (!selectedToolCallIds) {
+      return this.sessionLifecycle.clearPendingToolCallsForTurn(
+        conversationId,
+        turnId,
+        `graph abort committed: ${reason}`
+      ).length
     }
-    return { abortedToolCalls }
+    let cleared = 0
+    for (const entry of entries) {
+      if (
+        this.sessionLifecycle.clearPendingToolCall(
+          String(conversationId),
+          entry.toolCallId,
+          `graph abort committed: ${reason}`
+        )
+      ) {
+        cleared += 1
+      }
+    }
+    return cleared
   }
 
   // ── shared sweep helper ──────────────────────────────────────────
@@ -390,24 +479,10 @@ export class TurnCleanupCoordinator {
     turnId: TurnId,
     abortReason: AbortReason
   ): number {
-    let abortedCount = 0
-    this.messageStore.runInTransaction(conversationId, (txn) => {
-      const result = this.ledger.abortAll(txn, {
-        turnId,
-        reason: abortReason,
-      })
-      abortedCount = result.abortedToolCallIds.length
-      for (const entry of result.abortedToolCallIds) {
-        const block = ToolCallLedger.buildAbortToolResult(
-          entry.toolUseId,
-          abortReason
-        )
-        this.messageStore.appendAbortToolResultBlock(txn, block, {
-          turnId,
-        })
-      }
+    return this.contextState.abortOpenGraphToolCalls(conversationId, {
+      turnId,
+      reason: abortReason,
     })
-    return abortedCount
   }
 }
 
@@ -426,6 +501,6 @@ function mapReasonForBidi(
 
 function mapAbortReasonForBidi(
   kind: "bidi-closed" | "bidi-superseded"
-): AbortReason {
-  return kind === "bidi-superseded" ? "turn_superseded" : "bidi_teardown"
+): AbortReason | undefined {
+  return kind === "bidi-superseded" ? "turn_superseded" : undefined
 }

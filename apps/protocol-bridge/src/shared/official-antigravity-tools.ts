@@ -6,6 +6,14 @@ export interface OfficialAntigravityCanonicalToolInvocation {
   validationErrorMessage?: string
 }
 
+/**
+ * The official `browser_subagent` tool dispatches the runtime browser
+ * sub-agent by this exact identity.  Protocol oneof names are deliberately
+ * kept out of this contract: the browser-use wire case is not a second
+ * runtime agent name.
+ */
+export const OFFICIAL_ANTIGRAVITY_BROWSER_SUBAGENT_TYPE = "browser" as const
+
 interface OfficialAntigravityNormalizedEditChunk {
   allowMultiple?: boolean
   targetContent?: string
@@ -900,7 +908,7 @@ export function canonicalizeOfficialAntigravityToolInvocation(
           description:
             input.Task || input.task || input.description || input.TaskSummary,
           prompt: input.Task || input.task || input.description,
-          subagent_type: "browser",
+          subagent_type: OFFICIAL_ANTIGRAVITY_BROWSER_SUBAGENT_TYPE,
         },
         historyToolName,
         historyToolInput,

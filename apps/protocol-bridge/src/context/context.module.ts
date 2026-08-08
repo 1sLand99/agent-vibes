@@ -1,23 +1,21 @@
 import { Module } from "@nestjs/common"
 import { CompactWarningHookService } from "./compact-warning-hook.service"
 import { CompactWarningStateService } from "./compact-warning-state.service"
+import { ClaudeConversationProjector } from "./claude-conversation-projector"
 import { ContextAttachmentBuilderService } from "./context-attachment-builder.service"
-import { CodexContextAdapterService } from "./codex-context-adapter.service"
-import { ContextCollapseService } from "./context-collapse.service"
+import { CodexContextEngineService } from "./codex-context-engine.service"
 import { ContextCompactRunnerService } from "./context-compact-runner.service"
 import { ContextCompactionService } from "./context-compaction.service"
-import { ContextHookExecutorService } from "./context-hook-executor.service"
 import { ContextManagerService } from "./context-manager.service"
 import { ContextNativeManagementService } from "./context-native-management.service"
-import { ContextPipelineService } from "./context-pipeline.service"
+import { ContextPipeline } from "./context-pipeline.service"
 import { ContextProjectionService } from "./context-projection.service"
 import { ContextRequestPlannerService } from "./context-request-planner.service"
 import { ContextTelemetryService } from "./context-telemetry.service"
 import { ContextUsageLedgerService } from "./context-usage-ledger.service"
-import { PostCompactCleanupService } from "./post-compact-cleanup.service"
-import { ReasoningMemoryService } from "./reasoning-memory.service"
+import { ReasoningPreambleProjectorService } from "./reasoning-preamble-projector.service"
 import { TokenCounterService } from "./token-counter.service"
-import { SessionMemoryCompactionService } from "./session-memory-compaction.service"
+import { SessionMemoryService } from "./session-memory.service"
 import { ToolIntegrityService } from "./tool-integrity.service"
 import { ToolResultStorageService } from "./tool-result-storage.service"
 
@@ -35,7 +33,7 @@ import { ToolResultStorageService } from "./tool-result-storage.service"
  * - ContextManagerService: Single orchestration entry point for session and stateless requests
  * - ContextRequestPlannerService: Request budget + pre-send projection planner
  * - ContextNativeManagementService: Provider-native context edit strategy builder
- * - SessionMemoryCompactionService: Durable structured memory extracted at compaction boundaries
+ * - SessionMemoryService: Explicit structured memory events retained across boundaries
  * - ContextTelemetryService: Lightweight in-memory event counters for diagnostics
  *
  * Design:
@@ -46,49 +44,45 @@ import { ToolResultStorageService } from "./tool-result-storage.service"
 @Module({
   providers: [
     TokenCounterService,
-    CodexContextAdapterService,
+    ClaudeConversationProjector,
+    CodexContextEngineService,
     CompactWarningStateService,
     CompactWarningHookService,
-    PostCompactCleanupService,
     ToolIntegrityService,
     ToolResultStorageService,
     ContextAttachmentBuilderService,
-    ContextCollapseService,
     ContextCompactRunnerService,
-    ContextPipelineService,
+    ContextPipeline,
     ContextProjectionService,
     ContextTelemetryService,
     ContextUsageLedgerService,
     ContextCompactionService,
-    ContextHookExecutorService,
     ContextManagerService,
     ContextNativeManagementService,
     ContextRequestPlannerService,
-    ReasoningMemoryService,
-    SessionMemoryCompactionService,
+    ReasoningPreambleProjectorService,
+    SessionMemoryService,
   ],
   exports: [
     TokenCounterService,
-    CodexContextAdapterService,
+    ClaudeConversationProjector,
+    CodexContextEngineService,
     CompactWarningStateService,
     CompactWarningHookService,
-    PostCompactCleanupService,
     ToolIntegrityService,
     ToolResultStorageService,
     ContextAttachmentBuilderService,
-    ContextCollapseService,
     ContextCompactRunnerService,
-    ContextPipelineService,
+    ContextPipeline,
     ContextProjectionService,
     ContextTelemetryService,
     ContextUsageLedgerService,
     ContextCompactionService,
-    ContextHookExecutorService,
     ContextManagerService,
     ContextNativeManagementService,
     ContextRequestPlannerService,
-    ReasoningMemoryService,
-    SessionMemoryCompactionService,
+    ReasoningPreambleProjectorService,
+    SessionMemoryService,
   ],
 })
 export class ContextModule {}

@@ -11,6 +11,7 @@
  */
 
 import { randomUUID } from "crypto"
+import { requireOptionalExactDurableIdentifier } from "../../context/durable-identifier"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import { appendLanguageDirectiveToText } from "../shared/language-directive"
 import { resolveCloudCodeModel } from "../shared/model-registry"
@@ -156,6 +157,14 @@ export function claudeToKiro(
   dto: CreateMessageDto,
   options: ClaudeToKiroOptions = {}
 ): KiroPayload {
+  const conversationId = requireOptionalExactDurableIdentifier(
+    options.conversationId,
+    "Kiro conversation key"
+  )
+  const agentContinuationId = requireOptionalExactDurableIdentifier(
+    options.agentContinuationId,
+    "Kiro agent continuation key"
+  )
   const modelId = mapKiroModel(dto.model || "")
   const origin = "AI_EDITOR"
 
@@ -292,7 +301,7 @@ export function claudeToKiro(
   const payload: KiroPayload = {
     conversationState: {
       chatTriggerType: "MANUAL",
-      conversationId: options.conversationId || randomUUID(),
+      conversationId: conversationId ?? randomUUID(),
       currentMessage: {
         userInputMessage: {
           // 抓包验证：currentMessage.userInputMessage 同时带 modelId / origin。
@@ -308,7 +317,7 @@ export function claudeToKiro(
   if (isAgentMode) {
     payload.conversationState.agentTaskType = "vibe"
     payload.conversationState.agentContinuationId =
-      options.agentContinuationId || randomUUID()
+      agentContinuationId ?? randomUUID()
   }
 
   if (options.profileArn) {

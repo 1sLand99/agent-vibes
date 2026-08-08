@@ -11,9 +11,9 @@
  *   - Built-in agents always win on agentType conflicts. A user shouldn't
  *     accidentally shadow `general-purpose` and break the dynamic prompt
  *     fallback. Same precedence claude-code uses.
- *   - We re-scan disk on every `getAll()` call. Loader is cheap and the
- *     call site (`task` tool dispatch) is human-paced. This avoids stale
- *     cache after the user adds / edits an agent file.
+ *   - `getAll()` is a stateless snapshot read. The stream service invokes it
+ *     once at each new-user-turn boundary, then reuses that exact definition
+ *     set for prompt construction, tool continuations and child spawns.
  */
 
 import { Injectable, Logger } from "@nestjs/common"
@@ -33,7 +33,9 @@ export class SubagentRegistryService {
    * a built-in name (in which case the built-in wins and we log a warning). */
   getAll(projectCwd?: string): SubagentDefinition[] {
     const builtIns = getBuiltInSubagents()
-    const builtInNames = new Set(builtIns.map((agent) => agent.agentType))
+    const builtInNames = new Set<string>(
+      builtIns.map((agent) => agent.agentType)
+    )
 
     const custom = this.loader.getCustomSubagents(projectCwd)
     const result: SubagentDefinition[] = [...builtIns]
@@ -49,33 +51,5 @@ export class SubagentRegistryService {
       result.push(agent)
     }
     return result
-  }
-
-  /** Look up a single sub-agent by its `agentType`. Returns undefined when
-   * the model passes a `subagent_type` that nobody declared. Callers should
-   * treat an explicit unknown type as a tool error; only an omitted type
-   * defaults to `general-purpose`. */
-  findByType(
-    agentType: string,
-    projectCwd?: string
-  ): SubagentDefinition | undefined {
-    if (!agentType) return undefined
-    const normalized = this.normalizeAgentType(agentType)
-    if (!normalized) return undefined
-    return this.getAll(projectCwd).find(
-      (agent) => agent.agentType.trim().toLowerCase() === normalized
-    )
-  }
-
-  private normalizeAgentType(agentType: string): string {
-    const normalized = agentType.trim().toLowerCase()
-    switch (normalized) {
-      case "general":
-      case "general_purpose":
-      case "generalpurpose":
-        return "general-purpose"
-      default:
-        return normalized
-    }
   }
 }

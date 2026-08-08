@@ -437,11 +437,14 @@ function formatBusyRuntimeSession(session) {
     `backendStreams=${Number(session.activeBackendStreams) || 0}`,
     `pendingToolCalls=${Number(session.pendingToolCalls) || 0}`,
     `pendingInteractionQueries=${Number(session.pendingInteractionQueries) || 0}`,
+    `pendingAsyncUserInteractions=${Number(session.pendingAsyncUserInteractions) || 0}`,
     `deferredContinuations=${Number(session.deferredControlContinuations) || 0}`,
   ].join(" ")
 }
 
 function hasInterruptibleRuntimeWork(session) {
+  // Async user interactions are restart-safe: their resolution and
+  // continuation claim are durable and the bridge recovers them on resume.
   return (
     Number(session.activeBackendStreams) > 0 ||
     Number(session.pendingToolCalls) > 0 ||
@@ -494,12 +497,12 @@ async function assertSafeToRestartBridge(port, caCertPath) {
 
   if (snapshot.canRestartWithoutInterruptingRuns !== true) {
     console.warn(
-      "[restart:bridge] Runtime reported active session(s), but none have " +
-        "backend streams, pending tool calls, interaction queries, or deferred continuations; restarting is safe."
+      "[restart:bridge] Runtime reported durable pending work, but no " +
+        "non-recoverable backend stream, client tool, interaction query, or deferred continuation; restarting is safe."
     )
   }
 
-  const recoverySessionCount = Number(snapshot.recoverySessionCount) || 0
+  const recoverySessionCount = Number(snapshot.pendingRecoverySessionCount) || 0
   if (recoverySessionCount > 0) {
     console.warn(
       `[restart:bridge] ${recoverySessionCount} session(s) have restart recovery state; restart is allowed because no live work is active`

@@ -135,7 +135,7 @@ export type CoreToolNameSet = ReadonlySet<string>
 const NON_CURSOR_TOOL_REDIRECTS: ReadonlyMap<string, string> = new Map([
   [
     "view_content_chunk",
-    "`view_content_chunk` belongs to Antigravity / Google Cloud Code, not Cursor `agent.v1`. Cursor's `web_fetch` returns the entire document in one call; if you need to fetch a URL, call `web_fetch` instead. Bridge-internal `[tool_result stored]` archives are also not addressable by chunk — re-invoke the original tool to read again.",
+    "`view_content_chunk` belongs to Antigravity / Google Cloud Code, not Cursor `agent.v1`. Cursor's `web_fetch` returns the entire document in one call; if you need to fetch a URL, call `web_fetch` instead. Bridge-internal `[tool_result stored]` archives are not addressable by chunk; narrow the next search or read to the exact source instead of repeating the same broad invocation.",
   ],
   [
     "read_url_content",

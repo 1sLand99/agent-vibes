@@ -1,4 +1,9 @@
-import { normalizeCodexPromptCacheKey } from "./codex-prompt-cache-key"
+import { requireExactDurableIdentifier } from "../../context/durable-identifier"
+import {
+  assertCodexProviderIdentity,
+  type CodexProviderIdentity,
+  type CodexSubagentProviderIdentity,
+} from "./codex-provider-identity"
 
 export interface CodexTurnStateCarrier {
   turnState: string | undefined
@@ -28,10 +33,9 @@ export interface CodexTurnCompactionMetadata {
 }
 
 export interface CodexClientMetadataInput {
-  conversationId?: string
-  requestOrdinal?: number
-  turnId?: string
-  windowId?: string
+  identity: CodexProviderIdentity
+  turnId: string
+  windowId: string
   requestKind?: CodexResponsesRequestKind
   installationId: string
   workspaceRootPath?: string
@@ -61,23 +65,24 @@ export function buildCodexCompactionMetadata(
 
 export function buildCodexClientMetadata(
   input: CodexClientMetadataInput
-): Record<string, string> | undefined {
-  const conversationId = input.conversationId?.trim()
-  if (!conversationId) {
-    return undefined
-  }
+): Record<string, string> {
+  assertCodexProviderIdentity(input.identity)
 
-  const requestOrdinal = Math.max(1, Math.floor(input.requestOrdinal || 1))
-  const sessionId = normalizeCodexPromptCacheKey(conversationId)
-  const threadId = sessionId
-  const turnId = normalizeCodexPromptCacheKey(
-    input.turnId?.trim() || `${sessionId}:${requestOrdinal}`
+  const sessionId = input.identity.sessionId
+  const threadId = input.identity.threadId
+  const turnId = requireExactDurableIdentifier(
+    input.turnId,
+    "Codex turn metadata turnId"
   )
-  const windowId = normalizeCodexPromptCacheKey(
-    input.windowId?.trim() || `${threadId}:0`
+  const windowId = requireExactDurableIdentifier(
+    input.windowId,
+    "Codex turn metadata windowId"
   )
   const requestKind = input.requestKind === "compaction" ? "compaction" : "turn"
-  const installationId = input.installationId.trim()
+  const installationId = requireExactDurableIdentifier(
+    input.installationId,
+    "Codex installationId"
+  )
   const turnMetadata: Record<string, unknown> = {
     installation_id: installationId,
     session_id: sessionId,
@@ -85,8 +90,13 @@ export function buildCodexClientMetadata(
     turn_id: turnId,
     window_id: windowId,
     request_kind: requestKind,
-    thread_source: "user",
+    thread_source: input.identity.threadSource,
     sandbox: "none",
+  }
+
+  if (isCodexSubagentIdentity(input.identity)) {
+    turnMetadata.parent_thread_id = input.identity.parentThreadId
+    turnMetadata.subagent_kind = input.identity.subagentKind
   }
 
   const startedAt = input.turnStartedAtUnixMs
@@ -98,14 +108,19 @@ export function buildCodexClientMetadata(
     turnMetadata.compaction = input.compaction
   }
 
-  const rootPath = input.workspaceRootPath?.trim()
+  const rootPath =
+    typeof input.workspaceRootPath === "string" &&
+    input.workspaceRootPath.length > 0 &&
+    !input.workspaceRootPath.includes("\u0000")
+      ? input.workspaceRootPath
+      : undefined
   if (rootPath) {
     turnMetadata.workspaces = {
       [rootPath]: {},
     }
   }
 
-  return {
+  const metadata: Record<string, string> = {
     session_id: sessionId,
     thread_id: threadId,
     turn_id: turnId,
@@ -113,45 +128,84 @@ export function buildCodexClientMetadata(
     "x-codex-turn-metadata": JSON.stringify(turnMetadata),
     "x-codex-installation-id": installationId,
   }
+  if (isCodexSubagentIdentity(input.identity)) {
+    metadata["x-codex-parent-thread-id"] = input.identity.parentThreadId
+    metadata["x-openai-subagent"] = input.identity.subagentHeader
+  }
+  return metadata
+}
+
+function isCodexSubagentIdentity(
+  identity: CodexProviderIdentity
+): identity is CodexSubagentProviderIdentity {
+  return identity.threadSource === "subagent"
 }
 
 export function extractCodexTurnKey(
   codexRequest: Record<string, unknown>
 ): string {
   const metadata = codexRequest.client_metadata
-  if (!metadata || typeof metadata !== "object") {
-    return ""
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new Error("Codex request requires canonical client_metadata")
   }
 
   const record = metadata as Record<string, unknown>
-  const rawTurnMetadata = record["x-codex-turn-metadata"]
-  if (typeof rawTurnMetadata === "string" && rawTurnMetadata.trim()) {
-    const trimmedTurnMetadata = rawTurnMetadata.trim()
-    try {
-      const parsed = JSON.parse(trimmedTurnMetadata) as Record<string, unknown>
-      const turnId = parsed?.turn_id
-      if (typeof turnId === "string" && turnId.trim()) {
-        return turnId.trim()
-      }
-    } catch {
-      return trimmedTurnMetadata
-    }
-    return trimmedTurnMetadata
+  const rawTurnMetadata = requireExactDurableIdentifier(
+    record["x-codex-turn-metadata"],
+    "Codex x-codex-turn-metadata"
+  )
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(rawTurnMetadata)
+  } catch (error) {
+    throw new Error(
+      `Codex x-codex-turn-metadata must be valid JSON: ${String(error)}`
+    )
   }
-
-  const windowId = record["x-codex-window-id"]
-  return typeof windowId === "string" ? windowId.trim() : ""
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Codex x-codex-turn-metadata must be a JSON object")
+  }
+  const turnMetadata = parsed as Record<string, unknown>
+  const turnId = requireExactDurableIdentifier(
+    turnMetadata.turn_id,
+    "Codex x-codex-turn-metadata turn_id"
+  )
+  const flatTurnId = requireExactDurableIdentifier(
+    record.turn_id,
+    "Codex client_metadata turn_id"
+  )
+  if (flatTurnId !== turnId) {
+    throw new Error(
+      "Codex client_metadata turn_id does not match x-codex-turn-metadata"
+    )
+  }
+  const windowId = requireExactDurableIdentifier(
+    turnMetadata.window_id,
+    "Codex x-codex-turn-metadata window_id"
+  )
+  const flatWindowId = requireExactDurableIdentifier(
+    record["x-codex-window-id"],
+    "Codex client_metadata x-codex-window-id"
+  )
+  if (flatWindowId !== windowId) {
+    throw new Error(
+      "Codex client_metadata x-codex-window-id does not match x-codex-turn-metadata"
+    )
+  }
+  return turnId
 }
 
 export function applyCodexTurnStateHeader(
   headers: Record<string, string>,
   turnState: string | undefined
 ): boolean {
-  const normalizedTurnState = turnState?.trim()
-  if (!normalizedTurnState) {
+  if (turnState === undefined) {
     return false
   }
-  headers[CODEX_TURN_STATE_HEADER] = normalizedTurnState
+  headers[CODEX_TURN_STATE_HEADER] = requireExactDurableIdentifier(
+    turnState,
+    "Codex turn state"
+  )
   return true
 }
 
@@ -164,19 +218,23 @@ export function readCodexTurnStateFromHeaders(
 
   if (typeof (headers as Pick<Headers, "get">).get === "function") {
     const value = (headers as Pick<Headers, "get">).get(CODEX_TURN_STATE_HEADER)
-    return typeof value === "string" && value.trim() ? value.trim() : undefined
+    return value === null
+      ? undefined
+      : requireExactDurableIdentifier(value, "Codex turn state header")
   }
 
+  let turnState: string | undefined
   for (const [key, value] of Object.entries(headers)) {
-    if (key.trim().toLowerCase() !== CODEX_TURN_STATE_HEADER) {
+    if (key.toLowerCase() !== CODEX_TURN_STATE_HEADER) {
       continue
     }
-    if (typeof value === "string" && value.trim()) {
-      return value.trim()
+    if (turnState !== undefined) {
+      throw new Error("Codex response contains duplicate turn state headers")
     }
+    turnState = requireExactDurableIdentifier(value, "Codex turn state header")
   }
 
-  return undefined
+  return turnState
 }
 
 export function extractCodexTurnStateFromMetadataEvent(
@@ -196,10 +254,16 @@ export function captureCodexTurnState(
   carrier: CodexTurnStateCarrier | undefined,
   turnState: string | undefined
 ): boolean {
-  const normalizedTurnState = turnState?.trim()
-  if (!carrier || !normalizedTurnState || carrier.turnState) {
+  if (turnState === undefined) {
     return false
   }
-  carrier.turnState = normalizedTurnState
+  const exactTurnState = requireExactDurableIdentifier(
+    turnState,
+    "Codex turn state"
+  )
+  if (!carrier || carrier.turnState !== undefined) {
+    return false
+  }
+  carrier.turnState = exactTurnState
   return true
 }

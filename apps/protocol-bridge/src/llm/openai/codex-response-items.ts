@@ -4,6 +4,7 @@ import type {
   CodexInputItem,
   CodexInputMessage,
 } from "./codex-native-types"
+import { requireExactDurableIdentifier } from "../../context/durable-identifier"
 
 const CODEX_API_VISIBLE_INPUT_ITEM_TYPES = new Set([
   "additional_tools",
@@ -29,7 +30,7 @@ export function getCodexApiInputItemType(value: unknown): string {
     return ""
   }
   const type = (value as Record<string, unknown>).type
-  return typeof type === "string" ? type.trim() : ""
+  return typeof type === "string" ? type : ""
 }
 
 export function isCodexApiVisibleInputItem(
@@ -66,7 +67,10 @@ export function codexResponseOutputItemToInputItem(
     return {
       ...item,
       type: "function_call",
-      call_id: typeof item.call_id === "string" ? item.call_id : "",
+      call_id: requireExactDurableIdentifier(
+        item.call_id,
+        "Codex function-call response call_id"
+      ),
       name: typeof item.name === "string" ? item.name : "",
       arguments:
         typeof item.arguments === "string"
@@ -79,7 +83,10 @@ export function codexResponseOutputItemToInputItem(
     return {
       ...item,
       type: "custom_tool_call",
-      call_id: typeof item.call_id === "string" ? item.call_id : "",
+      call_id: requireExactDurableIdentifier(
+        item.call_id,
+        "Codex custom-tool-call response call_id"
+      ),
       name: typeof item.name === "string" ? item.name : "",
       input:
         typeof item.input === "string"

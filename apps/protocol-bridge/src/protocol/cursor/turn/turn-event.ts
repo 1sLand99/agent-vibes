@@ -120,6 +120,11 @@ export type TurnEventOfKind<K extends TurnEvent["kind"]> = Extract<
 export interface TurnRuntime {
   /** Step 6: thinking-only recovery counter, capped at 1. */
   thinkingOnlyRecoveryGuard: number
+  /**
+   * Mid-stream transport recovery counter (e.g. Codex WS 1006 → HTTP),
+   * capped at MAX_TRANSPORT_STREAM_RECOVERIES.
+   */
+  transportRecoveryGuard: number
   /** Max-output-tokens recovery attempt, capped at MAX_OUTPUT_TOKENS_RECOVERY_LIMIT. */
   maxOutputTokensRecoveryAttempt: number
 }
@@ -127,6 +132,7 @@ export interface TurnRuntime {
 export function createTurnRuntime(): TurnRuntime {
   return {
     thinkingOnlyRecoveryGuard: 0,
+    transportRecoveryGuard: 0,
     maxOutputTokensRecoveryAttempt: 0,
   }
 }

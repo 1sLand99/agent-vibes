@@ -1,7 +1,10 @@
 import { Module } from "@nestjs/common"
+import { ChatGptRealtimeCompanionService } from "../../llm/openai/chatgpt-realtime-companion.service"
+import { RequiredApiKeyGuard } from "../../shared/required-api-key.guard"
 import { AnthropicModule } from "../anthropic/anthropic.module"
 import { ChatCompletionsController } from "./chat-completions.controller"
 import { ChatCompletionsService } from "./chat-completions.service"
+import { RealtimeController } from "./realtime.controller"
 
 /**
  * OpenAiModule — inbound OpenAI-compatible protocol surface.
@@ -13,7 +16,11 @@ import { ChatCompletionsService } from "./chat-completions.service"
  */
 @Module({
   imports: [AnthropicModule],
-  controllers: [ChatCompletionsController],
-  providers: [ChatCompletionsService],
+  controllers: [ChatCompletionsController, RealtimeController],
+  providers: [
+    ChatCompletionsService,
+    ChatGptRealtimeCompanionService,
+    RequiredApiKeyGuard,
+  ],
 })
 export class OpenaiModule {}

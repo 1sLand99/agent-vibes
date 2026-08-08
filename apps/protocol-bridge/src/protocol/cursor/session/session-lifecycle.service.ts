@@ -11,37 +11,85 @@ import * as path from "path"
 import { AssistantToolBatchService } from "./assistant-tool-batch.service"
 import { ContextStateService } from "./context-state.service"
 import { SessionStreamService } from "./session-stream.service"
+import { ContextProjectionStore } from "./context-projection-store.service"
+import { rebuildContextProjectionRecords } from "./context-projection-recovery"
+import { ClaudeProjectionStore } from "./claude-projection-store.service"
+import { rebuildClaudeProjectionRecords } from "./claude-projection-recovery"
+import {
+  ContextProjectionHeadStore,
+  type ContextProjectionHead,
+} from "./context-projection-active-head.store"
+import { SnipBoundaryStore } from "./snip-boundary-store.service"
+import { SessionMemoryEventStore } from "./session-memory-event-store.service"
+import {
+  materializeSnipBoundaryRecords,
+  mergeSnipBoundariesIntoGraph,
+} from "./snip-boundary-projection"
+import {
+  getCursorUserMessageAction,
+  projectCursorFreshHistoryBootstrap,
+} from "./cursor-history-projector"
 import { TurnId, ConversationId } from "../turn/turn.types"
+import {
+  CURSOR_SKILL_ACTIVATION_RECEIPTS_METADATA_KEY,
+  type CursorSkillActivationReceipt,
+} from "../skills/skill-activation-receipt"
 import { MessageStore, type PersistedMessage } from "./message-store.service"
+import { applyMessageRevisionProjection } from "./message-revision-projection"
+import {
+  subagentGraphBranchFromRun,
+  type SubagentGraphBranch,
+} from "./subagent-graph"
 import {
   SessionPersistenceService,
   type PersistedSessionActivitySummary,
+  type SessionPersistenceSnapshot,
   type SessionRow,
   type SessionTodo,
+  type SessionTodoStatus,
 } from "./session-persistence.service"
 import {
   describeSessionFileStateLimit,
   getSessionFileStateSize,
   isSessionFileStateWithinLimit,
 } from "./file-state-limits"
-import { ToolCallLedger, type AbortReason } from "./tool-call-ledger.service"
+import { ToolCallLedger, type SessionTxn } from "./tool-call-ledger.service"
 import {
-  normalizePathForBoundaryCheck,
-  resolveAllowedWorkspaceRoots,
-} from "./workspace-root-resolver"
-import { resolveSessionContextWindowTransition } from "./context-window-transition"
+  ExecDispatchStore,
+  type ExecDispatchRecord,
+} from "./exec-dispatch-store.service"
+import {
+  addWorkspaceGrants as applyWorkspaceGrantBatch,
+  createSessionWorkspaceFromDeclaration,
+  createSessionWorkspaceFromDeclarationWithGrants,
+  describeWorkspaceRoots,
+  parseConfiguredWorkspaceGrantFile,
+  removeWorkspaceGrants as removeWorkspaceGrantBatch,
+  replaceConfiguredWorkspaceGrants,
+  restoreSessionWorkspace,
+  serializeSessionWorkspace,
+  type PersistedSessionWorkspaceState,
+  type SessionWorkspaceState,
+  type WorkspaceGrant,
+  WorkspaceSessionStateError,
+} from "./workspace-session-state"
+import {
+  restoreCursorManagedReadResources,
+  reconcileCursorManagedPlanRegistry,
+  serializeCursorManagedReadResources,
+  upsertCursorManagedPlanReadResource,
+  type CursorManagedReadResource,
+} from "./cursor-managed-read-resource"
+import {
+  assertContextTokenLimitProvenance,
+  resolveSessionContextWindowTransition,
+  type ContextTokenLimitSource,
+} from "./context-window-transition"
 import type {
   ContextCompactionCommit,
-  ContextCollapseCommit,
-  ContextCollapseState,
   ContextConversationState,
-  CodexContextState,
-  CodexContextWindowState,
-  CodexReplacementHistory,
-  CodexReplacementHistoryItem,
-  ContentBlock,
-  ContextInvestigationMemoryEntry,
   ContextSessionMemoryEntry,
+  ContentBlock,
   ContextTranscriptRecord,
   ContextUsageSnapshot,
   LooseMessageContent,
@@ -53,57 +101,79 @@ import {
   normalizeContent,
 } from "../../../context/types"
 import {
-  createCompactBoundaryRecord,
-  createCompactSummaryRecord,
   deriveCompactionHistoryFromTranscript,
   getActiveCompactCommitFromTranscript,
-  isContextCollapseSummaryRecord,
   isMessageRecord,
   isSnipBoundaryRecord,
-  stripInternalContextEvents,
 } from "../../../context/context-transcript-events"
+import { requireExactDurableIdentifier } from "../../../context/durable-identifier"
 import { ToolResultStorageService } from "../../../context/tool-result-storage.service"
 import type { ContextModelProfile } from "../../../context/context-model-profile"
 import type {
   BackendType,
   ModelRouteResult,
 } from "../../../llm/shared/model-router.service"
+import {
+  assertCodexRootProviderIdentity,
+  createCodexRootProviderIdentity,
+  type CodexRootProviderIdentity,
+} from "../../../llm/openai/codex-provider-identity"
 import { PersistenceService } from "../../../persistence"
-import { ParsedCursorRequest } from "../tools/cursor-request-parser"
+import type {
+  CursorThinkingLevel,
+  McpToolDef,
+  ParsedCursorRequest,
+} from "../tools/cursor-request-parser"
+import {
+  CURSOR_HOOK_ADDITIONAL_CONTEXTS_METADATA_KEY,
+  isCursorHookAdditionalContextEvent,
+  type CursorAgentHookStep,
+  type CursorHookAdditionalContextReceipt,
+} from "../hooks/cursor-hook-contract"
 import {
   EMPTY_SUBAGENT_MODEL_OVERRIDES,
+  type ResolvedSubagentOverride,
   type SubagentModelOverridesMap,
 } from "../subagents/subagent-model-override"
-import { safeJsonEqual, safeJsonStringify } from "../safe-json"
+import {
+  EMPTY_SELECTED_SUBAGENT_MODELS,
+  type SelectedSubagentModelCatalog,
+} from "../subagents/subagent-model-selection"
+import type { SubagentDefinition } from "../subagents/types"
+import type { ParentMcpToolSnapshot } from "../tools/mcp-call-contract"
+import { safeJsonStringify } from "../safe-json"
 import type {
   DeferredToolDescriptor,
   ToolDefinition,
 } from "../tools/cursor-tool-mapper"
 import type { EditFailureSelection } from "../tools/tool-protocol-helpers"
+import {
+  type BridgeGoalState,
+  deserializeBridgeGoalState,
+  serializeBridgeGoalState,
+} from "../tools/goal-state"
 import type {
   PendingToolExecutionState,
   ToolExecutionOwner,
   ToolExecutionRecoveryReason,
   ToolExecutionStatus,
 } from "./tool-execution-types"
-// CursorTurnState type is declared at the bottom of this file
-// (inlined from the deleted cursor-turn-state.ts module).
 import { type SessionTaskBudgetState } from "./task-budget-state"
+import { type ToolInterruptionReason } from "./tool-interruption"
 import {
-  buildInterruptedToolResultBlock,
-  normalizeToolInterruptionReason,
-  type ToolInterruptionReason,
-} from "./tool-interruption"
-
-const CODEX_REPLACEMENT_SUMMARY_PREFIX =
-  "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:"
-const CODEX_REPLACEMENT_HISTORICAL_NOTICE = [
-  "This is compressed historical context, not the current task directive.",
-  "Any later messages and topic-continuity guard that follow this summary are authoritative for the current request and next action.",
-  "Do not resume a task from this summary unless later messages explicitly continue it.",
-].join(" ")
-const CODEX_EMPTY_REPLACEMENT_SUMMARY =
-  "Remote compaction returned no textual summary after filtering synthetic context. Continue from the compacted context and any later messages."
+  CLAUDE_CONVERSATION_PROJECTION_LOCAL_KEY,
+  assertSameProjectionOwner,
+  createMainProjectionOwner,
+  createProviderProjectionRef,
+  type ProjectionOwner,
+  type SubagentProjectionBranchSnapshot,
+} from "./projection-owner"
+import {
+  SubagentRunStore,
+  type SubagentRunRecord,
+} from "./subagent-run-store.service"
+import { SubagentBranchStore } from "./subagent-branch-store.service"
+import { deriveSubagentGraphExecutionMetrics } from "../subagents/subagent-graph-metrics"
 
 export interface ClearSessionCacheResult {
   clearedLoadedSessions: number
@@ -111,6 +181,22 @@ export interface ClearSessionCacheResult {
   clearedToolResultDirs: number
   warnings: string[]
 }
+
+export type SessionCleanupHandler = (
+  conversationId: string,
+  session: SessionRecord
+) => void | Promise<void>
+
+/**
+ * A runtime-owned activity source which must prevent lifecycle eviction.
+ * Backend stream ownership lives outside the session cache, so it reports
+ * through this narrow contract instead of teaching Lifecycle about transport
+ * internals.
+ */
+export type SessionBusyProbe = (
+  conversationId: string,
+  session: SessionRecord
+) => boolean
 
 /**
  * Content block types for messages
@@ -151,80 +237,103 @@ export function canClearSessionRequestScopedFields(
   return resolveSessionRequestRefreshScope(request) === "full"
 }
 
-export interface PendingContextSummaryUiUpdate {
-  compactionId: string
-  summary: string
-  epoch: number
+export interface SessionWorkspaceRefreshResult {
+  readonly workspace?: SessionWorkspaceState
+  /** The primary root changed or the workspace identity was replaced. */
+  readonly reloadConfiguredWorkspaceGrants: boolean
 }
 
-export function restorePendingContextSummaryUiUpdateFromState(input: {
-  contextState: Pick<
-    ContextConversationState,
-    "compactionHistory" | "activeCompactionId" | "compactionEpoch"
+/**
+ * Apply a parsed workspace declaration at the lifecycle boundary.
+ *
+ * A full request without a declaration explicitly clears the workspace. A
+ * partial or control request without one retains the already-bound scope.
+ * Any incoming declaration remains protocol-authoritative, including on a
+ * control frame. Session grants survive only when its IDE root set is
+ * unchanged, while config grants are reloaded whenever the primary changes.
+ */
+export function resolveSessionWorkspaceRefresh(input: {
+  readonly current?: SessionWorkspaceState
+  readonly request?: Pick<
+    ParsedCursorRequest,
+    "workspaceDeclaration" | "resumeWorkspaceReferences"
   >
-  lastEmittedContextSummaryCompactionId?: string
-  lastEmittedContextSummaryCompactionEpoch?: number
-  lastContextSummaryCompactionEpoch?: number
-}): PendingContextSummaryUiUpdate | undefined {
-  const history = Array.isArray(input.contextState.compactionHistory)
-    ? input.contextState.compactionHistory.filter(
-        (commit): commit is ContextCompactionCommit =>
-          !!commit &&
-          typeof commit.id === "string" &&
-          commit.id.trim().length > 0 &&
-          typeof commit.summary === "string" &&
-          commit.summary.trim().length > 0
-      )
-    : []
-  if (history.length === 0) return undefined
-
-  const activeCompactionId =
-    typeof input.contextState.activeCompactionId === "string" &&
-    input.contextState.activeCompactionId.trim().length > 0
-      ? input.contextState.activeCompactionId.trim()
-      : history[history.length - 1]?.id
-  if (!activeCompactionId) return undefined
-
-  const activeCommit =
-    history.find((commit) => commit.id === activeCompactionId) ??
-    history[history.length - 1]
-  if (!activeCommit) return undefined
-
-  const epoch =
-    typeof input.lastContextSummaryCompactionEpoch === "number" &&
-    input.lastContextSummaryCompactionEpoch >= 0
-      ? Math.floor(input.lastContextSummaryCompactionEpoch)
-      : typeof activeCommit.epoch === "number" && activeCommit.epoch >= 0
-        ? Math.floor(activeCommit.epoch)
-        : typeof input.contextState.compactionEpoch === "number" &&
-            input.contextState.compactionEpoch >= 0
-          ? Math.floor(input.contextState.compactionEpoch)
-          : 0
-
-  const emittedCompactionId =
-    typeof input.lastEmittedContextSummaryCompactionId === "string" &&
-    input.lastEmittedContextSummaryCompactionId.trim().length > 0
-      ? input.lastEmittedContextSummaryCompactionId.trim()
-      : undefined
-  const emittedEpoch =
-    typeof input.lastEmittedContextSummaryCompactionEpoch === "number" &&
-    input.lastEmittedContextSummaryCompactionEpoch >= 0
-      ? Math.floor(input.lastEmittedContextSummaryCompactionEpoch)
-      : undefined
-  if (
-    emittedCompactionId === activeCommit.id &&
-    (emittedEpoch === epoch ||
-      (emittedEpoch === undefined &&
-        input.lastContextSummaryCompactionEpoch === undefined))
-  ) {
-    return undefined
+  readonly refreshScope: SessionRequestRefreshScope
+}): SessionWorkspaceRefreshResult {
+  const { current, request, refreshScope } = input
+  const incoming = request?.workspaceDeclaration
+  if (!incoming) {
+    if (refreshScope === "full") {
+      return { workspace: undefined, reloadConfiguredWorkspaceGrants: false }
+    }
+    return { workspace: current, reloadConfiguredWorkspaceGrants: false }
   }
 
+  if (!current) {
+    return {
+      workspace: createSessionWorkspaceFromDeclaration(incoming),
+      reloadConfiguredWorkspaceGrants: true,
+    }
+  }
+
+  const identityChanged =
+    current.scope.workspaceIdentity !== incoming.scope.workspaceIdentity
+  if (identityChanged) {
+    return {
+      workspace: createSessionWorkspaceFromDeclaration(incoming),
+      reloadConfiguredWorkspaceGrants: true,
+    }
+  }
+
+  const primaryChanged =
+    current.scope.primaryRoot !== incoming.scope.primaryRoot
+  const retainedGrants = primaryChanged
+    ? current.grants.filter((grant) => grant.source === "session")
+    : current.grants
   return {
-    compactionId: activeCommit.id,
-    summary: activeCommit.summary,
-    epoch,
+    workspace: createSessionWorkspaceFromDeclarationWithGrants(
+      incoming,
+      retainedGrants
+    ),
+    reloadConfiguredWorkspaceGrants: primaryChanged,
   }
+}
+
+/**
+ * Resume references are only useful when they name one of the already-bound
+ * IDE roots. They are never converted into a Scope or an additional grant.
+ */
+export function matchResumeWorkspaceReferences(
+  workspace: SessionWorkspaceState | undefined,
+  references: ParsedCursorRequest["resumeWorkspaceReferences"]
+): readonly NonNullable<
+  ParsedCursorRequest["resumeWorkspaceReferences"]
+>[number][] {
+  if (!workspace || !references || references.length === 0) {
+    return Object.freeze([])
+  }
+  const ideRoots = new Set(workspace.scope.ideRoots)
+  return Object.freeze(
+    references.filter((reference) => ideRoots.has(reference.path))
+  )
+}
+
+/**
+ * Cursor's plan registry is an authoritative read-capability snapshot only
+ * when ConversationStateStructure is present. Frames without conversation
+ * state retain the current registry regardless of their request refresh scope.
+ */
+export function resolveSessionManagedReadResourcesRefresh(input: {
+  readonly current: readonly CursorManagedReadResource[]
+  readonly request?: Pick<ParsedCursorRequest, "cursorManagedReadResources">
+}): readonly CursorManagedReadResource[] {
+  if (input.request?.cursorManagedReadResources !== undefined) {
+    return reconcileCursorManagedPlanRegistry(
+      input.current,
+      input.request.cursorManagedReadResources
+    )
+  }
+  return input.current
 }
 
 /**
@@ -234,15 +343,38 @@ export function restorePendingContextSummaryUiUpdateFromState(input: {
  * `uuid`); send-time normalization merges siblings by `message.id`. See
  * /Users/recronin/.claude/plans/think-users-recronin-repositories-vscod-hashed-chipmunk.md.
  */
-export interface SessionAssistantMessage {
+export interface SessionMessageGraphIdentity {
+  parentUuid?: string
+  logicalParentUuid?: string
+  sourceToolAssistantUuid?: string
+  provider?: string
+  providerMessageId?: string
+  blockOccurrence?: number
+  turnId?: string
+  threadId?: string
+  branchId?: string
+  agentId?: string
+  isSidechain?: boolean
+  forkSourceUuid?: string
+  forkLineage?: string[]
+  /** Retained in the durable graph but omitted from future provider prompts. */
+  excludedFromProviderProjection?: boolean
+  /**
+   * Protocol facts attached to the durable graph fragment. They are persisted
+   * as `session_messages.metadata_json` and never enter provider message
+   * content.
+   */
+  metadata?: Record<string, unknown>
+}
+
+export interface SessionAssistantMessage extends SessionMessageGraphIdentity {
   type: "assistant"
   uuid: string
   timestamp: string
   /** Backend request id, when available (Anthropic only). */
   requestId?: string
   message: {
-    /** Anthropic message id — split-sibling merge key. Undefined for legacy
-     *  rows or non-Anthropic backends that have no notion of message ids. */
+    /** Provider message id used as the split-sibling merge key when present. */
     id?: string
     role: "assistant"
     content: MessageContent
@@ -254,7 +386,7 @@ export interface SessionAssistantMessage {
   isApiErrorMessage?: boolean
 }
 
-export interface SessionUserMessage {
+export interface SessionUserMessage extends SessionMessageGraphIdentity {
   type: "user"
   uuid: string
   timestamp: string
@@ -287,24 +419,11 @@ export type SessionMessageInit = SessionMessage extends infer T
   : never
 
 /**
- * Convenience accessors so call sites that only need the legacy
- * `{role, content}` shape don't pay for full pattern-matching every time.
- */
-export function getMessageRole(msg: SessionMessage): "user" | "assistant" {
-  return msg.message.role
-}
-export function getMessageContent(msg: SessionMessage): MessageContent {
-  return msg.message.content
-}
-
-/**
  * Capture an input array onto the session as a *frozen* cache-key value.
  *
- * Several per-turn caches in the upstream-facing pipeline (the
- * prepared-tool-build memo on `cursor-connect-stream.service`,
- * `applySendTimeSanitize` and `normalizeHistoryForBackend` per-turn
- * memos) use the captured array's reference identity as part of their
- * cache key.  If a caller later mutated the same array in place
+ * The prepared-tool-build memo in `cursor-connect-stream.service` uses
+ * captured tool-definition arrays by reference as part of its cache key.
+ * If a caller later mutated the same array in place
  * (`push`, `splice`, …), the cache key would silently desynchronise
  * from the cached value.
  *
@@ -341,12 +460,7 @@ export function freezeCacheKeyArray<T>(
   return Object.freeze([...input]) as unknown as T[]
 }
 
-/**
- * Build a SessionMessage union member from a legacy `(role, content)` pair.
- * The streaming path will switch to passing pre-built `SessionAssistantMessage`
- * objects with a populated `message.id`; until then this factory keeps the
- * existing call sites working without leaking storage shape concerns to them.
- */
+/** Canonical factory for a durable SessionMessage union member. */
 export function makeSessionMessage(
   role: "user" | "assistant",
   content: MessageContent,
@@ -364,6 +478,21 @@ export function makeSessionMessage(
      *  Cleared on the next send via clearToolUseResultsBeforeNextSend
      *  (mirrors cc query.ts:530-538). */
     toolUseResult?: unknown
+    parentUuid?: string
+    logicalParentUuid?: string
+    sourceToolAssistantUuid?: string
+    provider?: string
+    providerMessageId?: string
+    blockOccurrence?: number
+    turnId?: string
+    threadId?: string
+    branchId?: string
+    agentId?: string
+    isSidechain?: boolean
+    forkSourceUuid?: string
+    forkLineage?: string[]
+    excludedFromProviderProjection?: boolean
+    metadata?: Record<string, unknown>
   }
 ): SessionMessage {
   const uuid = extras?.uuid ?? crypto.randomUUID()
@@ -373,6 +502,35 @@ export function makeSessionMessage(
       type: "assistant",
       uuid,
       timestamp,
+      ...(extras?.parentUuid ? { parentUuid: extras.parentUuid } : {}),
+      ...(extras?.logicalParentUuid
+        ? { logicalParentUuid: extras.logicalParentUuid }
+        : {}),
+      ...(extras?.sourceToolAssistantUuid
+        ? { sourceToolAssistantUuid: extras.sourceToolAssistantUuid }
+        : {}),
+      ...(extras?.provider ? { provider: extras.provider } : {}),
+      ...(extras?.providerMessageId
+        ? { providerMessageId: extras.providerMessageId }
+        : {}),
+      ...(extras?.blockOccurrence !== undefined
+        ? { blockOccurrence: extras.blockOccurrence }
+        : {}),
+      ...(extras?.turnId ? { turnId: extras.turnId } : {}),
+      ...(extras?.threadId ? { threadId: extras.threadId } : {}),
+      ...(extras?.branchId ? { branchId: extras.branchId } : {}),
+      ...(extras?.agentId ? { agentId: extras.agentId } : {}),
+      ...(extras?.isSidechain ? { isSidechain: true } : {}),
+      ...(extras?.forkSourceUuid
+        ? { forkSourceUuid: extras.forkSourceUuid }
+        : {}),
+      ...(extras?.forkLineage ? { forkLineage: [...extras.forkLineage] } : {}),
+      ...(extras?.excludedFromProviderProjection
+        ? { excludedFromProviderProjection: true }
+        : {}),
+      ...(extras?.metadata
+        ? { metadata: structuredClone(extras.metadata) }
+        : {}),
       ...(extras?.requestId ? { requestId: extras.requestId } : {}),
       message: {
         ...(extras?.messageId ? { id: extras.messageId } : {}),
@@ -385,6 +543,33 @@ export function makeSessionMessage(
     type: "user",
     uuid,
     timestamp,
+    ...(extras?.parentUuid ? { parentUuid: extras.parentUuid } : {}),
+    ...(extras?.logicalParentUuid
+      ? { logicalParentUuid: extras.logicalParentUuid }
+      : {}),
+    ...(extras?.sourceToolAssistantUuid
+      ? { sourceToolAssistantUuid: extras.sourceToolAssistantUuid }
+      : {}),
+    ...(extras?.provider ? { provider: extras.provider } : {}),
+    ...(extras?.providerMessageId
+      ? { providerMessageId: extras.providerMessageId }
+      : {}),
+    ...(extras?.blockOccurrence !== undefined
+      ? { blockOccurrence: extras.blockOccurrence }
+      : {}),
+    ...(extras?.turnId ? { turnId: extras.turnId } : {}),
+    ...(extras?.threadId ? { threadId: extras.threadId } : {}),
+    ...(extras?.branchId ? { branchId: extras.branchId } : {}),
+    ...(extras?.agentId ? { agentId: extras.agentId } : {}),
+    ...(extras?.isSidechain ? { isSidechain: true } : {}),
+    ...(extras?.forkSourceUuid
+      ? { forkSourceUuid: extras.forkSourceUuid }
+      : {}),
+    ...(extras?.forkLineage ? { forkLineage: [...extras.forkLineage] } : {}),
+    ...(extras?.excludedFromProviderProjection
+      ? { excludedFromProviderProjection: true }
+      : {}),
+    ...(extras?.metadata ? { metadata: structuredClone(extras.metadata) } : {}),
     ...(extras?.isMeta ? { isMeta: true } : {}),
     ...(extras?.toolUseResult !== undefined
       ? { toolUseResult: extras.toolUseResult }
@@ -394,6 +579,40 @@ export function makeSessionMessage(
       content,
     },
   }
+}
+
+/** Canonical pure projection of an accepted durable graph row. */
+export function projectPersistedMessageToSessionMessage(
+  message: PersistedMessage
+): SessionMessage {
+  const extras = {
+    uuid: message.uuid,
+    timestamp: new Date(message.timestamp).toISOString(),
+    parentUuid: message.parentUuid,
+    logicalParentUuid: message.logicalParentUuid,
+    sourceToolAssistantUuid: message.sourceToolAssistantUuid,
+    provider: message.provider,
+    providerMessageId: message.providerMessageId,
+    blockOccurrence: message.blockOccurrence,
+    turnId: message.turnId,
+    threadId: message.threadId,
+    branchId: message.branchId,
+    agentId: message.agentId,
+    isSidechain: message.isSidechain,
+    forkSourceUuid: message.forkSourceUuid,
+    forkLineage: message.forkLineage ? [...message.forkLineage] : undefined,
+    metadata: message.metadata,
+  }
+  if (message.role === "assistant") {
+    return makeSessionMessage("assistant", message.content as MessageContent, {
+      ...extras,
+      messageId: message.providerMessageId,
+    })
+  }
+  return makeSessionMessage("user", message.content as MessageContent, {
+    ...extras,
+    isMeta: message.isMeta,
+  })
 }
 
 /**
@@ -409,43 +628,11 @@ export function makeSessionMessage(
  * for the rationale.
  */
 
-/** Soft cap removed — reasoning continuity now lives in
- *  ReasoningMemoryService (apps/protocol-bridge/src/context/reasoning-memory.service.ts).
- *  See claude-code/src/utils/messages.ts:5501 stripSignatureBlocks for the
- *  upstream pattern this mirrors: single-shot string summary fields like
- *  `lastThinkingSummary` were never the right shape for cross-turn replay
- *  on backends that drop thinking blocks on the wire (kiro, codex). */
+/** Reasoning remains on durable assistant graph fragments. Kiro derives a
+ *  bounded text preamble from its exact request candidate, while Codex keeps
+ *  the same continuity through its native rollout. */
 
-function buildUserMessageContent(
-  text: string,
-  images?: ParsedCursorRequest["attachedImages"]
-): MessageContent {
-  if (!images?.length) {
-    return text
-  }
-
-  const blocks: Array<{ type: string; [key: string]: unknown }> = []
-  if (text) {
-    blocks.push({ type: "text", text })
-  }
-  for (const image of images) {
-    blocks.push({
-      type: "image",
-      source: {
-        type: "base64",
-        media_type: image.mimeType,
-        data: image.data,
-      },
-    })
-  }
-  return blocks
-}
-
-export type SessionTodoStatus =
-  | "pending"
-  | "in_progress"
-  | "completed"
-  | "cancelled"
+export type { SessionTodoStatus } from "./session-persistence.service"
 
 export interface SessionTodoItem {
   id: string
@@ -464,11 +651,13 @@ export interface InterruptedToolCallInfo {
   detail?: string
 }
 
-export interface SessionRestartRecovery {
-  restoredAt: Date
-  notice: string
+/**
+ * Immediate, explicit interruption data. This is only used by a caller that
+ * has received a real cancellation/supersession signal; it is never a
+ * process-restart surrogate.
+ */
+export interface InterruptedToolBatch {
   interruptedToolCalls: InterruptedToolCallInfo[]
-  interruptedInteractionQueryCount: number
   interruptedSubAgent?: {
     subagentId: string
     parentToolCallId: string
@@ -479,6 +668,14 @@ export interface SessionRestartRecovery {
 
 export interface SessionActiveToolBatch {
   batchId: string
+  /** Stable root user request shared by all continuation graph turns. */
+  topLevelTurnId: TurnId
+  /** Graph turn that emitted the assistant tool_use blocks in this batch. */
+  graphTurnId: TurnId
+  /** Exact accepted provider route that emitted this batch. */
+  readonly providerBackend: BackendType
+  readonly providerModel: string
+  readonly toolUseSummaryOverride?: ResolvedSubagentOverride
   toolCallIds: string[]
   assistantText: string
   readOnly: boolean
@@ -499,9 +696,15 @@ export interface SessionTopLevelContinuationBudget {
 }
 
 export interface SessionTopLevelAgentTurnState {
+  /** Absent only while the session has no active top-level user request. */
+  topLevelTurnId?: TurnId
   llmTurnCount: number
   continuationBudget: SessionTopLevelContinuationBudget
   activeToolBatch?: SessionActiveToolBatch
+  /** Current provider-context revision for this top-level user request. */
+  codexContextRevision: number
+  /** Revision installed by the last accepted Codex provider request. */
+  acceptedCodexContextRevision?: number
 }
 
 export type SessionBackgroundCommandStatus =
@@ -586,47 +789,8 @@ export interface EditFailureContext extends EditFailureSelection {
   matchCountInFile?: number
 }
 
-/**
- * A workspace root that was added to the session through a non-IDE
- * channel (REST API or `.cursor/agent-vibes.json` config), used by
- * the multi-root boundary check on top of IDE-supplied
- * `projectContext.workspaceFolders`.
- *
- * Mirrors claude-code's `AdditionalWorkingDirectory` shape — same
- * fields, same semantics — so future cross-pollination is cheap.
- */
-export interface AdditionalWorkspaceRoot {
-  /**
-   * Resolved absolute path. After `realpathSync` + macOS
-   * `/private/var` normalization. Used as the dedup key in the
-   * `additionalRoots` map AND as the value the boundary check
-   * compares candidate paths against. Storing the resolved form
-   * up-front means we don't have to re-resolve on every read_file.
-   */
-  path: string
-  /**
-   * The path the user originally typed / configured, before any
-   * normalization. Surfaced in error messages ("the root you added
-   * via /add-dir was: ...") so users recognize their own input.
-   */
-  rawPath: string
-  /**
-   * Where this root came from — affects who can remove it.
-   *
-   *  - `'session'`: added at runtime via REST API. Removable by
-   *    REST DELETE.
-   *  - `'config'`: loaded from `.cursor/agent-vibes.json`.
-   *    Replayed every session start; runtime DELETE has no effect
-   *    until the config file is edited.
-   */
-  source: "session" | "config"
-  addedAt: number
-}
-
 export type SessionTranscriptEventKind =
   | "session_restored"
-  | "snapshot_rewrite"
-  | "snapshot_repair"
   | "user_message"
   | "assistant_message"
   | "tool_use"
@@ -662,11 +826,10 @@ export interface SessionTranscriptEvent {
  * keyed by the input snapshot lets us skip both the IO and the
  * provenance / defer-policy work on every round after the first.
  *
- * Lifetime is the session: cleared automatically when the session is
- * evicted, so there is no global retention concern.  Invalidation is
- * implicit — the cache lookup in the stream service compares the
- * stored key against the live one and falls through to recompute on
- * any drift.
+ * Lifetime is one top-level user turn. The stream boundary clears it before
+ * the first request of the next user turn, so agent-file edits become visible
+ * at a deterministic boundary while every continuation and child spawn in the
+ * current turn sees exactly the catalog advertised to the parent model.
  */
 export interface SessionPreparedToolBuild {
   /** Snapshot of the inputs that fully determine the cached output. */
@@ -678,13 +841,11 @@ export interface SessionPreparedToolBuild {
     useWeb: boolean
     discoveredToolsSize: number
     projectCwd: string
+    selectedSubagentModelsRef: SelectedSubagentModelCatalog
     /**
-     * Sorted-and-joined `agentType` list of every visible sub-agent for
-     * the project cwd.  Used as a stable signature so a custom
-     * `.cursor/agents` markdown definition being added or removed
-     * mid-session invalidates the cache (the next continuation will
-     * scan disk again).  We only stamp the list once per cache build
-     * so the steady-state hit path stays IO-free.
+     * Frozen definition and capability fingerprints for every visible child.
+     * This is diagnostic cache identity only; the full definitions below are
+     * the spawn authority for the whole top-level user turn.
      */
     subagentSignature: string
   }
@@ -696,6 +857,15 @@ export interface SessionPreparedToolBuild {
   apiTools: ToolDefinition[]
   /** Deferred catalog advertised in the system prompt this turn. */
   deferred: DeferredToolDescriptor[]
+  /** Frozen MCP identity/schema catalog advertised for this parent turn. */
+  mcpToolDefsSnapshot: readonly ParentMcpToolSnapshot[]
+  /**
+   * Exact visible agent definitions loaded at the new-user-turn boundary.
+   * Task descriptions and every spawn in that turn consume this same
+   * snapshot; tool continuations never rescan agent files or drift to a
+   * definition the parent model was not shown.
+   */
+  subagentDefinitions: readonly SubagentDefinition[]
 }
 
 /**
@@ -713,11 +883,21 @@ export interface SessionLifecycleRecord {
   conversationId: string
   model: string
 
+  /**
+   * Durable Codex-native root identity. This is independent of Cursor's
+   * conversation id and of every local provider projection key.
+   */
+  codexProviderIdentity: CodexRootProviderIdentity
+
   // Per-subagent model selection captured from
   // AgentRunRequest.subagent_model_overrides (proto field 20).
   subagentModelOverrides: SubagentModelOverridesMap
 
-  thinkingLevel: number
+  /** Request-scoped Cursor allow-list for invocation-level task models. */
+  selectedSubagentModels: SelectedSubagentModelCatalog
+
+  /** Exact Cursor protocol enum; persisted and replayed without coercion. */
+  thinkingLevel: CursorThinkingLevel
   thinkingDetailsRequested: boolean
   isAgentic: boolean
   supportedTools: string[]
@@ -737,8 +917,14 @@ export interface SessionLifecycleRecord {
   createdAt: Date
   lastActivityAt: Date
 
-  // Initial-request injected context.
-  projectContext?: ParsedCursorRequest["projectContext"]
+  /**
+   * Lifecycle-owned workspace state. Its Scope is the only executable
+   * filesystem authority for this session; presentation is immutable
+   * metadata and cannot be interpreted as roots.
+   */
+  workspace?: SessionWorkspaceState
+  /** Exact read-only files granted by Cursor conversation protocol state. */
+  cursorManagedReadResources: readonly CursorManagedReadResource[]
   codeChunks?: ParsedCursorRequest["codeChunks"]
   cursorRules?: ParsedCursorRequest["cursorRules"]
   skillOptions?: ParsedCursorRequest["skillOptions"]
@@ -747,27 +933,33 @@ export interface SessionLifecycleRecord {
   activeCursorSkillNames?: string[]
   cursorCommands?: ParsedCursorRequest["cursorCommands"]
   customSystemPrompt?: ParsedCursorRequest["customSystemPrompt"]
+  /** SessionStart hook context supplied by Cursor in RequestContext. */
+  hooksAdditionalContext?: ParsedCursorRequest["hooksAdditionalContext"]
+  /** Durable ConversationStateStructure.goal_state for the composer session. */
+  goalState?: BridgeGoalState
+  /** Durable ConversationStateStructure.is_root_project_conversation. */
+  isRootProjectConversation?: boolean
   explicitContext?: string
   contextTokenLimit?: number
+  contextTokenLimitSource?: ContextTokenLimitSource
   contextMaxMode?: boolean
   usedContextTokens?: number
   requestedMaxOutputTokens?: number
   requestedModelParameters?: Record<string, string>
+  /** Request-scoped Agent v1 ExecuteHook capabilities advertised by Cursor. */
+  hookConfiguredSteps: readonly CursorAgentHookStep[]
 
-  /** Additional workspace roots from session API + .cursor/agent-vibes.json. */
-  additionalRoots?: Map<string, AdditionalWorkspaceRoot>
-  configuredAdditionalRootsLoaded?: boolean
-
-  /** Sub-agent context registry (foreground subagents only). */
-  subAgentContexts: Map<string, SubAgentContext>
-
-  /** Recovery notice for unrecoverable in-flight state after proxy restart. */
-  restartRecovery?: SessionRestartRecovery
+  /** Config roots are loaded once for the current workspace primary root. */
+  configuredWorkspaceGrantsLoadedForPrimary?: string
 
   /** Deferred control-frame continuations enqueued mid-turn. */
   deferredControlContinuations: Array<{
     parsed: ParsedCursorRequest
-    newMessage: string
+    payload: string
+    kind:
+      | "async_user_response"
+      | "background_task_notification"
+      | "goal_continuation"
     streamId: string
     reason: string
     enqueuedAt: number
@@ -778,17 +970,6 @@ export interface SessionLifecycleRecord {
   /** Last assistant backend (anthropic / codex / google etc). */
   lastAssistantBackend?: BackendType
   lastToolUseSummary?: string
-
-  /** @deprecated previous_response_id 现在由 CodexService transport state 管理 */
-  lastCodexResponseId?: string
-  /** @deprecated previous_response_id 现在由 CodexService.activeTurnContexts 管理 */
-  lastCodexRequestSignature?: string
-  /** @deprecated warmup payload 现在由 CodexService.warmupPayloadCache 管理 */
-  lastCodexWarmupPayload?: Record<string, unknown>
-  /** @deprecated previous_response_id 现在由 CodexService.activeTurnContexts 管理 */
-  pendingCodexResponseId?: string
-  /** @deprecated previous_response_id 现在由 CodexService.activeTurnContexts 管理 */
-  pendingCodexRequestSignature?: string
 }
 
 /**
@@ -796,30 +977,16 @@ export interface SessionLifecycleRecord {
  *
  * Transcript, message records, transcript events, cursor turn state
  * machine, task budget, read paths / file states / tool metrics,
- * snip projection, investigation memory, per-session counters.
+ * snip projection and per-session counters.
  */
 export interface ContextStateRecord {
-  /**
-   * Live transcript array — aliases SessionLifecycleService's
-   * `committedTranscripts` map slot for this conversation. Hot-path
-   * length / at(-1) / [i] reads need no defensive copy.
-   */
-  messages: SessionMessage[]
-  messagesGeneration: number
-  messageRecords: ContextTranscriptRecord[]
-  transcriptEvents: SessionTranscriptEvent[]
-  nextTranscriptEventSeq: number
-  contextState: ContextConversationState
-  currentTurnState?: CursorTurnState
-  recentTurnStates: CursorTurnState[]
+  /** Canonical parent-session projection. UI and session memory stay here. */
+  mainProjection: MountedContextProjection
+  /** Independently mounted child branch projections, keyed by owner key. */
+  childProjections: Map<string, MountedContextProjection>
   taskBudgetState?: SessionTaskBudgetState
   topLevelAgentTurnState: SessionTopLevelAgentTurnState
-  lastEmittedContextSummaryCompactionId?: string
-  lastEmittedContextSummaryCompactionEpoch?: number
-  pendingContextSummaryUiUpdate?: PendingContextSummaryUiUpdate
 
-  // Multi-turn checkpoint tracking.
-  usedTokens: number
   readPaths: Set<string>
   readSnapshots: SessionReadSnapshot[]
   fileStates: Map<string, { beforeContent: string; afterContent: string }>
@@ -832,9 +999,6 @@ export interface ContextStateRecord {
   stepId: number
   execId: number
 
-  /** Snip projection — message records hidden from the model view. */
-  snipState?: SessionSnipState
-
   /** Pending request context ledger projection. */
   pendingRequestContextLedger?: {
     promptTokenCount: number
@@ -846,6 +1010,32 @@ export interface ContextStateRecord {
   /** Todo list owned by the session todo manager. */
   todos: SessionTodoItem[]
 }
+
+/**
+ * One mounted read model derived from exactly one durable graph owner.
+ * `branchSnapshot` is mandatory for children and absent for the main graph.
+ */
+export interface MountedContextProjection {
+  readonly owner: ProjectionOwner
+  messages: SessionMessage[]
+  generation: number
+  messageRecords: ContextTranscriptRecord[]
+  transcriptEvents: SessionTranscriptEvent[]
+  nextTranscriptEventSeq: number
+  contextState: ContextConversationState
+  usedTokens: number
+  branchSnapshot?: SubagentProjectionBranchSnapshot
+}
+
+type PreparedInitialGraphProjection = Pick<
+  MountedContextProjection,
+  | "messages"
+  | "generation"
+  | "messageRecords"
+  | "transcriptEvents"
+  | "nextTranscriptEventSeq"
+  | "contextState"
+>
 
 export interface RetiredToolExecMapping {
   toolCallId: string
@@ -860,7 +1050,6 @@ export interface RetiredToolExecMapping {
  * mapping, current BiDi stream identifier.
  */
 export interface SessionStreamRecord {
-  backgroundCommands: Map<string, SessionBackgroundCommand>
   /** ExecServerMessage.id → toolCallId mapping for control messages. */
   pendingToolCallByExecId: Map<number, string>
   /** Recently detached exec ids. Used to ignore late Cursor result frames. */
@@ -892,57 +1081,16 @@ export interface SessionStreamRecord {
 }
 
 /**
- * The full SessionRecord is the union of the three domain record
- * slices. AssistantToolBatchService owns its state in its own
- * `Map<ConversationId, AssistantToolBatchRecord>` (not on this
- * object) so there is no fourth field block here.
- *
- * The intersection keeps a single physical record per conversation
- * for hot-path field reads while the three interfaces above declare
- * the domain ownership. Each service operates on its own record
- * type (SessionLifecycleRecord / ContextStateRecord /
- * SessionStreamRecord) but reads the same underlying object.
- *
- * `SessionRecord` (the legacy name) has been deleted; use
- * `SessionRecord` (or one of the three domain records) instead.
- */
-/**
- * Step 4 物理拆终态: SessionRecord 等价于 SessionLifecycleRecord。
- * SessionLifecycleService.sessions 只持 lifecycle 域字段。
- * Context-state 域字段在 ContextStateService.contextRecords,
- * Stream 域字段在 SessionStreamService.streamRecords。
- * caller 必须用 contextState.getContextRecord(cid) /
- * sessionStream.getStreamRecord(cid) 才能拿到对应域字段;
- * 不再有"一个 session 对象包所有字段"的反模式。
+ * The lifecycle session slice. ContextState and SessionStream keep their own
+ * records; callers must request those domains explicitly.
  */
 export type SessionRecord = SessionLifecycleRecord
-
-export interface SessionSnipBoundary {
-  id: string
-  createdAt: number
-  trigger: "model" | "user"
-  reason?: string
-  /** Record IDs that should be hidden from the model-facing projection. */
-  removedRecordIds: string[]
-  /** How many messages were live in ctx.messages when snip ran. */
-  snippedMessageCount: number
-}
-
-export interface SessionSnipState {
-  /** All snip boundaries in chronological order. */
-  boundaries: SessionSnipBoundary[]
-  /**
-   * Union of removedRecordIds across every boundary, kept for O(1) projection
-   * lookups during request build. Rebuilt whenever boundaries are mutated.
-   */
-  removedRecordIds: Set<string>
-}
 
 /**
  * Pending tool call ledger entry — what the bridge needs to remember
  * about a tool call so it can: (a) abort it on cancel, (b) match an
- * inbound tool_result back to its dispatcher, (c) synthesize a
- * recovery frame after a crash. Inlined from the deleted
+ * inbound tool_result back to its dispatcher, (c) preserve the exact
+ * durable client terminal wait across a process restart. Inlined from the deleted
  * `turn/pending-tool-store.ts` module.
  */
 export interface PendingToolEntry<TPayload = unknown> {
@@ -951,8 +1099,6 @@ export interface PendingToolEntry<TPayload = unknown> {
   readonly toolCallId: string
   readonly toolName: string
   readonly startedAt: number
-  readonly deadline?: number
-  readonly abort?: (reason: string) => void
   readonly recoveredFromCrash?: boolean
   payload?: TPayload
 }
@@ -968,19 +1114,22 @@ export interface PendingToolCall extends PendingToolExecutionState {
   historyToolName?: string
   historyToolInput?: Record<string, unknown>
   codexToolCallType?: "function" | "custom" | "tool_search"
+  /**
+   * Immutable skill-state transitions prepared with the durable tool_use.
+   * They are published only after the matching tool_result graph commit.
+   */
+  skillActivationReceipts?: readonly CursorSkillActivationReceipt[]
+  hookAdditionalContexts?: readonly CursorHookAdditionalContextReceipt[]
+  /**
+   * Records that this invocation has no Cursor ToolCall UI lifecycle. The
+   * matching tool result still closes the durable graph edge and remains in
+   * provider history; only started/completed client envelopes are omitted.
+   */
+  clientLifecycleSuppression?: PendingToolClientLifecycleSuppression
   toolFamilyHint?: "mcp" | "edit" | "web_fetch"
   modelCallId: string
   startedEmitted: boolean
   sentAt: Date
-  /**
-   * Optional epoch-ms wall-clock deadline. When set, the
-   * PendingDeadlineSweeper expires this entry by emitting a
-   * synthetic error tool_result so the agent unwinds and the
-   * conversation drops out of the pending-work state. Undefined =
-   * no automatic timeout (e.g. shell streams that legitimately run
-   * for hours).
-   */
-  deadline?: number
   execIds: Set<number>
   editApplyWarning?: string
   editFailureContext?: EditFailureContext
@@ -1021,14 +1170,34 @@ export interface PendingToolCall extends PendingToolExecutionState {
     started: boolean
   }
   /**
-   * When set, this tool call belongs to a sub-agent's LLM turn (not the
-   * parent agent). The handleToolResult router uses this marker to route
-   * the ExecClientMessage back to the sub-agent worker via
-   * SubagentExecBridgeService instead of feeding it into the parent's
-   * tool-result continuation pipeline. Value is the subagentId that owns
-   * the call.
+   * Immutable durable sidechain identity for a sub-agent exec.
+   *
+   * This is the only child-execution marker. A live worker may retain an
+   * exact waiter, but ownership, restart routing, and graph provenance all
+   * come from this assistant tool-use receipt.
    */
-  subagentOwner?: string
+  sidechainOwner?: SubagentSidechainToolOwner
+}
+
+export interface PendingToolClientLifecycleSuppression {
+  readonly reason: string
+  readonly family?: string
+}
+
+/**
+ * Exact graph ownership recovered from the assistant `tool_use` row that
+ * opened a sub-agent execution.  It is intentionally not inferred from a
+ * tool name, a transient waiter, or a parent task id.
+ */
+export interface SubagentSidechainToolOwner {
+  readonly agentId: string
+  readonly threadId: string
+  readonly branchId: string
+  readonly turnId: TurnId
+  readonly forkSourceUuid: string
+  readonly forkLineage: readonly string[]
+  /** Durable assistant row that contains the sidechain tool_use block. */
+  readonly sourceToolAssistantUuid: string
 }
 
 export interface SessionToolMetrics {
@@ -1090,104 +1259,21 @@ export interface ChatSessionAnalyticsSummary {
   sessions: ChatSessionAnalyticsEntry[]
 }
 
-/**
- * Sub-agent execution context for the task tool.
- * Stored in the parent SessionRecord while a sub-agent is running.
- *
- * Event-driven state machine: the sub-agent loop is NOT a blocking loop.
- * Instead, each phase dispatches exec messages and returns. When the bidi
- * handler receives the tool results, it calls back into the sub-agent to
- * start the next LLM turn.
- */
-export interface SubAgentContext {
-  /** The task tool call ID in the parent */
-  parentToolCallId: string
-  /** For Cursor UI correlation */
-  parentModelCallId: string
-  /** Unique sub-agent identifier */
-  subagentId: string
-  /** User-facing agent type, persisted for result metadata. */
-  agentType?: string
-  /** Sub-agent conversation history (Anthropic format) */
-  messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
-  /** LLM model for the sub-agent */
-  model: string
-  /** Tool definitions available to the sub-agent */
-  tools: unknown[]
-  /** Accumulated text from the current sub-agent turn */
-  accumulatedText: string
-  /** Tool call IDs that belong to this sub-agent (for routing results) */
-  pendingToolCallIds: Set<string>
-  /** Start time for duration tracking */
-  startTime: number
-  /** Number of LLM turns completed */
-  turnCount: number
-  /** Total tool calls made by the sub-agent */
-  toolCallCount: number
-  /** Modified file paths (for SubagentStopRequestQuery) */
-  modifiedFiles: string[]
-  /** Whether the parent task tool has been settled while the sub-agent continues in background */
-  isBackground?: boolean
-  /** Timestamp when the sub-agent was backgrounded */
-  backgroundedAt?: number
-
-  // ── Event-driven state machine fields ──
-
-  /** Tool calls from the current LLM turn, pending dispatch & results */
-  currentTurnToolCalls: Array<{
-    id: string
-    name: string
-    input: Record<string, unknown>
-  }>
-  /** Tool results collected so far for the current turn */
-  pendingToolResults: Map<string, SubAgentToolResult>
-  /** IDs of tools we are still waiting for (subset of currentTurnToolCalls) */
-  expectedToolCallIds: Set<string>
-
-  /**
-   * Accumulated `agent.v1.ConversationStep` proto values produced as the
-   * sub-agent runs — assistant text, thinking, tool calls. Filled into
-   * `TaskSuccess.conversationSteps` when the parent task tool settles
-   * so the IDE's parent task bubble can expand into the per-step detail
-   * accordion. Mirrors claude-code's per-turn step tracking. Stored as
-   * unknown[] because the proto type is private to cursor-grpc.service. */
-  conversationSteps: unknown[]
-
-  /**
-   * Snapshot of allowed workspace roots captured when this sub-agent
-   * was spawned. Used for prompt injection and restart persistence so
-   * in-flight sub-agents do not silently inherit parent-session root
-   * changes made after spawn.
-   */
-  allowedWorkspaceRoots?: string[]
-}
-
-export interface SubAgentToolResult {
-  toolCallId: string
-  content: string
-  resultData: Buffer
-  resultCase: string
-}
-
 interface PersistedPendingToolCall extends PendingToolExecutionState {
+  /** Durable graph owner; runtime calls must always carry one. */
+  turnId: TurnId
   toolCallId: string
   toolName: string
   toolInput: Record<string, unknown>
   historyToolName?: string
   historyToolInput?: Record<string, unknown>
   codexToolCallType?: "function" | "custom" | "tool_search"
+  skillActivationReceipts?: readonly CursorSkillActivationReceipt[]
+  hookAdditionalContexts?: readonly CursorHookAdditionalContextReceipt[]
   toolFamilyHint?: "mcp" | "edit" | "web_fetch"
   modelCallId: string
   startedEmitted: boolean
   sentAt: number
-  /**
-   * Optional epoch-ms deadline for automatic timeout. When set, the
-   * PendingDeadlineSweeper expires the entry by emitting a synthetic
-   * error tool_result so the agent unwinds and the conversation
-   * leaves the pending-work state. Undefined = no automatic timeout
-   * (e.g. shell streams that legitimately run for hours).
-   */
-  deadline?: number
   execIds: number[]
   editApplyWarning?: string
   editFailureContext?: EditFailureContext
@@ -1201,112 +1287,49 @@ interface PersistedPendingToolCall extends PendingToolExecutionState {
     signal?: string
     started: boolean
   }
+  /** Exact durable client envelopes still awaiting a terminal state. */
+  dispatches: Array<
+    Pick<
+      ExecDispatchRecord,
+      | "streamEpoch"
+      | "execId"
+      | "protocolExecId"
+      | "state"
+      | "dispatchKind"
+      | "queuedAt"
+      | "dispatchingAt"
+      | "dispatchedAt"
+    >
+  >
+  /** Present only for an exact durable sidechain tool_use owner. */
+  sidechainOwner?: SubagentSidechainToolOwner
 }
 
-interface PersistedBackgroundCommand {
-  commandId: string
-  originToolCallId: string
-  execIds: number[]
-  command: string
-  cwd: string
-  pid?: number
-  terminalsFolder?: string
-  status: SessionBackgroundCommandStatus
-  stdout: string[]
-  stderr: string[]
-  exitCode?: number
-  msToWait?: number
-  backgroundReason?: number
-  lastTerminalFileLength?: number
-  startedAt: number
-  updatedAt: number
-  completedAt?: number
+interface DurableRuntimeToolUse {
+  toolName: string
+  toolInput: Record<string, unknown>
+  sourceMessage: PersistedMessage
 }
 
-interface PersistedSubAgentContext {
-  parentToolCallId: string
-  parentModelCallId: string
-  subagentId: string
-  agentType?: string
-  messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
-  model: string
-  tools: unknown[]
-  accumulatedText: string
-  pendingToolCallIds: string[]
-  startTime: number
-  turnCount: number
-  toolCallCount: number
-  modifiedFiles: string[]
-  isBackground?: boolean
-  backgroundedAt?: number
-  currentTurnToolCalls: Array<{
-    id: string
-    name: string
-    input: Record<string, unknown>
-  }>
-  expectedToolCallIds: string[]
-  allowedWorkspaceRoots?: string[]
-}
+/**
+ * Migration 014 starts a fresh durable session domain. This is deliberately a
+ * single current schema, not a compatibility envelope for historical JSON
+ * snapshots. The graph, provider projections and tool ledger own their own
+ * tables; this restore input contains only their current read models plus the
+ * session configuration row.
+ */
+const CURRENT_SESSION_SNAPSHOT_VERSION = 20 as const
 
-interface PersistedSessionRestartRecovery {
-  restoredAt: number
-  notice: string
-  interruptedToolCalls: Array<{
-    toolCallId: string
-    toolName: string
-    sentAt: number
-    reason?: ToolInterruptionReason
-    detail?: string
-  }>
-  interruptedInteractionQueryCount: number
-  interruptedSubAgent?: {
-    subagentId: string
-    parentToolCallId: string
-    turnCount: number
-    toolCallCount: number
-  }
-}
-
-interface PersistedActiveToolBatch {
-  batchId: string
-  toolCallIds: string[]
-  assistantText: string
-  readOnly: boolean
-  startedAt: number
-  tools: Array<{
-    toolCallId: string
-    toolName: string
-    input: Record<string, unknown>
-    resultSummary?: string
-  }>
-}
-
-interface PersistedTopLevelAgentTurnState {
-  llmTurnCount: number
-  continuationBudget?: SessionTopLevelContinuationBudget
-  activeToolBatch?: PersistedActiveToolBatch
-}
-
-interface PersistedChatSessionV1 {
-  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15
+interface PersistedChatSession {
+  version: typeof CURRENT_SESSION_SNAPSHOT_VERSION
   conversationId: string
   messages: SessionMessage[]
-  messageRecords?: ContextTranscriptRecord[]
-  transcriptEvents?: SessionTranscriptEvent[]
-  nextTranscriptEventSeq?: number
-  contextState?: ContextConversationState
-  taskBudgetState?: SessionTaskBudgetState
-  topLevelAgentTurnState?: PersistedTopLevelAgentTurnState
-  lastEmittedContextSummaryCompactionId?: string
-  lastEmittedContextSummaryCompactionEpoch?: number
-  lastContextSummaryCompactionEpoch?: number
   model: string
+  codexProviderIdentity: CodexRootProviderIdentity
   lastAssistantBackend?: BackendType
   lastAssistantModel?: string
-  lastCodexResponseId?: string
-  lastCodexRequestSignature?: string
-  thinkingLevel: number
-  thinkingDetailsRequested?: boolean
+  thinkingLevel: CursorThinkingLevel
+  thinkingDetailsRequested: boolean
   isAgentic: boolean
   supportedTools: string[]
   mcpToolDefs?: ParsedCursorRequest["mcpToolDefs"]
@@ -1314,74 +1337,794 @@ interface PersistedChatSessionV1 {
   requestContextEnv?: ParsedCursorRequest["requestContextEnv"]
   createdAt: number
   lastActivityAt: number
-  pendingToolCalls: PersistedPendingToolCall[]
-  backgroundCommands?: PersistedBackgroundCommand[]
-  pendingInteractionQueryCount: number
-  projectContext?: ParsedCursorRequest["projectContext"]
+  /** Current durable open graph edges reconstructed from their outbox rows. */
+  restoredPendingToolCalls: PersistedPendingToolCall[]
+  /** `null` is an intentional no-workspace session; absence is invalid. */
+  workspace: SessionWorkspaceState | null
+  cursorManagedReadResources: readonly CursorManagedReadResource[]
   codeChunks?: ParsedCursorRequest["codeChunks"]
-  // Legacy only: request-scoped rules used to be persisted, but are now
-  // intentionally ignored on restore.
-  cursorRules?: ParsedCursorRequest["cursorRules"] | string[]
   cursorCommands?: ParsedCursorRequest["cursorCommands"]
   customSystemPrompt?: ParsedCursorRequest["customSystemPrompt"]
+  hooksAdditionalContext?: ParsedCursorRequest["hooksAdditionalContext"]
+  goalState?: BridgeGoalState
+  isRootProjectConversation?: boolean
   explicitContext?: string
   contextTokenLimit?: number
+  contextTokenLimitSource?: ContextTokenLimitSource
   contextMaxMode?: boolean
   usedContextTokens?: number
   requestedMaxOutputTokens?: number
   requestedModelParameters?: Record<string, string>
-  /**
-   * Persisted form of `SessionRecord.additionalRoots`. Stored as an
-   * array (Map doesn't round-trip through JSON) and rebuilt into a
-   * Map on load. Only `'session'` source entries actually survive
-   * the round-trip — `'config'` entries are re-derived from
-   * `.cursor/agent-vibes.json` at session start, so persisting them
-   * would cause stale config to silently linger after the file is
-   * edited.
-   */
-  additionalRoots?: AdditionalWorkspaceRoot[]
-  usedTokens: number
   readPaths: string[]
-  readSnapshots?: SessionReadSnapshot[]
   fileStates: Array<{
     path: string
     beforeContent: string
     afterContent: string
   }>
-  toolMetrics?: SessionToolMetrics
   messageBlobIds: string[]
-  turns: string[]
-  currentAssistantMessage?: Record<string, unknown>
-  stepId: number
-  execId: number
-  interactionQueryId: number
   todos: SessionTodoItem[]
-  /**
-   * @deprecated since 2026-05 — single-context schema. Read-only for
-   * backwards-compatible deserialization of pre-multi-subagent session
-   * snapshots. New writes use {@link subAgentContexts}.
-   */
-  subAgentContext?: PersistedSubAgentContext
-  /**
-   * Multi-subagent persistence schema. Each entry is one foreground
-   * sub-agent that was active at the time of the snapshot. The bridge
-   * does not currently restart sub-agent state machines on cold start
-   * (cf. `parsePersistedSession` — restart recovery only marks them as
-   * interrupted), so this is consumed exclusively by the recovery
-   * synthesis path.
-   */
-  subAgentContexts?: PersistedSubAgentContext[]
-  toolExecutionOrderCounter?: number
-  restartRecovery?: PersistedSessionRestartRecovery
+}
+
+interface LoadedPersistedSessionGraph {
+  /** Complete durable graph, including audited sub-agent sidechains. */
+  rawMessages: readonly PersistedMessage[]
+  /** Parent-session read model with message revisions applied. */
+  projectedMainMessages: SessionMessage[]
+}
+
+type RestoredSessionConfig = Pick<
+  PersistedChatSession,
+  | "version"
+  | "codexProviderIdentity"
+  | "lastAssistantBackend"
+  | "lastAssistantModel"
+  | "thinkingLevel"
+  | "thinkingDetailsRequested"
+  | "isAgentic"
+  | "supportedTools"
+  | "mcpToolDefs"
+  | "useWeb"
+  | "requestContextEnv"
+  | "workspace"
+  | "cursorManagedReadResources"
+  | "codeChunks"
+  | "cursorCommands"
+  | "customSystemPrompt"
+  | "hooksAdditionalContext"
+  | "goalState"
+  | "isRootProjectConversation"
+  | "explicitContext"
+  | "contextTokenLimit"
+  | "contextTokenLimitSource"
+  | "contextMaxMode"
+  | "usedContextTokens"
+  | "requestedMaxOutputTokens"
+  | "requestedModelParameters"
+>
+
+/** Exact durable JSON shape emitted by {@link serializeSessionConfig}. */
+type SerializedSessionConfig = Omit<
+  RestoredSessionConfig,
+  "workspace" | "cursorManagedReadResources" | "goalState"
+> & {
+  workspace: PersistedSessionWorkspaceState | null
+  cursorManagedReadResources: CursorManagedReadResource[]
+  goalState?: ReturnType<typeof serializeBridgeGoalState>
+}
+
+const SERIALIZED_SESSION_CONFIG_REQUIRED_FIELDS = [
+  "version",
+  "codexProviderIdentity",
+  "thinkingLevel",
+  "thinkingDetailsRequested",
+  "isAgentic",
+  "supportedTools",
+  "useWeb",
+  "workspace",
+  "cursorManagedReadResources",
+] as const
+
+const SERIALIZED_SESSION_CONFIG_OPTIONAL_FIELDS = [
+  "lastAssistantBackend",
+  "lastAssistantModel",
+  "mcpToolDefs",
+  "requestContextEnv",
+  "codeChunks",
+  "cursorCommands",
+  "customSystemPrompt",
+  "hooksAdditionalContext",
+  "goalState",
+  "isRootProjectConversation",
+  "explicitContext",
+  "contextTokenLimit",
+  "contextTokenLimitSource",
+  "contextMaxMode",
+  "usedContextTokens",
+  "requestedMaxOutputTokens",
+  "requestedModelParameters",
+] as const
+
+type PlainJsonRecord = Record<string, unknown>
+
+/**
+ * The JSON config column is a versioned persistence protocol, not a partial
+ * object that may acquire fields through casting. Decode the exact serializer
+ * shape before a session can reach any live registry.
+ */
+function decodeSerializedSessionConfig(
+  value: unknown,
+  conversationId: string
+): RestoredSessionConfig {
+  const label = `Session ${conversationId} current snapshot config`
+  const config = requireExactPlainRecord(
+    value,
+    label,
+    SERIALIZED_SESSION_CONFIG_REQUIRED_FIELDS,
+    SERIALIZED_SESSION_CONFIG_OPTIONAL_FIELDS
+  )
+  if (config.version !== CURRENT_SESSION_SNAPSHOT_VERSION) {
+    throw new Error(
+      `Session ${conversationId} has unsupported snapshot version ${String(config.version)}`
+    )
+  }
+
+  const contextTokenLimit = decodeOptionalConfigField(
+    config,
+    "contextTokenLimit",
+    (field) => requirePositiveSafeInteger(field, `${label}.contextTokenLimit`)
+  )
+  const contextTokenLimitSource = decodeOptionalConfigField(
+    config,
+    "contextTokenLimitSource",
+    (field) =>
+      decodeContextTokenLimitSource(field, `${label}.contextTokenLimitSource`)
+  )
+  assertContextTokenLimitProvenance({
+    contextTokenLimit,
+    contextTokenLimitSource,
+  })
+
+  const decoded: RestoredSessionConfig = {
+    version: CURRENT_SESSION_SNAPSHOT_VERSION,
+    codexProviderIdentity: decodeCodexRootIdentity(
+      config.codexProviderIdentity,
+      `${label}.codexProviderIdentity`
+    ),
+    // Cursor's request parser has exactly three persisted thinking levels:
+    // 0 (off), 1 (enabled), and 2 (max). This is a protocol enum, not a
+    // generic numeric preference.
+    thinkingLevel: requireThinkingLevel(
+      config.thinkingLevel,
+      `${label}.thinkingLevel`
+    ),
+    thinkingDetailsRequested: requireBoolean(
+      config.thinkingDetailsRequested,
+      `${label}.thinkingDetailsRequested`
+    ),
+    isAgentic: requireBoolean(config.isAgentic, `${label}.isAgentic`),
+    supportedTools: decodeCanonicalIdentifierArray(
+      config.supportedTools,
+      `${label}.supportedTools`
+    ),
+    useWeb: requireBoolean(config.useWeb, `${label}.useWeb`),
+    workspace: decodePersistedWorkspace(config.workspace, `${label}.workspace`),
+    cursorManagedReadResources: restoreCursorManagedReadResources(
+      config.cursorManagedReadResources,
+      `${label}.cursorManagedReadResources`
+    ),
+  }
+
+  const lastAssistantBackend = decodeOptionalConfigField(
+    config,
+    "lastAssistantBackend",
+    (field) => decodeBackendType(field, `${label}.lastAssistantBackend`)
+  )
+  if (lastAssistantBackend !== undefined) {
+    decoded.lastAssistantBackend = lastAssistantBackend
+  }
+  const lastAssistantModel = decodeOptionalConfigField(
+    config,
+    "lastAssistantModel",
+    (field) => requireCanonicalIdentifier(field, `${label}.lastAssistantModel`)
+  )
+  if (lastAssistantModel !== undefined) {
+    decoded.lastAssistantModel = lastAssistantModel
+  }
+  const mcpToolDefs = decodeOptionalConfigField(
+    config,
+    "mcpToolDefs",
+    (field) => decodeMcpToolDefs(field, `${label}.mcpToolDefs`)
+  )
+  if (mcpToolDefs !== undefined) {
+    decoded.mcpToolDefs = mcpToolDefs
+  }
+  const requestContextEnv = decodeOptionalConfigField(
+    config,
+    "requestContextEnv",
+    (field) => decodeRequestContextEnv(field, `${label}.requestContextEnv`)
+  )
+  if (requestContextEnv !== undefined) {
+    decoded.requestContextEnv = requestContextEnv
+  }
+  const codeChunks = decodeOptionalConfigField(config, "codeChunks", (field) =>
+    decodeCodeChunks(field, `${label}.codeChunks`)
+  )
+  if (codeChunks !== undefined) {
+    decoded.codeChunks = codeChunks
+  }
+  const cursorCommands = decodeOptionalConfigField(
+    config,
+    "cursorCommands",
+    (field) => decodeCursorCommands(field, `${label}.cursorCommands`)
+  )
+  if (cursorCommands !== undefined) {
+    decoded.cursorCommands = cursorCommands
+  }
+  const customSystemPrompt = decodeOptionalConfigField(
+    config,
+    "customSystemPrompt",
+    (field) => requireText(field, `${label}.customSystemPrompt`)
+  )
+  if (customSystemPrompt !== undefined) {
+    decoded.customSystemPrompt = customSystemPrompt
+  }
+  const hooksAdditionalContext = decodeOptionalConfigField(
+    config,
+    "hooksAdditionalContext",
+    (field) => requireText(field, `${label}.hooksAdditionalContext`)
+  )
+  if (hooksAdditionalContext !== undefined) {
+    decoded.hooksAdditionalContext = hooksAdditionalContext
+  }
+  const goalState = decodeOptionalConfigField(config, "goalState", (field) =>
+    deserializeBridgeGoalState(field, `${label}.goalState`)
+  )
+  if (goalState !== undefined) {
+    decoded.goalState = goalState
+  }
+  const isRootProjectConversation = decodeOptionalConfigField(
+    config,
+    "isRootProjectConversation",
+    (field) => requireBoolean(field, `${label}.isRootProjectConversation`)
+  )
+  if (isRootProjectConversation !== undefined) {
+    decoded.isRootProjectConversation = isRootProjectConversation
+  }
+  const explicitContext = decodeOptionalConfigField(
+    config,
+    "explicitContext",
+    (field) => requireText(field, `${label}.explicitContext`)
+  )
+  if (explicitContext !== undefined) {
+    decoded.explicitContext = explicitContext
+  }
+  if (contextTokenLimit !== undefined) {
+    decoded.contextTokenLimit = contextTokenLimit
+  }
+  if (contextTokenLimitSource !== undefined) {
+    decoded.contextTokenLimitSource = contextTokenLimitSource
+  }
+  const contextMaxMode = decodeOptionalConfigField(
+    config,
+    "contextMaxMode",
+    (field) => requireBoolean(field, `${label}.contextMaxMode`)
+  )
+  if (contextMaxMode !== undefined) {
+    decoded.contextMaxMode = contextMaxMode
+  }
+  const usedContextTokens = decodeOptionalConfigField(
+    config,
+    "usedContextTokens",
+    // This value is refreshed both from Cursor's uint32 conversation detail
+    // and from the bridge's completed-response usage ledger. The common
+    // durable domain is therefore a non-negative integral token count, not
+    // an arbitrary finite number.
+    (field) =>
+      requireNonNegativeSafeInteger(field, `${label}.usedContextTokens`)
+  )
+  if (usedContextTokens !== undefined) {
+    decoded.usedContextTokens = usedContextTokens
+  }
+  const requestedMaxOutputTokens = decodeOptionalConfigField(
+    config,
+    "requestedMaxOutputTokens",
+    (field) =>
+      requirePositiveSafeInteger(field, `${label}.requestedMaxOutputTokens`)
+  )
+  if (requestedMaxOutputTokens !== undefined) {
+    decoded.requestedMaxOutputTokens = requestedMaxOutputTokens
+  }
+  const requestedModelParameters = decodeOptionalConfigField(
+    config,
+    "requestedModelParameters",
+    (field) =>
+      decodeModelParameterRecord(field, `${label}.requestedModelParameters`)
+  )
+  if (requestedModelParameters !== undefined) {
+    decoded.requestedModelParameters = requestedModelParameters
+  }
+  return decoded
+}
+
+function decodeOptionalConfigField<T>(
+  record: PlainJsonRecord,
+  field: string,
+  decode: (value: unknown) => T
+): T | undefined {
+  return hasOwn(record, field) ? decode(record[field]) : undefined
+}
+
+function decodeCodexRootIdentity(
+  value: unknown,
+  label: string
+): CodexRootProviderIdentity {
+  const identity = requireExactPlainRecord(value, label, [
+    "sessionId",
+    "threadId",
+    "threadSource",
+  ])
+  assertCodexRootProviderIdentity(identity)
+  return {
+    sessionId: identity.sessionId,
+    threadId: identity.threadId,
+    threadSource: identity.threadSource,
+  }
+}
+
+function decodeBackendType(value: unknown, label: string): BackendType {
+  switch (value) {
+    case "google":
+    case "google-claude":
+    case "codex":
+    case "openai-compat":
+    case "claude-api":
+    case "kiro":
+      return value
+    default:
+      throw new Error(`${label} must be a supported backend`)
+  }
+}
+
+function decodeContextTokenLimitSource(
+  value: unknown,
+  label: string
+): ContextTokenLimitSource {
+  if (value === "requested" || value === "conversation_state") {
+    return value
+  }
+  throw new Error(`${label} must be requested or conversation_state`)
+}
+
+function decodePersistedWorkspace(
+  value: unknown,
+  label: string
+): SessionWorkspaceState | null {
+  if (value === null) return null
+  try {
+    return restoreSessionWorkspace(value)
+  } catch (error) {
+    throw new Error(`${label} is invalid: ${errorMessage(error)}`)
+  }
+}
+
+function decodeMcpToolDefs(value: unknown, label: string): McpToolDef[] {
+  return requirePlainArray(value, label).map((entry, index) => {
+    const entryLabel = `${label}[${index}]`
+    const definition = requireExactPlainRecord(
+      entry,
+      entryLabel,
+      [
+        "name",
+        "toolName",
+        "providerIdentifier",
+        "description",
+        "ideRegistryKey",
+      ],
+      ["inputSchema"]
+    )
+    const decoded: McpToolDef = {
+      name: requireCanonicalIdentifier(definition.name, `${entryLabel}.name`),
+      toolName: requireCanonicalIdentifier(
+        definition.toolName,
+        `${entryLabel}.toolName`
+      ),
+      // The wire parser deliberately uses an empty provider/key as its
+      // "no registry candidate" sentinel. Preserve that exact sentinel, but
+      // reject any non-canonical non-empty identity during recovery.
+      providerIdentifier: requireOptionalCanonicalIdentifier(
+        definition.providerIdentifier,
+        `${entryLabel}.providerIdentifier`
+      ),
+      description: requireText(
+        definition.description,
+        `${entryLabel}.description`
+      ),
+      ideRegistryKey: requireOptionalCanonicalIdentifier(
+        definition.ideRegistryKey,
+        `${entryLabel}.ideRegistryKey`
+      ),
+    }
+    const inputSchema = decodeOptionalConfigField(
+      definition,
+      "inputSchema",
+      (field) => decodeProtoJsonRecord(field, `${entryLabel}.inputSchema`)
+    )
+    if (inputSchema !== undefined) {
+      decoded.inputSchema = inputSchema
+    }
+    return decoded
+  })
+}
+
+function decodeRequestContextEnv(
+  value: unknown,
+  label: string
+): NonNullable<ParsedCursorRequest["requestContextEnv"]> {
+  const env = requireExactPlainRecord(
+    value,
+    label,
+    [],
+    [
+      "terminalsFolder",
+      "projectFolder",
+      "shell",
+      "timeZone",
+      "agentTranscriptsFolder",
+      "artifactsFolder",
+    ]
+  )
+  const decoded: NonNullable<ParsedCursorRequest["requestContextEnv"]> = {}
+  const filesystemPathFields = [
+    "terminalsFolder",
+    "projectFolder",
+    "agentTranscriptsFolder",
+    "artifactsFolder",
+  ] as const
+  for (const field of filesystemPathFields) {
+    if (!hasOwn(env, field)) continue
+    decoded[field] = requireFilesystemPathText(env[field], `${label}.${field}`)
+  }
+  for (const field of ["shell", "timeZone"] as const) {
+    if (!hasOwn(env, field)) continue
+    decoded[field] = requireNonEmptyText(env[field], `${label}.${field}`)
+  }
+  return decoded
+}
+
+function decodeCodeChunks(
+  value: unknown,
+  label: string
+): NonNullable<ParsedCursorRequest["codeChunks"]> {
+  return requirePlainArray(value, label).map((entry, index) => {
+    const entryLabel = `${label}[${index}]`
+    const chunk = requireExactPlainRecord(
+      entry,
+      entryLabel,
+      ["path", "content"],
+      ["startLine", "endLine"]
+    )
+    const decoded: NonNullable<ParsedCursorRequest["codeChunks"]>[number] = {
+      path: requireFilesystemPathText(chunk.path, `${entryLabel}.path`),
+      // An empty editor selection/file is still a real attached code chunk.
+      content: requireText(chunk.content, `${entryLabel}.content`),
+    }
+    const startLine = decodeOptionalConfigField(chunk, "startLine", (field) =>
+      requireFiniteNumber(field, `${entryLabel}.startLine`)
+    )
+    if (startLine !== undefined) decoded.startLine = startLine
+    const endLine = decodeOptionalConfigField(chunk, "endLine", (field) =>
+      requireFiniteNumber(field, `${entryLabel}.endLine`)
+    )
+    if (endLine !== undefined) decoded.endLine = endLine
+    return decoded
+  })
+}
+
+function decodeCursorCommands(
+  value: unknown,
+  label: string
+): NonNullable<ParsedCursorRequest["cursorCommands"]> {
+  return requirePlainArray(value, label).map((entry, index) => {
+    const entryLabel = `${label}[${index}]`
+    const command = requireExactPlainRecord(entry, entryLabel, [
+      "name",
+      "content",
+    ])
+    return {
+      name: requireNonEmptyText(command.name, `${entryLabel}.name`),
+      content: requireText(command.content, `${entryLabel}.content`),
+    }
+  })
+}
+
+function decodeCanonicalIdentifierArray(
+  value: unknown,
+  label: string
+): string[] {
+  return requirePlainArray(value, label).map((entry, index) =>
+    requireCanonicalIdentifier(entry, `${label}[${index}]`)
+  )
+}
+
+function decodeModelParameterRecord(
+  value: unknown,
+  label: string
+): Record<string, string> {
+  const record = requirePlainRecord(value, label)
+  const decoded: Record<string, string> = {}
+  for (const [key, entry] of Object.entries(record)) {
+    const identifier = requireCanonicalIdentifier(key, `${label} key`)
+    decoded[identifier] = requireText(entry, `${label}.${identifier}`)
+  }
+  return decoded
+}
+
+/** Decode an arbitrary protobuf-derived JSON object without accepting class instances. */
+function decodeProtoJsonRecord(
+  value: unknown,
+  label: string
+): Record<string, unknown> {
+  const record = requirePlainRecord(value, label)
+  return Object.fromEntries(
+    Object.entries(record).map(([key, entry]) => [
+      key,
+      decodeProtoJsonValue(entry, `${label}.${key}`),
+    ])
+  )
+}
+
+function decodeProtoJsonValue(value: unknown, label: string): unknown {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return value
+  }
+  if (typeof value === "number") {
+    return requireFiniteNumber(value, label)
+  }
+  if (Array.isArray(value)) {
+    return requirePlainArray(value, label).map((entry, index) =>
+      decodeProtoJsonValue(entry, `${label}[${index}]`)
+    )
+  }
+  return decodeProtoJsonRecord(value, label)
+}
+
+function requireExactPlainRecord(
+  value: unknown,
+  label: string,
+  required: readonly string[],
+  optional: readonly string[] = []
+): PlainJsonRecord {
+  const record = requirePlainRecord(value, label)
+  const allowed = new Set([...required, ...optional])
+  const fields = Object.keys(record)
+  const missing = required.filter((field) => !hasOwn(record, field))
+  const unexpected = fields.filter((field) => !allowed.has(field))
+  if (missing.length > 0 || unexpected.length > 0) {
+    const details = [
+      ...(missing.length > 0 ? [`missing ${missing.join(", ")}`] : []),
+      ...(unexpected.length > 0 ? [`unexpected ${unexpected.join(", ")}`] : []),
+    ]
+    throw new Error(
+      `${label} has an invalid field shape (${details.join("; ")})`
+    )
+  }
+  return record
+}
+
+function requirePlainRecord(value: unknown, label: string): PlainJsonRecord {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw new Error(`${label} must be a plain object`)
+  }
+  const record = value as PlainJsonRecord
+  assertPlainJsonRecordProperties(record, label)
+  return record
+}
+
+function requirePlainArray(value: unknown, label: string): unknown[] {
+  if (
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype
+  ) {
+    throw new Error(`${label} must be a plain array`)
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    throw new Error(`${label} must not contain symbol properties`)
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    if (!hasOwn(value, String(index))) {
+      throw new Error(`${label} must not contain sparse array holes`)
+    }
+  }
+  const allowedFields = new Set(
+    Array.from({ length: value.length }, (_, index) => String(index))
+  )
+  for (const field of Object.getOwnPropertyNames(value)) {
+    if (field === "length") continue
+    const descriptor = Object.getOwnPropertyDescriptor(value, field)
+    if (
+      !allowedFields.has(field) ||
+      !descriptor ||
+      !descriptor.enumerable ||
+      "get" in descriptor ||
+      "set" in descriptor
+    ) {
+      throw new Error(`${label} must contain only JSON array values`)
+    }
+  }
+  return value
+}
+
+function assertPlainJsonRecordProperties(
+  record: PlainJsonRecord,
+  label: string
+): void {
+  if (Object.getOwnPropertySymbols(record).length > 0) {
+    throw new Error(`${label} must not contain symbol properties`)
+  }
+  for (const field of Object.getOwnPropertyNames(record)) {
+    const descriptor = Object.getOwnPropertyDescriptor(record, field)
+    if (
+      !descriptor ||
+      !descriptor.enumerable ||
+      "get" in descriptor ||
+      "set" in descriptor
+    ) {
+      throw new Error(`${label} must contain only JSON object fields`)
+    }
+  }
+}
+
+/** Text payloads retain their exact bytes; only NUL is never serializable. */
+function requireText(value: unknown, label: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${label} must be a string`)
+  }
+  if (value.includes("\u0000")) {
+    throw new Error(`${label} must not contain NUL bytes`)
+  }
+  return value
+}
+
+/** Present optional fields must carry a real value; omission is the sentinel. */
+function requireNonEmptyText(value: unknown, label: string): string {
+  const text = requireText(value, label)
+  if (!text.trim()) {
+    throw new Error(`${label} must be non-empty text`)
+  }
+  return text
+}
+
+/** Filesystem paths preserve every non-NUL byte, including boundary spaces. */
+function requireFilesystemPathText(value: unknown, label: string): string {
+  const path = requireText(value, label)
+  if (path.length === 0) {
+    throw new Error(`${label} must be a non-empty local path`)
+  }
+  return path
+}
+
+/** Opaque stored keys are exact values, never recovery-normalized strings. */
+export function requireCanonicalIdentifier(
+  value: unknown,
+  label: string
+): string {
+  const identifier = requireNonEmptyText(value, label)
+  if (identifier.trim() !== identifier) {
+    throw new Error(
+      `${label} must be a canonical identifier without surrounding whitespace`
+    )
+  }
+  return identifier
+}
+
+/** Cursor represents an unavailable MCP registry candidate as an empty string. */
+function requireOptionalCanonicalIdentifier(
+  value: unknown,
+  label: string
+): string {
+  const identifier = requireText(value, label)
+  if (identifier === "") return identifier
+  if (!identifier.trim() || identifier.trim() !== identifier) {
+    throw new Error(
+      `${label} must be an empty sentinel or canonical identifier`
+    )
+  }
+  return identifier
+}
+
+function requireBoolean(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new Error(`${label} must be a boolean`)
+  }
+  return value
+}
+
+function requireFiniteNumber(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${label} must be a finite number`)
+  }
+  return value
+}
+
+function requireThinkingLevel(value: unknown, label: string): 0 | 1 | 2 {
+  if (value === 0 || value === 1 || value === 2) {
+    return value
+  }
+  throw new Error(`${label} must be one of 0, 1, or 2`)
+}
+
+function requireNonNegativeSafeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative safe integer`)
+  }
+  return value
+}
+
+function requireOptionalNonNegativeSafeInteger(
+  value: unknown,
+  label: string
+): number | undefined {
+  return value === undefined
+    ? undefined
+    : requireNonNegativeSafeInteger(value, label)
+}
+
+function requirePositiveSafeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive safe integer`)
+  }
+  return value
+}
+
+function hasOwn(record: object, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, field)
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+interface RestoredSessionBundle {
+  session: SessionLifecycleRecord
+  context: ContextStateRecord
+  stream: SessionStreamRecord
+  restoredPendingToolCalls: PersistedPendingToolCall[]
+}
+
+/**
+ * A fresh session before it is visible to any live registry. The bundle is
+ * intentionally detached until its session row, initial graph, and normalized
+ * domain state have committed together.
+ */
+interface FreshSessionBootstrap {
+  session: SessionLifecycleRecord
+  context: ContextStateRecord
+  stream: SessionStreamRecord
+  initialHistory: SessionMessage[]
+}
+
+interface PreparedSessionRequestRefresh {
+  session: SessionLifecycleRecord
+  context: ContextStateRecord
+  canRefreshProvidedFields: boolean
+  resetUsageLedger: boolean
+  reloadConfiguredWorkspaceGrants: boolean
 }
 
 @Injectable()
 export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(SessionLifecycleService.name)
-  // Step 4 物理拆: SessionLifecycleService 只持有 SessionLifecycleRecord
-  // (lifecycle 域字段)。ContextStateRecord / SessionStreamRecord 由
-  // 各自服务持有独立 Map,createFreshSession / parsePersistedSession /
-  // deleteSession 在 lifecycle 创建/销毁 record 时 fan-out。
+  // Lifecycle metadata is physically separate from context graph state and
+  // stream execution state; create/load/delete coordinate their owners.
   private readonly sessions = new Map<string, SessionLifecycleRecord>()
 
   // Pending tool calls — inlined from the deleted PendingToolStore
@@ -1399,104 +2142,19 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     Map<TurnId, Set<string>>
   >()
 
-  // Transcript staging — inlined from the deleted TranscriptStore
-  // class. The `committedTranscripts` map holds the canonical
-  // SessionMessage[] for each conversation; `SessionRecord.messages`
-  // aliases the same physical array so cursor's hot-path
-  // length / at(-1) / [i] reads need no defensive copy. The single-
-  // anchor staging discipline (one open turn per conversation) is
-  // enforced by `transcriptOpenAnchors` below — distinct from the
-  // lifecycle-level `turnAnchors` map which records the multi-array
-  // anchor (messages / messageRecords / transcriptEvents /
-  // contextRecords / usedTokens / messagesGeneration) used by
-  // beginTurn / commitTurn / abortTurn for full rewind.
-  private readonly committedTranscripts = new Map<
-    ConversationId,
-    SessionMessage[]
-  >()
-  private readonly transcriptOpenAnchors = new Map<
-    ConversationId,
-    { readonly turnId: TurnId; readonly anchorIndex: number }
-  >()
   /**
-   * Per-conversation transcript-turn anchor. Set by `beginTurn`,
-   * cleared by `commitTurn` / `abortTurn`. Records the index
-   * each tracked array was at when the turn opened so abortTurn
-   * can rewind atomically.
+   * One active durable-graph turn per conversation. This is an ownership
+   * guard only: accepted graph fragments are never staged in Lifecycle and
+   * are never rewound on abort.
    */
-  private readonly turnAnchors = new Map<
-    string,
-    {
-      readonly turnId: TurnId
-      readonly messagesAt: number
-      readonly messageRecordsAt: number
-      readonly transcriptEventsAt: number
-      readonly contextRecordsAt: number
-      readonly usedTokens: number
-      readonly messagesGeneration: number
-    }
-  >()
+  private readonly activeGraphTurns = new Map<string, TurnId>()
   private readonly ACTIVE_SESSION_WINDOW_MS = 5 * 60 * 1000
   private readonly SESSION_TIMEOUT = 30 * 60 * 1000 // 30 minutes
   private readonly PERSISTED_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
   private readonly PERSIST_FLUSH_INTERVAL_MS = 15 * 1000
   private readonly PERSIST_DEBOUNCE_MS = 250
-  /**
-   * Wall-clock budget the bridge gives the IDE to process a short
-   * ExecServerMessage before `PendingDeadlineSweeper` synthesises a
-   * timeout error tool_result.
-   */
-  private readonly EXEC_DISPATCH_DEADLINE_MS = 90 * 1000
-
-  /**
-   * Foreground terminal commands are streaming ExecServerMessages. They can
-   * legitimately run longer than short file/search tools, but they still
-   * block the per-conversation exec serializer and the assistant tool-result
-   * join barrier until they produce exit/backgrounded/rejected. If the IDE
-   * only sends `shell_stream.start` and then keeps the exec id alive with
-   * heartbeats, the bridge must finish the tool through the same synthetic
-   * tool_result path as every other deadline.
-   */
-  private readonly FOREGROUND_SHELL_STREAM_DEADLINE_MS = 5 * 60 * 1000
-
-  private readonly FOREGROUND_SHELL_STREAM_TOOLS: ReadonlySet<string> = new Set(
-    [
-      "run_terminal_command",
-      "run_terminal_command_v2",
-      "client_side_tool_v2_run_terminal_command_v2",
-    ]
-  )
-
-  /**
-   * Tool names whose ExecServerMessage path may legitimately run for
-   * minutes / hours. The deadline auto-arm in
-   * `registerPendingToolExecId` skips these; if they need a timeout
-   * the caller still sets one explicitly via `addPendingToolCall`'s
-   * `deadlineMs` argument.
-   *
-   * Names listed here are the **post-mapper user-facing** names stored
-   * on `PendingToolCall.toolName` (not proto enum keys), matching what
-   * the bridge persists for inbound tool dispatch.
-   */
-  private readonly EXEC_DISPATCH_DEADLINE_EXEMPT_TOOLS: ReadonlySet<string> =
-    new Set([
-      "background_shell_spawn",
-      "write_shell_stdin",
-      "task",
-      "task_v2",
-      "await_task",
-      "await",
-      "wait_agent",
-      "subagent_await",
-      "force_background_shell",
-      "force_background_subagent",
-    ])
   private readonly RETIRED_EXEC_ID_TTL_MS = 10 * 60 * 1000
   private readonly MAX_RETIRED_EXEC_ID_MAPPINGS = 512
-  private readonly MAX_READ_SNAPSHOTS_PER_SESSION = 24
-  private readonly MAX_READ_SNAPSHOTS_PER_FILE = 6
-  private readonly MAX_READ_SNAPSHOT_CHARS = 80_000
-  private readonly TURN_STATE_HISTORY_LIMIT = 12
   private readonly scheduledPersistTimers = new Map<
     string,
     ReturnType<typeof setTimeout>
@@ -1505,14 +2163,17 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   private persistFlushInterval!: ReturnType<typeof setInterval>
 
   /**
-   * Optional cleanup callback fired when a session is removed.
-   * The orchestration layer registers this to call ProviderAdapter.dispose(),
-   * releasing provider-specific resources (e.g., Codex WebSocket connections).
+   * Independent cleanup subscribers. Session eviction is a lifecycle event
+   * with more than one owner (provider adapters, runtime caches, etc.), so a
+   * later registration must not silently replace an earlier resource owner.
    */
-  private onSessionCleanupHandler?: (
-    conversationId: string,
-    session: SessionRecord
-  ) => void
+  private readonly sessionCleanupHandlers = new Set<SessionCleanupHandler>()
+
+  /**
+   * Transport/runtime work not represented by a graph turn or ledger entry.
+   * Each probe is conservative: an exception keeps the session alive.
+   */
+  private readonly sessionBusyProbes = new Set<SessionBusyProbe>()
 
   /**
    * Optional callback fired on the edge transition from "session has
@@ -1537,14 +2198,12 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
    * the manager calls this inline from `addPendingToolCall` to ask
    * "which turnId owns the new entry".
    *
-   * Defaults to a sentinel `legacy:<conv>` turnId when no resolver
-   * has been wired (tests / direct manager construction). The store
-   * doesn't care about the value semantics; it just uses it for
-   * cancellation cascade indexing.
+   * An unresolved turn is an invariant violation. Callers must install the
+   * supervisor resolver before registering a pending tool call.
    */
   private resolveTurnIdForConversation: (
     conversationId: string
-  ) => TurnId | undefined = (conv) => TurnId.of(`legacy:${conv}`)
+  ) => TurnId | undefined = () => undefined
 
   setPendingToolTurnIdResolver(
     resolver: (conversationId: string) => TurnId | undefined
@@ -1654,21 +2313,21 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly persistence: PersistenceService,
     private readonly toolResultStorage: ToolResultStorageService,
-    // Pending tool calls and transcript staging are inlined into
-    // this class (the legacy PendingToolStore + TranscriptStore
-    // classes have been deleted). See `pendingByConversation` /
-    // `pendingByTurn` + `pendingToolXxx` methods, and
-    // `committedTranscripts` / `transcriptOpenAnchors` +
-    // `transcriptXxx` methods below.
-    // Step 3 introduced ledger / message-store / session-persistence as
-    // the new owners of the v2 schema. SessionLifecycleService routes
-    // all SQLite reads/writes through SessionPersistenceService so the
-    // legacy `cursor_sessions` JSON-blob path is fully retired.
+    // The durable graph and active context projection are owned by
+    // MessageStore and ContextStateService. Lifecycle persistence uses the
+    // normalized session repository exclusively.
     private readonly sessionPersistence: SessionPersistenceService,
     private readonly messageStore: MessageStore,
     private readonly toolCallLedger: ToolCallLedger,
-    // Step 4 真正拆解: AssistantToolBatchService owns the in-flight
-    // assistant tool batch state machine. forwardRef breaks the
+    private readonly execDispatchStore: ExecDispatchStore,
+    private readonly contextProjectionStore: ContextProjectionStore,
+    private readonly contextProjectionHeads: ContextProjectionHeadStore,
+    private readonly snipBoundaryStore: SnipBoundaryStore,
+    private readonly sessionMemoryEvents: SessionMemoryEventStore,
+    private readonly subagentRunStore: SubagentRunStore,
+    private readonly subagentBranches: SubagentBranchStore,
+    // AssistantToolBatchService owns the in-flight assistant tool batch
+    // state machine. forwardRef breaks the
     // bidirectional cycle (lifecycle → batch on persistence /
     // detach paths, batch → lifecycle for markSessionDirty).
     @Inject(forwardRef(() => AssistantToolBatchService))
@@ -1676,7 +2335,8 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     @Inject(forwardRef(() => ContextStateService))
     private readonly contextState: ContextStateService,
     @Inject(forwardRef(() => SessionStreamService))
-    private readonly sessionStream: SessionStreamService
+    private readonly sessionStream: SessionStreamService,
+    private readonly claudeProjectionStore: ClaudeProjectionStore
   ) {}
 
   /**
@@ -1702,180 +2362,6 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     this.activeTurnSignalResolver = resolver
   }
 
-  /**
-   * Inlined TranscriptStore — staging contract for the canonical
-   * conversation transcript. SessionRecord.messages aliases the
-   * `committedTranscripts` array directly so cursor's hot-path reads
-   * (length / at(-1) / [i]) need no defensive copy. Single open turn
-   * per conversation is enforced by `transcriptOpenAnchors`.
-   *
-   * The legacy TranscriptStore class is deleted; callers go through
-   * these public methods instead. The naming keeps the
-   * `transcriptXxx` prefix to make grep easy and to avoid clashing
-   * with the lifecycle-level `beginTurn` / `commitTurn` /
-   * `abortTurn` (which run wider — they also rewind messageRecords,
-   * transcriptEvents, contextRecords, usedTokens, messagesGeneration
-   * via the `turnAnchors` map).
-   */
-  transcriptBeginTurn(conversationId: ConversationId, turnId: TurnId): void {
-    const existing = this.transcriptOpenAnchors.get(conversationId)
-    if (existing) {
-      throw new Error(
-        `transcriptBeginTurn: conversation ${conversationId} ` +
-          `already has open turn ${existing.turnId} (cannot start ${turnId})`
-      )
-    }
-    const list = this.transcriptGetCommittedRaw(conversationId)
-    this.transcriptOpenAnchors.set(conversationId, {
-      turnId,
-      anchorIndex: list.length,
-    })
-  }
-
-  transcriptStage(
-    conversationId: ConversationId,
-    turnId: TurnId,
-    message: SessionMessage
-  ): void {
-    const anchor = this.transcriptOpenAnchors.get(conversationId)
-    if (anchor && anchor.turnId !== turnId) {
-      throw new Error(
-        `transcriptStage: turn mismatch for ${conversationId}: ` +
-          `open=${anchor.turnId} given=${turnId}`
-      )
-    }
-    const list = this.transcriptGetCommittedRaw(conversationId)
-    list.push(message)
-  }
-
-  transcriptPeekStaged(
-    conversationId: ConversationId,
-    turnId: TurnId
-  ): SessionMessage[] {
-    const anchor = this.transcriptOpenAnchors.get(conversationId)
-    if (!anchor || anchor.turnId !== turnId) return []
-    const list = this.committedTranscripts.get(conversationId)
-    if (!list) return []
-    return list.slice(anchor.anchorIndex)
-  }
-
-  transcriptCommitTurn(conversationId: ConversationId, turnId: TurnId): number {
-    const anchor = this.transcriptOpenAnchors.get(conversationId)
-    if (!anchor) return 0
-    if (anchor.turnId !== turnId) {
-      throw new Error(
-        `transcriptCommitTurn: turn mismatch for ${conversationId}: ` +
-          `open=${anchor.turnId} given=${turnId}`
-      )
-    }
-    const list = this.committedTranscripts.get(conversationId)
-    const staged = list ? list.length - anchor.anchorIndex : 0
-    this.transcriptOpenAnchors.delete(conversationId)
-    return staged
-  }
-
-  transcriptAbortTurn(conversationId: ConversationId, turnId: TurnId): number {
-    const anchor = this.transcriptOpenAnchors.get(conversationId)
-    if (!anchor) return 0
-    if (anchor.turnId !== turnId) {
-      throw new Error(
-        `transcriptAbortTurn: turn mismatch for ${conversationId}: ` +
-          `open=${anchor.turnId} given=${turnId}`
-      )
-    }
-    const list = this.committedTranscripts.get(conversationId)
-    if (!list) {
-      this.transcriptOpenAnchors.delete(conversationId)
-      return 0
-    }
-    const dropped = list.length - anchor.anchorIndex
-    if (dropped > 0) {
-      list.splice(anchor.anchorIndex)
-    }
-    this.transcriptOpenAnchors.delete(conversationId)
-    return dropped
-  }
-
-  transcriptGetCommitted(conversationId: ConversationId): SessionMessage[] {
-    const list = this.committedTranscripts.get(conversationId)
-    return list ? [...list] : []
-  }
-
-  transcriptGetCommittedRaw(conversationId: ConversationId): SessionMessage[] {
-    let list = this.committedTranscripts.get(conversationId)
-    if (!list) {
-      list = []
-      this.committedTranscripts.set(conversationId, list)
-    }
-    return list
-  }
-
-  transcriptReplaceCommitted(
-    conversationId: ConversationId,
-    next: SessionMessage[]
-  ): void {
-    this.committedTranscripts.set(conversationId, [...next])
-    const anchor = this.transcriptOpenAnchors.get(conversationId)
-    if (anchor) {
-      this.transcriptOpenAnchors.set(conversationId, {
-        turnId: anchor.turnId,
-        anchorIndex: next.length,
-      })
-    }
-  }
-
-  transcriptReplaceAt(
-    conversationId: ConversationId,
-    index: number,
-    next: SessionMessage
-  ): void {
-    const list = this.committedTranscripts.get(conversationId)
-    if (!list) {
-      throw new Error(
-        `transcriptReplaceAt: no committed transcript for ${conversationId}`
-      )
-    }
-    if (index < 0 || index >= list.length) {
-      throw new Error(
-        `transcriptReplaceAt: index ${index} out of bounds (size=${list.length})`
-      )
-    }
-    list[index] = next
-  }
-
-  transcriptAppendCommitted(
-    conversationId: ConversationId,
-    message: SessionMessage
-  ): void {
-    const list = this.transcriptGetCommittedRaw(conversationId)
-    list.push(message)
-  }
-
-  transcriptMutateCommitted(
-    conversationId: ConversationId,
-    mutate: (list: SessionMessage[]) => void
-  ): void {
-    const list = this.transcriptGetCommittedRaw(conversationId)
-    mutate(list)
-  }
-
-  transcriptClearConversation(conversationId: ConversationId): void {
-    this.committedTranscripts.delete(conversationId)
-    this.transcriptOpenAnchors.delete(conversationId)
-  }
-
-  transcriptHasOpenTurn(conversationId: ConversationId): boolean {
-    return this.transcriptOpenAnchors.has(conversationId)
-  }
-
-  transcriptOpenTurnId(conversationId: ConversationId): TurnId | undefined {
-    return this.transcriptOpenAnchors.get(conversationId)?.turnId
-  }
-
-  transcriptCommittedSize(conversationId: ConversationId): number {
-    return this.committedTranscripts.get(conversationId)?.length ?? 0
-  }
-
   // ─── Inlined PendingToolStore — single source of truth ───────────
   // Replaces the deleted `turn/pending-tool-store.ts`. Same semantics
   // (single (conv, toolCallId) compound key, byTurn secondary index,
@@ -1888,24 +2374,33 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   pendingToolRegister<TPayload = unknown>(
     entry: PendingToolEntry<TPayload>
   ): void {
-    const convMap = this.getOrCreatePendingConvMap(entry.conversationId)
-    if (convMap.has(entry.toolCallId)) {
+    const conversationId = ConversationId.of(entry.conversationId)
+    const turnId = TurnId.of(entry.turnId)
+    const toolCallId = requireExactDurableIdentifier(
+      entry.toolCallId,
+      "pendingToolRegister toolCallId"
+    )
+    const convMap = this.getOrCreatePendingConvMap(conversationId)
+    if (convMap.has(toolCallId)) {
       throw new Error(
-        `pendingToolRegister: duplicate registration for conversation=${entry.conversationId} toolCallId=${entry.toolCallId}`
+        `pendingToolRegister: duplicate registration for conversation=${conversationId} toolCallId=${toolCallId}`
       )
     }
-    convMap.set(entry.toolCallId, {
+    convMap.set(toolCallId, {
       ...entry,
+      conversationId,
+      turnId,
+      toolCallId,
       resolved: false,
     } as PendingInternalEntry<unknown>)
 
-    const turnMap = this.getOrCreatePendingTurnMap(entry.conversationId)
-    let set = turnMap.get(entry.turnId)
+    const turnMap = this.getOrCreatePendingTurnMap(conversationId)
+    let set = turnMap.get(turnId)
     if (!set) {
       set = new Set()
-      turnMap.set(entry.turnId, set)
+      turnMap.set(turnId, set)
     }
-    set.add(entry.toolCallId)
+    set.add(toolCallId)
   }
 
   pendingToolUpdatePayload<TPayload = unknown>(
@@ -1913,12 +2408,17 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     toolCallId: string,
     mutate: (current: TPayload | undefined) => TPayload
   ): void {
+    const exactConversationId = ConversationId.of(conversationId)
+    const exactToolCallId = requireExactDurableIdentifier(
+      toolCallId,
+      "pendingToolUpdatePayload toolCallId"
+    )
     const entry = this.pendingByConversation
-      .get(conversationId)
-      ?.get(toolCallId)
+      .get(exactConversationId)
+      ?.get(exactToolCallId)
     if (!entry || entry.resolved) {
       throw new Error(
-        `pendingToolUpdatePayload: no live entry for conversation=${conversationId} toolCallId=${toolCallId}`
+        `pendingToolUpdatePayload: no live entry for conversation=${exactConversationId} toolCallId=${exactToolCallId}`
       )
     }
     entry.payload = mutate(entry.payload as TPayload | undefined)
@@ -1928,9 +2428,14 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     conversationId: ConversationId,
     toolCallId: string
   ): PendingToolEntry<TPayload> | undefined {
+    const exactConversationId = ConversationId.of(conversationId)
+    const exactToolCallId = requireExactDurableIdentifier(
+      toolCallId,
+      "pendingToolGet toolCallId"
+    )
     const entry = this.pendingByConversation
-      .get(conversationId)
-      ?.get(toolCallId)
+      .get(exactConversationId)
+      ?.get(exactToolCallId)
     if (!entry || entry.resolved) return undefined
     return entry as PendingToolEntry<TPayload>
   }
@@ -1940,25 +2445,32 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     toolCallId: string,
     turnId: TurnId
   ): boolean {
-    const entry = this.pendingToolGet(conversationId, toolCallId)
-    return entry?.turnId === turnId
+    const exactConversationId = ConversationId.of(conversationId)
+    const exactTurnId = TurnId.of(turnId)
+    const entry = this.pendingToolGet(exactConversationId, toolCallId)
+    return entry?.turnId === exactTurnId
   }
 
   pendingToolResolve(conversationId: ConversationId, toolCallId: string): void {
-    const convMap = this.pendingByConversation.get(conversationId)
-    const entry = convMap?.get(toolCallId)
+    const exactConversationId = ConversationId.of(conversationId)
+    const exactToolCallId = requireExactDurableIdentifier(
+      toolCallId,
+      "pendingToolResolve toolCallId"
+    )
+    const convMap = this.pendingByConversation.get(exactConversationId)
+    const entry = convMap?.get(exactToolCallId)
     if (!entry || entry.resolved) return
     entry.resolved = true
-    convMap!.delete(toolCallId)
+    convMap!.delete(exactToolCallId)
     if (convMap!.size === 0) {
-      this.pendingByConversation.delete(conversationId)
+      this.pendingByConversation.delete(exactConversationId)
     }
-    const turnMap = this.pendingByTurn.get(conversationId)
+    const turnMap = this.pendingByTurn.get(exactConversationId)
     const set = turnMap?.get(entry.turnId)
-    set?.delete(toolCallId)
+    set?.delete(exactToolCallId)
     if (set && set.size === 0) {
       turnMap!.delete(entry.turnId)
-      if (turnMap!.size === 0) this.pendingByTurn.delete(conversationId)
+      if (turnMap!.size === 0) this.pendingByTurn.delete(exactConversationId)
     }
   }
 
@@ -1966,9 +2478,11 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     conversationId: ConversationId,
     turnId: TurnId
   ): PendingToolEntry<TPayload>[] {
-    const set = this.pendingByTurn.get(conversationId)?.get(turnId)
+    const exactConversationId = ConversationId.of(conversationId)
+    const exactTurnId = TurnId.of(turnId)
+    const set = this.pendingByTurn.get(exactConversationId)?.get(exactTurnId)
     if (!set || set.size === 0) return []
-    const convMap = this.pendingByConversation.get(conversationId)
+    const convMap = this.pendingByConversation.get(exactConversationId)
     if (!convMap) return []
     const out: PendingToolEntry<TPayload>[] = []
     for (const id of set) {
@@ -1981,7 +2495,8 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   pendingToolSnapshotForConversation<TPayload = unknown>(
     conversationId: ConversationId
   ): PendingToolEntry<TPayload>[] {
-    const convMap = this.pendingByConversation.get(conversationId)
+    const exactConversationId = ConversationId.of(conversationId)
+    const convMap = this.pendingByConversation.get(exactConversationId)
     if (!convMap) return []
     const out: PendingToolEntry<TPayload>[] = []
     for (const e of convMap.values()) {
@@ -1990,34 +2505,36 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     return out
   }
 
-  pendingToolAbortTurn(
+  clearPendingToolCallsForTurn(
     conversationId: ConversationId,
     turnId: TurnId,
     reason: string
-  ): number {
-    const entries = this.pendingToolListForTurn(conversationId, turnId)
-    let aborted = 0
-    for (const e of entries) {
-      if (e.abort) {
-        try {
-          e.abort(reason)
-          aborted += 1
-        } catch (err) {
-          this.logger.warn(
-            `abort threw for tool=${e.toolName} conversation=${conversationId} turn=${turnId}: ${(err as Error).message}`
-          )
-        }
+  ): PendingToolCall[] {
+    const entries = this.pendingToolListForTurn<PendingToolCall>(
+      conversationId,
+      turnId
+    )
+    const cleared: PendingToolCall[] = []
+    for (const entry of entries) {
+      const pending = this.clearPendingToolCall(
+        String(conversationId),
+        entry.toolCallId,
+        reason
+      )
+      if (pending) {
+        cleared.push(pending)
       }
     }
-    return aborted
+    return cleared
   }
 
   pendingToolClearConversation(conversationId: ConversationId): number {
-    const convMap = this.pendingByConversation.get(conversationId)
+    const exactConversationId = ConversationId.of(conversationId)
+    const convMap = this.pendingByConversation.get(exactConversationId)
     if (!convMap) return 0
     const count = convMap.size
-    this.pendingByConversation.delete(conversationId)
-    this.pendingByTurn.delete(conversationId)
+    this.pendingByConversation.delete(exactConversationId)
+    this.pendingByTurn.delete(exactConversationId)
     return count
   }
 
@@ -2028,45 +2545,23 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   }
 
   private getOrCreatePendingConvMap(conversationId: ConversationId) {
-    let m = this.pendingByConversation.get(conversationId)
+    const exactConversationId = ConversationId.of(conversationId)
+    let m = this.pendingByConversation.get(exactConversationId)
     if (!m) {
       m = new Map()
-      this.pendingByConversation.set(conversationId, m)
+      this.pendingByConversation.set(exactConversationId, m)
     }
     return m
   }
 
   private getOrCreatePendingTurnMap(conversationId: ConversationId) {
-    let m = this.pendingByTurn.get(conversationId)
+    const exactConversationId = ConversationId.of(conversationId)
+    let m = this.pendingByTurn.get(exactConversationId)
     if (!m) {
       m = new Map()
-      this.pendingByTurn.set(conversationId, m)
+      this.pendingByTurn.set(exactConversationId, m)
     }
     return m
-  }
-
-  /**
-   * Re-pin the manager-level turn anchor after ContextStateService
-   * runs a wholesale `replaceMessages`. The anchor lives on
-   * SessionLifecycleService because turn open/commit/abort is owned
-   * by the lifecycle layer; ContextStateService asks the lifecycle
-   * to refresh its view once the new tail length is known.
-   */
-  repinTurnAnchorAfterReplaceMessages(conversationId: string): void {
-    const session = this.getSession(conversationId)
-    if (!session) return
-    const anchor = this.turnAnchors.get(conversationId)
-    if (!anchor) return
-    const ctx = this.contextState.getContextRecord(conversationId)!
-    this.turnAnchors.set(conversationId, {
-      ...anchor,
-      messagesAt: ctx.messages.length,
-      messageRecordsAt: ctx.messageRecords.length,
-      transcriptEventsAt: ctx.transcriptEvents.length,
-      contextRecordsAt: ctx.contextState.records.length,
-      usedTokens: ctx.usedTokens,
-      messagesGeneration: ctx.messagesGeneration,
-    })
   }
 
   onModuleInit(): void {
@@ -2089,10 +2584,81 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
    * Used by the orchestration layer to release provider-specific resources
    * (e.g., ProviderAdapter.dispose() for Codex WebSocket connections).
    */
-  registerSessionCleanupHandler(
-    handler: (conversationId: string, session: SessionRecord) => void
+  registerSessionCleanupHandler(handler: SessionCleanupHandler): () => void {
+    this.sessionCleanupHandlers.add(handler)
+    return () => {
+      this.sessionCleanupHandlers.delete(handler)
+    }
+  }
+
+  /**
+   * Register an external runtime-work probe. The disposer prevents a
+   * transport instance from pinning sessions after it has been torn down.
+   */
+  registerSessionBusyProbe(probe: SessionBusyProbe): () => void {
+    this.sessionBusyProbes.add(probe)
+    return () => {
+      this.sessionBusyProbes.delete(probe)
+    }
+  }
+
+  private invokeSessionCleanupHandlers(
+    conversationId: string,
+    session: SessionRecord
   ): void {
-    this.onSessionCleanupHandler = handler
+    // Snapshot first: a handler may dispose itself or register another owner
+    // without changing which owners observe this already-started eviction.
+    for (const handler of [...this.sessionCleanupHandlers]) {
+      try {
+        void Promise.resolve(handler(conversationId, session)).catch(
+          (error) => {
+            this.logger.error(
+              `Session cleanup handler failed for ${conversationId}: ${String(error)}`
+            )
+          }
+        )
+      } catch (error) {
+        this.logger.error(
+          `Session cleanup handler failed for ${conversationId}: ${String(error)}`
+        )
+      }
+    }
+  }
+
+  /**
+   * One conservative activity predicate shared by automatic expiry and the
+   * destructive clear-all path. Neither operation may evict a live graph
+   * turn, a provider/backend request, or a client interaction in flight.
+   */
+  private isSessionBusy(
+    conversationId: string,
+    session: SessionRecord
+  ): boolean {
+    const stream = this.sessionStream.getStreamRecord(conversationId)
+    const activeTurnSignal = this.getCurrentTurnAbortSignal(conversationId)
+    if (
+      this.activeGraphTurns.has(conversationId) ||
+      (activeTurnSignal != null && !activeTurnSignal.aborted) ||
+      this.pendingToolCallCount(session.conversationId) > 0 ||
+      (stream?.pendingInteractionQueries.size ?? 0) > 0 ||
+      this.listRunningSubagentRuns(conversationId).length > 0 ||
+      session.deferredControlContinuations.length > 0
+    ) {
+      return true
+    }
+    for (const probe of this.sessionBusyProbes) {
+      try {
+        if (probe(conversationId, session)) return true
+      } catch (error) {
+        // A failed probe must preserve the session; deleting a potentially
+        // active provider stream is strictly worse than postponing cleanup.
+        this.logger.warn(
+          `Session busy probe failed for ${conversationId}; preserving session: ${String(error)}`
+        )
+        return true
+      }
+    }
+    return false
   }
 
   /**
@@ -2186,7 +2752,15 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
 
     const timer = setTimeout(() => {
       this.scheduledPersistTimers.delete(conversationId)
-      this.persistSession(conversationId)
+      try {
+        this.persistSession(conversationId)
+      } catch (error) {
+        // A debounced flush has no synchronous caller to fail. Keep the
+        // mounted session visible, but never hide a rejected durable write.
+        this.logger.error(
+          `Scheduled session persistence failed for ${conversationId}: ${String(error)}`
+        )
+      }
     }, this.PERSIST_DEBOUNCE_MS)
     timer.unref?.()
     this.scheduledPersistTimers.set(conversationId, timer)
@@ -2200,16 +2774,12 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Synchronously flush a session's row to SQLite, bypassing the
+   * Synchronously flush a mounted session snapshot to SQLite, bypassing the
    * `schedulePersist` debounce.
    *
-   * The lifecycle service normally batches writes through a 5ms debounce
-   * so a burst of mutations on the same conversation collapses into one
-   * `upsertSession`. That is correct for the hot path, but it creates a
-   * window where a *just-mounted* session (newly created via
-   * `getOrCreateSession`) lives only in memory while downstream code
-   * already starts spawning turn rows whose foreign key references
-   * `sessions(conversation_id)`.
+   * Fresh bootstrap commits the parent row before it publishes any in-memory
+   * record. This remains the synchronous boundary for mutations made after
+   * mount and immediately before a downstream turn writes foreign-keyed rows.
    *
    * `TurnLifecycle.spawn` calls this method right before its first
    * `appendEvent({kind:"spawned"})` so `turn_events` cannot violate the
@@ -2221,7 +2791,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     this.clearScheduledPersist(conversationId)
     const session = this.sessions.get(conversationId)
     if (!session) return
-    this.writeSessionRow(conversationId, session)
+    this.persistMountedSessionSnapshot(conversationId, session)
   }
 
   private persistAllSessions(): void {
@@ -2239,15 +2809,13 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
    * where the caller knows the id but does not hold the live object —
    * the in-memory map is the source of truth, not the parameter.
    *
-   * For paths that hold the session object directly (load-time repair
-   * write-back, analytics-time silent write-back), use
-   * {@link writeSessionRow} which has no in-memory lookup and no
-   * silent-no-op behaviour.
+   * Direct holders use `persistMountedSessionSnapshot`, which requires its
+   * matching mounted context record instead of silently omitting a write.
    */
   persistSession(conversationId: string): void {
     const session = this.sessions.get(conversationId)
     if (!session) return
-    this.writeSessionRow(conversationId, session)
+    this.persistMountedSessionSnapshot(conversationId, session)
   }
 
   persistTodos(conversationId: string, todos: SessionTodoItem[]): void {
@@ -2274,13 +2842,31 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  getGoalState(conversationId: string): BridgeGoalState | undefined {
+    return this.sessions.get(conversationId)?.goalState
+  }
+
+  setGoalState(
+    conversationId: string,
+    goalState: BridgeGoalState | undefined
+  ): void {
+    const session = this.sessions.get(conversationId)
+    if (!session) {
+      throw new Error(
+        `Cannot persist goal state for missing session ${conversationId}`
+      )
+    }
+    session.goalState = goalState
+    this.persistSession(conversationId)
+  }
+
   private loadPersistedTodos(conversationId: string): SessionTodoItem[] {
     return this.sessionPersistence
       .listTodos(ConversationId.of(conversationId))
       .map((todo) => ({
         id: todo.id,
         content: todo.content,
-        status: this.normalizePersistedTodoStatus(todo.status),
+        status: todo.status,
         createdAt: todo.createdAt,
         updatedAt: todo.updatedAt,
         dependencies: [...todo.dependencies],
@@ -2288,298 +2874,626 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   }
 
   private loadRestoredOpenToolLedger(
-    conversationId: ConversationId
+    conversationId: ConversationId,
+    openRuntimeEdges: ReturnType<ToolCallLedger["listOpen"]>,
+    persistedGraph: readonly PersistedMessage[]
   ): PersistedPendingToolCall[] {
-    const restored = this.toolCallLedger.listOpen(conversationId).map(
-      (entry, index): PersistedPendingToolCall => ({
-        toolCallId: entry.toolUseId,
-        toolName: entry.toolName,
-        toolInput: {},
-        modelCallId: "",
-        startedEmitted: true,
-        sentAt: entry.openedAt,
-        execIds: [],
-        executionOwner: "client",
-        executionStatus: "aborted",
-        executionRecoveryReason: "session_restore",
-        executionOrder: entry.openMessageSeq || index + 1,
-      })
+    if (openRuntimeEdges.length === 0) {
+      return []
+    }
+    if (openRuntimeEdges.some((entry) => entry.origin !== "runtime")) {
+      throw new Error(
+        `Restored runtime tool projection received a non-runtime ledger edge for ${conversationId}`
+      )
+    }
+    const toolUses = this.loadDurableRuntimeToolUses(
+      conversationId,
+      persistedGraph
+    )
+    const restored = openRuntimeEdges.map(
+      (entry, index): PersistedPendingToolCall => {
+        if (!entry.turnId) {
+          throw new Error(
+            `Restored runtime tool edge has no turn owner: conversation=${conversationId} ` +
+              `toolCallId=${entry.toolUseId}`
+          )
+        }
+        const toolUse = toolUses.get(entry.toolUseId)
+        if (!toolUse) {
+          throw new Error(
+            `Restored runtime tool edge has no durable tool_use block: conversation=${conversationId} ` +
+              `toolCallId=${entry.toolUseId}`
+          )
+        }
+        if (toolUse.toolName !== entry.toolName) {
+          throw new Error(
+            `Restored runtime tool edge has conflicting tool names: conversation=${conversationId} ` +
+              `toolCallId=${entry.toolUseId} ledger=${entry.toolName} graph=${toolUse.toolName}`
+          )
+        }
+        if (!toolUse.sourceMessage.turnId) {
+          throw new Error(
+            `Restored runtime tool edge source has no graph turn: conversation=${conversationId} ` +
+              `toolCallId=${entry.toolUseId} sourceUuid=${toolUse.sourceMessage.uuid}`
+          )
+        }
+        if (toolUse.sourceMessage.turnId !== entry.turnId) {
+          throw new Error(
+            `Restored runtime tool edge turn ownership mismatch: conversation=${conversationId} ` +
+              `toolCallId=${entry.toolUseId} ledgerTurn=${entry.turnId} ` +
+              `graphTurn=${toolUse.sourceMessage.turnId}`
+          )
+        }
+        const dispatches = this.execDispatchStore.findActiveByToolCall(
+          conversationId,
+          entry.toolUseId
+        )
+        const sidechainOwner = this.resolveSubagentSidechainToolOwner(
+          conversationId,
+          entry.toolUseId,
+          toolUse.sourceMessage
+        )
+        const execution = this.resolveRestoredToolExecution(
+          dispatches,
+          sidechainOwner !== undefined
+        )
+        const skillActivationReceipts =
+          this.readDurableToolSkillActivationReceipts(
+            conversationId,
+            entry.toolUseId,
+            toolUse.sourceMessage
+          )
+        const hookAdditionalContexts =
+          this.readDurableToolHookAdditionalContexts(
+            conversationId,
+            entry.toolUseId,
+            toolUse.sourceMessage
+          )
+        return {
+          turnId: entry.turnId,
+          toolCallId: entry.toolUseId,
+          toolName: entry.toolName,
+          toolInput: toolUse.toolInput,
+          modelCallId: "",
+          startedEmitted: true,
+          sentAt: entry.openedAt,
+          execIds: dispatches.map((dispatch) => dispatch.execId),
+          executionOwner: "client",
+          executionStatus: execution.status,
+          executionRecoveryReason: execution.reason,
+          executionOrder: entry.openMessageSeq || index + 1,
+          ...(skillActivationReceipts.length > 0
+            ? { skillActivationReceipts }
+            : {}),
+          ...(hookAdditionalContexts.length > 0
+            ? { hookAdditionalContexts }
+            : {}),
+          ...(sidechainOwner ? { sidechainOwner } : {}),
+          dispatches: dispatches.map((dispatch) => ({
+            streamEpoch: dispatch.streamEpoch,
+            execId: dispatch.execId,
+            protocolExecId: dispatch.protocolExecId,
+            state: dispatch.state,
+            dispatchKind: dispatch.dispatchKind,
+            queuedAt: dispatch.queuedAt,
+            dispatchingAt: dispatch.dispatchingAt,
+            dispatchedAt: dispatch.dispatchedAt,
+          })),
+        }
+      }
     )
     if (restored.length > 0) {
       this.logger.warn(
-        `[context-restore] found ${restored.length} open ledger tool call(s) ` +
-          `requiring process_restart recovery for ${conversationId}`
+        `[context-restore] reconstructed ${restored.length} open runtime tool edge(s) ` +
+          `from durable graph and exec dispatch state for ${conversationId}`
       )
     }
     return restored
   }
 
-  abortRestoredOpenToolLedger(conversationId: string): number {
-    let abortedCount = 0
-    const conv = ConversationId.of(conversationId)
-    this.messageStore.runInTransaction(conv, (txn) => {
-      const result = this.toolCallLedger.abortOpenForConversation(txn, {
-        reason: "process_restart",
-      })
-      abortedCount = result.abortedToolCallIds.length
-      for (const entry of result.abortedToolCallIds) {
-        this.messageStore.appendAbortToolResultBlock(
-          txn,
-          buildInterruptedToolResultBlock({
-            toolCallId: entry.toolUseId,
-            toolName: entry.toolName,
-            reason: "process_restart",
-          }),
-          { turnId: entry.turnId }
+  /**
+   * Tool input is durable graph data, not restart fallback data. Reconstruct
+   * it exactly so a late client result follows the same formatter and edit
+   * path as it would have before the process restarted.
+   */
+  private loadDurableRuntimeToolUses(
+    conversationId: ConversationId,
+    persistedGraph: readonly PersistedMessage[]
+  ): Map<string, DurableRuntimeToolUse> {
+    const toolUses = new Map<string, DurableRuntimeToolUse>()
+    for (const message of persistedGraph) {
+      if (message.role !== "assistant") continue
+      let blocks: ContentBlock[]
+      try {
+        blocks = normalizeContent(message.content as MessageContent)
+      } catch (error) {
+        throw new Error(
+          `Cannot decode durable assistant content while restoring ${conversationId}: ${String(error)}`
         )
       }
-    })
-    if (abortedCount > 0) {
-      this.refreshTranscriptFromMessageStore(conversationId)
-      this.logger.warn(
-        `[context-restore] marked ${abortedCount} restored open ledger tool call(s) ` +
-          `as process_restart aborted and appended synthetic tool_result blocks for ${conversationId}`
-      )
-    }
-    return abortedCount
-  }
-
-  abortInterruptedOpenToolLedger(
-    conversationId: string,
-    interruptedToolCalls: readonly InterruptedToolCallInfo[]
-  ): number {
-    if (interruptedToolCalls.length === 0) return 0
-    let abortedCount = 0
-    const conv = ConversationId.of(conversationId)
-    const interruptedById = new Map(
-      interruptedToolCalls.map((toolCall) => [toolCall.toolCallId, toolCall])
-    )
-    const toolIdsByAbortReason = new Map<AbortReason, string[]>()
-    for (const toolCall of interruptedToolCalls) {
-      const abortReason = this.mapToolInterruptionAbortReason(toolCall.reason)
-      const ids = toolIdsByAbortReason.get(abortReason) ?? []
-      ids.push(toolCall.toolCallId)
-      toolIdsByAbortReason.set(abortReason, ids)
-    }
-
-    this.messageStore.runInTransaction(conv, (txn) => {
-      for (const [abortReason, toolUseIds] of toolIdsByAbortReason) {
-        const result = this.toolCallLedger.abortOpenToolCalls(txn, {
-          toolUseIds,
-          reason: abortReason,
-        })
-        abortedCount += result.abortedToolCallIds.length
-        for (const entry of result.abortedToolCallIds) {
-          const interrupted = interruptedById.get(entry.toolUseId)
-          this.messageStore.appendAbortToolResultBlock(
-            txn,
-            buildInterruptedToolResultBlock({
-              toolCallId: entry.toolUseId,
-              toolName: interrupted?.toolName || entry.toolName,
-              reason: interrupted?.reason ?? "stream_aborted",
-              detail: interrupted?.detail,
-            }),
-            { turnId: entry.turnId }
+      for (const block of blocks) {
+        if (!isToolUseBlock(block)) continue
+        if (toolUses.has(block.id)) {
+          throw new Error(
+            `Duplicate durable tool_use id while restoring ${conversationId}: ${block.id}`
           )
         }
+        toolUses.set(block.id, {
+          toolName: block.name,
+          toolInput: structuredClone(block.input),
+          sourceMessage: message,
+        })
       }
-    })
-
-    if (abortedCount > 0) {
-      this.refreshTranscriptFromMessageStore(conversationId)
-      this.logger.warn(
-        `[tool-interruption] marked ${abortedCount} open ledger tool call(s) ` +
-          `as aborted and appended synthetic tool_result blocks for ${conversationId}`
-      )
     }
-    return abortedCount
-  }
-
-  private mapToolInterruptionAbortReason(
-    reason: ToolInterruptionReason
-  ): AbortReason {
-    switch (reason) {
-      case "process_restart":
-        return "process_restart"
-      case "parent_turn_superseded":
-        return "turn_superseded"
-      case "parent_cancelled":
-        return "user_cancelled"
-      case "stream_aborted":
-        return "stream_failed"
-    }
-  }
-
-  private refreshTranscriptFromMessageStore(conversationId: string): void {
-    if (!this.sessions.has(conversationId)) return
-    const messages = this.loadPersistedMessages(
-      ConversationId.of(conversationId)
-    )
-    this.contextState.replaceMessages(conversationId, messages)
-  }
-
-  private normalizePersistedTodoStatus(value: string): SessionTodoStatus {
-    return value === "pending" ||
-      value === "in_progress" ||
-      value === "completed" ||
-      value === "cancelled"
-      ? value
-      : "pending"
+    return toolUses
   }
 
   /**
-   * Write a session row to SQLite without depending on `this.sessions`.
-   *
-   * This is the sole persistence primitive — `persistSession` is a thin
-   * wrapper around it that resolves the session via in-memory map first.
-   * Any code path that holds a session object (e.g. just-deserialized,
-   * not yet mounted) MUST call this directly instead of `persistSession`,
-   * otherwise the silent-no-op in `persistSession` will swallow the
-   * write and leave SQLite stale.
+   * Cold recovery may observe a main-graph Exec envelope after its outbound
+   * write began but before the bridge durably recorded the client terminal.
+   * Such a frame is delivery-uncertain and cannot be replayed without risking
+   * duplicate execution. Park every potentially sent main dispatch in one
+   * graph transaction; Cursor's official interrupted-pending resolution (or
+   * the original exact terminal frame) is then its only settlement authority.
+   * Queued frames remain replayable because their write never began.
    */
-  private writeSessionRow(
+  private parkRestoredMainClientDispatches(
+    conversationId: ConversationId,
+    openRuntimeEdges: ReturnType<ToolCallLedger["listOpen"]>,
+    persistedGraph: readonly PersistedMessage[],
+    recoveredAt: number = Date.now()
+  ): number {
+    if (openRuntimeEdges.length === 0) return 0
+    if (!Number.isSafeInteger(recoveredAt) || recoveredAt <= 0) {
+      throw new Error(
+        "parkRestoredMainClientDispatches: recoveredAt must be a positive epoch"
+      )
+    }
+    const toolUses = this.loadDurableRuntimeToolUses(
+      conversationId,
+      persistedGraph
+    )
+    return this.messageStore.runInTransaction(conversationId, (txn) => {
+      let parked = 0
+      for (const entry of openRuntimeEdges) {
+        const toolUse = toolUses.get(entry.toolUseId)
+        if (!toolUse) {
+          throw new Error(
+            `Restored runtime tool edge has no durable tool_use block: ` +
+              `conversation=${conversationId} toolCallId=${entry.toolUseId}`
+          )
+        }
+        if (toolUse.sourceMessage.isSidechain === true) {
+          continue
+        }
+        const dispatches = this.execDispatchStore.findActiveByToolCall(
+          conversationId,
+          entry.toolUseId
+        )
+        for (const dispatch of dispatches) {
+          if (
+            dispatch.state !== "dispatching" &&
+            dispatch.state !== "dispatched"
+          ) {
+            continue
+          }
+          this.execDispatchStore.awaitInterruptedResolutionInTransaction(
+            txn,
+            dispatch,
+            recoveredAt
+          )
+          parked += 1
+        }
+      }
+      return parked
+    })
+  }
+
+  /**
+   * Recover candidate skill transitions from the durable assistant tool_use
+   * that opened this exact ledger edge. Older graph rows legitimately omit
+   * the metadata; malformed current metadata is rejected rather than guessed.
+   */
+  private readDurableToolSkillActivationReceipts(
+    conversationId: ConversationId,
+    toolCallId: string,
+    source: PersistedMessage
+  ): readonly CursorSkillActivationReceipt[] {
+    const raw = source.metadata?.[CURSOR_SKILL_ACTIVATION_RECEIPTS_METADATA_KEY]
+    if (raw === undefined) return []
+    if (!Array.isArray(raw)) {
+      throw new Error(
+        `Invalid durable skill activation metadata for ${conversationId}/${toolCallId}: expected an array`
+      )
+    }
+
+    const byToolCallId = new Map<
+      string,
+      readonly CursorSkillActivationReceipt[]
+    >()
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error(
+          `Invalid durable skill activation metadata entry for ${conversationId}/${toolCallId}`
+        )
+      }
+      const value = entry as Record<string, unknown>
+      const rawToolCallId = value.toolCallId
+      const rawReceipts = value.receipts
+      if (
+        typeof rawToolCallId !== "string" ||
+        !rawToolCallId.trim() ||
+        rawToolCallId !== rawToolCallId.trim() ||
+        rawToolCallId.includes("\u0000") ||
+        !Array.isArray(rawReceipts) ||
+        byToolCallId.has(rawToolCallId)
+      ) {
+        throw new Error(
+          `Invalid durable skill activation metadata shape for ${conversationId}/${toolCallId}`
+        )
+      }
+      const receipts: CursorSkillActivationReceipt[] = []
+      const names = new Set<string>()
+      for (const rawReceipt of rawReceipts) {
+        if (
+          !rawReceipt ||
+          typeof rawReceipt !== "object" ||
+          Array.isArray(rawReceipt)
+        ) {
+          throw new Error(
+            `Invalid durable skill activation receipt for ${conversationId}/${rawToolCallId}`
+          )
+        }
+        const receipt = rawReceipt as Record<string, unknown>
+        const skillName = receipt.skillName
+        const reason = receipt.reason
+        if (
+          typeof skillName !== "string" ||
+          !skillName.trim() ||
+          typeof reason !== "string" ||
+          !reason.trim() ||
+          names.has(skillName)
+        ) {
+          throw new Error(
+            `Invalid durable skill activation receipt shape for ${conversationId}/${rawToolCallId}`
+          )
+        }
+        names.add(skillName)
+        receipts.push(
+          Object.freeze({
+            skillName,
+            reason,
+          })
+        )
+      }
+      byToolCallId.set(rawToolCallId, receipts)
+    }
+    return byToolCallId.get(toolCallId) ?? []
+  }
+
+  private readDurableToolHookAdditionalContexts(
+    conversationId: ConversationId,
+    toolCallId: string,
+    source: PersistedMessage
+  ): readonly CursorHookAdditionalContextReceipt[] {
+    const raw = source.metadata?.[CURSOR_HOOK_ADDITIONAL_CONTEXTS_METADATA_KEY]
+    if (raw === undefined) return []
+    if (!Array.isArray(raw)) {
+      throw new Error(
+        `Invalid durable hook context metadata for ${conversationId}/${toolCallId}: expected an array`
+      )
+    }
+    const matching = raw.filter((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error(
+          `Invalid durable hook context metadata entry for ${conversationId}/${toolCallId}`
+        )
+      }
+      return (entry as Record<string, unknown>).toolCallId === toolCallId
+    })
+    if (matching.length > 1) {
+      throw new Error(
+        `Duplicate durable hook context metadata for ${conversationId}/${toolCallId}`
+      )
+    }
+    if (matching.length === 0) return []
+    const contexts = (matching[0] as Record<string, unknown>).contexts
+    if (!Array.isArray(contexts)) {
+      throw new Error(
+        `Invalid durable hook contexts for ${conversationId}/${toolCallId}`
+      )
+    }
+    return contexts.map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error(
+          `Invalid durable hook context for ${conversationId}/${toolCallId}`
+        )
+      }
+      const value = entry as Record<string, unknown>
+      if (
+        typeof value.hookEventName !== "string" ||
+        !isCursorHookAdditionalContextEvent(value.hookEventName) ||
+        typeof value.content !== "string" ||
+        !value.content.length
+      ) {
+        throw new Error(
+          `Invalid durable hook context shape for ${conversationId}/${toolCallId}`
+        )
+      }
+      return Object.freeze({
+        hookEventName: value.hookEventName,
+        content: value.content,
+      })
+    })
+  }
+
+  /**
+   * Classify a restored tool edge from the message row that opened it.
+   *
+   * The sidechain path is intentionally fail-closed: an incomplete branch
+   * identity is never downgraded to a parent tool call, because that would
+   * let a late client terminal mutate the wrong graph after restart.
+   */
+  private resolveSubagentSidechainToolOwner(
+    conversationId: ConversationId,
+    toolCallId: string,
+    source: PersistedMessage
+  ): SubagentSidechainToolOwner | undefined {
+    if (source.isSidechain !== true) {
+      const leakedSidechainFields = [
+        source.threadId,
+        source.branchId,
+        source.agentId,
+        source.forkSourceUuid,
+      ].filter((value) => value !== undefined)
+      if (
+        leakedSidechainFields.length > 0 ||
+        source.forkLineage !== undefined
+      ) {
+        throw new Error(
+          `Restored parent tool edge carries sidechain identity fields: ` +
+            `conversation=${conversationId} toolCallId=${toolCallId} sourceUuid=${source.uuid}`
+        )
+      }
+      return undefined
+    }
+
+    const turnId = source.turnId
+    const forkLineage = source.forkLineage
+    let threadId: string
+    let branchId: string
+    let agentId: string
+    let forkSourceUuid: string
+    let exactForkLineage: string[]
+    try {
+      threadId = requireExactDurableIdentifier(
+        source.threadId,
+        "Restored sidechain thread id"
+      )
+      branchId = requireExactDurableIdentifier(
+        source.branchId,
+        "Restored sidechain branch id"
+      )
+      agentId = requireExactDurableIdentifier(
+        source.agentId,
+        "Restored sidechain agent id"
+      )
+      forkSourceUuid = requireExactDurableIdentifier(
+        source.forkSourceUuid,
+        "Restored sidechain fork source UUID"
+      )
+      exactForkLineage = Array.isArray(forkLineage)
+        ? forkLineage.map((value, index) =>
+            requireExactDurableIdentifier(
+              value,
+              `Restored sidechain fork lineage ${index}`
+            )
+          )
+        : []
+    } catch {
+      throw new Error(
+        `Restored sidechain tool edge has incomplete graph identity: ` +
+          `conversation=${conversationId} toolCallId=${toolCallId} sourceUuid=${source.uuid}`
+      )
+    }
+    if (!turnId || exactForkLineage.length === 0) {
+      throw new Error(
+        `Restored sidechain tool edge has incomplete graph identity: ` +
+          `conversation=${conversationId} toolCallId=${toolCallId} sourceUuid=${source.uuid}`
+      )
+    }
+    if (!exactForkLineage.includes(forkSourceUuid)) {
+      throw new Error(
+        `Restored sidechain tool edge fork lineage omits its fork source: ` +
+          `conversation=${conversationId} toolCallId=${toolCallId} sourceUuid=${source.uuid}`
+      )
+    }
+    return {
+      agentId,
+      threadId,
+      branchId,
+      turnId,
+      forkSourceUuid,
+      forkLineage: exactForkLineage,
+      sourceToolAssistantUuid: source.uuid,
+    }
+  }
+
+  /**
+   * A parked, potentially delivered request is deliberately non-terminal and
+   * must never be replayed on a new stream. Its original client identity
+   * remains authoritative until a real terminal frame or an official
+   * interrupted-pending resolution is received.
+   */
+  private resolveRestoredToolExecution(
+    dispatches: readonly ExecDispatchRecord[],
+    isRecoveredSidechain: boolean
+  ): {
+    status: ToolExecutionStatus
+    reason: ToolExecutionRecoveryReason
+  } {
+    if (
+      dispatches.some(
+        (dispatch) => dispatch.state === "awaiting_interrupted_resolution"
+      )
+    ) {
+      return {
+        status: "awaitingClientResult",
+        reason: isRecoveredSidechain
+          ? "subagent_restart"
+          : "interrupted_pending_resolution",
+      }
+    }
+    if (
+      dispatches.some(
+        (dispatch) =>
+          dispatch.state === "dispatching" || dispatch.state === "dispatched"
+      )
+    ) {
+      return {
+        status: "awaitingClientResult",
+        reason: isRecoveredSidechain ? "subagent_restart" : "session_restore",
+      }
+    }
+    return {
+      status: "pending",
+      reason: "session_restore",
+    }
+  }
+
+  /**
+   * Persist a mounted session's normalized state as one transaction. Graph
+   * writes have their own append API, while this method owns the session row
+   * and mutable domain projection that accompany it.
+   */
+  private persistMountedSessionSnapshot(
     conversationId: string,
     session: SessionRecord
   ): void {
-    const state = this.serializeSession(session)
-    try {
-      this.sessionPersistence.upsertSession({
-        conversationId: ConversationId.of(conversationId),
-        createdAt: session.createdAt.getTime(),
-        lastActivityAt: session.lastActivityAt.getTime(),
-        model: session.model,
-        config: this.serializeSessionConfig(state),
-      })
-      this.persistInitialTranscriptMessages(
-        ConversationId.of(conversationId),
-        state.messages
-      )
-      this.writeSessionDomainState(conversationId, state)
-    } catch (error) {
-      this.logger.error(
-        `Failed to persist session ${conversationId}: ${String(error)}`
+    if (session.conversationId !== conversationId) {
+      throw new Error(
+        `Cannot persist ${conversationId}: session belongs to ${session.conversationId}`
       )
     }
+    const context = this.contextState.getContextRecord(conversationId)
+    if (!context) {
+      throw new Error(
+        `Cannot persist ${conversationId}: ContextStateRecord is not mounted`
+      )
+    }
+    const cid = ConversationId.of(conversationId)
+    this.messageStore.runInTransaction(cid, (txn) => {
+      this.persistSessionSnapshotInTransaction(txn, session, context)
+    })
+  }
+
+  private persistSessionSnapshotInTransaction(
+    txn: SessionTxn,
+    session: SessionRecord,
+    context: ContextStateRecord
+  ): void {
+    const cid = ConversationId.of(session.conversationId)
+    if (txn.conversationId !== cid) {
+      throw new Error(
+        `Cannot persist session snapshot: transaction conversation ${txn.conversationId} does not match ${cid}`
+      )
+    }
+    this.sessionPersistence.persistSnapshotInTransaction(
+      txn,
+      this.createSessionPersistenceSnapshot(session, context)
+    )
   }
 
   private serializeSessionConfig(
-    state: PersistedChatSessionV1
-  ): Record<string, unknown> {
-    return {
-      version: state.version,
-      conversationId: state.conversationId,
-      model: state.model,
-      lastAssistantBackend: state.lastAssistantBackend,
-      lastAssistantModel: state.lastAssistantModel,
-      thinkingLevel: state.thinkingLevel,
-      thinkingDetailsRequested: state.thinkingDetailsRequested,
-      isAgentic: state.isAgentic,
-      supportedTools: state.supportedTools,
-      mcpToolDefs: state.mcpToolDefs,
-      useWeb: state.useWeb,
-      requestContextEnv: state.requestContextEnv,
-      createdAt: state.createdAt,
-      lastActivityAt: state.lastActivityAt,
-      projectContext: state.projectContext,
-      codeChunks: state.codeChunks,
-      cursorCommands: state.cursorCommands,
-      customSystemPrompt: state.customSystemPrompt,
-      explicitContext: state.explicitContext,
-      contextTokenLimit: state.contextTokenLimit,
-      contextMaxMode: state.contextMaxMode,
-      usedContextTokens: state.usedContextTokens,
-      requestedMaxOutputTokens: state.requestedMaxOutputTokens,
-      requestedModelParameters: state.requestedModelParameters,
-      additionalRoots: state.additionalRoots,
+    session: SessionRecord
+  ): SerializedSessionConfig {
+    const config: SerializedSessionConfig = {
+      version: CURRENT_SESSION_SNAPSHOT_VERSION,
+      codexProviderIdentity: session.codexProviderIdentity,
+      lastAssistantBackend: session.lastAssistantBackend,
+      lastAssistantModel: session.lastAssistantModel,
+      thinkingLevel: session.thinkingLevel,
+      thinkingDetailsRequested: session.thinkingDetailsRequested,
+      isAgentic: session.isAgentic,
+      supportedTools: [...session.supportedTools],
+      mcpToolDefs: session.mcpToolDefs,
+      useWeb: session.useWeb,
+      requestContextEnv: session.requestContextEnv,
+      workspace: session.workspace
+        ? serializeSessionWorkspace(session.workspace)
+        : null,
+      cursorManagedReadResources: serializeCursorManagedReadResources(
+        session.cursorManagedReadResources
+      ),
+      codeChunks: session.codeChunks,
+      cursorCommands: session.cursorCommands,
+      customSystemPrompt: session.customSystemPrompt,
+      hooksAdditionalContext: session.hooksAdditionalContext,
+      ...(session.goalState
+        ? { goalState: serializeBridgeGoalState(session.goalState) }
+        : {}),
+      ...(session.isRootProjectConversation !== undefined
+        ? { isRootProjectConversation: session.isRootProjectConversation }
+        : {}),
+      explicitContext: session.explicitContext,
+      contextTokenLimit: session.contextTokenLimit,
+      contextTokenLimitSource: session.contextTokenLimitSource,
+      contextMaxMode: session.contextMaxMode,
+      usedContextTokens: session.usedContextTokens,
+      requestedMaxOutputTokens: session.requestedMaxOutputTokens,
+      requestedModelParameters: session.requestedModelParameters,
     }
+    return config
   }
 
-  private writeSessionDomainState(
-    conversationId: string,
-    state: PersistedChatSessionV1
-  ): void {
-    const cid = ConversationId.of(conversationId)
+  private createSessionPersistenceSnapshot(
+    session: SessionRecord,
+    context: ContextStateRecord
+  ): SessionPersistenceSnapshot {
+    const cid = ConversationId.of(session.conversationId)
     const updatedAt = Date.now()
-    this.sessionPersistence.upsertContextState({
-      conversationId: cid,
-      updatedAt,
-      state: {
-        version: state.version,
-        messageRecords: state.messageRecords,
-        transcriptEvents: state.transcriptEvents,
-        nextTranscriptEventSeq: state.nextTranscriptEventSeq,
-        contextState: state.contextState,
-        taskBudgetState: state.taskBudgetState,
-        topLevelAgentTurnState: state.topLevelAgentTurnState,
-        lastEmittedContextSummaryCompactionId:
-          state.lastEmittedContextSummaryCompactionId,
-        lastEmittedContextSummaryCompactionEpoch:
-          state.lastEmittedContextSummaryCompactionEpoch,
-        lastContextSummaryCompactionEpoch:
-          state.lastContextSummaryCompactionEpoch,
-        pendingInteractionQueryCount: state.pendingInteractionQueryCount,
-        backgroundCommands: state.backgroundCommands,
-        currentAssistantMessage: state.currentAssistantMessage,
-        usedTokens: state.usedTokens,
-        toolMetrics: state.toolMetrics,
-        readSnapshots: state.readSnapshots,
-        turns: state.turns,
-        stepId: state.stepId,
-        execId: state.execId,
-        interactionQueryId: state.interactionQueryId,
-        subAgentContexts: state.subAgentContexts,
-        restartRecovery: state.restartRecovery,
-      },
-    })
-    this.sessionPersistence.replaceFileStates(
-      cid,
-      state.fileStates.flatMap((fileState) => {
-        const size = getSessionFileStateSize(
-          fileState.beforeContent,
-          fileState.afterContent
-        )
-        if (
-          !isSessionFileStateWithinLimit(
+    return {
+      row: this.createSessionRow(session),
+      fileStates: Array.from(context.fileStates.entries()).flatMap(
+        ([path, fileState]) => {
+          const size = getSessionFileStateSize(
             fileState.beforeContent,
             fileState.afterContent
           )
-        ) {
-          this.logger.warn(
-            `Skipping oversized file state persistence for ${conversationId} ${fileState.path}: ` +
-              describeSessionFileStateLimit(size.beforeBytes, size.afterBytes)
-          )
-          return []
+          if (
+            !isSessionFileStateWithinLimit(
+              fileState.beforeContent,
+              fileState.afterContent
+            )
+          ) {
+            this.logger.warn(
+              `Skipping oversized file state persistence for ${session.conversationId} ${path}: ` +
+                describeSessionFileStateLimit(size.beforeBytes, size.afterBytes)
+            )
+            return []
+          }
+          return [
+            {
+              conversationId: cid,
+              path,
+              beforeContent: Buffer.from(fileState.beforeContent),
+              afterContent: Buffer.from(fileState.afterContent),
+              updatedAt,
+            },
+          ]
         }
-        return [
-          {
-            conversationId: cid,
-            path: fileState.path,
-            beforeContent: Buffer.from(fileState.beforeContent),
-            afterContent: Buffer.from(fileState.afterContent),
-            updatedAt,
-          },
-        ]
-      })
-    )
-    this.sessionPersistence.replaceReadPaths(
-      cid,
-      state.readPaths.map((readPath) => ({
+      ),
+      readPaths: Array.from(context.readPaths).map((readPath) => ({
         conversationId: cid,
         path: readPath,
         readAt: updatedAt,
-      }))
-    )
-    this.sessionPersistence.replaceMessageBlobs(
-      cid,
-      state.messageBlobIds.map((blobId) => ({
+      })),
+      messageBlobs: context.messageBlobIds.map((blobId) => ({
         conversationId: cid,
         blobId,
         addedAt: updatedAt,
-      }))
-    )
-    this.sessionPersistence.replaceTodos(
-      cid,
-      state.todos.map(
+      })),
+      todos: context.todos.map(
         (todo): SessionTodo => ({
           conversationId: cid,
           id: todo.id,
@@ -2589,23 +3503,27 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
           updatedAt: todo.updatedAt,
           dependencies: [...todo.dependencies],
         })
-      )
-    )
+      ),
+    }
+  }
+
+  private createSessionRow(session: SessionRecord): SessionRow {
+    return {
+      conversationId: ConversationId.of(session.conversationId),
+      createdAt: session.createdAt.getTime(),
+      lastActivityAt: session.lastActivityAt.getTime(),
+      model: session.model,
+      config: this.serializeSessionConfig(session),
+    }
   }
 
   private loadPersistedSessionState(
     row: SessionRow,
-    options?: { restoredOpenToolCalls?: PersistedPendingToolCall[] }
-  ): PersistedChatSessionV1 {
+    graph: LoadedPersistedSessionGraph,
+    restoredPendingToolCalls: readonly PersistedPendingToolCall[]
+  ): PersistedChatSession {
     const conversationId = row.conversationId as string
-    const config = row.config as Partial<PersistedChatSessionV1>
-    const contextStateRow = this.sessionPersistence.loadContextState(
-      row.conversationId
-    )
-    const contextState = (contextStateRow?.state ||
-      {}) as Partial<PersistedChatSessionV1>
-    const restoredOpenToolCalls = options?.restoredOpenToolCalls ?? []
-    const messages = this.loadPersistedMessages(row.conversationId)
+    const config = this.readCurrentSessionConfig(row)
     const fileStates = this.sessionPersistence
       .listFileStates(row.conversationId)
       .map((fileState) => ({
@@ -2621,117 +3539,208 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       .map((blob) => blob.blobId)
 
     return {
-      version: 15,
+      version: CURRENT_SESSION_SNAPSHOT_VERSION,
       conversationId,
-      messages,
-      messageRecords:
-        restoredOpenToolCalls.length > 0 &&
-        Array.isArray(contextState.messageRecords)
-          ? this.reconcileMessageRecords(contextState.messageRecords, messages)
-          : contextState.messageRecords,
-      transcriptEvents: contextState.transcriptEvents,
-      nextTranscriptEventSeq: contextState.nextTranscriptEventSeq,
-      contextState: contextState.contextState,
-      taskBudgetState: contextState.taskBudgetState,
-      topLevelAgentTurnState: contextState.topLevelAgentTurnState,
-      lastEmittedContextSummaryCompactionId:
-        contextState.lastEmittedContextSummaryCompactionId,
-      lastEmittedContextSummaryCompactionEpoch:
-        contextState.lastEmittedContextSummaryCompactionEpoch,
-      lastContextSummaryCompactionEpoch:
-        contextState.lastContextSummaryCompactionEpoch,
+      messages: [...graph.projectedMainMessages],
       model: row.model,
+      codexProviderIdentity: config.codexProviderIdentity,
       lastAssistantBackend: config.lastAssistantBackend,
       lastAssistantModel: config.lastAssistantModel,
-      lastCodexResponseId: undefined,
-      lastCodexRequestSignature: undefined,
-      thinkingLevel:
-        typeof config.thinkingLevel === "number" ? config.thinkingLevel : 0,
-      thinkingDetailsRequested: config.thinkingDetailsRequested === true,
-      isAgentic: config.isAgentic === true,
-      supportedTools: Array.isArray(config.supportedTools)
-        ? config.supportedTools
-        : [],
+      thinkingLevel: config.thinkingLevel,
+      thinkingDetailsRequested: config.thinkingDetailsRequested,
+      isAgentic: config.isAgentic,
+      supportedTools: [...config.supportedTools],
       mcpToolDefs: config.mcpToolDefs,
-      useWeb: config.useWeb === true,
+      useWeb: config.useWeb,
       requestContextEnv: config.requestContextEnv,
-      createdAt:
-        typeof config.createdAt === "number" ? config.createdAt : row.createdAt,
-      lastActivityAt:
-        typeof config.lastActivityAt === "number"
-          ? config.lastActivityAt
-          : row.lastActivityAt,
-      pendingToolCalls: restoredOpenToolCalls,
-      backgroundCommands: Array.isArray(contextState.backgroundCommands)
-        ? contextState.backgroundCommands
-        : [],
-      pendingInteractionQueryCount:
-        typeof contextState.pendingInteractionQueryCount === "number"
-          ? contextState.pendingInteractionQueryCount
-          : 0,
-      projectContext: config.projectContext,
+      createdAt: row.createdAt,
+      lastActivityAt: row.lastActivityAt,
+      restoredPendingToolCalls: [...restoredPendingToolCalls],
+      workspace: config.workspace,
+      cursorManagedReadResources: config.cursorManagedReadResources,
       codeChunks: config.codeChunks,
       cursorCommands: config.cursorCommands,
       customSystemPrompt: config.customSystemPrompt,
+      hooksAdditionalContext: config.hooksAdditionalContext,
+      goalState: config.goalState,
+      isRootProjectConversation: config.isRootProjectConversation,
       explicitContext: config.explicitContext,
       contextTokenLimit: config.contextTokenLimit,
+      contextTokenLimitSource: config.contextTokenLimitSource,
       contextMaxMode: config.contextMaxMode,
       usedContextTokens: config.usedContextTokens,
       requestedMaxOutputTokens: config.requestedMaxOutputTokens,
       requestedModelParameters: config.requestedModelParameters,
-      additionalRoots: config.additionalRoots,
-      usedTokens:
-        typeof contextState.usedTokens === "number"
-          ? contextState.usedTokens
-          : 0,
       readPaths,
-      readSnapshots: Array.isArray(contextState.readSnapshots)
-        ? contextState.readSnapshots
-        : [],
       fileStates,
-      toolMetrics: contextState.toolMetrics,
       messageBlobIds,
-      turns: Array.isArray(contextState.turns) ? contextState.turns : [],
-      currentAssistantMessage: contextState.currentAssistantMessage,
-      stepId: typeof contextState.stepId === "number" ? contextState.stepId : 0,
-      execId: typeof contextState.execId === "number" ? contextState.execId : 1,
-      interactionQueryId:
-        typeof contextState.interactionQueryId === "number"
-          ? contextState.interactionQueryId
-          : 0,
       todos: this.loadPersistedTodos(conversationId),
-      subAgentContexts: Array.isArray(contextState.subAgentContexts)
-        ? contextState.subAgentContexts
-        : undefined,
-      restartRecovery: contextState.restartRecovery,
     }
   }
 
-  private loadPersistedMessages(
+  private readCurrentSessionConfig(row: SessionRow): RestoredSessionConfig {
+    return decodeSerializedSessionConfig(row.config, String(row.conversationId))
+  }
+
+  private loadPersistedGraph(
     conversationId: ConversationId
-  ): SessionMessage[] {
-    return this.messageStore
-      .getMessages(conversationId)
-      .map((message) => this.sessionMessageFromPersistedMessage(message))
+  ): LoadedPersistedSessionGraph {
+    const rawMessages = this.messageStore.getMessages(conversationId)
+    const revisionsByMessageUuid = new Map<
+      string,
+      ReturnType<MessageStore["getAllMessageRevisions"]>
+    >()
+    for (const revision of this.messageStore.getAllMessageRevisions(
+      conversationId
+    )) {
+      const revisions = revisionsByMessageUuid.get(revision.messageUuid)
+      if (revisions) {
+        revisions.push(revision)
+      } else {
+        revisionsByMessageUuid.set(revision.messageUuid, [revision])
+      }
+    }
+    const projectedMainMessages = rawMessages
+      // A sub-agent branch is persisted in the same conversation graph for
+      // audit and branch-local replay, but never becomes parent prompt state
+      // after a cold restore. Child runners load their own `thread_id` via
+      // ContextStateService.getSubagentGraphMessages instead.
+      .filter((message) => message.isSidechain !== true)
+      .map((message) =>
+        applyMessageRevisionProjection(
+          projectPersistedMessageToSessionMessage(message),
+          revisionsByMessageUuid.get(message.uuid) ?? []
+        )
+      )
+    return {
+      rawMessages,
+      projectedMainMessages,
+    }
   }
 
-  private sessionMessageFromPersistedMessage(
-    message: PersistedMessage
-  ): SessionMessage {
-    const timestamp = new Date(message.timestamp).toISOString()
-    const content = message.content as MessageContent
-    if (message.role === "assistant") {
-      return makeSessionMessage("assistant", content, {
-        uuid: message.uuid,
-        timestamp,
-        messageId: message.messageId,
-      })
+  /** Restore one owner-scoped provider-neutral compact layout. */
+  private restoreContextProjectionFromStore(
+    owner: ProjectionOwner,
+    state: ContextConversationState,
+    graphRecords: readonly ContextTranscriptRecord[],
+    snipBoundaryRecords: readonly ContextTranscriptRecord[],
+    activeHead: ContextProjectionHead
+  ): boolean {
+    const restored = this.contextProjectionStore.restore(owner, activeHead)
+    if (!restored) {
+      throw new Error(
+        `Generic projection active head has no durable layout for ` +
+          `${owner.conversationId}/${owner.ownerKey}`
+      )
     }
-    return makeSessionMessage("user", content, {
-      uuid: message.uuid,
-      timestamp,
-      isMeta: message.isMeta,
+    const rebuilt = rebuildContextProjectionRecords({
+      graphRecords,
+      snipBoundaryRecords,
+      restored,
     })
+    state.records = rebuilt.records
+    state.compactionHistory = deriveCompactionHistoryFromTranscript(
+      rebuilt.records
+    )
+    state.activeCompactionId = rebuilt.activeCommit.id
+    state.compactionEpoch = rebuilt.generation
+    state.lastAppliedCompaction = {
+      recordCount: rebuilt.records.length,
+      attachmentFingerprint: this.requireProjectionAttachmentFingerprint(
+        rebuilt.activeCommit,
+        owner.conversationId
+      ),
+      appliedAt: rebuilt.activeCommit.createdAt,
+      compactionId: rebuilt.activeCommit.id,
+      epoch: rebuilt.generation,
+    }
+    state.graphWatermarkUuid = graphRecords.at(-1)?.id
+    delete state.toolResultReplacementState
+    return true
+  }
+
+  /**
+   * Rebuild an owner-scoped Claude projection before it is mounted. The
+   * provider layout remains distinct from the full graph used by the UI; only
+   * `ContextConversationState.records` becomes Claude's exact active window.
+   *
+   * The mutation tail follows a strict detached sequence: recover the head,
+   * prepare its unconsumed append-only tail, materialize a local next state,
+   * CAS the durable watermark, then publish the completed state to the caller.
+   * A failure leaves every lifecycle registry untouched.
+   */
+  private restoreClaudeProjectionFromStore(
+    owner: ProjectionOwner,
+    state: ContextConversationState,
+    graphRecords: readonly ContextTranscriptRecord[],
+    snipBoundaryRecords: readonly ContextTranscriptRecord[]
+  ): boolean {
+    const ref = createProviderProjectionRef({
+      owner,
+      provider: "claude",
+      localKey: CLAUDE_CONVERSATION_PROJECTION_LOCAL_KEY,
+    })
+    const restored = this.claudeProjectionStore.restore(ref)
+    if (!restored) return false
+
+    const rebuiltRecords = rebuildClaudeProjectionRecords({
+      graphRecords,
+      snipBoundaryRecords,
+      restored,
+    })
+    const drain = this.claudeProjectionStore.prepareMutationDrain(ref)
+    if (drain.expectedHeadRevision !== restored.providerHeadRevision) {
+      throw new Error(
+        `Claude cold restore observed a changed provider head for ${owner.conversationId}/${owner.ownerKey}`
+      )
+    }
+    const nextReplacementState =
+      this.claudeProjectionStore.materializePreparedMutationDrain(drain)
+    const activeCommit = getActiveCompactCommitFromTranscript(rebuiltRecords)
+    const nextLastAppliedCompaction = activeCommit
+      ? {
+          recordCount: rebuiltRecords.length,
+          attachmentFingerprint: this.requireProjectionAttachmentFingerprint(
+            activeCommit,
+            owner.conversationId
+          ),
+          appliedAt: activeCommit.createdAt,
+          compactionId: activeCommit.id,
+          epoch: restored.generation,
+        }
+      : undefined
+
+    // This is the durable commit boundary. A newer tail may exist after the
+    // prepared target, but it remains unconsumed for the next explicit drain.
+    this.claudeProjectionStore.commitPreparedMutationDrain(drain)
+
+    state.records = rebuiltRecords
+    state.compactionHistory =
+      deriveCompactionHistoryFromTranscript(rebuiltRecords)
+    state.activeCompactionId = activeCommit?.id
+    state.compactionEpoch = restored.generation
+    state.lastAppliedCompaction = nextLastAppliedCompaction
+    state.toolResultReplacementState = nextReplacementState
+    state.graphWatermarkUuid = graphRecords.at(-1)?.id
+    return true
+  }
+
+  private requireProjectionAttachmentFingerprint(
+    commit: ContextCompactionCommit,
+    conversationId: ConversationId
+  ): string {
+    const fingerprint = commit.attachmentFingerprint?.trim()
+    if (!fingerprint) {
+      throw new Error(
+        `Context projection restore compact ${commit.id} has no attachment fingerprint for ${conversationId}`
+      )
+    }
+    if (!Number.isSafeInteger(commit.createdAt) || commit.createdAt <= 0) {
+      throw new Error(
+        `Context projection restore compact ${commit.id} has invalid createdAt for ${conversationId}`
+      )
+    }
+    return fingerprint
   }
 
   private loadPersistedSession(
@@ -2749,44 +3758,169 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         return undefined
       }
 
-      const restoredOpenToolCalls = this.loadRestoredOpenToolLedger(
-        row.conversationId
-      )
-      const persisted = this.loadPersistedSessionState(row, {
-        restoredOpenToolCalls,
-      })
+      // Cold recovery has one graph owner and must run before open-ledger
+      // reconstruction. It atomically terminalizes stale sub-agent runs,
+      // writes their parent delivery/memory, and parks any previously-sent
+      // sidechain exec for Cursor's official interrupted resolution. Mounting first
+      // would expose those inner edges to ordinary pending-tool recovery.
+      const coldSubagentRecovery =
+        this.contextState.reconcileStaleSubagentRunsBeforeMount(
+          row.conversationId
+        )
+      if (
+        coldSubagentRecovery.interruptedRuns > 0 ||
+        coldSubagentRecovery.deliveredParentResults > 0 ||
+        coldSubagentRecovery.abortedUnwrittenSidechainToolCalls > 0 ||
+        coldSubagentRecovery.parkedSidechainClientTerminals > 0
+      ) {
+        this.logger.warn(
+          `[context-restore] reconciled stale sub-agent work before mount ` +
+            `conversation=${conversationId} interrupted=${coldSubagentRecovery.interruptedRuns} ` +
+            `parentDeliveries=${coldSubagentRecovery.deliveredParentResults} ` +
+            `unwrittenSidechain=${coldSubagentRecovery.abortedUnwrittenSidechainToolCalls} ` +
+            `parkedClientTerminals=${coldSubagentRecovery.parkedSidechainClientTerminals}`
+        )
+      }
 
-      // Lifecycle:
-      //   1. Parse config blob → SessionRecord (pure, no side effects)
-      //   2. Mount into `this.sessions`
-      //   3. schedulePersist for deferred metadata flush
-      //
-      // The pre-step-3 design ran a write-time sanitize/enforceToolProtocol
-      // pass between (1) and (2) so the disk row would land in a
-      // protocol-correct state. Step 1 removed that path because protocol
-      // integrity is now a ledger invariant, not something the
-      // SessionLifecycleService corrects after the fact.
-      const session = this.parsePersistedSession(persisted)
-      this.sessions.set(conversationId, session)
-      const recoveredOrphans =
-        this.contextState.repairRestoredOrphanedToolUses(conversationId)
-      const ctx = this.contextState.getContextRecord(conversationId)!
+      const openRuntimeEdges = this.toolCallLedger
+        .listOpen(row.conversationId)
+        .filter((entry) => entry.origin === "runtime")
+      const persistedGraph = this.loadPersistedGraph(row.conversationId)
+      const parkedMainClientDispatches = this.parkRestoredMainClientDispatches(
+        row.conversationId,
+        openRuntimeEdges,
+        persistedGraph.rawMessages
+      )
+      if (parkedMainClientDispatches > 0) {
+        this.logger.warn(
+          `[context-restore] parked ${parkedMainClientDispatches} potentially sent main client dispatch(es) ` +
+            `for official interrupted-pending resolution conversation=${conversationId}`
+        )
+      }
+      const restoredPendingToolCalls = this.loadRestoredOpenToolLedger(
+        row.conversationId,
+        openRuntimeEdges,
+        persistedGraph.rawMessages
+      )
+      const persisted = this.loadPersistedSessionState(
+        row,
+        persistedGraph,
+        restoredPendingToolCalls
+      )
+
+      const restored = this.parsePersistedSession(persisted)
+      this.loadConfiguredWorkspaceGrants(restored.session)
+      const session = this.mountRestoredSession(restored)
+      const ctx = restored.context
       this.logger.log(
         `>>> Restored persisted session: ${conversationId} ` +
-          `(messages=${ctx.messages.length}, records=${ctx.messageRecords.length}, turns=${ctx.turns.length}, pending=${this.pendingToolCallCount(conversationId)}, recoveredOrphanToolUses=${recoveredOrphans})`
+          `(messages=${ctx.mainProjection.messages.length}, records=${ctx.mainProjection.messageRecords.length}, turns=${ctx.turns.length}, pending=${this.pendingToolCallCount(conversationId)})`
       )
-      if (session.restartRecovery) {
-        this.writeSessionRow(conversationId, session)
-      } else {
-        this.schedulePersist(conversationId)
-      }
+      this.schedulePersist(conversationId)
       return session
     } catch (error) {
       this.logger.error(
         `Failed to load persisted session ${conversationId}: ${String(error)}`
       )
-      return undefined
+      throw error instanceof Error ? error : new Error(String(error))
     }
+  }
+
+  private mountRestoredSession(restored: RestoredSessionBundle): SessionRecord {
+    const conversationId = restored.session.conversationId
+    const preparedPending = this.prepareRestoredPendingToolCalls(restored)
+    const session = this.publishDetachedSession(restored, preparedPending)
+    if (preparedPending.length > 0) {
+      this.logger.warn(
+        `[context-restore] waiting for ${preparedPending.length} durable tool terminal(s): ` +
+          `conversation=${conversationId}`
+      )
+    }
+    return session
+  }
+
+  /**
+   * Rebuild only the runtime indexes that are required to consume a genuine
+   * client terminal frame. The durable graph and exec outbox remain the source
+   * of truth; no restart path creates an abort result or guesses a terminal
+   * state. Old numeric exec ids are intentionally not copied into the
+   * stream-local map because that map has no epoch dimension.
+   */
+  private prepareRestoredPendingToolCalls(
+    restored: RestoredSessionBundle
+  ): Array<PendingToolEntry<PendingToolCall>> {
+    const { session, stream, restoredPendingToolCalls } = restored
+    const conversationId = ConversationId.of(session.conversationId)
+    const seen = new Set<string>()
+    const prepared: Array<PendingToolEntry<PendingToolCall>> = []
+    for (const recovered of restoredPendingToolCalls) {
+      const turnId = TurnId.of(recovered.turnId)
+      const toolCallId = requireExactDurableIdentifier(
+        recovered.toolCallId,
+        "SessionLifecycleService durable pending toolCallId"
+      )
+      if (seen.has(toolCallId)) {
+        throw new Error(
+          `Duplicate restored pending tool call: conversation=${session.conversationId} ` +
+            `toolCallId=${toolCallId}`
+        )
+      }
+      seen.add(toolCallId)
+      if (!this.toolCallLedger.isOpen(conversationId, toolCallId)) {
+        throw new Error(
+          `Restored pending tool call no longer has an open ledger edge: ` +
+            `conversation=${session.conversationId} toolCallId=${toolCallId}`
+        )
+      }
+      const pending: PendingToolCall = {
+        toolCallId,
+        toolName: recovered.toolName,
+        toolInput: structuredClone(recovered.toolInput),
+        historyToolName: recovered.historyToolName,
+        historyToolInput: recovered.historyToolInput
+          ? structuredClone(recovered.historyToolInput)
+          : undefined,
+        codexToolCallType: recovered.codexToolCallType,
+        skillActivationReceipts: recovered.skillActivationReceipts?.map(
+          (receipt) => ({ ...receipt })
+        ),
+        hookAdditionalContexts: recovered.hookAdditionalContexts?.map(
+          (context) => ({ ...context })
+        ),
+        toolFamilyHint: recovered.toolFamilyHint,
+        modelCallId: recovered.modelCallId,
+        startedEmitted: recovered.startedEmitted,
+        sentAt: new Date(recovered.sentAt),
+        execIds: new Set(recovered.execIds),
+        editApplyWarning: recovered.editApplyWarning,
+        editFailureContext: recovered.editFailureContext,
+        editNoopReason: recovered.editNoopReason,
+        beforeContent: recovered.beforeContent,
+        shellStreamOutput: recovered.shellStreamOutput
+          ? structuredClone(recovered.shellStreamOutput)
+          : undefined,
+        streamId: stream.currentStreamId,
+        sidechainOwner: recovered.sidechainOwner
+          ? {
+              ...recovered.sidechainOwner,
+              forkLineage: [...recovered.sidechainOwner.forkLineage],
+            }
+          : undefined,
+        executionOwner: recovered.executionOwner,
+        executionStatus: recovered.executionStatus,
+        executionRecoveryReason: recovered.executionRecoveryReason,
+        executionOrder: recovered.executionOrder,
+      }
+      prepared.push({
+        conversationId,
+        turnId,
+        toolCallId,
+        toolName: recovered.toolName,
+        startedAt: recovered.sentAt,
+        payload: pending,
+      })
+    }
+    return prepared
   }
 
   private deletePersistedSession(conversationId: string): void {
@@ -2809,20 +3943,6 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private toTimestamp(
-    value: Date | number | undefined,
-    fallback: number = Date.now()
-  ): number {
-    if (value instanceof Date) {
-      const ms = value.getTime()
-      return Number.isFinite(ms) ? ms : fallback
-    }
-    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-      return Math.floor(value)
-    }
-    return fallback
-  }
-
   private createEmptyToolMetrics(): SessionToolMetrics {
     return {
       completedCalls: 0,
@@ -2838,102 +3958,13 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   private createEmptyTopLevelAgentTurnState(): SessionTopLevelAgentTurnState {
     return {
       llmTurnCount: 1,
+      codexContextRevision: 0,
       continuationBudget: {
         continuationCount: 0,
         lastHistoryTokens: 0,
         lastDeltaTokens: 0,
         startedAt: Date.now(),
       },
-    }
-  }
-
-  private toNonNegativeInt(value: unknown): number {
-    return typeof value === "number" && Number.isFinite(value)
-      ? Math.max(0, Math.round(value))
-      : 0
-  }
-
-  private normalizeToolMetrics(value: unknown): SessionToolMetrics {
-    const metrics =
-      value && typeof value === "object"
-        ? (value as Partial<SessionToolMetrics>)
-        : {}
-    return {
-      completedCalls: this.toNonNegativeInt(metrics.completedCalls),
-      shellCalls: this.toNonNegativeInt(metrics.shellCalls),
-      editCalls: this.toNonNegativeInt(metrics.editCalls),
-      mcpCalls: this.toNonNegativeInt(metrics.mcpCalls),
-      otherCalls: this.toNonNegativeInt(metrics.otherCalls),
-      totalDurationMs: this.toNonNegativeInt(metrics.totalDurationMs),
-      lastCompletedAt:
-        typeof metrics.lastCompletedAt === "number" &&
-        Number.isFinite(metrics.lastCompletedAt)
-          ? Math.max(0, Math.round(metrics.lastCompletedAt))
-          : null,
-    }
-  }
-
-  private normalizeTaskBudgetState(
-    value: SessionTaskBudgetState | undefined
-  ): SessionTaskBudgetState | undefined {
-    if (!value || value.type !== "tokens") return undefined
-    if (
-      typeof value.total !== "number" ||
-      !Number.isFinite(value.total) ||
-      value.total <= 0
-    ) {
-      return undefined
-    }
-
-    const total = Math.floor(value.total)
-    const remaining =
-      typeof value.remaining === "number" &&
-      Number.isFinite(value.remaining) &&
-      value.remaining >= 0
-        ? Math.floor(value.remaining)
-        : undefined
-
-    return {
-      type: "tokens",
-      total,
-      remaining,
-      updatedAt:
-        typeof value.updatedAt === "number" && Number.isFinite(value.updatedAt)
-          ? Math.max(0, Math.floor(value.updatedAt))
-          : Date.now(),
-      compactionDeductions: Array.isArray(value.compactionDeductions)
-        ? value.compactionDeductions
-            .filter(
-              (deduction) =>
-                !!deduction &&
-                typeof deduction.compactionId === "string" &&
-                deduction.compactionId.trim().length > 0 &&
-                typeof deduction.preCompactContextTokens === "number" &&
-                Number.isFinite(deduction.preCompactContextTokens)
-            )
-            .map((deduction) => ({
-              compactionId: deduction.compactionId,
-              preCompactContextTokens: Math.max(
-                0,
-                Math.floor(deduction.preCompactContextTokens)
-              ),
-              remainingBefore:
-                typeof deduction.remainingBefore === "number" &&
-                Number.isFinite(deduction.remainingBefore)
-                  ? Math.max(0, Math.floor(deduction.remainingBefore))
-                  : total,
-              remainingAfter:
-                typeof deduction.remainingAfter === "number" &&
-                Number.isFinite(deduction.remainingAfter)
-                  ? Math.max(0, Math.floor(deduction.remainingAfter))
-                  : (remaining ?? total),
-              deductedAt:
-                typeof deduction.deductedAt === "number" &&
-                Number.isFinite(deduction.deductedAt)
-                  ? Math.max(0, Math.floor(deduction.deductedAt))
-                  : Date.now(),
-            }))
-        : [],
     }
   }
 
@@ -3037,15 +4068,14 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private getSessionLineChangeStats(session: SessionRecord): {
+  private getSessionLineChangeStats(context: ContextStateRecord): {
     linesAdded: number
     linesRemoved: number
   } {
-    const ctx = this.contextState.getContextRecord(session.conversationId)!
     let linesAdded = 0
     let linesRemoved = 0
 
-    for (const state of ctx.fileStates.values()) {
+    for (const state of context.fileStates.values()) {
       const delta = this.countLineDelta(state.beforeContent, state.afterContent)
       linesAdded += delta.linesAdded
       linesRemoved += delta.linesRemoved
@@ -3057,26 +4087,29 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   private buildAnalyticsEntry(
     conversationId: string,
     session: SessionRecord,
+    context: ContextStateRecord,
     loaded: boolean,
     now: number
   ): ChatSessionAnalyticsEntry {
-    const ctx = this.contextState.getContextRecord(session.conversationId)!
-    const lineStats = this.getSessionLineChangeStats(session)
+    const lineStats = this.getSessionLineChangeStats(context)
     const idleMs = Math.max(0, now - session.lastActivityAt.getTime())
     const contextTokenLimit =
       typeof session.contextTokenLimit === "number" &&
-      Number.isFinite(session.contextTokenLimit)
-        ? Math.max(0, Math.round(session.contextTokenLimit))
+      Number.isSafeInteger(session.contextTokenLimit) &&
+      session.contextTokenLimit > 0
+        ? session.contextTokenLimit
         : null
     const usedContextTokens =
       typeof session.usedContextTokens === "number" &&
-      Number.isFinite(session.usedContextTokens)
-        ? Math.max(0, Math.round(session.usedContextTokens))
+      Number.isSafeInteger(session.usedContextTokens) &&
+      session.usedContextTokens >= 0
+        ? session.usedContextTokens
         : null
     const requestedMaxOutputTokens =
       typeof session.requestedMaxOutputTokens === "number" &&
-      Number.isFinite(session.requestedMaxOutputTokens)
-        ? Math.max(0, Math.round(session.requestedMaxOutputTokens))
+      Number.isSafeInteger(session.requestedMaxOutputTokens) &&
+      session.requestedMaxOutputTokens > 0
+        ? session.requestedMaxOutputTokens
         : null
     const contextMaxMode =
       typeof session.contextMaxMode === "boolean"
@@ -3096,22 +4129,22 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       lastActivityAt: session.lastActivityAt.toISOString(),
       idleMs,
       pendingToolCalls: this.pendingToolCallCount(session.conversationId),
-      completedToolCalls: ctx.toolMetrics.completedCalls,
-      shellToolCalls: ctx.toolMetrics.shellCalls,
-      editToolCalls: ctx.toolMetrics.editCalls,
-      mcpToolCalls: ctx.toolMetrics.mcpCalls,
-      otherToolCalls: ctx.toolMetrics.otherCalls,
-      totalToolDurationMs: ctx.toolMetrics.totalDurationMs,
+      completedToolCalls: context.toolMetrics.completedCalls,
+      shellToolCalls: context.toolMetrics.shellCalls,
+      editToolCalls: context.toolMetrics.editCalls,
+      mcpToolCalls: context.toolMetrics.mcpCalls,
+      otherToolCalls: context.toolMetrics.otherCalls,
+      totalToolDurationMs: context.toolMetrics.totalDurationMs,
       avgToolDurationMs:
-        ctx.toolMetrics.completedCalls > 0
+        context.toolMetrics.completedCalls > 0
           ? Math.round(
-              (ctx.toolMetrics.totalDurationMs /
-                ctx.toolMetrics.completedCalls) *
+              (context.toolMetrics.totalDurationMs /
+                context.toolMetrics.completedCalls) *
                 10
             ) / 10
           : null,
-      readFiles: ctx.readPaths.size,
-      editedFiles: ctx.fileStates.size,
+      readFiles: context.readPaths.size,
+      editedFiles: context.fileStates.size,
       linesAdded: lineStats.linesAdded,
       linesRemoved: lineStats.linesRemoved,
       contextTokenLimit,
@@ -3119,343 +4152,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       usedContextTokens,
       contextUsagePct,
       requestedMaxOutputTokens,
-      subAgentTurns: this.sumSubAgentMetric(session, "turnCount"),
-      subAgentToolCalls: this.sumSubAgentMetric(session, "toolCallCount"),
-    }
-  }
-
-  private serializeSession(session: SessionRecord): PersistedChatSessionV1 {
-    const ctx = this.contextState.getContextRecord(session.conversationId)!
-    const stream = this.sessionStream.getStreamRecord(session.conversationId)!
-    return {
-      version: 15,
-      conversationId: session.conversationId,
-      messages: ctx.messages,
-      messageRecords: ctx.messageRecords,
-      transcriptEvents: ctx.transcriptEvents,
-      nextTranscriptEventSeq: ctx.nextTranscriptEventSeq,
-      contextState: {
-        ...ctx.contextState,
-        compactionHistory: deriveCompactionHistoryFromTranscript(
-          ctx.contextState.records
-        ),
-        activeCompactionId: getActiveCompactCommitFromTranscript(
-          ctx.contextState.records
-        )?.id,
-      },
-      taskBudgetState: ctx.taskBudgetState,
-      topLevelAgentTurnState: {
-        llmTurnCount: ctx.topLevelAgentTurnState.llmTurnCount,
-        continuationBudget: {
-          continuationCount:
-            ctx.topLevelAgentTurnState.continuationBudget.continuationCount,
-          lastHistoryTokens:
-            ctx.topLevelAgentTurnState.continuationBudget.lastHistoryTokens,
-          lastDeltaTokens:
-            ctx.topLevelAgentTurnState.continuationBudget.lastDeltaTokens,
-          startedAt: ctx.topLevelAgentTurnState.continuationBudget.startedAt,
-        },
-        activeToolBatch: ctx.topLevelAgentTurnState.activeToolBatch
-          ? {
-              batchId: ctx.topLevelAgentTurnState.activeToolBatch.batchId,
-              toolCallIds: [
-                ...ctx.topLevelAgentTurnState.activeToolBatch.toolCallIds,
-              ],
-              assistantText:
-                ctx.topLevelAgentTurnState.activeToolBatch.assistantText,
-              readOnly: ctx.topLevelAgentTurnState.activeToolBatch.readOnly,
-              startedAt: ctx.topLevelAgentTurnState.activeToolBatch.startedAt,
-              tools: ctx.topLevelAgentTurnState.activeToolBatch.tools.map(
-                (tool) => ({
-                  toolCallId: tool.toolCallId,
-                  toolName: tool.toolName,
-                  input: tool.input,
-                  resultSummary: tool.resultSummary,
-                })
-              ),
-            }
-          : undefined,
-      },
-      lastEmittedContextSummaryCompactionId:
-        ctx.lastEmittedContextSummaryCompactionId,
-      lastEmittedContextSummaryCompactionEpoch:
-        ctx.lastEmittedContextSummaryCompactionEpoch,
-      lastContextSummaryCompactionEpoch:
-        ctx.pendingContextSummaryUiUpdate?.epoch ??
-        ctx.contextState.compactionEpoch,
-      model: session.model,
-      lastAssistantBackend: session.lastAssistantBackend,
-      lastAssistantModel: session.lastAssistantModel,
-      lastCodexResponseId: session.lastCodexResponseId,
-      lastCodexRequestSignature: session.lastCodexRequestSignature,
-      thinkingLevel: session.thinkingLevel,
-      thinkingDetailsRequested: session.thinkingDetailsRequested,
-      isAgentic: session.isAgentic,
-      supportedTools: session.supportedTools,
-      mcpToolDefs: session.mcpToolDefs,
-      useWeb: session.useWeb,
-      requestContextEnv: session.requestContextEnv,
-      createdAt: this.toTimestamp(session.createdAt),
-      lastActivityAt: this.toTimestamp(session.lastActivityAt),
-      pendingToolCalls: this.listPendingToolCalls(session.conversationId).map(
-        (toolCall) => ({
-          toolCallId: toolCall.toolCallId,
-          toolName: toolCall.toolName,
-          toolInput: toolCall.toolInput,
-          historyToolName: toolCall.historyToolName,
-          historyToolInput: toolCall.historyToolInput,
-          codexToolCallType: toolCall.codexToolCallType,
-          toolFamilyHint: toolCall.toolFamilyHint,
-          modelCallId: toolCall.modelCallId,
-          startedEmitted: toolCall.startedEmitted,
-          sentAt: this.toTimestamp(toolCall.sentAt),
-          execIds: Array.from(toolCall.execIds),
-          editApplyWarning: toolCall.editApplyWarning,
-          editFailureContext: toolCall.editFailureContext,
-          editNoopReason: toolCall.editNoopReason,
-          beforeContent: toolCall.beforeContent,
-          executionOwner: toolCall.executionOwner,
-          executionStatus: toolCall.executionStatus,
-          executionRecoveryReason: toolCall.executionRecoveryReason,
-          executionOrder: toolCall.executionOrder,
-          shellStreamOutput: toolCall.shellStreamOutput
-            ? {
-                stdout: [...toolCall.shellStreamOutput.stdout],
-                stderr: [...toolCall.shellStreamOutput.stderr],
-                exitCode: toolCall.shellStreamOutput.exitCode,
-                signal: toolCall.shellStreamOutput.signal,
-                started: toolCall.shellStreamOutput.started,
-              }
-            : undefined,
-        })
-      ),
-      backgroundCommands: Array.from(stream.backgroundCommands.values()).map(
-        (command) => ({
-          commandId: command.commandId,
-          originToolCallId: command.originToolCallId,
-          execIds: [...command.execIds],
-          command: command.command,
-          cwd: command.cwd,
-          pid: command.pid,
-          terminalsFolder: command.terminalsFolder,
-          status: command.status,
-          stdout: [...command.stdout],
-          stderr: [...command.stderr],
-          exitCode: command.exitCode,
-          msToWait: command.msToWait,
-          backgroundReason: command.backgroundReason,
-          lastTerminalFileLength: command.lastTerminalFileLength,
-          startedAt: command.startedAt,
-          updatedAt: command.updatedAt,
-          completedAt: command.completedAt,
-        })
-      ),
-      pendingInteractionQueryCount: stream.pendingInteractionQueries.size,
-      projectContext: session.projectContext,
-      codeChunks: session.codeChunks,
-      cursorCommands: session.cursorCommands,
-      customSystemPrompt: session.customSystemPrompt,
-      explicitContext: session.explicitContext,
-      contextTokenLimit: session.contextTokenLimit,
-      contextMaxMode: session.contextMaxMode,
-      usedContextTokens: session.usedContextTokens,
-      requestedMaxOutputTokens: session.requestedMaxOutputTokens,
-      requestedModelParameters: session.requestedModelParameters,
-      usedTokens: ctx.usedTokens,
-      // Persist only `source='session'` additionalRoots — `'config'`
-      // entries get replayed from `.cursor/agent-vibes.json` on load
-      // so we don't want stale snapshots overriding fresh config.
-      additionalRoots: session.additionalRoots
-        ? Array.from(session.additionalRoots.values()).filter(
-            (r) => r.source === "session"
-          )
-        : undefined,
-      readPaths: Array.from(ctx.readPaths),
-      readSnapshots: ctx.readSnapshots.map((snapshot) => ({ ...snapshot })),
-      fileStates: Array.from(ctx.fileStates.entries()).map(
-        ([filePath, state]) => ({
-          path: filePath,
-          beforeContent: state.beforeContent,
-          afterContent: state.afterContent,
-        })
-      ),
-      toolMetrics: { ...ctx.toolMetrics },
-      messageBlobIds: [...ctx.messageBlobIds],
-      turns: [...ctx.turns],
-      currentAssistantMessage: ctx.currentAssistantMessage,
-      stepId: ctx.stepId,
-      execId: ctx.execId,
-      interactionQueryId: stream.interactionQueryId,
-      todos: [...ctx.todos],
-      toolExecutionOrderCounter:
-        this.assistantToolBatch.getToolExecutionOrderCounter(
-          session.conversationId
-        ),
-      subAgentContexts:
-        session.subAgentContexts.size > 0
-          ? Array.from(session.subAgentContexts.values()).map((ctx) =>
-              this.persistSubAgentContext(ctx)
-            )
-          : undefined,
-      restartRecovery: session.restartRecovery
-        ? {
-            restoredAt: this.toTimestamp(session.restartRecovery.restoredAt),
-            notice: session.restartRecovery.notice,
-            interruptedToolCalls:
-              session.restartRecovery.interruptedToolCalls.map((toolCall) => ({
-                toolCallId: toolCall.toolCallId,
-                toolName: toolCall.toolName,
-                sentAt: this.toTimestamp(toolCall.sentAt),
-                reason: toolCall.reason,
-                detail: toolCall.detail,
-              })),
-            interruptedInteractionQueryCount:
-              session.restartRecovery.interruptedInteractionQueryCount,
-            interruptedSubAgent: session.restartRecovery.interruptedSubAgent,
-          }
-        : undefined,
-    }
-  }
-
-  private buildRestartRecovery(
-    persisted: PersistedChatSessionV1
-  ): SessionRestartRecovery | undefined {
-    const pendingInterruptedToolCalls = Array.isArray(
-      persisted.pendingToolCalls
-    )
-      ? persisted.pendingToolCalls.map((toolCall) => ({
-          toolCallId: toolCall.toolCallId,
-          toolName: toolCall.toolName,
-          sentAt: new Date(this.toTimestamp(toolCall.sentAt)),
-          reason: "process_restart" as const,
-          detail: undefined,
-        }))
-      : []
-    const pendingInteractionQueryCount =
-      typeof persisted.pendingInteractionQueryCount === "number" &&
-      persisted.pendingInteractionQueryCount > 0
-        ? persisted.pendingInteractionQueryCount
-        : 0
-
-    if (persisted.restartRecovery) {
-      const interruptedToolCalls =
-        persisted.restartRecovery.interruptedToolCalls.map((toolCall) => ({
-          toolCallId: toolCall.toolCallId,
-          toolName: toolCall.toolName,
-          sentAt: new Date(this.toTimestamp(toolCall.sentAt)),
-          reason: normalizeToolInterruptionReason(
-            toolCall.reason,
-            "process_restart"
-          ),
-          detail:
-            typeof toolCall.detail === "string" &&
-            toolCall.detail.trim().length > 0
-              ? toolCall.detail.trim()
-              : undefined,
-        }))
-      const knownInterruptedIds = new Set(
-        interruptedToolCalls.map((toolCall) => toolCall.toolCallId)
-      )
-      for (const pendingToolCall of pendingInterruptedToolCalls) {
-        if (knownInterruptedIds.has(pendingToolCall.toolCallId)) continue
-        interruptedToolCalls.push(pendingToolCall)
-      }
-
-      let notice = persisted.restartRecovery.notice
-      if (pendingInterruptedToolCalls.length > 0) {
-        const sampleNames = pendingInterruptedToolCalls
-          .slice(0, 3)
-          .map((toolCall) => toolCall.toolName || toolCall.toolCallId)
-        notice +=
-          `\nPending tool calls from the last saved stream were also interrupted: ` +
-          sampleNames.join(", ")
-        if (pendingInterruptedToolCalls.length > sampleNames.length) {
-          notice += `, +${pendingInterruptedToolCalls.length - sampleNames.length} more`
-        }
-      }
-
-      return {
-        restoredAt: new Date(
-          this.toTimestamp(persisted.restartRecovery.restoredAt)
-        ),
-        notice,
-        interruptedToolCalls,
-        interruptedInteractionQueryCount:
-          persisted.restartRecovery.interruptedInteractionQueryCount +
-          pendingInteractionQueryCount,
-        interruptedSubAgent: persisted.restartRecovery.interruptedSubAgent,
-      }
-    }
-
-    const interruptedToolCalls = pendingInterruptedToolCalls
-    const interruptedInteractionQueryCount = pendingInteractionQueryCount
-    // Pick a representative interrupted sub-agent for the recovery
-    // notice. New persistence schema uses `subAgentContexts: []` (one
-    // entry per concurrent foreground sub-agent); legacy snapshots used
-    // singular `subAgentContext`. We accept both and surface the first
-    // foreground (non-background) entry — that's the one most likely to
-    // have user-visible work in flight at restart time.
-    const interruptedSubAgentSource: PersistedSubAgentContext | undefined =
-      (Array.isArray(persisted.subAgentContexts) &&
-        persisted.subAgentContexts.find((entry) => !entry.isBackground)) ||
-      (Array.isArray(persisted.subAgentContexts)
-        ? persisted.subAgentContexts[0]
-        : undefined) ||
-      persisted.subAgentContext
-
-    const interruptedSubAgent = interruptedSubAgentSource
-      ? {
-          subagentId: interruptedSubAgentSource.subagentId,
-          parentToolCallId: interruptedSubAgentSource.parentToolCallId,
-          turnCount: interruptedSubAgentSource.turnCount,
-          toolCallCount: interruptedSubAgentSource.toolCallCount,
-        }
-      : undefined
-
-    if (
-      interruptedToolCalls.length === 0 &&
-      interruptedInteractionQueryCount === 0 &&
-      !interruptedSubAgent
-    ) {
-      return undefined
-    }
-
-    const details: string[] = []
-    if (interruptedToolCalls.length > 0) {
-      const sampleNames = interruptedToolCalls
-        .slice(0, 3)
-        .map((toolCall) => toolCall.toolName || toolCall.toolCallId)
-      let toolSummary = `${interruptedToolCalls.length} pending tool call(s) were aborted`
-      if (sampleNames.length > 0) {
-        toolSummary += ` (${sampleNames.join(", ")}`
-        if (interruptedToolCalls.length > sampleNames.length) {
-          toolSummary += `, +${interruptedToolCalls.length - sampleNames.length} more`
-        }
-        toolSummary += `)`
-      }
-      details.push(toolSummary)
-    }
-    if (interruptedInteractionQueryCount > 0) {
-      details.push(
-        `${interruptedInteractionQueryCount} pending interaction quer${
-          interruptedInteractionQueryCount === 1 ? "y was" : "ies were"
-        } dropped`
-      )
-    }
-    if (interruptedSubAgent) {
-      details.push(
-        `sub-agent ${interruptedSubAgent.subagentId} was interrupted`
-      )
-    }
-
-    return {
-      restoredAt: new Date(),
-      notice:
-        `Bridge process restarted before the previous turn finished. ${details.join("; ")}.` +
-        ` Please retry the interrupted action if needed.`,
-      interruptedToolCalls,
-      interruptedInteractionQueryCount,
-      interruptedSubAgent,
+      ...this.deriveRunningSubagentMetrics(conversationId),
     }
   }
 
@@ -3464,7 +4161,33 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     createdAt: number = Date.now()
   ): ContextTranscriptRecord {
     return {
-      id: crypto.randomUUID(),
+      id: message.uuid,
+      ...(message.parentUuid ? { parentUuid: message.parentUuid } : {}),
+      ...(message.logicalParentUuid
+        ? { logicalParentUuid: message.logicalParentUuid }
+        : {}),
+      ...(message.sourceToolAssistantUuid
+        ? { sourceToolAssistantUuid: message.sourceToolAssistantUuid }
+        : {}),
+      ...(message.provider ? { provider: message.provider } : {}),
+      ...(message.providerMessageId
+        ? { providerMessageId: message.providerMessageId }
+        : {}),
+      ...(message.blockOccurrence !== undefined
+        ? { blockIndex: message.blockOccurrence }
+        : {}),
+      ...(message.turnId ? { turnId: message.turnId } : {}),
+      ...(message.threadId ? { threadId: message.threadId } : {}),
+      ...(message.branchId ? { branchId: message.branchId } : {}),
+      ...(message.agentId ? { agentId: message.agentId } : {}),
+      ...(message.isSidechain ? { isSidechain: true } : {}),
+      ...(message.forkSourceUuid
+        ? { forkSourceUuid: message.forkSourceUuid }
+        : {}),
+      ...(message.forkLineage ? { forkLineage: [...message.forkLineage] } : {}),
+      ...(message.excludedFromProviderProjection
+        ? { excludedFromProviderProjection: true }
+        : {}),
       role: message.message.role,
       kind: "message",
       content: message.message.content,
@@ -3477,72 +4200,200 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Build a SessionMessage for a freshly-loaded session (from the parsed
-   * conversation in `createFreshSession`). Uses a deterministic timestamp
-   * derived from `seedTime` so that record ordering matches insertion order
-   * even if multiple messages are minted in the same JS event loop tick.
+   * Build a SessionMessage for a typed Cursor history fragment. Uses a
+   * deterministic timestamp so imported graph order remains stable even when
+   * the complete history arrives in one event-loop turn.
    */
   makeFreshSessionMessage(
     role: "user" | "assistant",
     content: MessageContent,
-    seedTime: number = Date.now()
+    seedTime: number = Date.now(),
+    metadata?: Record<string, unknown>
   ): SessionMessage {
     return makeSessionMessage(role, content, {
       timestamp: new Date(seedTime).toISOString(),
+      metadata,
     })
   }
 
-  private persistInitialTranscriptMessages(
-    conversationId: ConversationId,
+  /**
+   * Seed a completely empty durable graph under an already-open session
+   * transaction. Both fresh bootstrap and the deferred control-first import
+   * persist their complete domain snapshot in this same transaction.
+   */
+  private persistInitialTranscriptMessagesInTransaction(
+    txn: SessionTxn,
     messages: SessionMessage[]
-  ): void {
+  ): SessionMessage[] {
+    const conversationId = txn.conversationId
+    if (this.messageStore.hasMessages(conversationId)) {
+      throw new Error(
+        `persistInitialTranscriptMessages: durable graph is not empty for ${conversationId}`
+      )
+    }
     if (messages.length === 0) {
-      return
+      return []
     }
-    if (this.messageStore.getMessages(conversationId).length > 0) {
-      return
+    if (
+      !messages.every(
+        (message) => message.metadata?.source === "cursor_conversation_history"
+      )
+    ) {
+      throw new Error(
+        "persistInitialTranscriptMessages: only typed Cursor conversation_history may seed an empty graph"
+      )
     }
-    this.messageStore.runInTransaction(conversationId, (txn) => {
-      for (const message of messages) {
-        const blocks = this.messageContentToBlocks(message.message.content)
-        if (message.type === "assistant") {
-          for (const block of blocks) {
-            if (block.type === "tool_result" || block.type === "cache_edits") {
-              continue
-            }
-            const result = this.messageStore.appendAssistantBlock(txn, block, {
-              turnId: ("initial:" + conversationId) as unknown as TurnId,
-              messageId: message.message.id,
-            })
-            if (isToolUseBlock(block)) {
-              this.toolCallLedger.open(txn, {
-                toolUseId: block.id,
-                toolName: block.name,
-                turnId: ("initial:" + conversationId) as unknown as TurnId,
-                openMessageSeq: result.seq,
-              })
-            }
+    const acceptedMessages: SessionMessage[] = []
+    for (const message of messages) {
+      const blocks = this.messageContentToBlocks(message.message.content)
+      const timestamp = Date.parse(message.timestamp)
+      let previousFragmentUuid: string | undefined
+      if (message.type === "assistant") {
+        for (let index = 0; index < blocks.length; index++) {
+          const block = blocks[index]!
+          if (block.type === "tool_result" || block.type === "cache_edits") {
+            continue
           }
-          continue
+          const result = this.messageStore.appendAssistantBlock(txn, block, {
+            metadata: message.metadata,
+            provider: message.provider,
+            providerMessageId: message.providerMessageId ?? message.message.id,
+            logicalParentUuid: message.logicalParentUuid ?? message.uuid,
+            parentUuid: previousFragmentUuid ?? message.parentUuid,
+            threadId: message.threadId,
+            branchId: message.branchId,
+            agentId: message.agentId,
+            isSidechain: message.isSidechain,
+            forkSourceUuid: message.forkSourceUuid,
+            forkLineage: message.forkLineage,
+            blockOccurrence: index,
+            timestamp: Number.isFinite(timestamp) ? timestamp : undefined,
+          })
+          previousFragmentUuid = result.recordUuid
+          acceptedMessages.push(
+            projectPersistedMessageToSessionMessage(result.message)
+          )
+          if (isToolUseBlock(block)) {
+            this.toolCallLedger.open(txn, {
+              toolUseId: block.id,
+              toolName: block.name,
+              origin: "cursor_history",
+              openMessageSeq: result.seq,
+            })
+          }
         }
+        continue
+      }
 
-        for (const block of blocks) {
-          if (
-            isToolResultBlock(block) &&
-            this.toolCallLedger.isOpen(conversationId, block.tool_use_id)
-          ) {
-            this.messageStore.appendToolResultBlock(txn, block, {
-              turnId: ("initial:" + conversationId) as unknown as TurnId,
-            })
-          } else {
-            this.messageStore.appendUserMessage(txn, [block], {
-              turnId: ("initial:" + conversationId) as unknown as TurnId,
-              isMeta: message.isMeta,
-            })
+      for (let index = 0; index < blocks.length; index++) {
+        const block = blocks[index]!
+        if (isToolResultBlock(block)) {
+          if (!this.toolCallLedger.isOpen(conversationId, block.tool_use_id)) {
+            throw new Error(
+              `persistInitialTranscriptMessages: refusing unmatched tool_result ` +
+                `conversation=${conversationId} toolUseId=${block.tool_use_id}`
+            )
           }
+          const result = this.messageStore.appendToolResultBlock(txn, block, {
+            metadata: message.metadata,
+            logicalParentUuid: message.logicalParentUuid ?? message.uuid,
+            parentUuid: previousFragmentUuid ?? message.parentUuid,
+            provider: message.provider,
+            providerMessageId: message.providerMessageId,
+            threadId: message.threadId,
+            branchId: message.branchId,
+            agentId: message.agentId,
+            isSidechain: message.isSidechain,
+            forkSourceUuid: message.forkSourceUuid,
+            forkLineage: message.forkLineage,
+            blockOccurrence: index,
+            timestamp: Number.isFinite(timestamp) ? timestamp : undefined,
+          })
+          previousFragmentUuid = result.recordUuid
+          acceptedMessages.push(
+            projectPersistedMessageToSessionMessage(result.message)
+          )
+        } else {
+          const result = this.messageStore.appendUserMessage(txn, [block], {
+            isMeta: message.isMeta,
+            metadata: message.metadata,
+            logicalParentUuid: message.logicalParentUuid ?? message.uuid,
+            parentUuid: previousFragmentUuid ?? message.parentUuid,
+            sourceToolAssistantUuid: message.sourceToolAssistantUuid,
+            provider: message.provider,
+            providerMessageId: message.providerMessageId,
+            threadId: message.threadId,
+            branchId: message.branchId,
+            agentId: message.agentId,
+            isSidechain: message.isSidechain,
+            forkSourceUuid: message.forkSourceUuid,
+            forkLineage: message.forkLineage,
+            blockOccurrence: index,
+            timestamp: Number.isFinite(timestamp) ? timestamp : undefined,
+          })
+          previousFragmentUuid = result.recordUuid
+          acceptedMessages.push(
+            projectPersistedMessageToSessionMessage(result.message)
+          )
         }
       }
+    }
+    return acceptedMessages
+  }
+
+  /**
+   * Build the first active graph projection while the fresh context record is
+   * still detached. The committed graph is its only input; parser envelopes
+   * never become mounted transcript state.
+   */
+  private prepareDetachedInitialGraphProjection(
+    context: ContextStateRecord,
+    messages: SessionMessage[]
+  ): PreparedInitialGraphProjection {
+    this.assertEmptyInitialGraphProjection(
+      context,
+      "prepareDetachedInitialGraphProjection"
+    )
+
+    const records = messages.map((message) => {
+      const createdAt = Date.parse(message.timestamp)
+      return this.createTranscriptRecord(
+        message,
+        Number.isFinite(createdAt) ? createdAt : Date.now()
+      )
     })
+    const events: SessionTranscriptEvent[] = []
+    let nextSeq = 1
+    for (const record of records) {
+      const built = this.buildTranscriptEventsForRecord(record, nextSeq)
+      events.push(...built)
+      nextSeq += built.length
+    }
+
+    return {
+      messages: [...messages],
+      generation: messages.length,
+      messageRecords: records,
+      contextState: this.createContextState(records),
+      transcriptEvents: events,
+      nextTranscriptEventSeq: nextSeq,
+    }
+  }
+
+  private assertEmptyInitialGraphProjection(
+    context: ContextStateRecord,
+    owner: string
+  ): void {
+    if (
+      context.mainProjection.generation !== 0 ||
+      context.mainProjection.messages.length > 0 ||
+      context.mainProjection.messageRecords.length > 0 ||
+      context.mainProjection.transcriptEvents.length > 0
+    ) {
+      throw new Error(
+        `${owner}: refusing to replace a non-empty initial graph projection`
+      )
+    }
   }
 
   private messageContentToBlocks(content: MessageContent): ContentBlock[] {
@@ -3552,7 +4403,8 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   }
 
   createContextState(
-    records: ContextTranscriptRecord[]
+    records: ContextTranscriptRecord[],
+    sessionMemory?: readonly ContextSessionMemoryEntry[]
   ): ContextConversationState {
     return {
       records: [...records],
@@ -3561,651 +4413,15 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       compactionEpoch: 0,
       lastAppliedCompaction: undefined,
       usageLedger: {},
-      codexContext: this.createCodexContextState(),
       toolResultReplacementState: {
         seenToolUseIds: [],
         replacementByToolUseId: {},
         storedByToolUseId: {},
         records: [],
       },
-      contextCollapseState: {
-        commits: [],
-      },
-      investigationMemory: [],
-      sessionMemory: [],
+      sessionMemory: (sessionMemory || []).map((entry) => ({ ...entry })),
+      graphWatermarkUuid: records.slice().reverse().find(isMessageRecord)?.id,
     }
-  }
-
-  private createCodexContextState(): CodexContextState {
-    return {
-      historyVersion: 0,
-      truncationPolicy: {
-        mode: "bytes",
-        limit: 10_000,
-      },
-    }
-  }
-
-  private normalizeCodexContextState(value: unknown): CodexContextState {
-    const input =
-      value && typeof value === "object"
-        ? (value as Partial<CodexContextState>)
-        : {}
-    const truncationPolicy =
-      input.truncationPolicy &&
-      typeof input.truncationPolicy === "object" &&
-      (input.truncationPolicy.mode === "bytes" ||
-        input.truncationPolicy.mode === "tokens") &&
-      typeof input.truncationPolicy.limit === "number" &&
-      Number.isFinite(input.truncationPolicy.limit) &&
-      input.truncationPolicy.limit > 0
-        ? {
-            mode: input.truncationPolicy.mode,
-            limit: Math.floor(input.truncationPolicy.limit),
-          }
-        : {
-            mode: "bytes" as const,
-            limit: 10_000,
-          }
-    const activeWindow = this.normalizeCodexContextWindowState(
-      input.activeWindow
-    )
-    return {
-      historyVersion:
-        typeof input.historyVersion === "number" && input.historyVersion >= 0
-          ? Math.floor(input.historyVersion)
-          : 0,
-      tokenInfo:
-        input.tokenInfo &&
-        typeof input.tokenInfo === "object" &&
-        typeof input.tokenInfo.totalTokens === "number"
-          ? {
-              totalTokens: Math.max(0, Math.floor(input.tokenInfo.totalTokens)),
-              modelContextWindow:
-                typeof input.tokenInfo.modelContextWindow === "number"
-                  ? Math.max(0, Math.floor(input.tokenInfo.modelContextWindow))
-                  : undefined,
-              updatedAt:
-                typeof input.tokenInfo.updatedAt === "number"
-                  ? input.tokenInfo.updatedAt
-                  : Date.now(),
-            }
-          : undefined,
-      referenceContextItem:
-        input.referenceContextItem &&
-        typeof input.referenceContextItem === "object"
-          ? {
-              ...input.referenceContextItem,
-              truncationPolicy,
-              updatedAt:
-                typeof input.referenceContextItem.updatedAt === "number"
-                  ? input.referenceContextItem.updatedAt
-                  : Date.now(),
-            }
-          : undefined,
-      activeWindow,
-      truncationPolicy,
-    }
-  }
-
-  private normalizeCodexContextWindowState(
-    value: unknown
-  ): CodexContextWindowState | undefined {
-    const input =
-      value && typeof value === "object"
-        ? (value as Partial<CodexContextWindowState>)
-        : undefined
-    if (!input) return undefined
-    if (
-      typeof input.windowNumber !== "number" ||
-      !Number.isFinite(input.windowNumber) ||
-      input.windowNumber < 0 ||
-      typeof input.windowId !== "string" ||
-      input.windowId.trim().length === 0 ||
-      typeof input.firstWindowId !== "string" ||
-      input.firstWindowId.trim().length === 0
-    ) {
-      return undefined
-    }
-
-    const windowId = input.windowId.trim()
-    const replacementHistory = this.normalizeCodexReplacementHistory(
-      input.replacementHistory
-    )
-    return {
-      windowNumber: Math.floor(input.windowNumber),
-      firstWindowId: input.firstWindowId.trim(),
-      previousWindowId:
-        typeof input.previousWindowId === "string" &&
-        input.previousWindowId.trim().length > 0
-          ? input.previousWindowId.trim()
-          : undefined,
-      windowId,
-      createdAt:
-        typeof input.createdAt === "number" ? input.createdAt : Date.now(),
-      compactionId:
-        typeof input.compactionId === "string" &&
-        input.compactionId.trim().length > 0
-          ? input.compactionId.trim()
-          : replacementHistory?.compactionId,
-      replacementHistory:
-        replacementHistory?.windowId === windowId
-          ? replacementHistory
-          : undefined,
-    }
-  }
-
-  private normalizeCodexReplacementHistory(
-    value: unknown
-  ): CodexReplacementHistory | undefined {
-    const input =
-      value && typeof value === "object"
-        ? (value as Partial<CodexReplacementHistory>)
-        : undefined
-    if (
-      !input ||
-      typeof input.compactionId !== "string" ||
-      input.compactionId.trim().length === 0 ||
-      !Array.isArray(input.items) ||
-      typeof input.windowNumber !== "number" ||
-      !Number.isFinite(input.windowNumber) ||
-      input.windowNumber < 0 ||
-      typeof input.windowId !== "string" ||
-      input.windowId.trim().length === 0 ||
-      typeof input.firstWindowId !== "string" ||
-      input.firstWindowId.trim().length === 0
-    ) {
-      return undefined
-    }
-
-    const filteredItems = input.items.flatMap((item) =>
-      this.normalizeCodexReplacementHistoryItem(item)
-    )
-    const summary = this.normalizeCodexReplacementHistorySummary(
-      input.summary,
-      filteredItems
-    )
-    const items = this.buildCodexReplacementProjectionItems(
-      filteredItems,
-      summary
-    )
-    if (items.length === 0) {
-      return undefined
-    }
-
-    return {
-      compactionId: input.compactionId.trim(),
-      createdAt:
-        typeof input.createdAt === "number" ? input.createdAt : Date.now(),
-      injectionMode:
-        input.injectionMode === "mid_turn" ? "mid_turn" : "pre_turn",
-      windowNumber: Math.floor(input.windowNumber),
-      firstWindowId: input.firstWindowId.trim(),
-      previousWindowId:
-        typeof input.previousWindowId === "string" &&
-        input.previousWindowId.trim().length > 0
-          ? input.previousWindowId.trim()
-          : undefined,
-      windowId: input.windowId.trim(),
-      anchorRecordId:
-        typeof input.anchorRecordId === "string" &&
-        input.anchorRecordId.trim().length > 0
-          ? input.anchorRecordId.trim()
-          : undefined,
-      anchorRecordCount:
-        typeof input.anchorRecordCount === "number"
-          ? Math.max(0, Math.floor(input.anchorRecordCount))
-          : 0,
-      summary,
-      items,
-    }
-  }
-
-  private normalizeCodexReplacementHistoryItem(
-    value: unknown
-  ): CodexReplacementHistoryItem[] {
-    if (!value || typeof value !== "object") {
-      return []
-    }
-    const item = { ...(value as CodexReplacementHistoryItem) }
-    return this.shouldKeepCodexReplacementHistoryItem(item) ? [item] : []
-  }
-
-  private shouldKeepCodexReplacementHistoryItem(
-    item: CodexReplacementHistoryItem
-  ): boolean {
-    if (this.isCodexRawCompactionItem(item)) {
-      return true
-    }
-    const role = typeof item.role === "string" ? item.role : ""
-    if (role !== "user" && role !== "assistant") {
-      return false
-    }
-    const text = this.extractCodexReplacementHistoryItemText(item).trim()
-    if (!text) {
-      return false
-    }
-    return role !== "user" || !this.isSyntheticCodexHistoryText(text)
-  }
-
-  private normalizeCodexReplacementHistorySummary(
-    value: unknown,
-    items: CodexReplacementHistoryItem[]
-  ): string {
-    const raw = typeof value === "string" ? value.trim() : ""
-    const seen = new Set<string>()
-    const parts: string[] = []
-    for (const item of items) {
-      const text = this.extractCodexReplacementHistoryItemText(item).trim()
-      if (!text || this.isSyntheticCodexHistoryText(text)) continue
-      const key = text.replace(/\s+/g, " ").trim()
-      if (!key || seen.has(key)) continue
-      seen.add(key)
-      parts.push(text)
-    }
-    if (parts.length > 0) {
-      return this.wrapCodexReplacementSummary(parts.join("\n\n"))
-    }
-    if (raw && !this.isSyntheticCodexHistoryText(raw)) {
-      return this.wrapCodexReplacementSummary(raw)
-    }
-    const body =
-      raw && raw.startsWith(CODEX_REPLACEMENT_SUMMARY_PREFIX)
-        ? raw
-        : CODEX_EMPTY_REPLACEMENT_SUMMARY
-    return this.wrapCodexReplacementSummary(body)
-  }
-
-  private buildCodexReplacementProjectionItems(
-    items: CodexReplacementHistoryItem[],
-    summary: string
-  ): CodexReplacementHistoryItem[] {
-    const rawCompactionItems = items.filter((item) =>
-      this.isCodexRawCompactionItem(item)
-    )
-    if (rawCompactionItems.length > 0) {
-      return [rawCompactionItems[rawCompactionItems.length - 1]!]
-    }
-    const text = summary.trim()
-    if (!text) return []
-    return [
-      {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text }],
-      },
-    ]
-  }
-
-  private wrapCodexReplacementSummary(summary: string): string {
-    const trimmed = summary.trim()
-    if (trimmed.startsWith(CODEX_REPLACEMENT_SUMMARY_PREFIX)) {
-      return trimmed
-    }
-    return [
-      CODEX_REPLACEMENT_SUMMARY_PREFIX,
-      CODEX_REPLACEMENT_HISTORICAL_NOTICE,
-      "",
-      trimmed || CODEX_EMPTY_REPLACEMENT_SUMMARY,
-    ].join("\n")
-  }
-
-  private isCodexRawCompactionItem(item: CodexReplacementHistoryItem): boolean {
-    return item.type === "compaction" || item.type === "context_compaction"
-  }
-
-  private isSyntheticCodexHistoryText(text: string): boolean {
-    const normalized = text.trimStart()
-    return (
-      normalized.startsWith("Current Codex turn context:") ||
-      normalized.startsWith(CODEX_REPLACEMENT_SUMMARY_PREFIX) ||
-      normalized.startsWith("This is compressed historical context") ||
-      /^(?:\[Context (?:attachment|summary|collapse|boundary|attachment removed)|\[Result of an earlier tool call|\[tool_result stored\])/i.test(
-        normalized
-      ) ||
-      /^# AGENTS\.md instructions\b/i.test(normalized) ||
-      /^<environment_context>/i.test(normalized) ||
-      /^<turn_aborted>/i.test(normalized) ||
-      /^Grep completed:\s*pattern=/i.test(normalized) ||
-      /\bDocumentId:\s*tool_result:/i.test(normalized) ||
-      /\/\.agent-vibes\/tool-results\//i.test(normalized) ||
-      /\n(?:Session Memory|Investigation Memory|Recent File Snapshots|Tracked File Changes)\b/i.test(
-        normalized
-      )
-    )
-  }
-
-  private extractCodexReplacementHistoryItemText(
-    item: CodexReplacementHistoryItem
-  ): string {
-    const content = item.content
-    if (typeof content === "string") {
-      return content
-    }
-    if (Array.isArray(content)) {
-      return content
-        .map((block) =>
-          block && typeof block === "object"
-            ? typeof (block as { text?: unknown }).text === "string"
-              ? (block as { text: string }).text
-              : ""
-            : typeof block === "string"
-              ? block
-              : ""
-        )
-        .filter(Boolean)
-        .join("\n")
-    }
-    if (typeof item.summary === "string") {
-      return item.summary
-    }
-    if (typeof item.message === "string") {
-      return item.message
-    }
-    try {
-      return extractText(content as LooseMessageContent)
-    } catch {
-      return ""
-    }
-  }
-
-  private normalizeInvestigationMemoryEntry(
-    value: unknown
-  ): ContextInvestigationMemoryEntry {
-    const entry =
-      value && typeof value === "object"
-        ? (value as Partial<ContextInvestigationMemoryEntry>)
-        : {}
-
-    return {
-      batchId:
-        typeof entry.batchId === "string" && entry.batchId.trim().length > 0
-          ? entry.batchId.trim()
-          : `recovered_${crypto.randomUUID()}`,
-      label: typeof entry.label === "string" ? entry.label : "",
-      details: typeof entry.details === "string" ? entry.details : "",
-      toolCallIds: Array.isArray(entry.toolCallIds)
-        ? entry.toolCallIds.filter(
-            (toolCallId): toolCallId is string =>
-              typeof toolCallId === "string" && toolCallId.trim().length > 0
-          )
-        : [],
-      toolCount:
-        typeof entry.toolCount === "number" && Number.isFinite(entry.toolCount)
-          ? Math.max(0, Math.floor(entry.toolCount))
-          : 0,
-      readOnly: entry.readOnly === true,
-      createdAt:
-        typeof entry.createdAt === "number" && Number.isFinite(entry.createdAt)
-          ? entry.createdAt
-          : Date.now(),
-    }
-  }
-
-  private normalizeSessionMemoryEntry(
-    value: unknown
-  ): ContextSessionMemoryEntry {
-    const entry =
-      value && typeof value === "object"
-        ? (value as Partial<ContextSessionMemoryEntry>)
-        : {}
-    const kind =
-      entry.kind === "objective" ||
-      entry.kind === "decision" ||
-      entry.kind === "progress" ||
-      entry.kind === "file" ||
-      entry.kind === "constraint" ||
-      entry.kind === "verification" ||
-      entry.kind === "risk" ||
-      entry.kind === "command" ||
-      entry.kind === "sub_agent" ||
-      entry.kind === "open_item"
-        ? entry.kind
-        : "progress"
-
-    return {
-      id:
-        typeof entry.id === "string" && entry.id.trim().length > 0
-          ? entry.id.trim()
-          : `recovered_${crypto.randomUUID()}`,
-      kind,
-      text: typeof entry.text === "string" ? entry.text : "",
-      sourceCompactionId:
-        typeof entry.sourceCompactionId === "string"
-          ? entry.sourceCompactionId
-          : "",
-      sourceRecordId:
-        typeof entry.sourceRecordId === "string"
-          ? entry.sourceRecordId
-          : undefined,
-      createdAt:
-        typeof entry.createdAt === "number" && Number.isFinite(entry.createdAt)
-          ? entry.createdAt
-          : Date.now(),
-      weight:
-        typeof entry.weight === "number" && Number.isFinite(entry.weight)
-          ? Math.max(0, Math.floor(entry.weight))
-          : 1,
-    }
-  }
-
-  private normalizeContextCollapseState(value: unknown): ContextCollapseState {
-    const state =
-      value && typeof value === "object"
-        ? (value as Partial<ContextCollapseState>)
-        : {}
-    return {
-      updatedAt:
-        typeof state.updatedAt === "number" && Number.isFinite(state.updatedAt)
-          ? state.updatedAt
-          : undefined,
-      commits: Array.isArray(state.commits)
-        ? state.commits.flatMap((commit) =>
-            this.normalizeContextCollapseCommit(commit)
-          )
-        : [],
-    }
-  }
-
-  private normalizeContextCollapseCommit(
-    value: unknown
-  ): ContextCollapseCommit[] {
-    if (!value || typeof value !== "object") {
-      return []
-    }
-    const commit = value as Partial<ContextCollapseCommit>
-    if (
-      typeof commit.id !== "string" ||
-      commit.id.trim().length === 0 ||
-      !Array.isArray(commit.archivedRecordIds) ||
-      commit.archivedRecordIds.length === 0 ||
-      typeof commit.summaryRecordId !== "string" ||
-      commit.summaryRecordId.trim().length === 0 ||
-      typeof commit.summary !== "string" ||
-      commit.summary.trim().length === 0
-    ) {
-      return []
-    }
-    const archivedRecordIds = commit.archivedRecordIds.filter(
-      (recordId): recordId is string =>
-        typeof recordId === "string" && recordId.trim().length > 0
-    )
-    if (archivedRecordIds.length === 0) {
-      return []
-    }
-    return [
-      {
-        id: commit.id.trim(),
-        createdAt:
-          typeof commit.createdAt === "number" &&
-          Number.isFinite(commit.createdAt)
-            ? commit.createdAt
-            : Date.now(),
-        strategy:
-          commit.strategy === "manual" || commit.strategy === "reactive"
-            ? commit.strategy
-            : "auto",
-        parentCollapseId:
-          typeof commit.parentCollapseId === "string" &&
-          commit.parentCollapseId.trim().length > 0
-            ? commit.parentCollapseId.trim()
-            : undefined,
-        archivedRecordIds,
-        archivedThroughRecordId:
-          typeof commit.archivedThroughRecordId === "string" &&
-          commit.archivedThroughRecordId.trim().length > 0
-            ? commit.archivedThroughRecordId.trim()
-            : archivedRecordIds[archivedRecordIds.length - 1]!,
-        summaryRecordId: commit.summaryRecordId.trim(),
-        sourceRecordCount: this.normalizeNonNegativeInteger(
-          commit.sourceRecordCount,
-          archivedRecordIds.length
-        ),
-        sourceMessageCount: this.normalizeNonNegativeInteger(
-          commit.sourceMessageCount,
-          archivedRecordIds.length
-        ),
-        sourceTokenCount: this.normalizeNonNegativeInteger(
-          commit.sourceTokenCount,
-          0
-        ),
-        retainedStartRecordId:
-          typeof commit.retainedStartRecordId === "string" &&
-          commit.retainedStartRecordId.trim().length > 0
-            ? commit.retainedStartRecordId.trim()
-            : undefined,
-        retainedRecordCount: this.normalizeNonNegativeInteger(
-          commit.retainedRecordCount,
-          0
-        ),
-        retainedTokenCount:
-          typeof commit.retainedTokenCount === "number" &&
-          Number.isFinite(commit.retainedTokenCount) &&
-          commit.retainedTokenCount >= 0
-            ? Math.floor(commit.retainedTokenCount)
-            : undefined,
-        summary: commit.summary.trim(),
-        summaryTokenCount: this.normalizeNonNegativeInteger(
-          commit.summaryTokenCount,
-          0
-        ),
-        projectedTokenCount: this.normalizeNonNegativeInteger(
-          commit.projectedTokenCount,
-          0
-        ),
-      },
-    ]
-  }
-
-  private normalizeNonNegativeInteger(
-    value: unknown,
-    fallback: number
-  ): number {
-    return typeof value === "number" && Number.isFinite(value) && value >= 0
-      ? Math.floor(value)
-      : fallback
-  }
-
-  private normalizeCompactionHistory(
-    state: ContextConversationState,
-    persistedVersion: PersistedChatSessionV1["version"]
-  ): {
-    compactionHistory: ContextCompactionCommit[]
-    activeCompactionId?: string
-  } {
-    const history = Array.isArray(state.compactionHistory)
-      ? state.compactionHistory.filter(
-          (commit): commit is ContextCompactionCommit =>
-            !!commit &&
-            typeof commit === "object" &&
-            typeof commit.id === "string" &&
-            commit.id.trim().length > 0 &&
-            typeof commit.archivedThroughRecordId === "string" &&
-            commit.archivedThroughRecordId.trim().length > 0 &&
-            typeof commit.summary === "string"
-        )
-      : []
-    const activeCompactionId =
-      typeof state.activeCompactionId === "string" &&
-      state.activeCompactionId.trim().length > 0
-        ? state.activeCompactionId
-        : undefined
-    const activeCommit = activeCompactionId
-      ? history.find((commit) => commit.id === activeCompactionId)
-      : undefined
-
-    if (persistedVersion >= 8) {
-      return {
-        compactionHistory: history,
-        activeCompactionId: activeCommit?.id,
-      }
-    }
-
-    return activeCommit
-      ? {
-          compactionHistory: [
-            {
-              ...activeCommit,
-              parentCompactionId: undefined,
-            },
-          ],
-          activeCompactionId: activeCommit.id,
-        }
-      : {
-          compactionHistory: [],
-          activeCompactionId: undefined,
-        }
-  }
-
-  private hasContextEventRecords(
-    records: readonly ContextTranscriptRecord[] | undefined
-  ): boolean {
-    return records != null && records.some((record) => !isMessageRecord(record))
-  }
-
-  private normalizeTranscriptRecords(
-    records: readonly ContextTranscriptRecord[]
-  ): ContextTranscriptRecord[] {
-    return records.flatMap((record) => {
-      if (!record || typeof record !== "object") return []
-      if (!record.kind) {
-        return [{ ...record, kind: "message" as const }]
-      }
-      return [{ ...record }]
-    })
-  }
-
-  private migrateCompactionStateToTranscript(
-    rawContextState: ContextConversationState,
-    messageRecords: ContextTranscriptRecord[],
-    normalizedCompactionState:
-      | {
-          compactionHistory: ContextCompactionCommit[]
-          activeCompactionId?: string
-        }
-      | undefined
-  ): ContextTranscriptRecord[] {
-    const rawRecords = this.normalizeTranscriptRecords(rawContextState.records)
-    if (this.hasContextEventRecords(rawRecords)) {
-      return rawRecords
-    }
-
-    const activeCommit = normalizedCompactionState?.activeCompactionId
-      ? normalizedCompactionState.compactionHistory.find(
-          (commit) => commit.id === normalizedCompactionState.activeCompactionId
-        )
-      : undefined
-    if (!activeCommit) {
-      return messageRecords
-    }
-
-    const retainedRecords = stripInternalContextEvents(rawRecords)
-    const createdAt = activeCommit.createdAt || Date.now()
-    return [
-      createCompactBoundaryRecord(activeCommit, createdAt),
-      createCompactSummaryRecord(activeCommit, createdAt + 1),
-      ...retainedRecords,
-    ]
   }
 
   private syncMessagesFromRecords(
@@ -4213,8 +4429,24 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   ): SessionMessage[] {
     return records.filter(isMessageRecord).map((record) =>
       makeSessionMessage(record.role, record.content, {
+        uuid: record.id,
+        timestamp: new Date(record.createdAt).toISOString(),
         messageId: record.messageId,
         isMeta: record.isMeta,
+        parentUuid: record.parentUuid,
+        logicalParentUuid: record.logicalParentUuid,
+        sourceToolAssistantUuid: record.sourceToolAssistantUuid,
+        provider: record.provider,
+        providerMessageId: record.providerMessageId,
+        blockOccurrence: record.blockIndex,
+        turnId: record.turnId,
+        threadId: record.threadId,
+        branchId: record.branchId,
+        agentId: record.agentId,
+        isSidechain: record.isSidechain,
+        forkSourceUuid: record.forkSourceUuid,
+        forkLineage: record.forkLineage,
+        excludedFromProviderProjection: record.excludedFromProviderProjection,
       })
     )
   }
@@ -4236,114 +4468,6 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     return { events, nextSeq }
   }
 
-  private normalizeTranscriptEvents(
-    value: unknown,
-    fallbackRecords: ContextTranscriptRecord[]
-  ): {
-    events: SessionTranscriptEvent[]
-    nextSeq: number
-  } {
-    if (!Array.isArray(value) || value.length === 0) {
-      return this.rebuildTranscriptEventsFromRecords(fallbackRecords)
-    }
-    const events = value.flatMap((event) =>
-      this.normalizeTranscriptEvent(event)
-    )
-    if (events.length === 0) {
-      return this.rebuildTranscriptEventsFromRecords(fallbackRecords)
-    }
-    events.sort(
-      (left, right) => left.seq - right.seq || left.createdAt - right.createdAt
-    )
-    const maxSeq = events.reduce((max, event) => Math.max(max, event.seq), 0)
-    return {
-      events,
-      nextSeq: maxSeq + 1,
-    }
-  }
-
-  private normalizeTranscriptEvent(value: unknown): SessionTranscriptEvent[] {
-    if (!value || typeof value !== "object") {
-      return []
-    }
-    const event = value as Partial<SessionTranscriptEvent>
-    if (
-      typeof event.kind !== "string" ||
-      !this.isTranscriptEventKind(event.kind)
-    ) {
-      return []
-    }
-    const seq =
-      typeof event.seq === "number" && Number.isFinite(event.seq)
-        ? Math.max(1, Math.floor(event.seq))
-        : 1
-    return [
-      {
-        id:
-          typeof event.id === "string" && event.id.trim().length > 0
-            ? event.id.trim()
-            : `evt_${seq}_${crypto.randomUUID()}`,
-        seq,
-        kind: event.kind,
-        recordId:
-          typeof event.recordId === "string" && event.recordId.trim().length > 0
-            ? event.recordId.trim()
-            : undefined,
-        role:
-          event.role === "user" || event.role === "assistant"
-            ? event.role
-            : undefined,
-        messageId:
-          typeof event.messageId === "string" &&
-          event.messageId.trim().length > 0
-            ? event.messageId.trim()
-            : undefined,
-        toolUseId:
-          typeof event.toolUseId === "string" &&
-          event.toolUseId.trim().length > 0
-            ? event.toolUseId.trim()
-            : undefined,
-        toolName:
-          typeof event.toolName === "string" && event.toolName.trim().length > 0
-            ? event.toolName.trim()
-            : undefined,
-        contentChars:
-          typeof event.contentChars === "number" &&
-          Number.isFinite(event.contentChars) &&
-          event.contentChars >= 0
-            ? Math.floor(event.contentChars)
-            : undefined,
-        createdAt:
-          typeof event.createdAt === "number" &&
-          Number.isFinite(event.createdAt)
-            ? event.createdAt
-            : Date.now(),
-        turnId:
-          typeof event.turnId === "string" && event.turnId.trim().length > 0
-            ? event.turnId.trim()
-            : undefined,
-        summary:
-          typeof event.summary === "string" && event.summary.trim().length > 0
-            ? event.summary.trim()
-            : undefined,
-      },
-    ]
-  }
-
-  private isTranscriptEventKind(
-    value: string
-  ): value is SessionTranscriptEventKind {
-    return (
-      value === "session_restored" ||
-      value === "snapshot_rewrite" ||
-      value === "snapshot_repair" ||
-      value === "user_message" ||
-      value === "assistant_message" ||
-      value === "tool_use" ||
-      value === "tool_result"
-    )
-  }
-
   appendTranscriptEvent(
     session: SessionRecord,
     event: Omit<SessionTranscriptEvent, "id" | "seq" | "createdAt"> & {
@@ -4351,41 +4475,24 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     }
   ): SessionTranscriptEvent {
     const ctx = this.contextState.getContextRecord(session.conversationId)!
-    const seq = ctx.nextTranscriptEventSeq || 1
+    const seq = ctx.mainProjection.nextTranscriptEventSeq || 1
     const fullEvent: SessionTranscriptEvent = {
       id: `evt_${seq}_${crypto.randomUUID()}`,
       seq,
       createdAt: event.createdAt ?? Date.now(),
       ...event,
     }
-    ctx.transcriptEvents.push(fullEvent)
-    ctx.nextTranscriptEventSeq = seq + 1
+    ctx.mainProjection.transcriptEvents.push(fullEvent)
+    ctx.mainProjection.nextTranscriptEventSeq = seq + 1
     return fullEvent
-  }
-
-  appendTranscriptEventsForMessage(
-    session: SessionRecord,
-    record: ContextTranscriptRecord,
-    message: SessionMessage
-  ): SessionTranscriptEvent[] {
-    const ctx = this.contextState.getContextRecord(session.conversationId)!
-    const events = this.buildTranscriptEventsForRecord(
-      record,
-      ctx.nextTranscriptEventSeq || 1,
-      message.uuid
-    )
-    ctx.transcriptEvents.push(...events)
-    ctx.nextTranscriptEventSeq =
-      (ctx.nextTranscriptEventSeq || 1) + events.length
-    return events
   }
 
   buildTranscriptEventsForRecord(
     record: ContextTranscriptRecord,
-    startSeq: number,
-    turnId?: string
+    startSeq: number
   ): SessionTranscriptEvent[] {
     const events: SessionTranscriptEvent[] = []
+    const turnId = record.turnId
     const base = {
       recordId: record.id,
       role: record.role,
@@ -4402,7 +4509,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     })
 
     let nextSeq = startSeq + 1
-    for (const block of this.safeNormalizeContent(record.content)) {
+    for (const block of normalizeContent(record.content)) {
       if (isToolUseBlock(block)) {
         events.push({
           id: `evt_${nextSeq}_${crypto.randomUUID()}`,
@@ -4436,91 +4543,23 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     return events
   }
 
-  safeNormalizeContent(content: MessageContent) {
-    try {
-      return normalizeContent(content)
-    } catch {
-      return []
-    }
-  }
-
   countContentChars(content: MessageContent): number {
     if (typeof content === "string") {
       return content.length
     }
-    try {
-      return safeJsonStringify(content, {
-        maxDepth: 8,
-        maxArrayItems: 200,
-        maxObjectKeys: 100,
-        maxStringLength: 8 * 1024,
-      }).length
-    } catch {
-      return 0
-    }
+    return safeJsonStringify(content, {
+      maxDepth: 8,
+      maxArrayItems: 200,
+      maxObjectKeys: 100,
+      maxStringLength: 8 * 1024,
+    }).length
   }
 
   shouldFlushMessageImmediately(message: SessionMessage): boolean {
     if (message.type !== "user" || message.isMeta) {
       return false
     }
-    return !this.safeNormalizeContent(message.message.content).some(
-      isToolResultBlock
-    )
-  }
-
-  messageContentEqual(left: MessageContent, right: MessageContent): boolean {
-    if (left === right) return true
-    if (typeof left !== typeof right) return false
-    try {
-      return safeJsonEqual(left, right)
-    } catch {
-      return false
-    }
-  }
-
-  messagesEqual(left: SessionMessage, right: SessionMessage): boolean {
-    return (
-      left.message.role === right.message.role &&
-      this.messageContentEqual(left.message.content, right.message.content)
-    )
-  }
-
-  hasStableRecordProjection(
-    previousRecords: ContextTranscriptRecord[],
-    nextRecords: ContextTranscriptRecord[],
-    throughRecordId: string
-  ): boolean {
-    const previousIndex = previousRecords.findIndex(
-      (record) => record.id === throughRecordId
-    )
-    const nextIndex = nextRecords.findIndex(
-      (record) => record.id === throughRecordId
-    )
-    if (previousIndex < 0 || nextIndex < 0) {
-      return false
-    }
-
-    // The projection is "stable" (compatible — archived context still valid)
-    // as long as every previous record from the anchor still appears in the
-    // next records IN THE SAME RELATIVE ORDER. Insertions/appends are benign:
-    // an async/delayed tool_result repaired into place next to its tool_use,
-    // or a freshly appended turn, must NOT invalidate compaction. Only a
-    // genuine rewrite — a previous record removed or reordered — is
-    // incompatible. (A previous contiguous-equality check treated any
-    // mid-transcript insertion as a rewrite, which discarded the compaction
-    // archive on nearly every async tool result, forcing churning
-    // re-compaction.)
-    const previousSuffix = previousRecords.slice(previousIndex)
-    let prev = 0
-    let next = nextIndex
-    while (prev < previousSuffix.length && next < nextRecords.length) {
-      if (previousSuffix[prev]?.id === nextRecords[next]?.id) {
-        prev++
-      }
-      next++
-    }
-    return prev === previousSuffix.length
+    return !normalizeContent(message.message.content).some(isToolResultBlock)
   }
 
   syncContextRecordsFromMessageRecords(
@@ -4528,33 +4567,6 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     messageRecords: ContextTranscriptRecord[]
   ): void {
     const activeCommit = getActiveCompactCommitFromTranscript(state.records)
-    if (!activeCommit) {
-      // No compact_boundary, but the existing state may still have snip
-      // boundaries (durable record-drop markers). Wholesale-replacing
-      // state.records with messageRecords would erase those, forcing the
-      // next compaction round to re-snip the same 1500+ records and
-      // re-emit a 1M-token `predictive_limit_reached` reading. Carry the
-      // snip boundaries forward in the same relative position so the
-      // projection layer keeps hiding the dropped IDs.
-      const snipBoundaries = state.records.filter(isSnipBoundaryRecord)
-      const remappedMessages = messageRecords.map((record) => ({
-        ...record,
-        kind: record.kind || "message",
-      }))
-      state.records =
-        snipBoundaries.length > 0
-          ? [...remappedMessages, ...snipBoundaries]
-          : remappedMessages
-      state.compactionHistory = []
-      state.activeCompactionId = undefined
-      state.codexContext = {
-        ...(state.codexContext || this.createCodexContextState()),
-        historyVersion: (state.codexContext?.historyVersion || 0) + 1,
-        activeWindow: undefined,
-      }
-      return
-    }
-
     const visibleById = new Map(
       messageRecords.map((record) => [record.id, record])
     )
@@ -4565,18 +4577,51 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       const visible = visibleById.get(record.id)
       return visible ? { ...visible, kind: "message" as const } : record
     })
-    const lastStateMessage = [...state.records]
-      .reverse()
-      .find((record) => isMessageRecord(record))
-    const lastVisibleIndex = lastStateMessage
-      ? messageRecords.findIndex((record) => record.id === lastStateMessage.id)
-      : -1
-    const appended =
-      lastVisibleIndex >= 0
-        ? messageRecords
-            .slice(lastVisibleIndex + 1)
-            .filter((record) => !knownMessageIds.has(record.id))
-        : messageRecords.filter((record) => !knownMessageIds.has(record.id))
+    const excludedMessageIds = new Set<string>()
+    for (const record of state.records) {
+      if (!isSnipBoundaryRecord(record)) continue
+      for (const recordId of record.snipMetadata?.removedRecordIds ?? []) {
+        excludedMessageIds.add(recordId)
+      }
+    }
+    const graphWatermarkUuid =
+      state.graphWatermarkUuid === undefined
+        ? undefined
+        : requireExactDurableIdentifier(
+            state.graphWatermarkUuid,
+            "Claude graph watermark"
+          )
+    let continuationRecords: ContextTranscriptRecord[]
+    if (graphWatermarkUuid) {
+      const graphWatermarkIndex = messageRecords.findIndex(
+        (record) => record.id === graphWatermarkUuid
+      )
+      if (graphWatermarkIndex < 0) {
+        throw new Error(
+          `Claude graph watermark ${graphWatermarkUuid} is missing from the mounted durable graph`
+        )
+      }
+      continuationRecords = messageRecords.slice(graphWatermarkIndex + 1)
+    } else {
+      if (state.records.length > 0) {
+        throw new Error(
+          "Mounted context projection has records but no durable main-graph watermark"
+        )
+      }
+      const lastVisibleIndex = messageRecords.reduce(
+        (lastIndex, record, index) =>
+          knownMessageIds.has(record.id) ? index : lastIndex,
+        -1
+      )
+      continuationRecords =
+        lastVisibleIndex >= 0
+          ? messageRecords.slice(lastVisibleIndex + 1)
+          : messageRecords
+    }
+    const appended = continuationRecords.filter(
+      (record) =>
+        !knownMessageIds.has(record.id) && !excludedMessageIds.has(record.id)
+    )
     state.records = [
       ...synced,
       ...appended.map((record) => ({
@@ -4587,530 +4632,114 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     state.compactionHistory = deriveCompactionHistoryFromTranscript(
       state.records
     )
-    state.activeCompactionId = activeCommit.id
-  }
-
-  reconcileMessageRecords(
-    existing: ContextTranscriptRecord[],
-    nextMessages: SessionMessage[]
-  ): ContextTranscriptRecord[] {
-    const recordMatchesMessage = (
-      record: ContextTranscriptRecord,
-      msg: SessionMessage
-    ): boolean =>
-      record.role === msg.message.role &&
-      Boolean(record.isMeta) === Boolean(msg.type === "user" && msg.isMeta) &&
-      this.messageContentEqual(record.content, msg.message.content)
-
-    let prefix = 0
-    while (
-      prefix < existing.length &&
-      prefix < nextMessages.length &&
-      recordMatchesMessage(existing[prefix]!, nextMessages[prefix]!)
-    ) {
-      prefix++
-    }
-
-    let existingSuffix = existing.length - 1
-    let nextSuffix = nextMessages.length - 1
-    while (
-      existingSuffix >= prefix &&
-      nextSuffix >= prefix &&
-      recordMatchesMessage(existing[existingSuffix]!, nextMessages[nextSuffix]!)
-    ) {
-      existingSuffix--
-      nextSuffix--
-    }
-
-    const reconciled: ContextTranscriptRecord[] = []
-    reconciled.push(...existing.slice(0, prefix))
-    for (let i = prefix; i <= nextSuffix; i++) {
-      reconciled.push(this.createTranscriptRecord(nextMessages[i]!))
-    }
-    if (existingSuffix + 1 < existing.length) {
-      reconciled.push(...existing.slice(existingSuffix + 1))
-    }
-    return reconciled
-  }
-
-  isContextStateCompatible(
-    state: ContextConversationState,
-    records: ContextTranscriptRecord[],
-    previousRecords: ContextTranscriptRecord[] = state.records
-  ): boolean {
-    if (getActiveCompactCommitFromTranscript(state.records)) {
-      return true
-    }
-    if (
-      typeof state.activeCompactionId === "string" ||
-      (Array.isArray(state.compactionHistory) &&
-        state.compactionHistory.length > 0)
-    ) {
-      return true
-    }
-    // Snip boundaries are durable archive markers too — they record the IDs
-    // of records that the projection layer should hide, even though no
-    // summary text was generated. Treating them as "incompatible state"
-    // would force `replaceMessages` to discard `state.records` after every
-    // transcript rewrite (tool batch return, mid-turn re-anchor, etc.),
-    // so the next turn would see ALL pre-snip records again, re-estimate
-    // ~1M tokens, and re-snip the same 1500+ records — wasting tokenizer
-    // CPU and producing a 6×-inflated `predictive_limit_reached` value
-    // that masks any real growth.
-    //
-    // We require both `state.records` and the incoming `records` to retain
-    // the snip boundary; if either side has dropped it, we fall through to
-    // the strict-projection check (which will return false and reset).
-    const stateHasSnipBoundary = state.records.some(isSnipBoundaryRecord)
-    const incomingHasSnipBoundary = records.some(isSnipBoundaryRecord)
-    if (stateHasSnipBoundary && incomingHasSnipBoundary) {
-      return true
-    }
-    // Context collapses are a separate, lighter-weight summarization track
-    // (see ContextCollapseService). Their commits live on
-    // `contextCollapseState.commits` and are NOT recorded in
-    // `compactionHistory`, but they do leave `context_collapse_summary`
-    // records inline in the transcript and a non-empty
-    // `contextCollapseState.commits` array. Without this branch, a turn that
-    // had an LLM-backed collapse applied (a 30–110s round-trip on Opus)
-    // followed by a transcript rewrite (e.g. tool integrity repair on the
-    // next continuation) would fall through to the strict stable-projection
-    // check, return false, and cause `replaceMessages` to throw away the
-    // freshly-archived collapse along with the rest of `contextState`,
-    // forcing the next turn to redo the LLM compact from scratch. Treat
-    // either an inline summary record OR a tracked commit as sufficient
-    // proof that archived context is in play and worth preserving.
-    if (records.some((record) => isContextCollapseSummaryRecord(record))) {
-      return true
-    }
-    const collapseCommits = state.contextCollapseState?.commits
-    if (Array.isArray(collapseCommits) && collapseCommits.length > 0) {
-      return true
-    }
-
-    const stateMessageRecords = stripInternalContextEvents(previousRecords)
-    if (stateMessageRecords.length === 0) return true
-    return this.hasStableRecordProjection(
-      stateMessageRecords,
-      records,
-      stateMessageRecords[0]!.id
-    )
-  }
-
-  shouldRetainUsageLedger(
-    state: ContextConversationState,
-    records: ContextTranscriptRecord[],
-    previousRecords: ContextTranscriptRecord[] = state.records
-  ): boolean {
-    const anchorRecordId = state.usageLedger.anchorRecordId
-    if (!anchorRecordId) return true
-    if (getActiveCompactCommitFromTranscript(state.records)) {
-      return records.some((record) => record.id === anchorRecordId)
-    }
-
-    return this.hasStableRecordProjection(
-      previousRecords,
-      records,
-      anchorRecordId
-    )
+    state.activeCompactionId = activeCommit?.id
+    state.graphWatermarkUuid = messageRecords.at(-1)?.id
   }
 
   /**
-   * Pure deserialization — JSON row → in-memory `SessionRecord`.
-   *
-   * No side effects:
-   *   - does NOT log
-   *   - does NOT persist
-   *   - does NOT mount into `this.sessions`
-   *
-   * Schema migration (compaction history derivation, transcript event
-   * normalization) IS performed because it is part of the
-   * "interpret raw JSON as a current-shape SessionRecord" contract.
-   *
-   * Callers that need a usable session (mount + audit) should
-   * use {@link loadPersistedSession}. Callers that just need a transient
-   * snapshot (analytics, dashboards) should call this and optionally
-   * {@link writeSessionRow}.
+   * Read-only restore construction. It never touches the lifecycle,
+   * ContextState or SessionStream registries, so analytics can inspect a
+   * durable row without creating live transient state.
    */
   private parsePersistedSession(
-    persisted: PersistedChatSessionV1
-  ): SessionRecord {
-    const now = Date.now()
-    const createdAt = new Date(this.toTimestamp(persisted.createdAt, now))
-    const lastActivityAt = new Date(
-      this.toTimestamp(persisted.lastActivityAt, createdAt.getTime())
+    persisted: PersistedChatSession
+  ): RestoredSessionBundle {
+    const createdAt = new Date(persisted.createdAt)
+    const lastActivityAt = new Date(persisted.lastActivityAt)
+    const messageRecords = persisted.messages.map((message, index) =>
+      this.createTranscriptRecord(message, createdAt.getTime() + index * 1000)
     )
-    const baseMessages = Array.isArray(persisted.messages)
-      ? persisted.messages
-      : []
-    const messageRecords =
-      Array.isArray(persisted.messageRecords) &&
-      persisted.messageRecords.length > 0
-        ? persisted.messageRecords
-        : baseMessages.map((message, index) =>
-            this.createTranscriptRecord(
-              message,
-              createdAt.getTime() + index * 1000
-            )
-          )
-    const rawContextState =
-      persisted.contextState && typeof persisted.contextState === "object"
-        ? persisted.contextState
-        : undefined
-    const normalizedCompactionState = rawContextState
-      ? this.normalizeCompactionHistory(rawContextState, persisted.version)
-      : undefined
-    const migratedContextRecords = rawContextState
-      ? this.migrateCompactionStateToTranscript(
-          rawContextState,
-          messageRecords,
-          normalizedCompactionState
-        )
-      : undefined
-    const contextState =
-      rawContextState &&
-      Array.isArray(rawContextState.records) &&
-      this.isContextStateCompatible(
-        rawContextState,
+    const conversationId = ConversationId.of(persisted.conversationId)
+    const snipBoundaryRecords = materializeSnipBoundaryRecords({
+      graphRecords: messageRecords,
+      events: this.snipBoundaryStore.list(conversationId),
+    })
+    const sessionMemory =
+      this.sessionMemoryEvents.listMaterialized(conversationId)
+    // Session configuration never owns a mutable context JSON mirror. The
+    // main graph and provider-neutral layout events build the initial detached
+    // state, then an installed Claude head replaces only the provider context
+    // window before this bundle can become visible.
+    const mainContextState = this.createContextState(
+      mergeSnipBoundariesIntoGraph({
+        graphRecords: messageRecords,
+        boundaryRecords: snipBoundaryRecords,
+      }),
+      sessionMemory
+    )
+    const mainOwner = createMainProjectionOwner(conversationId)
+    const activeMainProjectionHead = this.contextProjectionHeads.get(mainOwner)
+    if (activeMainProjectionHead) {
+      this.restoreContextProjectionFromStore(
+        mainOwner,
+        mainContextState,
         messageRecords,
-        rawContextState.records
-      )
-        ? {
-            ...rawContextState,
-            records: migratedContextRecords || messageRecords,
-            compactionHistory: deriveCompactionHistoryFromTranscript(
-              migratedContextRecords || []
-            ),
-            activeCompactionId: getActiveCompactCommitFromTranscript(
-              migratedContextRecords || []
-            )?.id,
-            compactionEpoch:
-              typeof rawContextState.compactionEpoch === "number" &&
-              rawContextState.compactionEpoch >= 0
-                ? rawContextState.compactionEpoch
-                : 0,
-            lastAppliedCompaction:
-              rawContextState.lastAppliedCompaction &&
-              typeof rawContextState.lastAppliedCompaction === "object" &&
-              (typeof rawContextState.lastAppliedCompaction.compactionId ===
-                "string" ||
-                typeof rawContextState.activeCompactionId === "string")
-                ? {
-                    recordCount:
-                      typeof rawContextState.lastAppliedCompaction
-                        .recordCount === "number" &&
-                      rawContextState.lastAppliedCompaction.recordCount >= 0
-                        ? rawContextState.lastAppliedCompaction.recordCount
-                        : messageRecords.length,
-                    attachmentFingerprint:
-                      typeof rawContextState.lastAppliedCompaction
-                        .attachmentFingerprint === "string"
-                        ? rawContextState.lastAppliedCompaction
-                            .attachmentFingerprint
-                        : "",
-                    appliedAt:
-                      typeof rawContextState.lastAppliedCompaction.appliedAt ===
-                      "number"
-                        ? rawContextState.lastAppliedCompaction.appliedAt
-                        : Date.now(),
-                    compactionId:
-                      typeof rawContextState.lastAppliedCompaction
-                        .compactionId === "string"
-                        ? rawContextState.lastAppliedCompaction.compactionId
-                        : (rawContextState.activeCompactionId as string),
-                    epoch:
-                      typeof rawContextState.lastAppliedCompaction.epoch ===
-                        "number" &&
-                      rawContextState.lastAppliedCompaction.epoch >= 0
-                        ? rawContextState.lastAppliedCompaction.epoch
-                        : typeof rawContextState.compactionEpoch === "number"
-                          ? rawContextState.compactionEpoch
-                          : 0,
-                  }
-                : undefined,
-            usageLedger: this.shouldRetainUsageLedger(
-              rawContextState,
-              messageRecords,
-              rawContextState.records
-            )
-              ? rawContextState.usageLedger
-              : {},
-            codexContext: this.normalizeCodexContextState(
-              rawContextState.codexContext
-            ),
-            toolResultReplacementState:
-              rawContextState.toolResultReplacementState
-                ? {
-                    seenToolUseIds: Array.isArray(
-                      rawContextState.toolResultReplacementState.seenToolUseIds
-                    )
-                      ? [
-                          ...rawContextState.toolResultReplacementState
-                            .seenToolUseIds,
-                        ]
-                      : [],
-                    replacementByToolUseId:
-                      rawContextState.toolResultReplacementState
-                        .replacementByToolUseId &&
-                      typeof rawContextState.toolResultReplacementState
-                        .replacementByToolUseId === "object"
-                        ? {
-                            ...rawContextState.toolResultReplacementState
-                              .replacementByToolUseId,
-                          }
-                        : {},
-                    storedByToolUseId:
-                      rawContextState.toolResultReplacementState
-                        .storedByToolUseId &&
-                      typeof rawContextState.toolResultReplacementState
-                        .storedByToolUseId === "object"
-                        ? {
-                            ...rawContextState.toolResultReplacementState
-                              .storedByToolUseId,
-                          }
-                        : {},
-                    records: Array.isArray(
-                      rawContextState.toolResultReplacementState.records
-                    )
-                      ? [...rawContextState.toolResultReplacementState.records]
-                      : [],
-                  }
-                : {
-                    seenToolUseIds: [],
-                    replacementByToolUseId: {},
-                    storedByToolUseId: {},
-                    records: [],
-                  },
-            contextCollapseState: this.normalizeContextCollapseState(
-              rawContextState.contextCollapseState
-            ),
-            investigationMemory: Array.isArray(
-              rawContextState.investigationMemory
-            )
-              ? rawContextState.investigationMemory.map((entry) =>
-                  this.normalizeInvestigationMemoryEntry(entry)
-                )
-              : [],
-            sessionMemory: Array.isArray(rawContextState.sessionMemory)
-              ? rawContextState.sessionMemory.map((entry) =>
-                  this.normalizeSessionMemoryEntry(entry)
-                )
-              : [],
-          }
-        : this.createContextState(messageRecords)
-    this.syncContextRecordsFromMessageRecords(contextState, messageRecords)
-    if (contextState.lastAppliedCompaction) {
-      contextState.lastAppliedCompaction = {
-        ...contextState.lastAppliedCompaction,
-        recordCount: contextState.records.length,
-      }
-    }
-    const transcriptEventState = this.normalizeTranscriptEvents(
-      persisted.transcriptEvents,
-      messageRecords
-    )
-    if (
-      typeof persisted.nextTranscriptEventSeq === "number" &&
-      Number.isFinite(persisted.nextTranscriptEventSeq) &&
-      persisted.nextTranscriptEventSeq > transcriptEventState.nextSeq
-    ) {
-      transcriptEventState.nextSeq = Math.floor(
-        persisted.nextTranscriptEventSeq
+        snipBoundaryRecords,
+        activeMainProjectionHead
       )
     }
-
-    const topLevelAgentTurnState: SessionTopLevelAgentTurnState =
-      persisted.topLevelAgentTurnState
-        ? {
-            llmTurnCount:
-              typeof persisted.topLevelAgentTurnState.llmTurnCount ===
-                "number" && persisted.topLevelAgentTurnState.llmTurnCount > 0
-                ? persisted.topLevelAgentTurnState.llmTurnCount
-                : 1,
-            continuationBudget:
-              persisted.topLevelAgentTurnState.continuationBudget &&
-              typeof persisted.topLevelAgentTurnState.continuationBudget ===
-                "object"
-                ? {
-                    continuationCount:
-                      typeof persisted.topLevelAgentTurnState.continuationBudget
-                        .continuationCount === "number" &&
-                      persisted.topLevelAgentTurnState.continuationBudget
-                        .continuationCount >= 0
-                        ? persisted.topLevelAgentTurnState.continuationBudget
-                            .continuationCount
-                        : 0,
-                    lastHistoryTokens:
-                      typeof persisted.topLevelAgentTurnState.continuationBudget
-                        .lastHistoryTokens === "number" &&
-                      persisted.topLevelAgentTurnState.continuationBudget
-                        .lastHistoryTokens >= 0
-                        ? persisted.topLevelAgentTurnState.continuationBudget
-                            .lastHistoryTokens
-                        : 0,
-                    lastDeltaTokens:
-                      typeof persisted.topLevelAgentTurnState.continuationBudget
-                        .lastDeltaTokens === "number" &&
-                      persisted.topLevelAgentTurnState.continuationBudget
-                        .lastDeltaTokens >= 0
-                        ? persisted.topLevelAgentTurnState.continuationBudget
-                            .lastDeltaTokens
-                        : 0,
-                    startedAt:
-                      typeof persisted.topLevelAgentTurnState.continuationBudget
-                        .startedAt === "number" &&
-                      Number.isFinite(
-                        persisted.topLevelAgentTurnState.continuationBudget
-                          .startedAt
-                      ) &&
-                      persisted.topLevelAgentTurnState.continuationBudget
-                        .startedAt > 0
-                        ? persisted.topLevelAgentTurnState.continuationBudget
-                            .startedAt
-                        : Date.now(),
-                  }
-                : {
-                    continuationCount: 0,
-                    lastHistoryTokens: 0,
-                    lastDeltaTokens: 0,
-                    startedAt: Date.now(),
-                  },
-            activeToolBatch: persisted.topLevelAgentTurnState.activeToolBatch
-              ? {
-                  batchId:
-                    persisted.topLevelAgentTurnState.activeToolBatch.batchId,
-                  toolCallIds: Array.isArray(
-                    persisted.topLevelAgentTurnState.activeToolBatch.toolCallIds
-                  )
-                    ? [
-                        ...persisted.topLevelAgentTurnState.activeToolBatch
-                          .toolCallIds,
-                      ]
-                    : [],
-                  assistantText:
-                    persisted.topLevelAgentTurnState.activeToolBatch
-                      .assistantText || "",
-                  readOnly:
-                    persisted.topLevelAgentTurnState.activeToolBatch
-                      .readOnly === true,
-                  startedAt:
-                    typeof persisted.topLevelAgentTurnState.activeToolBatch
-                      .startedAt === "number"
-                      ? persisted.topLevelAgentTurnState.activeToolBatch
-                          .startedAt
-                      : Date.now(),
-                  tools: Array.isArray(
-                    persisted.topLevelAgentTurnState.activeToolBatch.tools
-                  )
-                    ? persisted.topLevelAgentTurnState.activeToolBatch.tools.map(
-                        (tool) => ({
-                          toolCallId: tool.toolCallId,
-                          toolName: tool.toolName,
-                          input:
-                            tool.input &&
-                            typeof tool.input === "object" &&
-                            !Array.isArray(tool.input)
-                              ? tool.input
-                              : {},
-                          resultSummary:
-                            typeof tool.resultSummary === "string"
-                              ? tool.resultSummary
-                              : undefined,
-                        })
-                      )
-                    : [],
-                }
-              : undefined,
-          }
-        : this.createEmptyTopLevelAgentTurnState()
-
-    // Codex response chains are bound to slot assignments within a single
-    // bridge process lifetime. After a restart, slots may be reassigned and
-    // server-side response caches expire, so restoring these fields would
-    // cause continuation requests to fail with 400 "Previous response not found".
-    const restoredLastCodexRequestSignature: string | undefined = undefined
-    const restoredLastCodexResponseId: string | undefined = undefined
-
-    const conv = ConversationId.of(persisted.conversationId)
-    this.transcriptReplaceCommitted(
-      conv,
-      this.syncMessagesFromRecords(messageRecords)
+    this.restoreClaudeProjectionFromStore(
+      mainOwner,
+      mainContextState,
+      messageRecords,
+      snipBoundaryRecords
     )
-    const sessionMessages = this.transcriptGetCommittedRaw(conv)
+    const transcriptEventState =
+      this.rebuildTranscriptEventsFromRecords(messageRecords)
+    const topLevelAgentTurnState = this.createEmptyTopLevelAgentTurnState()
 
-    // Step 4 物理拆: fan-out context / stream records to their owning
-    // services before returning the lifecycle slice. parsePersistedSession's
-    // caller (loadPersistedSession / cleanupExpiredSessions) only stores
-    // the lifecycle record into this.sessions; the other two records are
-    // already in their respective service Maps by the time the caller
-    // sees the lifecycle return value.
+    // The active projection is rebuilt directly from the durable graph
+    // records. Lifecycle keeps no transcript mirror.
+    const sessionMessages = this.syncMessagesFromRecords(messageRecords)
+
+    const mainProjection: MountedContextProjection = {
+      owner: mainOwner,
+      messages: sessionMessages,
+      generation: sessionMessages.length,
+      messageRecords,
+      transcriptEvents: transcriptEventState.events,
+      nextTranscriptEventSeq: transcriptEventState.nextSeq,
+      contextState: mainContextState,
+      usedTokens: 0,
+    }
+    const childProjections = this.restoreChildMountedProjections(conversationId)
+
     const contextRecord = this.buildContextRecordFromPersisted(
       persisted,
-      sessionMessages,
-      messageRecords,
-      transcriptEventState,
-      contextState,
+      mainProjection,
+      childProjections,
       topLevelAgentTurnState
     )
-    this.contextState.createInitialRecord(
-      persisted.conversationId,
-      contextRecord
-    )
-    const streamRecord = this.buildStreamRecordFromPersisted(persisted)
-    this.sessionStream.createInitialRecord(
-      persisted.conversationId,
-      streamRecord
-    )
+    const streamRecord = this.buildStreamRecordFromPersisted()
 
-    return {
+    const session: SessionLifecycleRecord = {
       conversationId: persisted.conversationId,
-      model: persisted.model || "claude-sonnet-4.5",
-      lastAssistantBackend:
-        typeof persisted.lastAssistantBackend === "string"
-          ? persisted.lastAssistantBackend
-          : undefined,
+      model: persisted.model,
+      codexProviderIdentity: persisted.codexProviderIdentity,
+      lastAssistantBackend: persisted.lastAssistantBackend,
       // Subagent model overrides are request-scoped (Cursor re-sends them
       // on every AgentRunRequest), so we don't persist them.  A reloaded
       // session starts empty and the next AgentRunRequest will refresh
       // it via getOrCreateSession.
       subagentModelOverrides: EMPTY_SUBAGENT_MODEL_OVERRIDES,
-      lastAssistantModel:
-        typeof persisted.lastAssistantModel === "string"
-          ? persisted.lastAssistantModel
-          : undefined,
-      // `lastThinkingSummary` was previously persisted as a single-shot
-      // string cache. Reasoning continuity now lives in
-      // ReasoningMemoryService, which has no on-disk component (records
-      // are recaptured on the next streaming turn). Older snapshots that
-      // carried the field are silently ignored on restore — there is no
-      // migration needed because the field was always advisory.
-      lastCodexResponseId: restoredLastCodexResponseId,
-      lastCodexRequestSignature: restoredLastCodexRequestSignature,
-      pendingCodexResponseId: undefined,
-      pendingCodexRequestSignature: undefined,
-      thinkingLevel:
-        typeof persisted.thinkingLevel === "number"
-          ? persisted.thinkingLevel
-          : 0,
-      thinkingDetailsRequested: persisted.thinkingDetailsRequested === true,
-      isAgentic: persisted.isAgentic === true,
-      supportedTools: freezeCacheKeyArray(
-        Array.isArray(persisted.supportedTools)
-          ? persisted.supportedTools
-          : undefined,
-        []
-      ),
+      selectedSubagentModels: EMPTY_SELECTED_SUBAGENT_MODELS,
+      lastAssistantModel: persisted.lastAssistantModel,
+      thinkingLevel: persisted.thinkingLevel,
+      thinkingDetailsRequested: persisted.thinkingDetailsRequested,
+      isAgentic: persisted.isAgentic,
+      supportedTools: freezeCacheKeyArray(persisted.supportedTools, []),
       // discoveredTools is intentionally not persisted: a tool's full
       // schema is cheaper to re-discover (one extra inline turn) than
       // to keep the schema set in sync across SQLite restarts and
       // upstream-side schema changes.  Always start fresh on restore.
       discoveredTools: new Set<string>(),
       mcpToolDefs: freezeCacheKeyArray(persisted.mcpToolDefs),
-      useWeb: persisted.useWeb === true,
+      useWeb: persisted.useWeb,
       requestContextEnv: persisted.requestContextEnv,
       createdAt,
       lastActivityAt,
-      projectContext: persisted.projectContext,
+      workspace: persisted.workspace === null ? undefined : persisted.workspace,
+      cursorManagedReadResources: persisted.cursorManagedReadResources,
       codeChunks: persisted.codeChunks,
       // Cursor rules are request-scoped and re-sent by Cursor on each
       // user/resume action. Restoring them from persisted session state causes
@@ -5122,284 +4751,281 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       activeCursorSkillNames: [],
       cursorCommands: persisted.cursorCommands,
       customSystemPrompt: persisted.customSystemPrompt,
+      hooksAdditionalContext: persisted.hooksAdditionalContext,
+      goalState: persisted.goalState,
+      isRootProjectConversation: persisted.isRootProjectConversation,
       explicitContext: persisted.explicitContext,
       contextTokenLimit: persisted.contextTokenLimit,
+      contextTokenLimitSource: persisted.contextTokenLimitSource,
       contextMaxMode: persisted.contextMaxMode,
       usedContextTokens: persisted.usedContextTokens,
       requestedMaxOutputTokens: persisted.requestedMaxOutputTokens,
       requestedModelParameters: persisted.requestedModelParameters,
-      // Rebuild the additionalRoots Map from the persisted array.
-      // Only `'session'` source entries are persisted, so we don't
-      // need to filter on read. `'config'` entries get re-injected
-      // by the bridge on session load (see Phase 4) — we still
-      // initialize the map here so that injection has a target.
-      additionalRoots: Array.isArray(persisted.additionalRoots)
-        ? new Map(
-            persisted.additionalRoots
-              .filter(
-                (root): root is AdditionalWorkspaceRoot =>
-                  !!root &&
-                  typeof root.path === "string" &&
-                  root.path.trim().length > 0
-              )
-              .map((root) => [root.path, root])
-          )
-        : new Map(),
-      subAgentContexts: new Map(),
-      restartRecovery: this.buildRestartRecovery(persisted),
+      // Cursor re-advertises hooks_config on each request/reattach. A restored
+      // process must not execute a stale project hook selection before that.
+      hookConfiguredSteps: Object.freeze([]),
+      // Config grants are reconciled from the current primary root after the
+      // session mounts; persisted config grants only describe the exact
+      // snapshot that was previously active.
+      configuredWorkspaceGrantsLoadedForPrimary: undefined,
       // Intentionally NOT rehydrated — the IDE re-sends any unconsumed
       // ConversationAction frames (e.g. asyncAskQuestionCompletion)
       // after bidi-stream restart, so a persisted entry would just
       // duplicate the replayed frame.
       deferredControlContinuations: [],
     }
-  }
 
-  /**
-   * Build the ContextStateRecord from a persisted blob — paired with
-   * parsePersistedSession; called by loadPersistedSession to seed
-   * ContextStateService.contextRecords for the restored session.
-   */
-  private buildContextRecordFromPersisted(
-    persisted: PersistedChatSessionV1,
-    sessionMessages: SessionMessage[],
-    messageRecords: ContextTranscriptRecord[],
-    transcriptEventState: { events: SessionTranscriptEvent[]; nextSeq: number },
-    contextState: ContextConversationState,
-    topLevelAgentTurnState: SessionTopLevelAgentTurnState
-  ): ContextStateRecord {
     return {
-      messages: sessionMessages,
-      messagesGeneration: 0,
-      messageRecords,
-      transcriptEvents: transcriptEventState.events,
-      nextTranscriptEventSeq: transcriptEventState.nextSeq,
-      contextState,
-      currentTurnState: undefined,
-      recentTurnStates: [],
-      taskBudgetState: this.normalizeTaskBudgetState(persisted.taskBudgetState),
-      topLevelAgentTurnState,
-      lastEmittedContextSummaryCompactionId:
-        typeof persisted.lastEmittedContextSummaryCompactionId === "string" &&
-        persisted.lastEmittedContextSummaryCompactionId.trim().length > 0
-          ? persisted.lastEmittedContextSummaryCompactionId.trim()
-          : undefined,
-      lastEmittedContextSummaryCompactionEpoch:
-        typeof persisted.lastEmittedContextSummaryCompactionEpoch ===
-          "number" && persisted.lastEmittedContextSummaryCompactionEpoch >= 0
-          ? persisted.lastEmittedContextSummaryCompactionEpoch
-          : undefined,
-      pendingContextSummaryUiUpdate:
-        restorePendingContextSummaryUiUpdateFromState({
-          contextState,
-          lastEmittedContextSummaryCompactionId:
-            persisted.lastEmittedContextSummaryCompactionId,
-          lastEmittedContextSummaryCompactionEpoch:
-            persisted.lastEmittedContextSummaryCompactionEpoch,
-          lastContextSummaryCompactionEpoch:
-            persisted.lastContextSummaryCompactionEpoch,
-        }),
-      usedTokens:
-        typeof persisted.usedTokens === "number" ? persisted.usedTokens : 0,
-      readPaths: new Set(
-        Array.isArray(persisted.readPaths) ? persisted.readPaths : []
-      ),
-      readSnapshots: Array.isArray(persisted.readSnapshots)
-        ? persisted.readSnapshots
-            .filter(
-              (snapshot): snapshot is SessionReadSnapshot =>
-                !!snapshot &&
-                typeof snapshot.filePath === "string" &&
-                snapshot.filePath.trim().length > 0 &&
-                typeof snapshot.content === "string" &&
-                snapshot.content.length > 0 &&
-                typeof snapshot.capturedAt === "number" &&
-                Number.isFinite(snapshot.capturedAt) &&
-                typeof snapshot.sourceToolName === "string" &&
-                snapshot.sourceToolName.trim().length > 0
-            )
-            .map((snapshot) => ({
-              filePath: snapshot.filePath,
-              startLine:
-                typeof snapshot.startLine === "number" &&
-                Number.isFinite(snapshot.startLine)
-                  ? Math.max(1, Math.floor(snapshot.startLine))
-                  : undefined,
-              endLine:
-                typeof snapshot.endLine === "number" &&
-                Number.isFinite(snapshot.endLine)
-                  ? Math.max(1, Math.floor(snapshot.endLine))
-                  : undefined,
-              content: snapshot.content,
-              capturedAt: Math.max(0, Math.floor(snapshot.capturedAt)),
-              sourceToolName: snapshot.sourceToolName,
-            }))
-        : [],
-      fileStates: new Map(
-        Array.isArray(persisted.fileStates)
-          ? persisted.fileStates.map((state) => [
-              state.path,
-              {
-                beforeContent: state.beforeContent,
-                afterContent: state.afterContent,
-              },
-            ])
-          : []
-      ),
-      toolMetrics: this.normalizeToolMetrics(persisted.toolMetrics),
-      messageBlobIds: Array.isArray(persisted.messageBlobIds)
-        ? persisted.messageBlobIds
-        : [],
-      turns: Array.isArray(persisted.turns) ? persisted.turns : [],
-      currentAssistantMessage: persisted.currentAssistantMessage,
-      stepId: typeof persisted.stepId === "number" ? persisted.stepId : 0,
-      execId: typeof persisted.execId === "number" ? persisted.execId : 1,
-      todos: Array.isArray(persisted.todos) ? persisted.todos : [],
+      session,
+      context: contextRecord,
+      stream: streamRecord,
+      restoredPendingToolCalls: persisted.restoredPendingToolCalls,
     }
   }
 
   /**
-   * Build the SessionStreamRecord from a persisted blob — paired with
-   * parsePersistedSession.
+   * Cold-mount every durable child branch from its own graph, layout head and
+   * branch receipt. Parent UI/session memory never becomes child input.
    */
-  private buildStreamRecordFromPersisted(
-    persisted: PersistedChatSessionV1
-  ): SessionStreamRecord {
+  private restoreChildMountedProjections(
+    conversationId: ConversationId
+  ): Map<string, MountedContextProjection> {
+    const projections = new Map<string, MountedContextProjection>()
+    for (const run of this.subagentRunStore.listInConversation(
+      conversationId
+    )) {
+      const owner = this.subagentBranches.createProjectionOwnerForAgent(
+        conversationId,
+        run.agentId
+      )
+      const branch = this.subagentBranches.readProjectionBranch(owner)
+      const messages = this.contextState.getSubagentGraphMessages(
+        String(conversationId),
+        branch
+      )
+      const records = messages.map((message) => {
+        const createdAt = Date.parse(message.timestamp)
+        return this.createTranscriptRecord(
+          message,
+          Number.isFinite(createdAt) ? createdAt : Date.now()
+        )
+      })
+      const state = this.createContextState(records)
+      const activeHead = this.contextProjectionHeads.get(owner)
+      if (activeHead) {
+        this.restoreContextProjectionFromStore(
+          owner,
+          state,
+          records,
+          [],
+          activeHead
+        )
+      }
+      this.restoreClaudeProjectionFromStore(owner, state, records, [])
+      const transcriptEvents = this.rebuildTranscriptEventsFromRecords(records)
+      const snapshot = this.subagentBranches.readProjectionBranchSnapshot(owner)
+      const projection: MountedContextProjection = {
+        owner,
+        messages,
+        generation: messages.length,
+        messageRecords: records,
+        transcriptEvents: transcriptEvents.events,
+        nextTranscriptEventSeq: transcriptEvents.nextSeq,
+        contextState: state,
+        usedTokens: 0,
+        branchSnapshot: snapshot,
+      }
+      if (projections.has(owner.ownerKey)) {
+        throw new Error(
+          `SessionLifecycleService: duplicate child projection owner during restore ` +
+            `conversation=${conversationId} owner=${owner.ownerKey}`
+        )
+      }
+      projections.set(owner.ownerKey, projection)
+    }
+    return projections
+  }
+
+  /** Build a detached context restore bundle from current durable tables. */
+  private buildContextRecordFromPersisted(
+    persisted: PersistedChatSession,
+    mainProjection: MountedContextProjection,
+    childProjections: Map<string, MountedContextProjection>,
+    topLevelAgentTurnState: SessionTopLevelAgentTurnState
+  ): ContextStateRecord {
     return {
-      backgroundCommands: new Map(
-        Array.isArray(persisted.backgroundCommands)
-          ? persisted.backgroundCommands
-              .filter(
-                (command): command is PersistedBackgroundCommand =>
-                  !!command &&
-                  typeof command.commandId === "string" &&
-                  command.commandId.trim().length > 0
-              )
-              .map((command) => [
-                command.commandId,
-                {
-                  commandId: command.commandId,
-                  originToolCallId: command.originToolCallId,
-                  execIds: Array.isArray(command.execIds)
-                    ? command.execIds
-                        .filter(
-                          (value): value is number =>
-                            typeof value === "number" && Number.isFinite(value)
-                        )
-                        .map((value) => Math.max(0, Math.floor(value)))
-                    : [],
-                  command: command.command || "",
-                  cwd: command.cwd || "",
-                  pid:
-                    typeof command.pid === "number" &&
-                    Number.isFinite(command.pid)
-                      ? Math.max(0, Math.floor(command.pid))
-                      : undefined,
-                  terminalsFolder:
-                    typeof command.terminalsFolder === "string" &&
-                    command.terminalsFolder.trim().length > 0
-                      ? command.terminalsFolder.trim()
-                      : undefined,
-                  status:
-                    command.status === "completed" ||
-                    command.status === "failed" ||
-                    command.status === "aborted"
-                      ? command.status
-                      : "running",
-                  stdout: Array.isArray(command.stdout)
-                    ? [...command.stdout]
-                    : [],
-                  stderr: Array.isArray(command.stderr)
-                    ? [...command.stderr]
-                    : [],
-                  exitCode:
-                    typeof command.exitCode === "number" &&
-                    Number.isFinite(command.exitCode)
-                      ? Math.floor(command.exitCode)
-                      : undefined,
-                  msToWait:
-                    typeof command.msToWait === "number" &&
-                    Number.isFinite(command.msToWait)
-                      ? Math.floor(command.msToWait)
-                      : undefined,
-                  backgroundReason:
-                    typeof command.backgroundReason === "number" &&
-                    Number.isFinite(command.backgroundReason)
-                      ? Math.floor(command.backgroundReason)
-                      : undefined,
-                  lastTerminalFileLength:
-                    typeof command.lastTerminalFileLength === "number" &&
-                    Number.isFinite(command.lastTerminalFileLength)
-                      ? Math.max(0, Math.floor(command.lastTerminalFileLength))
-                      : undefined,
-                  startedAt: this.toTimestamp(command.startedAt),
-                  updatedAt: this.toTimestamp(command.updatedAt),
-                  completedAt:
-                    typeof command.completedAt === "number" &&
-                    Number.isFinite(command.completedAt)
-                      ? Math.max(0, Math.floor(command.completedAt))
-                      : undefined,
-                } satisfies SessionBackgroundCommand,
-              ])
-          : []
+      mainProjection,
+      childProjections,
+      taskBudgetState: undefined,
+      topLevelAgentTurnState,
+      readPaths: new Set(persisted.readPaths),
+      readSnapshots: [],
+      fileStates: new Map(
+        persisted.fileStates.map((state) => [
+          state.path,
+          {
+            beforeContent: state.beforeContent,
+            afterContent: state.afterContent,
+          },
+        ])
       ),
+      toolMetrics: this.createEmptyToolMetrics(),
+      messageBlobIds: [...persisted.messageBlobIds],
+      turns: [],
+      currentAssistantMessage: undefined,
+      stepId: 0,
+      execId: this.execDispatchStore.nextExecIdAfterHistory(
+        ConversationId.of(persisted.conversationId)
+      ),
+      todos: [...persisted.todos],
+    }
+  }
+
+  /** In-flight stream ownership is never restored across a process restart. */
+  private buildStreamRecordFromPersisted(): SessionStreamRecord {
+    return {
       pendingToolCallByExecId: new Map(),
       retiredToolCallByExecId: new Map(),
       currentStreamId: crypto.randomUUID(),
       editPathHolderByPath: new Map(),
       editPathQueueByPath: new Map(),
       pendingInteractionQueries: new Map(),
-      interactionQueryId:
-        typeof persisted.interactionQueryId === "number"
-          ? persisted.interactionQueryId
-          : 0,
+      interactionQueryId: 0,
     }
   }
 
-  private createFreshSession(
+  /**
+   * Fresh Cursor sessions import only typed `conversation_history`. The
+   * current action's prepend/current user fields belong to the real graph
+   * turn and are appended by CursorConnectStream after it opens that turn.
+   */
+  private projectFreshCursorHistoryMessages(
+    initialRequest?: ParsedCursorRequest
+  ): SessionMessage[] {
+    const wire = initialRequest?.cursorWire
+    if (!getCursorUserMessageAction(wire)) {
+      return []
+    }
+    const wireFrameRef = initialRequest?.cursorWireFrameRef
+    if (!wireFrameRef) {
+      throw new Error(
+        "Fresh Cursor history cannot seed the durable graph before its inbound wire frame is stored"
+      )
+    }
+    const projection = projectCursorFreshHistoryBootstrap({
+      history: wire?.userMessageActionHistory ?? [],
+      conversationState: wire?.conversationState,
+      wireFrameRef,
+    })
+    const seedTime = Date.now()
+    return projection.messages.map((message, index) =>
+      this.makeFreshSessionMessage(
+        message.role,
+        message.content,
+        seedTime + index,
+        message.metadata
+      )
+    )
+  }
+
+  /**
+   * A control-first attachment can create an empty local session before its
+   * first real UserMessageAction arrives. Seed only the still-empty durable
+   * graph once; never replace a graph from an inbound history envelope.
+   */
+  private persistDeferredCursorHistoryBootstrap(
+    conversationId: string,
+    session: SessionLifecycleRecord,
+    context: ContextStateRecord,
+    initialRequest?: ParsedCursorRequest
+  ): PreparedInitialGraphProjection | undefined {
+    if (
+      context.mainProjection.messages.length > 0 ||
+      context.mainProjection.generation !== 0
+    ) {
+      return undefined
+    }
+    this.assertEmptyInitialGraphProjection(
+      context,
+      "persistDeferredCursorHistoryBootstrap"
+    )
+
+    const messages = this.projectFreshCursorHistoryMessages(initialRequest)
+    const cid = ConversationId.of(conversationId)
+    if (messages.length === 0) {
+      if (this.messageStore.hasMessages(cid)) {
+        throw new Error(
+          `persistDeferredCursorHistoryBootstrap: persisted graph exists but active projection is empty for ${conversationId}`
+        )
+      }
+      return undefined
+    }
+
+    return this.messageStore.runInTransaction(cid, (txn) => {
+      const acceptedMessages =
+        this.persistInitialTranscriptMessagesInTransaction(txn, messages)
+      if (acceptedMessages.length === 0) {
+        throw new Error(
+          `persistDeferredCursorHistoryBootstrap: failed to persist typed Cursor history for ${conversationId}`
+        )
+      }
+      const prepared = this.prepareDetachedInitialGraphProjection(
+        context,
+        acceptedMessages
+      )
+      this.persistSessionSnapshotInTransaction(txn, session, {
+        ...context,
+        mainProjection: {
+          ...context.mainProjection,
+          ...prepared,
+        },
+      })
+      return prepared
+    })
+  }
+
+  private createDetachedFreshSession(
     conversationId: string,
     initialRequest?: ParsedCursorRequest
-  ): SessionLifecycleRecord {
-    const initialMessages: SessionMessage[] =
-      initialRequest?.conversation.map((message, index, conversation) => {
-        const content =
-          index === conversation.length - 1 &&
-          message.role === "user" &&
-          initialRequest.attachedImages?.length
-            ? buildUserMessageContent(
-                message.content,
-                initialRequest.attachedImages
-              )
-            : message.content
-        return this.makeFreshSessionMessage(message.role, content)
-      }) || []
-    const messageRecords = initialMessages.map((message, index) =>
-      this.createTranscriptRecord(message, Date.now() + index * 1000)
+  ): FreshSessionBootstrap {
+    const initialUsedContextTokens = requireOptionalNonNegativeSafeInteger(
+      initialRequest?.usedContextTokens,
+      "initial request usedContextTokens"
     )
-    const contextState = this.createContextState(messageRecords)
-    const transcriptEventState =
-      this.rebuildTranscriptEventsFromRecords(messageRecords)
+    assertContextTokenLimitProvenance({
+      contextTokenLimit: initialRequest?.contextTokenLimit,
+      contextTokenLimitSource: initialRequest?.contextTokenLimitSource,
+    })
+    const initialWorkspace = resolveSessionWorkspaceRefresh({
+      current: undefined,
+      request: initialRequest,
+      refreshScope: resolveSessionRequestRefreshScope(initialRequest),
+    })
+    const initialHistory =
+      this.projectFreshCursorHistoryMessages(initialRequest)
 
-    const conv = ConversationId.of(conversationId)
-    this.transcriptReplaceCommitted(conv, initialMessages)
-    const sessionMessages = this.transcriptGetCommittedRaw(conv)
-
-    // Step 4 物理拆: 3 independent records.
+    // The three records are constructed together but remain detached until
+    // the complete durable bootstrap transaction has committed.
     const lifecycleRecord: SessionLifecycleRecord = {
       conversationId,
       model: initialRequest?.model || "claude-sonnet-4.5",
+      codexProviderIdentity: createCodexRootProviderIdentity(),
       lastAssistantBackend: undefined,
       subagentModelOverrides:
         initialRequest?.subagentModelOverrides ??
         EMPTY_SUBAGENT_MODEL_OVERRIDES,
+      selectedSubagentModels:
+        initialRequest?.selectedSubagentModels ??
+        EMPTY_SELECTED_SUBAGENT_MODELS,
       lastAssistantModel: undefined,
       lastToolUseSummary: undefined,
-      lastCodexResponseId: undefined,
-      lastCodexRequestSignature: undefined,
-      lastCodexWarmupPayload: undefined,
-      pendingCodexResponseId: undefined,
-      pendingCodexRequestSignature: undefined,
-      thinkingLevel: initialRequest?.thinkingLevel || 0,
+      thinkingLevel:
+        initialRequest?.thinkingLevel === undefined
+          ? 0
+          : requireThinkingLevel(
+              initialRequest.thinkingLevel,
+              "initial request thinkingLevel"
+            ),
       thinkingDetailsRequested:
         initialRequest?.thinkingDetailsRequested === true,
       isAgentic: initialRequest?.isAgentic || false,
@@ -5413,7 +5039,9 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       requestContextEnv: initialRequest?.requestContextEnv,
       createdAt: new Date(),
       lastActivityAt: new Date(),
-      projectContext: initialRequest?.projectContext,
+      workspace: initialWorkspace.workspace,
+      cursorManagedReadResources:
+        initialRequest?.cursorManagedReadResources ?? Object.freeze([]),
       codeChunks: initialRequest?.codeChunks,
       cursorRules: initialRequest?.cursorRules,
       skillOptions: initialRequest?.skillOptions,
@@ -5422,34 +5050,37 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       activeCursorSkillNames: [],
       cursorCommands: initialRequest?.cursorCommands,
       customSystemPrompt: initialRequest?.customSystemPrompt,
+      hooksAdditionalContext: initialRequest?.hooksAdditionalContext,
+      goalState: initialRequest?.goalState,
+      isRootProjectConversation: initialRequest?.isRootProjectConversation,
       explicitContext: initialRequest?.explicitContext,
       contextTokenLimit: initialRequest?.contextTokenLimit,
+      contextTokenLimitSource: initialRequest?.contextTokenLimitSource,
       contextMaxMode: initialRequest?.contextMaxMode,
-      usedContextTokens: initialRequest?.usedContextTokens,
+      usedContextTokens: initialUsedContextTokens,
       requestedMaxOutputTokens: initialRequest?.requestedMaxOutputTokens,
       requestedModelParameters: initialRequest?.requestedModelParameters,
-      additionalRoots: new Map(),
-      configuredAdditionalRootsLoaded: undefined,
-      subAgentContexts: new Map(),
-      restartRecovery: undefined,
+      hookConfiguredSteps: Object.freeze([
+        ...(initialRequest?.hookConfiguredSteps ?? []),
+      ]),
+      configuredWorkspaceGrantsLoadedForPrimary: undefined,
       deferredControlContinuations: [],
     }
 
     const contextRecord: ContextStateRecord = {
-      messages: sessionMessages,
-      messagesGeneration: 0,
-      messageRecords,
-      transcriptEvents: transcriptEventState.events,
-      nextTranscriptEventSeq: transcriptEventState.nextSeq,
-      contextState,
-      currentTurnState: undefined,
-      recentTurnStates: [],
+      mainProjection: {
+        owner: createMainProjectionOwner(ConversationId.of(conversationId)),
+        messages: [],
+        generation: 0,
+        messageRecords: [],
+        transcriptEvents: [],
+        nextTranscriptEventSeq: 1,
+        contextState: this.createContextState([]),
+        usedTokens: initialUsedContextTokens ?? 0,
+      },
+      childProjections: new Map(),
       taskBudgetState: undefined,
       topLevelAgentTurnState: this.createEmptyTopLevelAgentTurnState(),
-      lastEmittedContextSummaryCompactionId: undefined,
-      lastEmittedContextSummaryCompactionEpoch: undefined,
-      pendingContextSummaryUiUpdate: undefined,
-      usedTokens: initialRequest?.usedContextTokens || 0,
       readPaths: new Set(),
       readSnapshots: [],
       fileStates: new Map(),
@@ -5459,13 +5090,11 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       currentAssistantMessage: undefined,
       stepId: 0,
       execId: 1,
-      snipState: undefined,
       pendingRequestContextLedger: undefined,
       todos: [],
     }
 
     const streamRecord: SessionStreamRecord = {
-      backgroundCommands: new Map(),
       pendingToolCallByExecId: new Map(),
       retiredToolCallByExecId: new Map(),
       currentStreamId: crypto.randomUUID(),
@@ -5475,11 +5104,96 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       interactionQueryId: 0,
     }
 
-    this.contextState.createInitialRecord(conversationId, contextRecord)
-    this.sessionStream.createInitialRecord(conversationId, streamRecord)
+    return {
+      session: lifecycleRecord,
+      context: contextRecord,
+      stream: streamRecord,
+      initialHistory,
+    }
+  }
 
-    this.logMcpAdvisoryIfMissing(lifecycleRecord, "fresh_session")
-    return lifecycleRecord
+  private assertSessionMountSlotAvailable(conversationId: string): void {
+    const cid = ConversationId.of(conversationId)
+    if (
+      this.sessions.has(conversationId) ||
+      this.contextState.getContextRecord(conversationId) ||
+      this.sessionStream.getStreamRecord(conversationId) ||
+      this.pendingByConversation.has(cid) ||
+      this.pendingByTurn.has(cid)
+    ) {
+      throw new Error(
+        `Cannot mount session ${conversationId}: a live record or pending index already exists`
+      )
+    }
+  }
+
+  /**
+   * Commit the parent row, imported transcript graph, first projection, and
+   * mutable domain snapshot as one SQLite transaction. Nothing is mounted
+   * until this returns successfully.
+   */
+  private persistFreshSessionBootstrap(bootstrap: FreshSessionBootstrap): void {
+    const { session, context, initialHistory } = bootstrap
+    const conversationId = session.conversationId
+    const cid = ConversationId.of(conversationId)
+    this.assertSessionMountSlotAvailable(conversationId)
+
+    this.messageStore.runInTransaction(cid, (txn) => {
+      // The graph has a foreign key to sessions, so its parent row must be
+      // accepted first but remains rollback-bound to the rest of bootstrap.
+      this.sessionPersistence.upsertSessionInTransaction(
+        txn,
+        this.createSessionRow(session)
+      )
+      const acceptedMessages =
+        this.persistInitialTranscriptMessagesInTransaction(txn, initialHistory)
+      if (initialHistory.length > 0 && acceptedMessages.length === 0) {
+        throw new Error(
+          `Cannot bootstrap fresh session ${conversationId}: initial Cursor history was not accepted into the durable graph`
+        )
+      }
+
+      context.mainProjection = {
+        ...context.mainProjection,
+        ...this.prepareDetachedInitialGraphProjection(
+          context,
+          acceptedMessages
+        ),
+      }
+      this.sessionPersistence.replaceDomainStateInTransaction(
+        txn,
+        this.createSessionPersistenceSnapshot(session, context)
+      )
+    })
+  }
+
+  /** Publish every live owner together; a failed publication leaves none. */
+  private publishDetachedSession(
+    bundle: Pick<RestoredSessionBundle, "session" | "context" | "stream">,
+    pending: readonly PendingToolEntry<PendingToolCall>[] = []
+  ): SessionRecord {
+    const { session, context, stream } = bundle
+    const conversationId = session.conversationId
+    const cid = ConversationId.of(conversationId)
+    this.assertSessionMountSlotAvailable(conversationId)
+
+    try {
+      this.contextState.createInitialRecord(conversationId, context)
+      this.sessionStream.createInitialRecord(conversationId, stream)
+      this.sessions.set(conversationId, session)
+      for (const entry of pending) {
+        this.pendingToolRegister(entry)
+      }
+    } catch (error) {
+      this.pendingByConversation.delete(cid)
+      this.pendingByTurn.delete(cid)
+      this.sessions.delete(conversationId)
+      this.contextState.deleteRecord(conversationId)
+      this.sessionStream.deleteRecord(conversationId)
+      throw error
+    }
+
+    return session
   }
 
   /**
@@ -5533,16 +5247,286 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     return true
   }
 
-  // ── 以下方法已废弃并删除 ──────────────────────────────────────────────
-  // cacheCodexWarmupPayload()        → 移入 CodexService.warmupPayloadCache
-  // getCachedCodexWarmupPayload()    → 移入 CodexService.warmupPayloadCache
-  // stagePendingCodexRequestSignature()
-  // commitPendingCodexResponse()
-  // discardPendingCodexResponse()
-  //
-  // previous_response_id 的完整生命周期现在由 CodexService.activeTurnContexts 管理。
-  // warmup payload 的缓存现在由 CodexService.warmupPayloadCache 管理。
-  // 采用 Codex CLI 的 ModelClientSession.WebsocketSession 设计。
+  /**
+   * Derive one request refresh without mutating the mounted session. A
+   * control-first history import persists these candidates with its graph;
+   * every other request publishes them directly and schedules the normal
+   * snapshot write.
+   */
+  private prepareSessionRequestRefresh(
+    session: SessionLifecycleRecord,
+    context: ContextStateRecord,
+    initialRequest?: ParsedCursorRequest
+  ): PreparedSessionRequestRefresh {
+    const incomingThinkingLevel =
+      initialRequest?.thinkingLevel === undefined
+        ? undefined
+        : requireThinkingLevel(
+            initialRequest.thinkingLevel,
+            "request refresh thinkingLevel"
+          )
+    const incomingUsedContextTokens = requireOptionalNonNegativeSafeInteger(
+      initialRequest?.usedContextTokens,
+      "request refresh usedContextTokens"
+    )
+    const preparedSession: SessionLifecycleRecord = { ...session }
+    const preparedContext: ContextStateRecord = {
+      ...context,
+      mainProjection: {
+        ...context.mainProjection,
+        contextState: structuredClone(context.mainProjection.contextState),
+      },
+    }
+    const refreshScope = resolveSessionRequestRefreshScope(initialRequest)
+    const canRefreshProvidedFields = refreshScope !== "control"
+    const canClearRequestScopedFields =
+      canClearSessionRequestScopedFields(initialRequest)
+    const matchedResumeReferences = matchResumeWorkspaceReferences(
+      session.workspace,
+      initialRequest?.resumeWorkspaceReferences
+    )
+    if (
+      initialRequest?.resumeWorkspaceReferences &&
+      initialRequest.resumeWorkspaceReferences.length !==
+        matchedResumeReferences.length
+    ) {
+      this.logger.debug(
+        `Ignored ${initialRequest.resumeWorkspaceReferences.length - matchedResumeReferences.length} resume workspace reference(s) outside the already-bound IDE root set`
+      )
+    }
+    const workspaceRefresh = resolveSessionWorkspaceRefresh({
+      current: session.workspace,
+      request: initialRequest,
+      refreshScope,
+    })
+    preparedSession.workspace = workspaceRefresh.workspace
+    preparedSession.cursorManagedReadResources =
+      resolveSessionManagedReadResourcesRefresh({
+        current: session.cursorManagedReadResources,
+        request: initialRequest,
+      })
+    if (
+      workspaceRefresh.reloadConfiguredWorkspaceGrants ||
+      !workspaceRefresh.workspace
+    ) {
+      preparedSession.configuredWorkspaceGrantsLoadedForPrimary = undefined
+    }
+    const contextWindowTransition = resolveSessionContextWindowTransition({
+      current: {
+        model: session.model,
+        contextTokenLimit: session.contextTokenLimit,
+        contextTokenLimitSource: session.contextTokenLimitSource,
+        contextMaxMode: session.contextMaxMode,
+      },
+      incoming: {
+        model: initialRequest?.model,
+        contextTokenLimit: initialRequest?.contextTokenLimit,
+        contextTokenLimitSource: initialRequest?.contextTokenLimitSource,
+        contextMaxMode: initialRequest?.contextMaxMode,
+      },
+      canRefreshProvidedFields,
+      canClearRequestScopedFields,
+    })
+
+    preparedSession.lastActivityAt = new Date()
+    preparedSession.model = contextWindowTransition.model
+    preparedSession.contextTokenLimit =
+      contextWindowTransition.contextTokenLimit
+    preparedSession.contextTokenLimitSource =
+      contextWindowTransition.contextTokenLimitSource
+    preparedSession.contextMaxMode = contextWindowTransition.contextMaxMode
+    if (contextWindowTransition.modelChanged) {
+      preparedContext.mainProjection = {
+        ...preparedContext.mainProjection,
+        usedTokens: 0,
+      }
+      preparedContext.pendingRequestContextLedger = undefined
+      preparedContext.mainProjection.contextState = {
+        ...context.mainProjection.contextState,
+        usageLedger: {},
+      }
+    }
+
+    if (canClearRequestScopedFields && initialRequest) {
+      preparedSession.subagentModelOverrides =
+        initialRequest.subagentModelOverrides ?? EMPTY_SUBAGENT_MODEL_OVERRIDES
+    } else if (
+      canRefreshProvidedFields &&
+      initialRequest?.subagentModelOverrides
+    ) {
+      preparedSession.subagentModelOverrides =
+        initialRequest.subagentModelOverrides
+    }
+    if (canClearRequestScopedFields && initialRequest) {
+      preparedSession.selectedSubagentModels =
+        initialRequest.selectedSubagentModels ?? EMPTY_SELECTED_SUBAGENT_MODELS
+    } else if (
+      canRefreshProvidedFields &&
+      initialRequest?.selectedSubagentModels
+    ) {
+      preparedSession.selectedSubagentModels =
+        initialRequest.selectedSubagentModels
+    }
+    if (canClearRequestScopedFields && incomingThinkingLevel !== undefined) {
+      preparedSession.thinkingLevel = incomingThinkingLevel
+    }
+    if (
+      canClearRequestScopedFields &&
+      initialRequest?.thinkingDetailsRequested !== undefined
+    ) {
+      preparedSession.thinkingDetailsRequested =
+        initialRequest.thinkingDetailsRequested === true
+    }
+    if (canClearRequestScopedFields && initialRequest?.supportedTools) {
+      preparedSession.supportedTools = freezeCacheKeyArray(
+        initialRequest.supportedTools,
+        []
+      )
+    } else if (
+      canRefreshProvidedFields &&
+      (initialRequest?.supportedTools?.length ?? 0) > 0
+    ) {
+      preparedSession.supportedTools = freezeCacheKeyArray(
+        Array.from(
+          new Set([
+            ...session.supportedTools,
+            ...(initialRequest?.supportedTools ?? []),
+          ])
+        ),
+        []
+      )
+    }
+    if (canClearRequestScopedFields && initialRequest) {
+      preparedSession.mcpToolDefs =
+        initialRequest.mcpToolDefs !== undefined
+          ? freezeCacheKeyArray(initialRequest.mcpToolDefs)
+          : undefined
+    } else if (
+      canRefreshProvidedFields &&
+      initialRequest?.mcpToolDefs !== undefined
+    ) {
+      preparedSession.mcpToolDefs = freezeCacheKeyArray(
+        initialRequest.mcpToolDefs
+      )
+    }
+    if (canClearRequestScopedFields && initialRequest?.useWeb !== undefined) {
+      preparedSession.useWeb = initialRequest.useWeb
+    } else if (canRefreshProvidedFields && initialRequest?.useWeb === true) {
+      preparedSession.useWeb = true
+    }
+    if (canClearRequestScopedFields && initialRequest) {
+      preparedSession.requestContextEnv = initialRequest.requestContextEnv
+    } else if (canRefreshProvidedFields) {
+      if (initialRequest?.requestContextEnv) {
+        preparedSession.requestContextEnv = initialRequest.requestContextEnv
+      }
+    }
+    if (canClearRequestScopedFields && initialRequest) {
+      preparedSession.cursorRules = initialRequest.cursorRules
+      preparedSession.skillOptions = initialRequest.skillOptions
+      preparedSession.selectedCursorRulePaths =
+        initialRequest.selectedCursorRulePaths
+      preparedSession.selectedCursorRuleNames =
+        initialRequest.selectedCursorRuleNames
+    } else if (canRefreshProvidedFields) {
+      if (initialRequest?.cursorRules !== undefined) {
+        preparedSession.cursorRules = initialRequest.cursorRules
+      }
+      if (initialRequest?.skillOptions !== undefined) {
+        preparedSession.skillOptions = initialRequest.skillOptions
+      }
+      if (initialRequest?.selectedCursorRulePaths !== undefined) {
+        preparedSession.selectedCursorRulePaths =
+          initialRequest.selectedCursorRulePaths
+      }
+      if (initialRequest?.selectedCursorRuleNames !== undefined) {
+        preparedSession.selectedCursorRuleNames =
+          initialRequest.selectedCursorRuleNames
+      }
+    }
+    if (canClearRequestScopedFields && initialRequest) {
+      preparedSession.cursorCommands = initialRequest.cursorCommands
+      preparedSession.customSystemPrompt = initialRequest.customSystemPrompt
+      preparedSession.explicitContext = initialRequest.explicitContext
+      preparedSession.requestedMaxOutputTokens =
+        initialRequest.requestedMaxOutputTokens
+      preparedSession.requestedModelParameters =
+        initialRequest.requestedModelParameters
+      preparedSession.hookConfiguredSteps = Object.freeze([
+        ...(initialRequest.hookConfiguredSteps ?? []),
+      ])
+    } else if (canRefreshProvidedFields) {
+      if (initialRequest?.cursorCommands !== undefined) {
+        preparedSession.cursorCommands = initialRequest.cursorCommands
+      }
+      if (initialRequest?.customSystemPrompt !== undefined) {
+        preparedSession.customSystemPrompt = initialRequest.customSystemPrompt
+      }
+      if (initialRequest?.explicitContext !== undefined) {
+        preparedSession.explicitContext = initialRequest.explicitContext
+      }
+      if (initialRequest?.requestedMaxOutputTokens !== undefined) {
+        preparedSession.requestedMaxOutputTokens =
+          initialRequest.requestedMaxOutputTokens
+      }
+      if (initialRequest?.requestedModelParameters !== undefined) {
+        preparedSession.requestedModelParameters =
+          initialRequest.requestedModelParameters
+      }
+      if (initialRequest?.hookConfiguredSteps !== undefined) {
+        preparedSession.hookConfiguredSteps = Object.freeze([
+          ...initialRequest.hookConfiguredSteps,
+        ])
+      }
+    }
+    // SessionStart context lives for the Cursor composer session. A later
+    // request may omit the field without revoking it; an explicitly present
+    // empty string clears it.
+    if (initialRequest?.hooksAdditionalContext !== undefined) {
+      preparedSession.hooksAdditionalContext =
+        initialRequest.hooksAdditionalContext
+    }
+    // Inbound ConversationStateStructure.goal_state is authoritative when the
+    // client reattaches with an explicit goal record. Omitting the field keeps
+    // the durable session projection.
+    if (initialRequest?.goalState !== undefined) {
+      preparedSession.goalState = initialRequest.goalState
+    }
+    // Same authority rule as goal_state: an explicit inbound flag wins;
+    // omission keeps the durable session projection.
+    if (initialRequest?.isRootProjectConversation !== undefined) {
+      preparedSession.isRootProjectConversation =
+        initialRequest.isRootProjectConversation
+    }
+    if (canRefreshProvidedFields && incomingUsedContextTokens !== undefined) {
+      preparedSession.usedContextTokens = incomingUsedContextTokens
+      preparedContext.mainProjection.usedTokens = incomingUsedContextTokens
+    }
+
+    return {
+      session: preparedSession,
+      context: preparedContext,
+      canRefreshProvidedFields,
+      resetUsageLedger: contextWindowTransition.modelChanged,
+      reloadConfiguredWorkspaceGrants:
+        workspaceRefresh.reloadConfiguredWorkspaceGrants,
+    }
+  }
+
+  private applyPreparedSessionRequestRefresh(
+    session: SessionLifecycleRecord,
+    context: ContextStateRecord,
+    prepared: PreparedSessionRequestRefresh
+  ): void {
+    Object.assign(session, prepared.session)
+    context.mainProjection.usedTokens =
+      prepared.context.mainProjection.usedTokens
+    context.pendingRequestContextLedger =
+      prepared.context.pendingRequestContextLedger
+    if (prepared.resetUsageLedger) {
+      context.mainProjection.contextState.usageLedger = {}
+    }
+  }
 
   /**
    * Create or get existing session
@@ -5552,371 +5536,128 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     initialRequest?: ParsedCursorRequest
   ): SessionRecord {
     let session = this.getSession(conversationId)
+    let persistedDuringCall = false
 
     if (!session) {
-      session = this.createFreshSession(conversationId, initialRequest)
-      this.loadConfiguredAdditionalRoots(session)
-      this.sessions.set(conversationId, session)
+      const bootstrap = this.createDetachedFreshSession(
+        conversationId,
+        initialRequest
+      )
+      this.loadConfiguredWorkspaceGrants(bootstrap.session)
+      this.persistFreshSessionBootstrap(bootstrap)
+      persistedDuringCall = true
+      session = this.publishDetachedSession(bootstrap)
+      this.logMcpAdvisoryIfMissing(session, "fresh_session")
       this.logger.log(
         `>>> Created new session: ${conversationId} (model: ${session.model})`
       )
     } else {
       const ctx = this.contextState.getContextRecord(conversationId)!
-      const refreshScope = resolveSessionRequestRefreshScope(initialRequest)
-      const canRefreshProvidedFields = refreshScope !== "control"
-      const canClearRequestScopedFields =
-        canClearSessionRequestScopedFields(initialRequest)
-      const contextWindowTransition = resolveSessionContextWindowTransition({
-        current: {
-          model: session.model,
-          contextTokenLimit: session.contextTokenLimit,
-          contextMaxMode: session.contextMaxMode,
-        },
-        incoming: {
-          model: initialRequest?.model,
-          contextTokenLimit: initialRequest?.contextTokenLimit,
-          contextTokenLimitSource: initialRequest?.contextTokenLimitSource,
-          contextMaxMode: initialRequest?.contextMaxMode,
-        },
-        canRefreshProvidedFields,
-        canClearRequestScopedFields,
-      })
-      session.lastActivityAt = new Date()
-      session.model = contextWindowTransition.model
-      session.contextTokenLimit = contextWindowTransition.contextTokenLimit
-      session.contextMaxMode = contextWindowTransition.contextMaxMode
-      if (contextWindowTransition.modelChanged) {
-        ctx.usedTokens = 0
-        ctx.pendingRequestContextLedger = undefined
-        ctx.contextState.usageLedger = {}
-      }
+      const preparedRefresh = this.prepareSessionRequestRefresh(
+        session,
+        ctx,
+        initialRequest
+      )
+      const preparedProjection = this.persistDeferredCursorHistoryBootstrap(
+        conversationId,
+        preparedRefresh.session,
+        preparedRefresh.context,
+        initialRequest
+      )
 
-      // Refresh protocol fields only from frames that are authoritative for
-      // them. Cursor sends resume / attach / control frames on the same stream;
-      // treating those as full turns silently clears the last real request's
-      // model parameters, rules, environment, and tool capabilities.
-      if (canClearRequestScopedFields && initialRequest) {
-        session.subagentModelOverrides =
-          initialRequest.subagentModelOverrides ??
-          EMPTY_SUBAGENT_MODEL_OVERRIDES
-      } else if (
-        canRefreshProvidedFields &&
-        initialRequest?.subagentModelOverrides
-      ) {
-        session.subagentModelOverrides = initialRequest.subagentModelOverrides
+      // From this point forward every durable initialization fact is already
+      // committed. Publishing is field assignment only; no relation is
+      // re-read or inferred from live state.
+      this.applyPreparedSessionRequestRefresh(session, ctx, preparedRefresh)
+      if (preparedProjection) {
+        ctx.mainProjection = {
+          ...ctx.mainProjection,
+          ...preparedProjection,
+        }
+        persistedDuringCall = true
       }
-      if (
-        canClearRequestScopedFields &&
-        initialRequest?.thinkingLevel !== undefined
-      ) {
-        session.thinkingLevel = initialRequest.thinkingLevel
-      }
-      if (
-        canClearRequestScopedFields &&
-        initialRequest?.thinkingDetailsRequested !== undefined
-      ) {
-        session.thinkingDetailsRequested =
-          initialRequest.thinkingDetailsRequested === true
-      }
-      if (canClearRequestScopedFields && initialRequest?.supportedTools) {
-        // Freeze the array reference we capture onto the session so any
-        // downstream code that holds it as a cache key (e.g. the
-        // prepared-tool-build memo on `cursor-connect-stream.service`)
-        // cannot have its key silently desynchronised by an in-place
-        // mutation.
-        session.supportedTools = freezeCacheKeyArray(
-          initialRequest.supportedTools,
-          []
-        )
-      } else if (
-        canRefreshProvidedFields &&
-        (initialRequest?.supportedTools?.length ?? 0) > 0
-      ) {
-        session.supportedTools = freezeCacheKeyArray(
-          Array.from(
-            new Set([
-              ...session.supportedTools,
-              ...(initialRequest?.supportedTools ?? []),
-            ])
-          ),
-          []
-        )
-      }
-      if (canClearRequestScopedFields && initialRequest) {
-        session.mcpToolDefs =
-          initialRequest.mcpToolDefs !== undefined
-            ? freezeCacheKeyArray(initialRequest.mcpToolDefs)
-            : undefined
-      } else if (
-        canRefreshProvidedFields &&
-        initialRequest?.mcpToolDefs !== undefined
-      ) {
-        // AgentService continuation / control requests can omit MCP
-        // definitions even though the conversation already learned them from
-        // an earlier full request. Absence means "not present on this frame",
-        // not "clear the registry"; keep the last known definitions so
-        // history replay and follow-up dispatch can still resolve concrete
-        // MCP names such as cursor-ide-browser-browser_snapshot.
-        session.mcpToolDefs = freezeCacheKeyArray(initialRequest.mcpToolDefs)
-      }
-      if (canRefreshProvidedFields) {
+      if (preparedRefresh.canRefreshProvidedFields) {
         this.logMcpAdvisoryIfMissing(session, "session_reuse")
       }
-      if (canClearRequestScopedFields && initialRequest?.useWeb !== undefined) {
-        session.useWeb = initialRequest.useWeb
-      } else if (canRefreshProvidedFields && initialRequest?.useWeb === true) {
-        session.useWeb = true
-      }
-      if (canClearRequestScopedFields && initialRequest) {
-        session.requestContextEnv = initialRequest.requestContextEnv
-      } else if (
-        canRefreshProvidedFields &&
-        initialRequest?.requestContextEnv
-      ) {
-        session.requestContextEnv = initialRequest.requestContextEnv
-      }
-      if (canClearRequestScopedFields && initialRequest) {
-        session.projectContext = initialRequest.projectContext
-      } else if (canRefreshProvidedFields && initialRequest?.projectContext) {
-        session.projectContext = initialRequest.projectContext
-      }
-      if (canClearRequestScopedFields && initialRequest) {
-        session.cursorRules = initialRequest.cursorRules
-        session.skillOptions = initialRequest.skillOptions
-        session.selectedCursorRulePaths = initialRequest.selectedCursorRulePaths
-        session.selectedCursorRuleNames = initialRequest.selectedCursorRuleNames
-      } else if (canRefreshProvidedFields) {
-        if (initialRequest?.cursorRules !== undefined) {
-          session.cursorRules = initialRequest.cursorRules
-        }
-        if (initialRequest?.skillOptions !== undefined) {
-          session.skillOptions = initialRequest.skillOptions
-        }
-        if (initialRequest?.selectedCursorRulePaths !== undefined) {
-          session.selectedCursorRulePaths =
-            initialRequest.selectedCursorRulePaths
-        }
-        if (initialRequest?.selectedCursorRuleNames !== undefined) {
-          session.selectedCursorRuleNames =
-            initialRequest.selectedCursorRuleNames
-        }
-      }
-      if (canClearRequestScopedFields && initialRequest) {
-        session.cursorCommands = initialRequest.cursorCommands
-        session.customSystemPrompt = initialRequest.customSystemPrompt
-        session.explicitContext = initialRequest.explicitContext
-        session.requestedMaxOutputTokens =
-          initialRequest.requestedMaxOutputTokens
-        session.requestedModelParameters =
-          initialRequest.requestedModelParameters
-      } else if (canRefreshProvidedFields) {
-        if (initialRequest?.cursorCommands !== undefined) {
-          session.cursorCommands = initialRequest.cursorCommands
-        }
-        if (initialRequest?.customSystemPrompt !== undefined) {
-          session.customSystemPrompt = initialRequest.customSystemPrompt
-        }
-        if (initialRequest?.explicitContext !== undefined) {
-          session.explicitContext = initialRequest.explicitContext
-        }
-        if (initialRequest?.requestedMaxOutputTokens !== undefined) {
-          session.requestedMaxOutputTokens =
-            initialRequest.requestedMaxOutputTokens
-        }
-        if (initialRequest?.requestedModelParameters !== undefined) {
-          session.requestedModelParameters =
-            initialRequest.requestedModelParameters
-        }
-      }
-      if (canRefreshProvidedFields && initialRequest?.explicitContext) {
-        session.explicitContext = initialRequest.explicitContext
-      }
-      if (
-        canRefreshProvidedFields &&
-        initialRequest?.usedContextTokens !== undefined
-      ) {
-        session.usedContextTokens = initialRequest.usedContextTokens
-        ctx.usedTokens = initialRequest.usedContextTokens
-      }
-      this.loadConfiguredAdditionalRoots(session)
+      this.loadConfiguredWorkspaceGrants(session)
 
       this.logger.log(
         `>>> Using existing session: ${conversationId} ` +
-          `(messages=${ctx.messages.length}, records=${ctx.messageRecords.length}, blobIds=${ctx.messageBlobIds.length}, turns=${ctx.turns.length}, pending=${this.pendingToolCallCount(session.conversationId)})`
+          `(messages=${ctx.mainProjection.messages.length}, records=${ctx.mainProjection.messageRecords.length}, blobIds=${ctx.messageBlobIds.length}, turns=${ctx.turns.length}, pending=${this.pendingToolCallCount(session.conversationId)})`
       )
     }
 
-    this.schedulePersist(conversationId)
+    if (!persistedDuringCall) {
+      this.schedulePersist(conversationId)
+    }
     return session
   }
 
   /**
-   * Open a transcript-staging turn. Records anchors on every array
-   * the addMessage path appends to (messages, messageRecords,
-   * transcriptEvents, plus contextState's contextRecords) plus the
-   * usedTokens scalar, so `abortTurn` can rewind atomically.
-   *
-   * Cursor's model is one open turn per conversation; throws if a
-   * turn is already open. The supersede path in
-   * cursor-connect-stream is responsible for awaiting the prior
-   * turn's terminal (via `TurnLifecycle.cancelTurnAndAwait`) before
-   * calling `beginTurn` for the new one — i.e. the happens-before
-   * for anchor-singleton is established at the supervisor layer,
-   * not by best-effort cleanup down here.
+   * Returns the active graph turn for a conversation. The turn supervisor
+   * uses this to establish the happens-before edge before starting a
+   * superseding turn.
    */
-
-  // listOverdueDeadlines / listAsyncAskFollowups / findAsyncAskFollowupById
-  // moved to SessionStreamService (step 4 真正拆解). Callers inject
-  // SessionStreamService directly.
-
-  /**
-   * Returns the turnId that currently owns the open transcript anchor
-   * for the conversation, or undefined if no turn is open. Used by
-   * cursor-connect-stream's supersede serializer to decide whether to
-   * await a stale turn before begin/commit.
-   */
-  openTurnIdForConversation(conversationId: string): TurnId | undefined {
-    return this.turnAnchors.get(conversationId)?.turnId
+  getActiveGraphTurnId(conversationId: string): TurnId | undefined {
+    return this.activeGraphTurns.get(conversationId)
   }
 
-  beginTurn(conversationId: string, turnId: TurnId): void {
+  /**
+   * Open a durable-graph turn. Opening a turn never creates an in-memory
+   * transcript staging area: each accepted fragment is appended directly by
+   * ContextStateService and linked to this turn id.
+   */
+  beginGraphTurn(conversationId: string, turnId: TurnId): void {
     const session = this.getSession(conversationId)
     if (!session) {
-      throw new Error(`beginTurn: no session ${conversationId}`)
+      throw new Error(`beginGraphTurn: no session ${conversationId}`)
     }
-    const existingAnchor = this.turnAnchors.get(conversationId)
-    if (existingAnchor) {
-      if (existingAnchor.turnId === turnId) {
-        // Idempotent re-begin of the same turn. Should not happen, but
-        // throwing here would permanently lock the conversation, so we
-        // log and skip rather than fail the new turn.
-        this.logger.warn(
-          `beginTurn: conversation ${conversationId} already has turn ` +
-            `${existingAnchor.turnId} open; skipping redundant re-begin.`
-        )
+    const activeTurnId = this.activeGraphTurns.get(conversationId)
+    if (activeTurnId) {
+      if (activeTurnId === turnId) {
         return
       }
-      // A stale anchor from a prior turn is still open while we open a
-      // new one. With transcript-anchor finalize owned by the turn
-      // lifecycle (TurnLifecycle.driveRunner runs onFinalize →
-      // commit/abort BEFORE resolving terminalPromise), the supersede
-      // serializer's `await cancelTurnAndAwait` is guaranteed to observe
-      // a cleared anchor before it begins the next turn. Reaching this
-      // branch means a real finalize-ordering bug upstream — fail loud
-      // instead of masking it by force-aborting the stale turn.
       throw new Error(
-        `beginTurn: conversation ${conversationId} still has stale turn ` +
-          `${existingAnchor.turnId} open while opening ${turnId}; anchor ` +
-          `finalize did not run before the superseding turn began.`
+        `beginGraphTurn: conversation ${conversationId} still has active ` +
+          `turn ${activeTurnId} while opening ${turnId}; its terminal graph ` +
+          `transaction did not finalize before the superseding turn began.`
       )
     }
-    const ctx = this.contextState.getContextRecord(conversationId)!
-    this.turnAnchors.set(conversationId, {
-      turnId,
-      messagesAt: ctx.messages.length,
-      messageRecordsAt: ctx.messageRecords.length,
-      transcriptEventsAt: ctx.transcriptEvents.length,
-      contextRecordsAt: ctx.contextState.records.length,
-      usedTokens: ctx.usedTokens,
-      messagesGeneration: ctx.messagesGeneration,
-    })
-    // Mirror onto the TranscriptStore so its open-turn invariants
-    // (no replaceCommitted mid-turn) hold even though the actual
-    // staging happens through manager-level rewind.
-    this.transcriptBeginTurn(ConversationId.of(conversationId), turnId)
+    this.activeGraphTurns.set(conversationId, turnId)
   }
 
   /**
-   * Close the open turn without rewinding. Anchors dropped.
-   *
-   * If the open anchor belongs to a different turnId we throw: the
-   * turn lifecycle runs onFinalize (commit/abort) before resolving the
-   * terminal promise, so by the time a superseding turn begins the
-   * anchor is always either this turn's or absent. A mismatch is a real
-   * finalize-ordering bug, not a tolerable race — fail loud.
+   * Commit a graph turn. All fragments were already durable when accepted;
+   * completing the turn only releases ownership of the turn id.
    */
-  commitTurn(conversationId: string, turnId: TurnId): void {
-    const anchor = this.turnAnchors.get(conversationId)
-    if (!anchor) return
-    if (anchor.turnId !== turnId) {
+  commitGraphTurn(conversationId: string, turnId: TurnId): void {
+    const activeTurnId = this.activeGraphTurns.get(conversationId)
+    if (!activeTurnId) return
+    if (activeTurnId !== turnId) {
       throw new Error(
-        `commitTurn: anchor owned by another turn (open=${anchor.turnId} ` +
-          `given=${turnId}); anchor finalize ordering is broken.`
+        `commitGraphTurn: active turn belongs to ${activeTurnId} ` +
+          `(given=${turnId}); terminal ordering is broken.`
       )
     }
-    this.turnAnchors.delete(conversationId)
-    this.transcriptCommitTurn(ConversationId.of(conversationId), turnId)
+    this.activeGraphTurns.delete(conversationId)
   }
 
   /**
-   * Discard everything appended since beginTurn. Splices each
-   * tracked array back to its anchor index and restores
-   * usedTokens / messagesGeneration. Also clears any pending tool
-   * calls that were registered after the anchor.
-   *
-   * If the open anchor belongs to a different turnId (supersede race),
-   * we log and return 0 — see `commitTurn` for the same rationale.
+   * Abort a graph turn without deleting accepted fragments. Durable tool-edge
+   * termination and pending-runtime cleanup are owned by
+   * TurnCleanupCoordinator after ContextState commits the abort transaction;
+   * this method only releases the active graph-turn identity.
    */
-  abortTurn(conversationId: string, turnId: TurnId): number {
-    const anchor = this.turnAnchors.get(conversationId)
-    if (!anchor) return 0
-    if (anchor.turnId !== turnId) {
+  abortGraphTurn(conversationId: string, turnId: TurnId): void {
+    const activeTurnId = this.activeGraphTurns.get(conversationId)
+    if (!activeTurnId) return
+    if (activeTurnId !== turnId) {
       throw new Error(
-        `abortTurn: anchor owned by another turn (open=${anchor.turnId} ` +
-          `given=${turnId}); anchor finalize ordering is broken.`
+        `abortGraphTurn: active turn belongs to ${activeTurnId} ` +
+          `(given=${turnId}); terminal ordering is broken.`
       )
     }
-    const session = this.getSession(conversationId)
-    if (!session) {
-      this.turnAnchors.delete(conversationId)
-      return 0
-    }
-    const ctx = this.contextState.getContextRecord(session.conversationId)!
-    const droppedMessages = ctx.messages.length - anchor.messagesAt
-    if (droppedMessages > 0) {
-      ctx.messages.splice(anchor.messagesAt)
-    }
-    if (ctx.messageRecords.length > anchor.messageRecordsAt) {
-      ctx.messageRecords.splice(anchor.messageRecordsAt)
-    }
-    if (ctx.transcriptEvents.length > anchor.transcriptEventsAt) {
-      ctx.transcriptEvents.splice(anchor.transcriptEventsAt)
-    }
-    if (ctx.contextState.records.length > anchor.contextRecordsAt) {
-      ctx.contextState.records.splice(anchor.contextRecordsAt)
-    }
-    ctx.usedTokens = anchor.usedTokens
-    ctx.messagesGeneration = anchor.messagesGeneration
-
-    // Pending tool calls registered during the aborted turn are
-    // also doomed — drop them so the next turn starts clean.
-    this.pendingToolAbortTurn(
-      ConversationId.of(conversationId),
-      turnId,
-      "transcript-turn-aborted"
-    )
-
-    this.turnAnchors.delete(conversationId)
-    this.transcriptAbortTurn(ConversationId.of(conversationId), turnId)
-    return droppedMessages
-  }
-
-  /**
-   * Add pending tool call
-   */
-  private resolveWorkspaceFilePath(
-    session: SessionRecord,
-    filePath: string
-  ): string {
-    const rootPath =
-      typeof session.projectContext?.rootPath === "string" &&
-      session.projectContext.rootPath.trim() !== ""
-        ? session.projectContext.rootPath
-        : process.cwd()
-    const normalizedRoot = path.resolve(rootPath)
-    return path.isAbsolute(filePath)
-      ? path.resolve(filePath)
-      : path.resolve(normalizedRoot, filePath)
+    this.activeGraphTurns.delete(conversationId)
   }
 
   addPendingToolCall(
@@ -5929,10 +5670,13 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     historyToolName?: string,
     historyToolInput?: Record<string, unknown>,
     codexToolCallType?: "function" | "custom" | "tool_search",
-    subagentOwner?: string,
     // Optional caller-supplied turnId. When omitted the resolver
     // installed by CursorConnectStreamService is queried.
-    _turnId?: TurnId
+    _turnId?: TurnId,
+    sidechainOwner?: SubagentSidechainToolOwner,
+    skillActivationReceipts: readonly CursorSkillActivationReceipt[] = [],
+    clientLifecycleSuppression?: PendingToolClientLifecycleSuppression,
+    hookAdditionalContexts: readonly CursorHookAdditionalContextReceipt[] = []
   ): void {
     const stream = this.sessionStream.getStreamRecord(conversationId)!
     const session = this.getSession(conversationId)
@@ -5955,6 +5699,27 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         historyToolName,
         historyToolInput,
         codexToolCallType,
+        ...(skillActivationReceipts.length > 0
+          ? {
+              skillActivationReceipts: skillActivationReceipts.map(
+                (receipt) => ({ ...receipt })
+              ),
+            }
+          : {}),
+        ...(hookAdditionalContexts.length > 0
+          ? {
+              hookAdditionalContexts: hookAdditionalContexts.map((context) => ({
+                ...context,
+              })),
+            }
+          : {}),
+        ...(clientLifecycleSuppression
+          ? {
+              clientLifecycleSuppression: {
+                ...clientLifecycleSuppression,
+              },
+            }
+          : {}),
         toolFamilyHint,
         modelCallId,
         startedEmitted: false,
@@ -5966,7 +5731,14 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         executionOrder: this.assistantToolBatch.bumpToolExecutionOrderCounter(
           session.conversationId
         ),
-        subagentOwner,
+        ...(sidechainOwner
+          ? {
+              sidechainOwner: {
+                ...sidechainOwner,
+                forkLineage: [...sidechainOwner.forkLineage],
+              },
+            }
+          : {}),
       }
       const turnId =
         _turnId ?? this.resolveTurnIdForConversation(conversationId)
@@ -5974,15 +5746,6 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         throw new Error(
           `addPendingToolCall: no turnId resolvable for ${conversationId}`
         )
-      }
-      // Resolve any prior entry under this id (legacy Map semantics
-      // was overwrite — store throws on duplicate, so resolve first).
-      const existing = this.pendingToolGet(
-        ConversationId.of(conversationId),
-        toolCallId
-      )
-      if (existing) {
-        this.pendingToolResolve(ConversationId.of(conversationId), toolCallId)
       }
       this.pendingToolRegister<PendingToolCall>({
         conversationId: ConversationId.of(conversationId),
@@ -5995,7 +5758,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       session.lastActivityAt = new Date()
       this.logger.debug(
         `Added pending tool call: ${toolCallId} (${toolName}) for session ${conversationId}` +
-          (subagentOwner ? ` [subagent=${subagentOwner}]` : "")
+          (sidechainOwner ? ` [subagent=${sidechainOwner.agentId}]` : "")
       )
       this.schedulePersist(conversationId)
     }
@@ -6110,8 +5873,12 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     toolCall: PendingToolCall
   ): void {
     const stream = this.sessionStream.getStreamRecord(session.conversationId)!
-    const path = toolCall.editPath?.trim()
-    if (!path) {
+    const path = toolCall.editPath
+    if (
+      typeof path !== "string" ||
+      path.length === 0 ||
+      path.includes("\u0000")
+    ) {
       // 即使没有 editPath，也把 toolCallId 从所有 queue 中扫一遍以防遗漏。
       // edit_file_v2 一定有 path，这里只是兜底。
       this.removeToolCallFromAllEditQueues(session, toolCall.toolCallId)
@@ -6168,8 +5935,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
 
   consumePendingToolCall(
     conversationId: string,
-    toolCallId: string,
-    options?: { deferBatchSettle?: boolean }
+    toolCallId: string
   ): PendingToolCall | undefined {
     const session = this.getSession(conversationId)
     if (session) {
@@ -6179,31 +5945,27 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       const wasPending =
         this.pendingToolCallCount(conversationId) > 0 ||
         this.sessionStream.hasBlockingInteractionQueries(conversationId)
+      const pendingEntry = this.pendingToolGet<PendingToolCall>(
+        ConversationId.of(conversationId),
+        toolCallId
+      )
       const toolCall = this.detachPendingToolCall(session, toolCallId)
       if (toolCall) {
-        // Settle this tool in the batch barrier so that continuation is only
-        // triggered after ALL tools in the assistant turn have completed.
-        //
-        // deferBatchSettle: the 第 1 类 join-barrier append path
-        // (appendToolResultWithIntegrity) requires the batch settle to land in
-        // the SAME synchronous slice as the history append, with no await in
-        // between. Detaching the pending entry here while settling the batch
-        // many awaits later (emitToolCompletedAndStep, etc.) lets sibling
-        // results settle out from under the buffer-flush condition
-        // (unsettledToolCallIds === 0): by the time the first sibling's append
-        // runs the whole batch is already settled, so the join collapses into
-        // per-result flushes and re-triggers the displaced-tool_result repair.
-        // Callers on that path pass deferBatchSettle:true and call
-        // settleAssistantToolBatchTool themselves immediately before the
-        // append, so "settled" means "result written to history" — the
-        // correct barrier semantics. Detach still happens here unconditionally,
-        // so a tool that is consumed always reaches its append (the only
-        // intervening early return is the `!toolCall` guard above, which
-        // never settled in the first place).
-        if (!options?.deferBatchSettle) {
+        // Result handlers append their durable graph fact before consuming the
+        // pending entry. Therefore this settle transition means the result is
+        // already available to the next provider request.
+        const batch =
+          this.assistantToolBatch.getActiveAssistantToolBatchSnapshot(
+            conversationId
+          )
+        if (batch && batch.graphTurnId === pendingEntry?.turnId) {
           this.assistantToolBatch.settleAssistantToolBatchTool(
             conversationId,
-            toolCallId
+            toolCallId,
+            {
+              topLevelTurnId: batch.topLevelTurnId,
+              graphTurnId: batch.graphTurnId,
+            }
           )
         }
         this.logger.debug(
@@ -6230,14 +5992,28 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       this.pendingToolCallCount(conversationId) > 0 ||
       this.sessionStream.hasBlockingInteractionQueries(conversationId)
 
+    const pendingEntry = this.pendingToolGet<PendingToolCall>(
+      ConversationId.of(conversationId),
+      toolCallId
+    )
     const toolCall = this.detachPendingToolCall(session, toolCallId)
     if (!toolCall) return undefined
 
     // Settle this tool in the batch barrier (same as consumePendingToolCall).
-    this.assistantToolBatch.settleAssistantToolBatchTool(
-      conversationId,
-      toolCallId
-    )
+    const batch =
+      this.assistantToolBatch.getActiveAssistantToolBatchSnapshot(
+        conversationId
+      )
+    if (batch && batch.graphTurnId === pendingEntry?.turnId) {
+      this.assistantToolBatch.settleAssistantToolBatchTool(
+        conversationId,
+        toolCallId,
+        {
+          topLevelTurnId: batch.topLevelTurnId,
+          graphTurnId: batch.graphTurnId,
+        }
+      )
+    }
 
     const reasonSuffix = reason ? ` (${reason})` : ""
     this.logger.warn(
@@ -6253,111 +6029,36 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     toolCallId: string,
     execIdNumber: number
   ): boolean {
-    const stream = this.sessionStream.getStreamRecord(conversationId)!
-    const session = this.getSession(conversationId)
+    const exactConversationId = ConversationId.of(conversationId)
+    const exactToolCallId = requireExactDurableIdentifier(
+      toolCallId,
+      "registerPendingToolExecId toolCallId"
+    )
+    const stream = this.sessionStream.getStreamRecord(exactConversationId)!
+    const session = this.getSession(exactConversationId)
     if (!session) return false
     if (!Number.isFinite(execIdNumber) || execIdNumber <= 0) return false
 
-    const pending = this.getPendingToolCall(session.conversationId, toolCallId)
+    const pending = this.getPendingToolCall(
+      session.conversationId,
+      exactToolCallId
+    )
     if (!pending) {
       this.logger.warn(
-        `registerPendingToolExecId: pending tool call not found: ${toolCallId}`
+        `registerPendingToolExecId: pending tool call not found: ${exactToolCallId}`
       )
       return false
     }
 
     const normalizedExecId = Math.floor(execIdNumber)
-    stream.pendingToolCallByExecId.set(normalizedExecId, toolCallId)
+    stream.pendingToolCallByExecId.set(normalizedExecId, exactToolCallId)
     pending.execIds.add(normalizedExecId)
     session.lastActivityAt = new Date()
-    // Arm a wall-clock deadline on the first execId mapping for this
-    // tool. The PendingDeadlineSweeper scans `payload.deadline` every
-    // 5s and synthesises a `[<tool> timeout]` error tool_result via
-    // `expirePendingToolCall` if the IDE never closes the slot. Without
-    // this, a stalled IDE leaves the conversation stuck on
-    // `pendingToolCalls=1` forever — the failure mode observed in
-    // agent-vibes-bridge.log on 2026-05-31 with `list_directory`.
-    //
-    // Long-running channels (shell, sub-agent) opt out by tool name;
-    // a caller may still set an explicit deadline by writing to
-    // `pending.deadline` directly after this call returns.
-    const deadlineMs = this.resolveExecDispatchDeadlineMs(pending)
-    if (pending.deadline === undefined && deadlineMs !== undefined) {
-      pending.deadline = Date.now() + deadlineMs
-      this.logger.debug(
-        `Armed exec-dispatch deadline (+${deadlineMs}ms) ` +
-          `for tool=${pending.toolName} toolCallId=${toolCallId} ` +
-          `execId=${normalizedExecId}`
-      )
-    }
     this.logger.debug(
-      `Mapped execId=${normalizedExecId} -> toolCallId=${toolCallId} for session ${conversationId}`
+      `Mapped execId=${normalizedExecId} -> toolCallId=${exactToolCallId} for session ${exactConversationId}`
     )
-    this.schedulePersist(conversationId)
+    this.schedulePersist(exactConversationId)
     return true
-  }
-
-  /**
-   * Reset a pending tool's deadline — used when the BiDi attachment
-   * was torn down (Premature close), the pending was parked in
-   * `awaitingClientResult`, and the IDE has now reconnected with
-   * `resumeAction`. Conceptually equivalent to "the tool was just
-   * dispatched": the new BiDi gets the same fresh 90s window the
-   * original dispatch did.
-   *
-   * Returns true when a deadline was actually written; false when the
-   * conversation/pending is gone or the tool opted out of the sweeper.
-   */
-  resetPendingToolDeadline(
-    conversationId: string,
-    toolCallId: string
-  ): boolean {
-    return this.refreshPendingToolDeadline(
-      conversationId,
-      toolCallId,
-      "post-resumeAction reattach"
-    )
-  }
-
-  refreshPendingToolDeadline(
-    conversationId: string,
-    toolCallId: string,
-    reason: string
-  ): boolean {
-    const session = this.getSession(conversationId)
-    if (!session) return false
-    const pending = this.getPendingToolCall(session.conversationId, toolCallId)
-    if (!pending) return false
-    const deadlineMs = this.resolveExecDispatchDeadlineMs(pending)
-    if (deadlineMs === undefined) return false
-
-    pending.deadline = Date.now() + deadlineMs
-    session.lastActivityAt = new Date()
-    this.logger.debug(
-      `Refreshed exec-dispatch deadline (+${deadlineMs}ms) ` +
-        `for tool=${pending.toolName} toolCallId=${toolCallId} (${reason})`
-    )
-    this.schedulePersist(conversationId)
-    return true
-  }
-
-  /**
-   * Decide whether `registerPendingToolExecId` should auto-arm the
-   * sweeper deadline. The default is 90s; foreground terminal streams get a
-   * longer activity deadline; background/task/await channels opt out because
-   * they have their own lifecycle.
-   */
-  private resolveExecDispatchDeadlineMs(
-    pending: PendingToolCall
-  ): number | undefined {
-    const normalized = (pending.toolName || "").trim().toLowerCase()
-    if (this.FOREGROUND_SHELL_STREAM_TOOLS.has(normalized)) {
-      return this.FOREGROUND_SHELL_STREAM_DEADLINE_MS
-    }
-    if (this.EXEC_DISPATCH_DEADLINE_EXEMPT_TOOLS.has(normalized)) {
-      return undefined
-    }
-    return this.EXEC_DISPATCH_DEADLINE_MS
   }
 
   markPendingToolCallStarted(conversationId: string, toolCallId: string): void {
@@ -6511,6 +6212,76 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     )
   }
 
+  searchConversations(
+    query: string,
+    limit: number
+  ): {
+    hits: Array<{
+      conversationId: string
+      title: string
+      updatedAtMs: number
+      snippet: string
+    }>
+    truncated: boolean
+    partial: boolean
+  } {
+    const normalizedQuery = query.trim().toLowerCase()
+    if (!normalizedQuery) {
+      throw new Error("Conversation search query is required")
+    }
+
+    const normalizedLimit = Math.min(Math.max(Math.floor(limit), 1), 50)
+    const maxScannedSessions = 200
+    const candidates = this.sessionPersistence.listSessions()
+    const partial = candidates.length > maxScannedSessions
+    const hits: Array<{
+      conversationId: string
+      title: string
+      updatedAtMs: number
+      snippet: string
+    }> = []
+
+    for (const candidate of candidates.slice(0, maxScannedSessions)) {
+      const messages = this.messageStore.getMessages(candidate.conversationId)
+      const searchableMessages = messages
+        .filter((message) => !message.isMeta)
+        .map((message) => ({
+          role: message.role,
+          text: extractText(message.content as LooseMessageContent).trim(),
+        }))
+        .filter((message) => message.text.length > 0)
+      const searchableText = searchableMessages
+        .map((message) => message.text)
+        .join("\n")
+      const matchIndex = searchableText.toLowerCase().indexOf(normalizedQuery)
+      if (matchIndex < 0) continue
+
+      const firstUserMessage = searchableMessages.find(
+        (message) => message.role === "user"
+      )?.text
+      const titleSource = firstUserMessage || searchableMessages[0]?.text || ""
+      const title = (titleSource.split(/\r?\n/, 1)[0] || "").slice(0, 120)
+      const snippetStart = Math.max(0, matchIndex - 120)
+      const snippetEnd = Math.min(
+        searchableText.length,
+        matchIndex + normalizedQuery.length + 180
+      )
+      hits.push({
+        conversationId: candidate.conversationId,
+        title,
+        updatedAtMs: candidate.lastActivityAt,
+        snippet: searchableText.slice(snippetStart, snippetEnd),
+      })
+      if (hits.length > normalizedLimit) break
+    }
+
+    return {
+      hits: hits.slice(0, normalizedLimit),
+      truncated: hits.length > normalizedLimit,
+      partial,
+    }
+  }
+
   // ─── Lifecycle-domain field accessors ─────────────────────────
   // step 4 终结: caller 不再 `session.xxx`,通过这些 method 访问
   // SessionLifecycleFields 字段。physical record 仍是单 SessionRecord
@@ -6546,19 +6317,6 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     const s = this.getSession(conversationId)
     if (!s) return
     s.mcpToolDefs = mcpToolDefs
-  }
-  getProjectContext(
-    conversationId: string
-  ): ParsedCursorRequest["projectContext"] | undefined {
-    return this.getSession(conversationId)?.projectContext
-  }
-  setProjectContext(
-    conversationId: string,
-    projectContext: ParsedCursorRequest["projectContext"]
-  ): void {
-    const s = this.getSession(conversationId)
-    if (!s) return
-    s.projectContext = projectContext
   }
   getCursorRules(
     conversationId: string
@@ -6659,13 +6417,13 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     if (!s) return
     s.subagentModelOverrides = overrides
   }
-  getThinkingLevel(conversationId: string): number {
+  getThinkingLevel(conversationId: string): CursorThinkingLevel {
     return this.getSession(conversationId)?.thinkingLevel ?? 0
   }
-  setThinkingLevel(conversationId: string, level: number): void {
+  setThinkingLevel(conversationId: string, level: CursorThinkingLevel): void {
     const s = this.getSession(conversationId)
     if (!s) return
-    s.thinkingLevel = level
+    s.thinkingLevel = requireThinkingLevel(level, "setThinkingLevel")
   }
   getThinkingDetailsRequested(conversationId: string): boolean {
     return this.getSession(conversationId)?.thinkingDetailsRequested ?? false
@@ -6741,6 +6499,28 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     s.deferredControlContinuations.length = 0
     return drained
   }
+  takeDeferredControlContinuations(
+    conversationId: string,
+    predicate: (
+      entry: SessionRecord["deferredControlContinuations"][number]
+    ) => boolean
+  ): SessionRecord["deferredControlContinuations"] {
+    const session = this.getSession(conversationId)
+    if (!session) return []
+    const matched: SessionRecord["deferredControlContinuations"] = []
+    const retained: SessionRecord["deferredControlContinuations"] = []
+    for (const entry of session.deferredControlContinuations) {
+      if (predicate(entry)) {
+        matched.push(entry)
+      } else {
+        retained.push(entry)
+      }
+    }
+    if (matched.length === 0) return matched
+    session.deferredControlContinuations = retained
+    this.touchLastActivityAt(conversationId)
+    return matched
+  }
   clearDeferredControlContinuations(
     conversationId: string,
     reason: string
@@ -6806,9 +6586,22 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     conversationId: string,
     value: number | undefined
   ): void {
+    const normalized = requireOptionalNonNegativeSafeInteger(
+      value,
+      "setUsedContextTokens"
+    )
     const s = this.getSession(conversationId)
     if (!s) return
-    s.usedContextTokens = value
+    const context = this.contextState.getContextRecord(conversationId)
+    if (!context) {
+      throw new Error(
+        `Cannot set used context tokens for ${conversationId}: context projection is not mounted`
+      )
+    }
+    s.usedContextTokens = normalized
+    context.mainProjection.usedTokens = normalized ?? 0
+    s.lastActivityAt = new Date()
+    this.schedulePersist(conversationId)
   }
   getActiveCursorSkillNames(conversationId: string): string[] | undefined {
     return this.getSession(conversationId)?.activeCursorSkillNames
@@ -6920,6 +6713,91 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
   getContextRecord(conversationId: string): ContextStateRecord | undefined {
     return this.contextState.getContextRecord(conversationId)
   }
+
+  /**
+   * Explicitly remount a child after a durable execution-lease handoff. This
+   * is not a hot-state fallback: every field is reconstructed from the child
+   * branch's durable graph, generic layout head and current head/lease
+   * receipt before it replaces the stale mounted projection.
+   */
+  remountSubagentProjection(
+    conversationId: string,
+    branch: SubagentGraphBranch
+  ): MountedContextProjection {
+    const cid = ConversationId.of(conversationId)
+    if (branch.conversationId !== cid) {
+      throw new Error(
+        `SessionLifecycleService.remountSubagentProjection: branch belongs to ` +
+          `${branch.conversationId}, not ${conversationId}`
+      )
+    }
+    if (!this.contextState.getContextRecord(conversationId)) {
+      throw new Error(
+        `SessionLifecycleService.remountSubagentProjection: context is not mounted ` +
+          `conversation=${conversationId}`
+      )
+    }
+    const owner = this.subagentBranches.createProjectionOwner(branch)
+    const durableBranch = this.subagentBranches.readProjectionBranch(owner)
+    assertSameProjectionOwner(
+      owner,
+      this.subagentBranches.createProjectionOwner(durableBranch),
+      "SessionLifecycleService.remountSubagentProjection"
+    )
+    if (durableBranch.turnId !== branch.turnId) {
+      throw new Error(
+        `SessionLifecycleService.remountSubagentProjection: branch execution lease changed ` +
+          `conversation=${conversationId} agentId=${branch.agentId}`
+      )
+    }
+    const messages = this.contextState.getSubagentGraphMessages(
+      conversationId,
+      durableBranch
+    )
+    const messageRecords = messages.map((message) => {
+      const createdAt = Date.parse(message.timestamp)
+      return this.createTranscriptRecord(
+        message,
+        Number.isFinite(createdAt) ? createdAt : Date.now()
+      )
+    })
+    const contextState = this.createContextState(messageRecords)
+    const activeHead = this.contextProjectionHeads.get(owner)
+    if (activeHead) {
+      this.restoreContextProjectionFromStore(
+        owner,
+        contextState,
+        messageRecords,
+        [],
+        activeHead
+      )
+    }
+    this.restoreClaudeProjectionFromStore(
+      owner,
+      contextState,
+      messageRecords,
+      []
+    )
+    const events = this.rebuildTranscriptEventsFromRecords(messageRecords)
+    const projection: MountedContextProjection = {
+      owner,
+      messages,
+      generation: messages.length,
+      messageRecords,
+      transcriptEvents: events.events,
+      nextTranscriptEventSeq: events.nextSeq,
+      contextState,
+      usedTokens: 0,
+      branchSnapshot: this.subagentBranches.readProjectionBranchSnapshot(owner),
+    }
+    this.contextState.applyPreparedMountedProjectionInstall(
+      this.contextState.prepareMountedProjectionInstall(
+        conversationId,
+        projection
+      )
+    )
+    return projection
+  }
   getStreamRecord(conversationId: string): SessionStreamRecord | undefined {
     return this.sessionStream.getStreamRecord(conversationId)
   }
@@ -6971,10 +6849,10 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     return {
       conversationId,
       model: session.model || "",
-      messageCount: ctx.messages.length,
-      transcriptRecordCount: ctx.messageRecords.length,
-      activeCompactionId: ctx.contextState.activeCompactionId,
-      compactionEpoch: ctx.contextState.compactionEpoch ?? 0,
+      messageCount: ctx.mainProjection.messages.length,
+      transcriptRecordCount: ctx.mainProjection.messageRecords.length,
+      activeCompactionId: ctx.mainProjection.contextState.activeCompactionId,
+      compactionEpoch: ctx.mainProjection.contextState.compactionEpoch ?? 0,
       lastActivityAt: session.lastActivityAt.toISOString(),
     }
   }
@@ -6987,12 +6865,13 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     if (session) {
       const stream = this.sessionStream.getStreamRecord(session.conversationId)
       if (stream) stream.pendingInteractionQueries.clear()
-      this.onSessionCleanupHandler?.(conversationId, session)
+      this.invokeSessionCleanupHandlers(conversationId, session)
     }
     this.clearScheduledPersist(conversationId)
     // Step 4 物理拆: fan-out 到三个 service 各自的 record map,否则
     // context/stream record 在 lifecycle delete 后泄漏。
     this.sessions.delete(conversationId)
+    this.activeGraphTurns.delete(conversationId)
     this.contextState.deleteRecord(conversationId)
     this.sessionStream.deleteRecord(conversationId)
     this.deletePersistedSession(conversationId)
@@ -7009,16 +6888,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     // request. The user sees a warning and the operation is a no-op.
     const busySessionIds = loadedSessionIds.filter((conversationId) => {
       const session = this.sessions.get(conversationId)
-      if (!session) return false
-      const stream = this.sessionStream.getStreamRecord(conversationId)
-      const activeTurnSignal = this.getCurrentTurnAbortSignal(
-        session.conversationId
-      )
-      return (
-        (activeTurnSignal != null && !activeTurnSignal.aborted) ||
-        this.pendingToolCallCount(session.conversationId) > 0 ||
-        (stream?.pendingInteractionQueries.size ?? 0) > 0
-      )
+      return session ? this.isSessionBusy(conversationId, session) : false
     })
 
     if (busySessionIds.length > 0) {
@@ -7046,23 +6916,19 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
           session.conversationId
         )
         if (stream) stream.pendingInteractionQueries.clear()
-        this.onSessionCleanupHandler?.(conversationId, session)
+        this.invokeSessionCleanupHandlers(conversationId, session)
       }
       this.clearScheduledPersist(conversationId)
       this.sessions.delete(conversationId)
+      this.activeGraphTurns.delete(conversationId)
       this.contextState.deleteRecord(conversationId)
       this.sessionStream.deleteRecord(conversationId)
       clearedLoadedSessions++
     }
 
-    // 2. Truncate the v2 SQLite schema in one shot. The `sessions`
-    //    table is the parent of every other session-* table via
-    //    `ON DELETE CASCADE`, so a single `DELETE FROM sessions` also
-    //    wipes session_messages, tool_call_ledger, turn_events,
-    //    session_file_states, session_todos, session_message_blobs,
-    //    and session_read_paths. If the persistence layer happens to
-    //    not be ready yet (very early in boot), skip silently — there
-    //    is nothing on disk to clear.
+    // 2. Truncate every conversation-owned table in the current graph schema
+    //    through SessionPersistenceService. If the persistence layer is not
+    //    ready yet (very early in boot), there is nothing on disk to clear.
     let clearedPersistedSessions = 0
     if (this.persistence.isReady) {
       try {
@@ -7120,22 +6986,17 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       if (now - session.lastActivityAt.getTime() <= this.SESSION_TIMEOUT) {
         continue
       }
-      const stream = this.sessionStream.getStreamRecord(conversationId)
-      if (!stream) continue
-
-      const hasPendingWork =
-        this.pendingToolCallCount(session.conversationId) > 0 ||
-        this.sessionStream.hasBlockingInteractionQueries(session.conversationId)
-      if (hasPendingWork) {
+      if (this.isSessionBusy(conversationId, session)) {
         this.logger.debug(
-          `Skipping cleanup for session ${conversationId}: pendingToolCalls=${this.pendingToolCallCount(session.conversationId)}, pendingInteractionQueries=${stream.pendingInteractionQueries.size}`
+          `Skipping cleanup for active session ${conversationId}`
         )
         continue
       }
 
       this.clearScheduledPersist(conversationId)
-      this.onSessionCleanupHandler?.(conversationId, session)
+      this.invokeSessionCleanupHandlers(conversationId, session)
       this.sessions.delete(conversationId)
+      this.activeGraphTurns.delete(conversationId)
       this.contextState.deleteRecord(conversationId)
       this.sessionStream.deleteRecord(conversationId)
       cleanedCount++
@@ -7188,12 +7049,20 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       string,
       {
         session: SessionRecord
+        context: ContextStateRecord
         loaded: boolean
       }
     >()
 
     for (const [conversationId, session] of this.sessions.entries()) {
-      sessions.set(conversationId, { session, loaded: true })
+      const context = this.contextState.getContextRecord(conversationId)
+      if (!context) {
+        this.logger.error(
+          `Skipping analytics for ${conversationId}: mounted session has no ContextStateRecord`
+        )
+        continue
+      }
+      sessions.set(conversationId, { session, context, loaded: true })
     }
 
     if (this.persistence.isReady) {
@@ -7206,24 +7075,16 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
               ConversationId.of(conversationId)
             )
             if (!row) continue
-            const persisted = this.loadPersistedSessionState(row)
+            const persisted = this.loadPersistedSessionState(
+              row,
+              this.loadPersistedGraph(row.conversationId),
+              []
+            )
 
-            // Analytics-side lifecycle:
-            //   1. Parse config blob → SessionRecord (pure)
-            //   2. Use the session for analytics WITHOUT mounting it
-            //      into `this.sessions` — these are "transient view"
-            //      sessions, not active ones. The next mutating
-            //      operation that needs them will go through
-            //      getSession()→loadPersistedSession() and properly
-            //      mount + log + audit at that point.
-            //
-            // Step 1 of the refactor removed the analytics-side silent
-            // integrity-repair-and-rewrite loop because protocol
-            // integrity is now a ledger invariant, not something the
-            // analytics dashboard fixes after the fact.
-            const session = this.parsePersistedSession(persisted)
+            const restored = this.parsePersistedSession(persisted)
             sessions.set(conversationId, {
-              session,
+              session: restored.session,
+              context: restored.context,
               loaded: false,
             })
           } catch (error) {
@@ -7244,6 +7105,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
         this.buildAnalyticsEntry(
           conversationId,
           value.session,
+          value.context,
           value.loaded,
           now
         )
@@ -7306,637 +7168,161 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // ── Sub-Agent Context helpers ──────────────────────────
-  //
-  // Multi-foreground-subagent model. When the parent agent dispatches
-  // several `task` tool calls in the same batch (cf.
-  // `dispatchPreparedToolBatch`), each one spins its own
-  // {@link SubAgentContext} state machine. We key them by `subagentId`
-  // and resolve via toolCallId at the BiDi boundary because the IDE
-  // routes ExecClientMessage results by execId/toolCallId, not by
-  // sub-agent.
-
   /**
-   * Register or replace a sub-agent context. Replacement only happens
-   * when the same `subagentId` re-runs (defensive — the executor
-   * recreates a context after an aborted turn). Different sub-agents
-   * coexist as separate map entries.
+   * Running child execution is a durable run state.  The process keeps no
+   * parallel child-context registry: graph counters are projected directly
+   * from the run's immutable branch.
    */
-  setSubAgentContext(conversationId: string, context: SubAgentContext): void {
-    const session = this.getSession(conversationId)
-    if (session) {
-      session.subAgentContexts.set(context.subagentId, context)
-      session.lastActivityAt = new Date()
-      this.logger.log(
-        `Set SubAgentContext for ${conversationId}: subagentId=${context.subagentId}, parentToolCallId=${context.parentToolCallId} (active=${session.subAgentContexts.size})`
-      )
-      this.schedulePersist(conversationId)
-    }
+  private listRunningSubagentRuns(conversationId: string): SubagentRunRecord[] {
+    return this.subagentRunStore
+      .listInConversation(ConversationId.of(conversationId))
+      .filter((run) => run.status === "running")
   }
 
-  /**
-   * Look up an active sub-agent by subagentId. Returns undefined when
-   * the sub-agent has already settled / been cleared. Prefer this when
-   * the caller already has the subagentId in scope (e.g. inside the
-   * executor's own loop) — the toolCallId fallback is for BiDi-boundary
-   * routing where only the protocol-level identifier is available.
-   */
-  getSubAgentContextById(
-    conversationId: string,
-    subagentId: string
-  ): SubAgentContext | undefined {
-    return this.getSession(conversationId)?.subAgentContexts.get(subagentId)
-  }
-
-  /**
-   * Resolve a sub-agent from a tool call id. Matches in this order:
-   *   1. parentToolCallId — the `task` envelope itself
-   *   2. pendingToolCallIds — inner tool calls owned by the sub-agent
-   *   3. currentTurnToolCalls — pre-dispatch entries that have not yet
-   *      registered as pending (race window between LLM emit and
-   *      registerPreparedToolInvocation)
-   * Returns the first match; in practice toolCallIds are unique across
-   * sub-agents in the same session because each sub-agent's LLM
-   * generates fresh ids.
-   */
-  getSubAgentContextByToolCallId(
-    conversationId: string,
-    toolCallId: string
-  ): SubAgentContext | undefined {
-    const session = this.getSession(conversationId)
-    if (!session) return undefined
-    for (const ctx of session.subAgentContexts.values()) {
-      if (ctx.parentToolCallId === toolCallId) return ctx
-      if (ctx.pendingToolCallIds.has(toolCallId)) return ctx
-      if (ctx.currentTurnToolCalls.some((tc) => tc.id === toolCallId)) {
-        return ctx
-      }
-    }
-    return undefined
-  }
-
-  /**
-   * List every sub-agent currently attached to the session. Used by
-   * analytics / context attachment building / shutdown sweeps that want
-   * to enumerate everything live.
-   */
-  listSubAgentContexts(conversationId: string): SubAgentContext[] {
-    const session = this.getSession(conversationId)
-    if (!session) return []
-    return Array.from(session.subAgentContexts.values())
-  }
-
-  /**
-   * Internal helper used by analytics / restart-recovery serialization
-   * to sum a numeric field across every active sub-agent. Callers used
-   * to read `session.subAgentContext?.<field> ?? 0` from the singleton;
-   * with the multi-context model that becomes a per-conversation sum.
-   */
-  private sumSubAgentMetric(
-    session: SessionRecord,
-    field: "turnCount" | "toolCallCount"
-  ): number {
-    let total = 0
-    for (const ctx of session.subAgentContexts.values()) {
-      total += ctx[field]
-    }
-    return total
-  }
-
-  /**
-   * Persistence helper: project a runtime SubAgentContext into the
-   * shape we write to disk. Centralised so serializeSession can map
-   * over `subAgentContexts.values()` without repeating the field-by-
-   * field copy.
-   */
-  private persistSubAgentContext(
-    ctx: SubAgentContext
-  ): PersistedSubAgentContext {
-    return {
-      parentToolCallId: ctx.parentToolCallId,
-      parentModelCallId: ctx.parentModelCallId,
-      subagentId: ctx.subagentId,
-      agentType: ctx.agentType,
-      messages: ctx.messages,
-      model: ctx.model,
-      tools: ctx.tools,
-      accumulatedText: ctx.accumulatedText,
-      pendingToolCallIds: Array.from(ctx.pendingToolCallIds),
-      startTime: ctx.startTime,
-      turnCount: ctx.turnCount,
-      toolCallCount: ctx.toolCallCount,
-      modifiedFiles: [...ctx.modifiedFiles],
-      isBackground: ctx.isBackground,
-      backgroundedAt: ctx.backgroundedAt,
-      currentTurnToolCalls: ctx.currentTurnToolCalls.map((toolCall) => ({
-        id: toolCall.id,
-        name: toolCall.name,
-        input: toolCall.input,
-      })),
-      expectedToolCallIds: Array.from(ctx.expectedToolCallIds),
-      allowedWorkspaceRoots: ctx.allowedWorkspaceRoots
-        ? [...ctx.allowedWorkspaceRoots]
-        : undefined,
-    }
-  }
-
-  /**
-   * Mark a specific foreground sub-agent as backgrounded. The caller
-   * must supply the parent task tool call id (or subagent id) so we
-   * disambiguate when several sub-agents are active. Returns the
-   * mutated context on success or undefined when the lookup misses
-   * (e.g. tool call already settled).
-   */
-  markSubAgentBackgrounded(
-    conversationId: string,
-    toolCallId?: string
-  ): SubAgentContext | undefined {
-    const session = this.getSession(conversationId)
-    if (!session || session.subAgentContexts.size === 0) return undefined
-
-    const normalizedToolCallId = toolCallId?.trim()
-    let ctx: SubAgentContext | undefined
-
-    if (normalizedToolCallId) {
-      // Try parent / subagent / pending lookup. Match what the model
-      // is most likely to have referenced when emitting the
-      // backgroundSubagentAction.
-      ctx =
-        this.getSubAgentContextByToolCallId(
+  private deriveRunningSubagentMetrics(conversationId: string): {
+    subAgentTurns: number
+    subAgentToolCalls: number
+  } {
+    let subAgentTurns = 0
+    let subAgentToolCalls = 0
+    for (const run of this.listRunningSubagentRuns(conversationId)) {
+      const metrics = deriveSubagentGraphExecutionMetrics(
+        this.contextState.getSubagentGraphMessages(
           conversationId,
-          normalizedToolCallId
-        ) ?? session.subAgentContexts.get(normalizedToolCallId)
-      if (!ctx) return undefined
-    } else if (session.subAgentContexts.size === 1) {
-      // No id supplied and exactly one foreground sub-agent active —
-      // the legacy single-context call site. Pick it.
-      ctx = session.subAgentContexts.values().next().value
-    } else {
-      // Ambiguous: don't background-mark a random sub-agent; force the
-      // caller to disambiguate.
-      this.logger.warn(
-        `markSubAgentBackgrounded: ambiguous request for ${conversationId} ` +
-          `(${session.subAgentContexts.size} sub-agents active, no toolCallId provided)`
+          subagentGraphBranchFromRun(run)
+        )
       )
-      return undefined
+      subAgentTurns += metrics.turnCount
+      subAgentToolCalls += metrics.toolCallCount
     }
-    if (!ctx) return undefined
+    return { subAgentTurns, subAgentToolCalls }
+  }
 
-    ctx.isBackground = true
-    ctx.backgroundedAt = Date.now()
-    session.lastActivityAt = new Date()
-    this.logger.log(
-      `Marked SubAgentContext backgrounded for ${conversationId}: subagentId=${ctx.subagentId}, parentToolCallId=${ctx.parentToolCallId}`
-    )
-    this.schedulePersist(conversationId)
-    return ctx
+  /** Return the lifecycle's explicit workspace state, if this session has one. */
+  getWorkspace(conversationId: string): SessionWorkspaceState | undefined {
+    return this.getSession(conversationId)?.workspace
+  }
+
+  /** The durable scope snapshot exposed to REST diagnostics. */
+  getWorkspaceScopeSnapshot(conversationId: string) {
+    return this.getSession(conversationId)?.workspace?.scope.toFrozenSnapshot()
+  }
+
+  /** Every executable root with its authority source. */
+  getWorkspaceRootSources(conversationId: string) {
+    const workspace = this.getSession(conversationId)?.workspace
+    return workspace ? describeWorkspaceRoots(workspace) : []
   }
 
   /**
-   * Remove a single sub-agent's context. Other concurrent sub-agents
-   * remain untouched. Pass `undefined` only as a defensive escape hatch
-   * when the caller does not know the id; it clears all active
-   * contexts and logs a warning.
+   * Publish one successful CreatePlanResult as an exact read-only capability
+   * before its tool result is returned to the model.
    */
-  clearSubAgentContext(conversationId: string, subagentId?: string): void {
+  registerCursorManagedPlanReadResource(
+    conversationId: string,
+    toolCallId: string,
+    planUri: string
+  ): CursorManagedReadResource {
     const session = this.getSession(conversationId)
-    if (!session) return
-
-    if (subagentId === undefined) {
-      if (session.subAgentContexts.size === 0) return
-      const ids = Array.from(session.subAgentContexts.keys())
-      this.logger.warn(
-        `clearSubAgentContext called without subagentId on ${conversationId}; ` +
-          `clearing ${ids.length} active context(s): ${ids.join(", ")}`
+    if (!session) {
+      throw new Error(
+        `Cannot register Cursor plan resource for missing session ${conversationId}`
       )
-      session.subAgentContexts.clear()
-      session.lastActivityAt = new Date()
-      this.schedulePersist(conversationId)
+    }
+    const next = upsertCursorManagedPlanReadResource(
+      session.cursorManagedReadResources,
+      { id: toolCallId, path: planUri }
+    )
+    session.cursorManagedReadResources = next.resources
+    this.markSessionDirty(conversationId)
+    return next.resource
+  }
+
+  /**
+   * Validate a REST grant batch off-record, then install one fresh immutable
+   * Scope. A grant cannot establish a session workspace: the IDE declaration
+   * must exist first.
+   */
+  addWorkspaceGrants(
+    conversationId: string,
+    rawPaths: readonly string[]
+  ): readonly WorkspaceGrant[] | null {
+    const session = this.getSession(conversationId)
+    if (!session?.workspace) return null
+    try {
+      const result = applyWorkspaceGrantBatch(
+        session.workspace,
+        rawPaths,
+        "session",
+        Date.now()
+      )
+      session.workspace = result.state
+      this.markSessionDirty(conversationId)
+      return result.grants
+    } catch (error) {
+      if (error instanceof WorkspaceSessionStateError) return null
+      throw error
+    }
+  }
+
+  /** Validate and remove a grant batch in one immutable Scope replacement. */
+  removeWorkspaceGrants(
+    conversationId: string,
+    rawPaths: readonly string[]
+  ): readonly WorkspaceGrant[] | null {
+    const session = this.getSession(conversationId)
+    if (!session?.workspace) return null
+    try {
+      const result = removeWorkspaceGrantBatch(session.workspace, rawPaths)
+      session.workspace = result.state
+      if (result.removed.length > 0) this.markSessionDirty(conversationId)
+      return result.removed
+    } catch (error) {
+      if (error instanceof WorkspaceSessionStateError) return null
+      throw error
+    }
+  }
+
+  /**
+   * Load the exact `.cursor/agent-vibes.json` schema for the current primary
+   * root. Config grants are first cleared so malformed or removed config
+   * fails closed instead of retaining prior filesystem authority.
+   */
+  private loadConfiguredWorkspaceGrants(session: SessionRecord): void {
+    const workspace = session.workspace
+    if (!workspace) return
+    const primaryRoot = workspace.scope.primaryRoot
+    if (session.configuredWorkspaceGrantsLoadedForPrimary === primaryRoot) {
       return
     }
 
-    if (!session.subAgentContexts.delete(subagentId)) return
-    // P0-2 / smoke-regression #1: when a sub-agent settles (completed /
-    // failed / killed), the IDE never emits matching `streamClose`
-    // frames for the shell streams the sub-agent owned, because from
-    // the IDE's perspective the sub-agent's outer toolCall has already
-    // finished. Without an explicit sweep here, those shell_stream
-    // pending entries linger in `session.pendingToolCalls` forever and
-    // the parent BiDi loop logs `Still waiting for pendingToolCalls=N`
-    // indefinitely. Cheap no-op when no owned entries are pending.
-    let strandedOwned = 0
-    for (const [pendingToolCallId, pending] of this.listPendingToolCallEntries(
-      session.conversationId
-    )) {
-      if (pending.subagentOwner !== subagentId) continue
-      this.resolvePendingToolCallEntry(
-        session.conversationId,
-        pendingToolCallId
-      )
-      // Phase H7a: view.delete() auto-resolves the store mirror.
-      strandedOwned += 1
-      this.logger.warn(
-        `Released stranded pending tool call ${pendingToolCallId} ` +
-          `(${pending.toolName}) owned by settled sub-agent ${subagentId}`
-      )
-    }
-    session.lastActivityAt = new Date()
-    this.logger.log(
-      `Cleared SubAgentContext for ${conversationId}: subagentId=${subagentId} ` +
-        `(remaining=${session.subAgentContexts.size}, ` +
-        `releasedStrandedPending=${strandedOwned})`
+    // A reload starts from session grants only. This also removes persisted
+    // config grants before a missing or malformed file can be observed.
+    session.workspace = replaceConfiguredWorkspaceGrants(
+      workspace,
+      [],
+      Date.now()
     )
-    this.schedulePersist(conversationId)
-  }
+    session.configuredWorkspaceGrantsLoadedForPrimary = primaryRoot
 
-  /**
-   * Check whether a tool call belongs to any active sub-agent. Used by
-   * BiDi handlers that need to decide whether to route an
-   * ExecClientMessage to the sub-agent dispatch path.
-   */
-  isSubAgentToolCall(conversationId: string, toolCallId: string): boolean {
-    const session = this.getSession(conversationId)
-    if (!session) return false
-    for (const ctx of session.subAgentContexts.values()) {
-      if (ctx.pendingToolCallIds.has(toolCallId)) return true
-    }
-    return false
-  }
-
-  /**
-   * Add a workspace root to the session's `additionalRoots` map.
-   *
-   * Mirrors claude-code's `addDirectories` permission update — the
-   * IDE's `projectContext.workspaceFolders` are the primary source
-   * of truth, and this map carries roots that come in through other
-   * channels (REST API, `.cursor/agent-vibes.json` config). Once
-   * added, sub-agent inline tools can read/grep/list files inside
-   * the new root the same way they handle the IDE-pushed ones.
-   *
-   * Dedup key is the resolved absolute path (post `realpathSync` +
-   * macOS `/private` collapse), so two different relative paths
-   * pointing at the same dir merge into one entry. When an entry
-   * already exists, the higher-priority source wins:
-   * `'config'` > `'session'` (config is project-level intent;
-   * session is per-conversation user action). Equal-priority
-   * re-adds refresh `addedAt` and keep the original `rawPath`.
-   *
-   * Returns the resolved entry that's now in the map, or `null`
-   * when the input path could not be resolved (caller surfaces a
-   * 400 in the REST handler).
-   */
-  addAdditionalWorkspaceRoot(
-    conversationId: string,
-    rawPath: string,
-    source: "session" | "config"
-  ): AdditionalWorkspaceRoot | null {
-    const session = this.getSession(conversationId)
-    if (!session) return null
-    const trimmedRaw = (rawPath || "").trim()
-    if (!trimmedRaw) return null
-    const resolved = normalizePathForBoundaryCheck(trimmedRaw)
-    if (!resolved) return null
-
-    if (!session.additionalRoots) {
-      session.additionalRoots = new Map()
-    }
-    const existing = session.additionalRoots.get(resolved)
-    const priority: Record<"session" | "config", number> = {
-      session: 1,
-      config: 2,
-    }
-    if (existing && priority[existing.source] > priority[source]) {
-      return existing
-    }
-    const entry: AdditionalWorkspaceRoot = {
-      path: resolved,
-      rawPath: trimmedRaw,
-      source,
-      addedAt: Date.now(),
-    }
-    session.additionalRoots.set(resolved, entry)
-    this.contextState.markContextStateDirty(conversationId)
-    return entry
-  }
-
-  /**
-   * Remove a workspace root from the session's `additionalRoots`.
-   *
-   * `'config'` source entries CAN be removed at runtime — they will
-   * be re-added on the next session creation by the bridge config
-   * loader, so the runtime delete is effectively a session-scoped
-   * mute. The user can permanently remove a config root by editing
-   * `.cursor/agent-vibes.json`.
-   *
-   * Returns `true` when an entry was actually removed.
-   */
-  removeAdditionalWorkspaceRoot(
-    conversationId: string,
-    rawPath: string
-  ): boolean {
-    const session = this.getSession(conversationId)
-    if (!session?.additionalRoots) return false
-    const trimmedRaw = (rawPath || "").trim()
-    if (!trimmedRaw) return false
-    const resolved = normalizePathForBoundaryCheck(trimmedRaw)
-    if (!resolved) return false
-    const existed = session.additionalRoots.delete(resolved)
-    if (existed) {
-      this.contextState.markContextStateDirty(conversationId)
-    }
-    return existed
-  }
-
-  /**
-   * List the resolved set of allowed workspace roots for a session.
-   *
-   * Combines `projectContext.rootPath`, IDE-pushed
-   * `projectContext.workspaceFolders`, and `additionalRoots` into a
-   * single ordered, dedup'd list of absolute paths. The boundary
-   * check (`isPathWithinAllowedRoots`) and sub-agent system-prompt
-   * injection both consume this list — keeping the union centralized
-   * means the two stay in lockstep.
-   */
-  listAllowedWorkspaceRoots(conversationId: string): string[] {
-    const session = this.getSession(conversationId)
-    if (!session) return []
-    return resolveAllowedWorkspaceRoots({
-      rootPath: session.projectContext?.rootPath,
-      workspaceFolders: session.projectContext?.workspaceFolders,
-      additionalRoots: session.additionalRoots,
-    })
-  }
-
-  /**
-   * Inspect the additional-roots map directly. Used by REST
-   * handlers to render `{ session: [...], config: [...] }` for
-   * dashboards. Returns a plain array snapshot so callers can't
-   * mutate session state.
-   */
-  getAdditionalWorkspaceRoots(
-    conversationId: string
-  ): AdditionalWorkspaceRoot[] {
-    const session = this.getSession(conversationId)
-    if (!session?.additionalRoots) return []
-    return Array.from(session.additionalRoots.values())
-  }
-
-  /**
-   * Load project-level extra working directories from
-   * `.cursor/agent-vibes.json`. Supported keys:
-   * `additionalWorkingDirectories` (preferred) and `extraRoots`
-   * (legacy alias). Relative paths are resolved against the primary
-   * workspace root from the IDE-synced project context.
-   */
-  private loadConfiguredAdditionalRoots(session: SessionRecord): void {
-    if (session.configuredAdditionalRootsLoaded) return
-    const workspaceRoot = session.projectContext?.rootPath
-    if (!workspaceRoot) return
-    session.configuredAdditionalRootsLoaded = true
-
-    const configPath = path.join(workspaceRoot, ".cursor", "agent-vibes.json")
+    const configPath = path.join(primaryRoot, ".cursor", "agent-vibes.json")
     if (!fs.existsSync(configPath)) return
 
-    let parsed: unknown
     try {
-      parsed = JSON.parse(fs.readFileSync(configPath, "utf8"))
+      const configured = parseConfiguredWorkspaceGrantFile(
+        JSON.parse(fs.readFileSync(configPath, "utf8"))
+      )
+      session.workspace = replaceConfiguredWorkspaceGrants(
+        session.workspace,
+        configured,
+        Date.now()
+      )
     } catch (error) {
       this.logger.warn(
-        `Failed to parse ${configPath}: ${error instanceof Error ? error.message : String(error)}`
+        `Failed to load strict workspace config ${configPath}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
       )
-      return
-    }
-
-    const record =
-      parsed && typeof parsed === "object"
-        ? (parsed as Record<string, unknown>)
-        : {}
-    const configured = [
-      ...(Array.isArray(record.additionalWorkingDirectories)
-        ? (record.additionalWorkingDirectories as unknown[])
-        : []),
-      ...(Array.isArray(record.extraRoots)
-        ? (record.extraRoots as unknown[])
-        : []),
-    ]
-
-    for (const raw of configured) {
-      if (typeof raw !== "string" || raw.trim().length === 0) continue
-      const rawPath = raw.trim()
-      const absPath = path.isAbsolute(rawPath)
-        ? rawPath
-        : path.resolve(workspaceRoot, rawPath)
-      const resolved = normalizePathForBoundaryCheck(absPath)
-      if (!resolved) continue
-      if (!session.additionalRoots) {
-        session.additionalRoots = new Map()
-      }
-      const existing = session.additionalRoots.get(resolved)
-      if (existing?.source === "session") continue
-      session.additionalRoots.set(resolved, {
-        path: resolved,
-        rawPath,
-        source: "config",
-        addedAt: Date.now(),
-      })
     }
   }
-
-  getRestartRecovery(
-    conversationId: string
-  ): SessionRestartRecovery | undefined {
-    return this.getSession(conversationId)?.restartRecovery
-  }
-
-  clearRestartRecovery(conversationId: string): void {
-    const session = this.getSession(conversationId)
-    if (!session) return
-    session.restartRecovery = undefined
-    session.lastActivityAt = new Date()
-    this.schedulePersist(conversationId)
-  }
-}
-
-// ─── Inlined from the deleted cursor-turn-state.ts ────────────
-// Cursor IDE-protocol-facing turn state machine. Distinct from
-// turn-event.ts (which is the bridge-internal lifecycle audit
-// log) — this captures cursor-specific phases (waiting_for_tools,
-// max_output_tokens_recovery, backend_switch, etc.) that the
-// bridge surfaces for IDE-side trace consumers.
-
-export type CursorTurnPhase =
-  | "received"
-  | "context_preparing"
-  | "context_ready"
-  | "request_streaming"
-  | "waiting_for_tools"
-  | "continuing_after_tool"
-  | "retrying"
-  | "completed"
-  | "failed"
-  | "aborted"
-
-export type CursorTurnOrigin =
-  | "chat"
-  | "tool_result"
-  | "shell_result"
-  | "recovery"
-
-export type CursorTurnTransitionReason =
-  | "new_chat_turn"
-  | "context_preparation_started"
-  | "context_collapse_applied"
-  | "context_compaction_applied"
-  | "context_prepared"
-  | "backend_stream_started"
-  | "reactive_context_retry"
-  | "backend_switch"
-  | "assistant_tool_batch"
-  | "tool_result_continuation"
-  | "shell_result_continuation"
-  | "empty_stream_retry"
-  | "thinking_only_recovery"
-  | "max_output_tokens_escalate"
-  | "max_output_tokens_recovery"
-  | "max_output_tokens_exhausted"
-  | "partial_stream_finalized"
-  | "assistant_final"
-  | "friendly_final"
-  | "superseded_stream"
-  | "stream_aborted"
-  | "stream_error"
-
-export type CursorTurnDetailValue = string | number | boolean | null
-
-export type CursorTurnDetails = Record<string, CursorTurnDetailValue>
-
-export interface CursorTurnTransition {
-  reason: CursorTurnTransitionReason
-  phase: CursorTurnPhase
-  at: number
-  attempt: number
-  backend?: string
-  model?: string
-  details?: CursorTurnDetails
-}
-
-export interface CursorTurnState {
-  id: string
-  conversationId: string
-  origin: CursorTurnOrigin
-  phase: CursorTurnPhase
-  startedAt: number
-  updatedAt: number
-  attempt: number
-  streamId?: string
-  backend?: string
-  model?: string
-  backendModel?: string
-  lastTransition: CursorTurnTransition
-  transitions: CursorTurnTransition[]
-}
-
-export interface CreateCursorTurnStateInput {
-  id: string
-  conversationId: string
-  origin: CursorTurnOrigin
-  now: number
-  initialReason?: CursorTurnTransitionReason
-  streamId?: string
-  backend?: string
-  model?: string
-  backendModel?: string
-  details?: CursorTurnDetails
-}
-
-export interface CursorTurnTransitionInput {
-  phase: CursorTurnPhase
-  reason: CursorTurnTransitionReason
-  now: number
-  backend?: string
-  model?: string
-  backendModel?: string
-  streamId?: string
-  incrementAttempt?: boolean
-  details?: CursorTurnDetails
-}
-
-const MAX_RETAINED_TRANSITIONS = 32
-
-export function createCursorTurnState(
-  input: CreateCursorTurnStateInput
-): CursorTurnState {
-  const firstTransition: CursorTurnTransition = {
-    reason: input.initialReason ?? "new_chat_turn",
-    phase: "received",
-    at: input.now,
-    attempt: 0,
-    backend: input.backend,
-    model: input.model,
-    details: input.details,
-  }
-
-  return {
-    id: input.id,
-    conversationId: input.conversationId,
-    origin: input.origin,
-    phase: "received",
-    startedAt: input.now,
-    updatedAt: input.now,
-    attempt: 0,
-    streamId: input.streamId,
-    backend: input.backend,
-    model: input.model,
-    backendModel: input.backendModel,
-    lastTransition: firstTransition,
-    transitions: [firstTransition],
-  }
-}
-
-export function transitionCursorTurnState(
-  state: CursorTurnState,
-  input: CursorTurnTransitionInput
-): CursorTurnState {
-  const nextAttempt = input.incrementAttempt ? state.attempt + 1 : state.attempt
-  const transition: CursorTurnTransition = {
-    reason: input.reason,
-    phase: input.phase,
-    at: input.now,
-    attempt: nextAttempt,
-    backend: input.backend ?? state.backend,
-    model: input.model ?? state.model,
-    details: input.details,
-  }
-
-  return {
-    ...state,
-    phase: input.phase,
-    updatedAt: input.now,
-    attempt: nextAttempt,
-    streamId: input.streamId ?? state.streamId,
-    backend: input.backend ?? state.backend,
-    model: input.model ?? state.model,
-    backendModel: input.backendModel ?? state.backendModel,
-    lastTransition: transition,
-    transitions: [...state.transitions, transition].slice(
-      -MAX_RETAINED_TRANSITIONS
-    ),
-  }
-}
-
-export function summarizeCursorTurnState(state: CursorTurnState): string {
-  const parts = [
-    `turn=${state.id}`,
-    `conversation=${state.conversationId}`,
-    `phase=${state.phase}`,
-    `reason=${state.lastTransition.reason}`,
-    `attempt=${state.attempt}`,
-  ]
-
-  if (state.backend) parts.push(`backend=${state.backend}`)
-  if (state.backendModel) parts.push(`backendModel=${state.backendModel}`)
-  if (state.model) parts.push(`model=${state.model}`)
-  if (state.streamId) parts.push(`stream=${state.streamId}`)
-
-  return parts.join(" ")
 }

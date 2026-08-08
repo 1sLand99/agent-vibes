@@ -1,690 +1,459 @@
-/**
- * Background sub-agent worker.
- *
- * Entry point for sub-agents that the parent agent spawned with
- * `task(run_in_background=true)`. Runs the sub-agent's LLM loop the
- * same way `executeSubAgentTask` does for foreground sub-agents, but
- * with two structural differences:
- *
- *   1. NO outbound BiDi yields. The parent task tool is settled the
- *      moment the worker is spawned, so the BiDi stream that handed
- *      off the task is already closed by the time the worker is
- *      executing real LLM turns. Instead of `yield Buffer`, every
- *      event is appended to the agent's transcript JSONL on disk.
- *
- *   2. NO ExecServerMessage tools. With no parent BiDi stream there is
- *      no place to send shell/edit/delete protocol messages. The worker
- *      surface is clamped to bridge-local / inline tools: read-only
- *      workspace search/read/list plus web, semantic search, MCP,
- *      reflect, todo, plan, lints, project metadata, rules, symbols,
- *      knowledge_base, and fetch_pull_request.
- *
- * The worker writes a final `result.txt` and updates `metadata.json`
- * `status` to `completed` / `failed` / `killed`. The parent agent reads
- * either of these via the standard `read_file` tool when the user
- * follows up.
- */
-
 import { Injectable, Logger } from "@nestjs/common"
-import * as crypto from "crypto"
 
-import { CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE } from "../../../context"
+import { ContextStateService } from "../session/context-state.service"
+import type { SubagentGraphBranch } from "../session/subagent-graph"
+import type { SubagentRunRecord } from "../session/subagent-run-store.service"
+import type { WorkspaceScope } from "../session/workspace-scope"
 import {
-  resolveSubagentToolSurface,
-  SUB_AGENT_SAFE_TOOL_NAMES,
-} from "./subagent-tool-resolver"
-import { getSubagentSystemPrompt, type SubagentDefinition } from "./types"
+  requireSubagentProviderRequestReceipt,
+  type SubagentProviderRequestReceipt,
+} from "../session/projection-request-scope"
 import {
-  type SubagentTaskMetadata,
-  SubagentTranscriptStore,
-} from "./subagent-transcript-store.service"
+  FrozenCapabilityInvocationResolver,
+  type FrozenCapabilityPresentationInvocation,
+  type ResolvedFrozenCapabilityInvocation,
+} from "./subagent-capability-runtime"
+import { findLastSubagentAssistantText } from "./subagent-graph-metrics"
+import { buildSubagentToolResultRejectionMetadata } from "./subagent-tool-result-presentation"
+import type { SubAgentAssistantContentBlock } from "./subagent-sse-turn-collector"
+import { SubagentTranscriptStore } from "./subagent-transcript-store.service"
 
-/**
- * Tool families that are safe for background sub-agents — i.e. tools
- * fully serviceable inside the bridge process without an
- * ExecServerMessage round-trip. The intersection with
- * `SUB_AGENT_SAFE_TOOL_NAMES` is what the resolver actually applies; we
- * keep this list separate so the universe shrinks symmetrically when
- * the safe surface evolves.
- */
-const BACKGROUND_INLINE_ONLY_TOOLS: ReadonlySet<string> = new Set([
-  "semantic_search",
-  "deep_search",
-  "read_semsearch_files",
-  "file_search",
-  "glob_search",
-  "search_symbols",
-  "go_to_definition",
-  "grep_search",
-  "read_file",
-  "list_directory",
-  "web_search",
-  "web_fetch",
-  "fetch",
-  "exa_search",
-  "exa_fetch",
-  "fetch_rules",
-  "read_lints",
-  "read_project",
-  "read_todos",
-  "update_todos",
-  "create_plan",
-  "get_mcp_tools",
-  "mcp_tool",
-  "list_mcp_resources",
-  "read_mcp_resource",
-  "knowledge_base",
-  "fetch_pull_request",
-  "reflect",
-])
-
-function parseToolInputJson(inputJson: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(inputJson || "{}")
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    return parsed as Record<string, unknown>
-  }
-  return { _value: parsed }
-}
-
-export function buildFailedBackgroundResult(args: {
-  agentId: string
-  turnCount: number
-  toolCallCount: number
-  errorMessage: string
-}): string {
-  return [
-    "[background sub-agent failed before producing a final answer]",
-    "",
-    "Sub-agent result metadata:",
-    `- agentId: ${args.agentId}`,
-    `- turns: ${args.turnCount}`,
-    `- tool calls: ${args.toolCallCount}`,
-    `- error: ${args.errorMessage}`,
-    "- completed work remains available in transcript.jsonl and metadata.json",
-  ].join("\n")
-}
-
-/** Filter the universal sub-agent surface down to the inline-only set
- * — applied AFTER the per-agent tools/disallowedTools resolution so an
- * agent's frontmatter still narrows further. */
-export function clampToBackgroundInlineSurface(
-  toolNames: readonly string[]
-): string[] {
-  return toolNames.filter((name) => BACKGROUND_INLINE_ONLY_TOOLS.has(name))
-}
-
-/** Subset of dependencies the worker needs from
- * `CursorConnectStreamService`. We use a structural interface instead
- * of importing the full service so the cyclic graph stays sane. */
 export interface BackgroundWorkerHostDeps {
-  logger: Logger
-  /** Run a bridge-local / inline deferred tool exactly like the foreground sub-agent
-   * does. Returns the formatted text content the worker writes back to
-   * its message history.
-   *
-   * `abortSignal` is the worker's `AbortController.signal`. Inline
-   * tools that do network I/O (web_fetch, web_search, fetch, exa_*)
-   * compose this with their own timeouts via `AbortSignal.any([...])`,
-   * so a `kill_agent` raised mid-fetch unwinds quickly instead of
-   * having to wait for the full HTTP timeout (or the next turn
-   * boundary, which used to keep killed sub-agents running for tens of
-   * seconds while they finished a `web_fetch` loop). */
-  runInlineDeferredTool(
+  runFrozenCapability(
     conversationId: string,
-    toolName: string,
-    parsedInput: Record<string, unknown>,
-    options?: { abortSignal?: AbortSignal }
+    run: SubagentRunRecord,
+    invocation: ResolvedFrozenCapabilityInvocation,
+    workspaceScope: WorkspaceScope,
+    options: { abortSignal: AbortSignal }
   ): Promise<{ content: string; status: "success" | "error" }>
-  /** Run one LLM turn for the sub-agent and return the final assistant
-   * text + tool calls. Worker drives the loop; host owns the actual
-   * backend stream invocation so we re-use the existing
-   * Kiro/Codex/Anthropic/Google routing.
-   *
-   * `toolNames` is the user-facing inline tool surface (e.g.
-   * "semantic_search", "web_fetch") — host is responsible for
-   * converting these into proper ToolDefinition[] via buildToolsForApi
-   * so backend schema validation passes. We don't pre-build them in the
-   * worker because the worker doesn't have the per-session MCP defs /
-   * backend selection. */
   runSubAgentLlmTurn(
     conversationId: string,
     ctx: {
-      subagentId: string
-      messages: Array<{ role: "user" | "assistant"; content: unknown }>
-      model: string
-      toolNames: string[]
+      run: SubagentRunRecord
+      branch: SubagentGraphBranch
       abortSignal: AbortSignal
-      /**
-       * When true, the host strips tool definitions from the DTO and
-       * swaps the system addendum for a synthesis-only prompt. Used by
-       * the worker on its very last turn (after MAX_TURNS) to force the
-       * LLM to produce a final answer instead of another tool_use.
-       * See foreground sub-agent loop for the matching foreground path.
-       */
-      forceFinalSynthesis?: boolean
     }
-  ): Promise<{
-    fullText: string
-    toolCalls: Array<{ id: string; name: string; inputJson: string }>
-    rawResponseItems: Record<string, unknown>[]
-    error?: string
-  }>
-  /** Build a ConversationStep wrapping an assistant text reply. Host
-   * delegates to `cursor-grpc.service.ts::buildAssistantConversationStep`
-   * which returns a proto-typed object the worker stores opaquely. */
+  ): Promise<BackgroundWorkerLlmTurnResult>
   buildAssistantStep(text: string): unknown
-  /** Build a ConversationStep wrapping a sub-agent tool call (with
-   * args + result already encoded into the proto ToolCall envelope). */
   buildToolCallStep(args: {
-    toolName: string
+    invocation: FrozenCapabilityPresentationInvocation
     callId: string
     parsedInput: Record<string, unknown>
     resultContent: string
-  }): unknown
+    outcome: { status: "success" | "error" }
+  }): {
+    conversationStep: unknown
+    toolResultMetadata: Record<string, unknown>
+  }
 }
 
-interface SpawnArgs {
-  parentConversationId: string
-  parentToolCallId: string
-  description: string
-  agent: SubagentDefinition
-  model: string
-  /** Snapshot of allowed workspace roots captured at spawn time. */
-  allowedWorkspaceRoots?: string[]
+/**
+ * A worker only receives a workspace authority with an accepted provider
+ * response. Failure and cancellation never carry a prepare-time authority.
+ */
+export type BackgroundWorkerLlmTurnResult =
+  | {
+      readonly kind: "accepted"
+      readonly fullText: string
+      /** The one accepted provider block sequence already committed to graph. */
+      readonly assistantContent: readonly SubAgentAssistantContentBlock[]
+      readonly rawResponseItems: Record<string, unknown>[]
+      readonly requestReceipt: SubagentProviderRequestReceipt
+    }
+  | {
+      readonly kind: "failed"
+      readonly error: string
+    }
+
+interface BackgroundWorkerMetrics {
+  turnCount: number
+  toolCallCount: number
+  conversationSteps: unknown[]
+}
+
+export type BackgroundWorkerOutcome =
+  | (BackgroundWorkerMetrics & {
+      status: "completed"
+      finalText: string
+    })
+  | (BackgroundWorkerMetrics & {
+      status: "failed"
+      errorMessage: string
+    })
+  | (BackgroundWorkerMetrics & {
+      status: "aborted"
+      errorMessage: string
+    })
+
+/**
+ * The worker can observe only that its signal was aborted. Whether that
+ * signal represents an explicit `kill_agent`, shutdown, or another
+ * interruption belongs to the owning TurnHandle and is classified there.
+ */
+export type BackgroundWorkerTerminalOutcome =
+  | (BackgroundWorkerMetrics & {
+      status: "completed"
+      finalText: string
+    })
+  | (BackgroundWorkerMetrics & {
+      status: "failed" | "killed" | "interrupted"
+      errorMessage: string
+    })
+
+export interface RunBackgroundWorkerArgs {
+  conversationId: string
+  /** The persisted child run is the sole runtime authority. */
+  run: SubagentRunRecord
+  branch: SubagentGraphBranch
+  signal: AbortSignal
   host: BackgroundWorkerHostDeps
 }
 
+interface DurableBackgroundGraphMetrics {
+  turnCount: number
+  toolCallCount: number
+}
+
+/**
+ * Executes one detached sub-agent sidechain. It owns no spawn identity, run
+ * status, delivery state, or cancellation controller; those belong to the
+ * TurnLifecycle and SubagentRunStore. Transcript files are diagnostic exports.
+ */
 @Injectable()
 export class SubagentBackgroundWorker {
   private readonly logger = new Logger(SubagentBackgroundWorker.name)
 
-  constructor(private readonly transcriptStore: SubagentTranscriptStore) {}
+  constructor(
+    private readonly transcriptStore: SubagentTranscriptStore,
+    private readonly contextState: ContextStateService
+  ) {}
 
-  /**
-   * Spawn a new background sub-agent. Returns the agentId and a
-   * promise that resolves when the worker finishes (clean or aborted).
-   * The caller (`task` dispatcher) is expected to register both with
-   * the SubagentTaskRegistry and immediately settle the parent task
-   * tool with `taskSuccess { agentId, isBackground: true }`.
-   */
-  spawn(args: SpawnArgs): {
-    agentId: string
-    abortController: AbortController
-    donePromise: Promise<void>
-    metadata: SubagentTaskMetadata
-  } {
-    const agentId = `subagent-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`
-    const abortController = new AbortController()
-    const startedAt = Date.now()
-
-    // Resolve tool surface: per-agent allowlist/disallowlist first,
-    // then clamp to inline-only families because background workers
-    // have no BiDi stream for ExecServerMessage round-trips.
-    const surface = resolveSubagentToolSurface(args.agent)
-    const inlineToolNames = clampToBackgroundInlineSurface(surface.toolNames)
-
-    const initialMetadata: SubagentTaskMetadata = {
-      agentId,
-      agentType: args.agent.agentType,
-      parentToolCallId: args.parentToolCallId,
-      parentConversationId: args.parentConversationId,
-      status: "running",
-      startedAt,
-      turnCount: 0,
-      toolCallCount: 0,
-      modifiedFiles: [],
-    }
-
-    this.logger.log(
-      `[BackgroundSubAgent] Spawning ${agentId} (agentType=${args.agent.agentType}, ` +
-        `tools=${inlineToolNames.length}, model=${args.model})`
-    )
-
-    const donePromise = this.runWorkerLoop({
-      agentId,
-      abortController,
-      args,
-      inlineToolNames,
-    }).catch((error) => {
-      // runWorkerLoop should not throw — it always lands in finally
-      // and writes terminal metadata. Any escape here is a bug.
-      this.logger.error(
-        `[BackgroundSubAgent] ${agentId} worker loop escaped with error: ${String(error)}`
-      )
-    })
-
-    return {
-      agentId,
-      abortController,
-      donePromise,
-      metadata: initialMetadata,
-    }
-  }
-
-  private async runWorkerLoop(opts: {
-    agentId: string
-    abortController: AbortController
-    args: SpawnArgs
-    inlineToolNames: string[]
-  }): Promise<void> {
-    const { agentId, abortController, args, inlineToolNames } = opts
-    const { agent } = args
-    const startedAt = Date.now()
-
-    // Only inject roots that are genuinely "additional" — exclude the
-    // primary workspace root (first entry) since the sub-agent already
-    // uses it as cwd. This matches the foreground sub-agent behavior.
-    const additionalRoots = args.allowedWorkspaceRoots?.length
-      ? args.allowedWorkspaceRoots.slice(1)
-      : []
-    const workingDirectoriesPrompt =
-      additionalRoots.length > 0
-        ? `\n\nPrimary working directories:\n${additionalRoots.map((root) => `- ${root}`).join("\n")}\nThese are the main project roots. You may also access paths outside these directories (e.g. ~/.agent-vibes/, /tmp/, or other user-specified paths) when the task requires it.\n`
-        : ""
-    const systemPrompt = `${getSubagentSystemPrompt(agent)}${workingDirectoriesPrompt}`
-    const messages: Array<{ role: "user" | "assistant"; content: unknown }> = [
-      {
-        role: "user",
-        content: `${systemPrompt}\n\n--- TASK ---\n\n${args.description}`,
-      },
-    ]
-
-    const MAX_TURNS = agent.maxTurns ?? 20
-    let turnCount = 0
-    let toolCallCount = 0
-    let finalText = ""
-    let terminalStatus: "completed" | "failed" | "killed" = "completed"
-    let errorMessage: string | undefined
-    /**
-     * Accumulator for TaskSuccess.conversationSteps[]. Worker stores the
-     * proto-typed step values as opaque blobs (host built them via
-     * buildAssistantStep / buildToolCallStep) so external readers of
-     * metadata.json see the same step layout the foreground sub-agent
-     * would project into TaskSuccess.
-     */
+  async run(args: RunBackgroundWorkerArgs): Promise<BackgroundWorkerOutcome> {
+    const initialMetrics = this.readDurableGraphMetrics(args)
+    const maxTurns = args.run.spawnRequest.maxTurns
+    const capabilityResolver = new FrozenCapabilityInvocationResolver()
     const conversationSteps: unknown[] = []
 
-    this.transcriptStore.appendTranscript(agentId, {
-      ts: startedAt,
+    this.transcriptStore.appendTranscript(args.run.agentId, {
+      ts: Date.now(),
       kind: "turn_start",
-      data: {
-        turnIndex: 0,
-        message: "background sub-agent worker starting",
-      },
+      data: { turnIndex: 0, message: "background sub-agent started" },
     })
 
-    const runFinalSynthesis = async (
-      prompt: string,
-      transcriptMessage: string
-    ): Promise<void> => {
-      messages.push({ role: "user", content: prompt })
-      this.transcriptStore.appendTranscript(agentId, {
-        ts: Date.now(),
-        kind: "turn_start",
-        data: {
-          turnIndex: turnCount + 1,
-          message: transcriptMessage,
-        },
-      })
-
-      try {
-        const synthesisResult = await args.host.runSubAgentLlmTurn(
-          args.parentConversationId,
-          {
-            subagentId: agentId,
-            messages,
-            model: args.model,
-            toolNames: inlineToolNames,
-            abortSignal: abortController.signal,
-            forceFinalSynthesis: true,
-          }
-        )
-        if (!synthesisResult.error) {
-          const synthText = synthesisResult.fullText.trim()
-          if (synthText.length === 0) return
-
-          finalText = synthesisResult.fullText
-          const assistantContentParts: Array<Record<string, unknown>> = []
-          for (const rawItem of synthesisResult.rawResponseItems) {
-            assistantContentParts.push({
-              type: CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
-              item: rawItem,
-            })
-          }
-          assistantContentParts.push({
-            type: "text",
-            text: synthesisResult.fullText,
-          })
-          messages.push({
-            role: "assistant",
-            content: assistantContentParts,
-          })
-          this.transcriptStore.appendTranscript(agentId, {
-            ts: Date.now(),
-            kind: "assistant_text",
-            data: { text: synthesisResult.fullText },
-          })
-          conversationSteps.push(
-            args.host.buildAssistantStep(synthesisResult.fullText)
-          )
-          return
-        }
-
-        if (
-          synthesisResult.error === "aborted" ||
-          abortController.signal.aborted
-        ) {
-          terminalStatus = "killed"
-          errorMessage = "aborted by registry"
-          return
-        }
-
-        this.logger.warn(
-          `[BackgroundSubAgent] ${agentId} synthesis turn LLM error: ` +
-            synthesisResult.error
-        )
-      } catch (synthesisError) {
-        this.logger.warn(
-          `[BackgroundSubAgent] ${agentId} synthesis turn threw: ` +
-            String(synthesisError)
-        )
-      }
-    }
-
     try {
-      for (let turn = 0; turn < MAX_TURNS; turn++) {
-        if (abortController.signal.aborted) {
-          terminalStatus = "killed"
-          errorMessage = "aborted by registry"
-          break
-        }
-        turnCount++
-        this.transcriptStore.appendTranscript(agentId, {
+      for (
+        let persistedTurnCount = initialMetrics.turnCount;
+        maxTurns === null || persistedTurnCount < maxTurns;
+        persistedTurnCount++
+      ) {
+        args.signal.throwIfAborted()
+        this.transcriptStore.appendTranscript(args.run.agentId, {
           ts: Date.now(),
           kind: "turn_start",
-          data: { turnIndex: turn + 1 },
+          data: { turnIndex: persistedTurnCount + 1 },
         })
 
-        // Re-resolve the tool list each turn so later iterations see
-        // any state-mutating side-effects (e.g. todos changing). The
-        // worker passes only tool NAMES — the host is responsible for
-        // expanding them into real ToolDefinition[] (with schemas) via
-        // buildToolsForApi when assembling the backend request. Worker
-        // doesn't have access to per-session MCP defs / backend hints
-        // so doing the expansion in the host keeps the call site happy.
-        let llmResult: Awaited<
-          ReturnType<BackgroundWorkerHostDeps["runSubAgentLlmTurn"]>
-        >
-        try {
-          llmResult = await args.host.runSubAgentLlmTurn(
-            args.parentConversationId,
-            {
-              subagentId: agentId,
-              messages,
-              model: args.model,
-              toolNames: inlineToolNames,
-              abortSignal: abortController.signal,
-            }
-          )
-        } catch (error) {
-          // If the abort signal fired DURING the LLM stream the host
-          // re-throws — treat that as a clean kill rather than a
-          // failure so the registry/UI can distinguish operator
-          // intent from an upstream backend error.
-          if (abortController.signal.aborted) {
-            terminalStatus = "killed"
-            errorMessage = "aborted by registry"
-          } else {
-            terminalStatus = "failed"
-            errorMessage = `LLM stream error: ${String(error)}`
+        const llmResult = await args.host.runSubAgentLlmTurn(
+          args.conversationId,
+          {
+            run: args.run,
+            branch: args.branch,
+            abortSignal: args.signal,
           }
-          break
+        )
+        args.signal.throwIfAborted()
+        if (llmResult.kind === "failed") {
+          throw new Error(`LLM turn failed: ${llmResult.error}`)
+        }
+        const requestReceipt = requireSubagentProviderRequestReceipt({
+          receipt: llmResult.requestReceipt,
+          branch: args.branch,
+        })
+
+        if (llmResult.fullText) {
+          this.exportAssistantText(args, llmResult.fullText, conversationSteps)
         }
 
-        if (llmResult.error) {
-          // Same distinction here: host returns `error: "aborted"` when
-          // it observed our abortSignal flipping mid-stream. That's a
-          // kill, not a failure.
-          if (llmResult.error === "aborted" || abortController.signal.aborted) {
-            terminalStatus = "killed"
-            errorMessage = "aborted by registry"
-          } else {
-            terminalStatus = "failed"
-            errorMessage = llmResult.error
+        const acceptedToolCalls = llmResult.assistantContent.flatMap((block) =>
+          block.type === "tool_use" ? [block] : []
+        )
+
+        if (acceptedToolCalls.length === 0) {
+          const finalText = llmResult.fullText.trim()
+          if (!finalText) {
+            throw new Error(
+              "Sub-agent completed without a final assistant answer."
+            )
           }
-          break
-        }
-
-        finalText = llmResult.fullText
-
-        // Record assistant text + tool_use blocks into the message
-        // history exactly like the foreground worker does.
-        const assistantContentParts: Array<Record<string, unknown>> = []
-        for (const rawItem of llmResult.rawResponseItems) {
-          assistantContentParts.push({
-            type: CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE,
-            item: rawItem,
-          })
-        }
-        if (finalText) {
-          assistantContentParts.push({ type: "text", text: finalText })
-          this.transcriptStore.appendTranscript(agentId, {
-            ts: Date.now(),
-            kind: "assistant_text",
-            data: { text: finalText },
-          })
-          // ConversationStep accumulation: same shape as foreground
-          // sub-agent so external `read_file` consumers see consistent
-          // step lists in metadata.json.
-          conversationSteps.push(args.host.buildAssistantStep(finalText))
-        }
-        for (const tc of llmResult.toolCalls) {
-          let parsedInput: Record<string, unknown> = {}
-          try {
-            parsedInput = parseToolInputJson(tc.inputJson)
-          } catch {
-            parsedInput = { _raw: tc.inputJson }
+          return {
+            status: "completed",
+            finalText: llmResult.fullText,
+            ...this.readDurableGraphMetrics(args),
+            conversationSteps,
           }
-          assistantContentParts.push({
-            type: "tool_use",
-            id: tc.id,
-            name: tc.name,
-            input: parsedInput,
-          })
         }
-        if (assistantContentParts.length > 0) {
-          messages.push({
-            role: "assistant",
-            content: assistantContentParts,
-          })
-        }
+        const workspaceScope = requestReceipt.workspaceScope
 
-        // No tool calls → sub-agent is done.
-        if (llmResult.toolCalls.length === 0) {
-          break
-        }
-
-        // Dispatch each tool call. Background workers ONLY support
-        // bridge-local / inline deferred tools; anything else gets a hard error in
-        // the message history so the LLM stops looping on a
-        // non-existent capability.
-        toolCallCount += llmResult.toolCalls.length
-        const toolResults: Array<Record<string, unknown>> = []
-        for (const tc of llmResult.toolCalls) {
-          if (abortController.signal.aborted) break
-          let parsedInput: Record<string, unknown> = {}
-          try {
-            parsedInput = parseToolInputJson(tc.inputJson)
-          } catch {
-            parsedInput = { _raw: tc.inputJson }
+        let completedToolCalls = 0
+        for (const toolCall of acceptedToolCalls) {
+          args.signal.throwIfAborted()
+          // The collector validates every accepted tool block before the
+          // graph append. Use the exact persisted input rather than carrying
+          // a second serialized tool-call representation through the worker.
+          const parsedInput = structuredClone(toolCall.input)
+          let resultContent: string | undefined
+          let resultStatus: "success" | "error" = "error"
+          const resolved = capabilityResolver.resolve({
+            toolContract: args.run.spawnRequest.toolContract,
+            phase: "background",
+            modelToolName: toolCall.name,
+            parsedJson: parsedInput,
+          })
+          if (
+            resolved.kind === "tool_error" &&
+            resolved.code !== "unknown_capability"
+          ) {
+            throw new Error(
+              `Frozen child capability resolution is not persistable: ${resolved.code}: ${resolved.message}`
+            )
           }
-          this.transcriptStore.appendTranscript(agentId, {
+          let dispatchInvocation: ResolvedFrozenCapabilityInvocation | undefined
+          let presentationInvocation:
+            | FrozenCapabilityPresentationInvocation
+            | undefined
+          let rejectionMetadata: Record<string, unknown> | undefined
+
+          this.transcriptStore.appendTranscript(args.run.agentId, {
             ts: Date.now(),
             kind: "tool_call_start",
-            data: { id: tc.id, name: tc.name, input: parsedInput },
+            data: { id: toolCall.id, name: toolCall.name, input: parsedInput },
           })
-          let resultContent: string
-          let resultStatus: "success" | "error" = "success"
-          if (BACKGROUND_INLINE_ONLY_TOOLS.has(tc.name)) {
-            try {
-              const result = await args.host.runInlineDeferredTool(
-                args.parentConversationId,
-                tc.name,
-                parsedInput,
-                { abortSignal: abortController.signal }
-              )
-              resultContent = result.content
-              resultStatus = result.status
-            } catch (err) {
-              resultStatus = "error"
-              resultContent = `[tool error] ${String(err)}`
+
+          if (resolved.kind !== "resolved") {
+            resultStatus = "error"
+            resultContent = formatFrozenCapabilityToolError(resolved)
+            if (resolved.kind === "rejected") {
+              presentationInvocation = resolved
+            } else if (resolved.kind === "unowned") {
+              rejectionMetadata = {
+                ...buildSubagentToolResultRejectionMetadata({
+                  version: 1,
+                  capabilityId: resolved.capabilityId,
+                  phase: resolved.phase,
+                  modelToolName: resolved.modelToolName,
+                  code: resolved.code,
+                }),
+              }
+            } else if (resolved.code === "unknown_capability") {
+              rejectionMetadata = {
+                ...buildSubagentToolResultRejectionMetadata({
+                  version: 1,
+                  capabilityId: null,
+                  phase: "background",
+                  modelToolName: resolved.modelToolName,
+                  code: "unknown_capability",
+                }),
+              }
             }
           } else {
-            resultStatus = "error"
-            resultContent =
-              `[tool error] Tool "${tc.name}" is not available to ` +
-              `background sub-agents (no ExecServerMessage channel). ` +
-              `Available background tools: ${[...BACKGROUND_INLINE_ONLY_TOOLS].join(", ")}.`
+            dispatchInvocation = resolved
+            presentationInvocation = resolved
+            try {
+              const result = await args.host.runFrozenCapability(
+                args.conversationId,
+                args.run,
+                dispatchInvocation,
+                workspaceScope,
+                { abortSignal: args.signal }
+              )
+              args.signal.throwIfAborted()
+              resultStatus = result.status
+              resultContent = result.content
+            } catch (error) {
+              args.signal.throwIfAborted()
+              resultStatus = "error"
+              resultContent = `[tool error] ${String(error)}`
+            }
           }
-          this.transcriptStore.appendTranscript(agentId, {
+
+          if (resultContent === undefined) {
+            throw new Error(
+              `Tool ${toolCall.name} completed without a result projection.`
+            )
+          }
+
+          this.transcriptStore.appendTranscript(args.run.agentId, {
             ts: Date.now(),
             kind: "tool_call_end",
             data: {
-              id: tc.id,
-              name: tc.name,
+              id: toolCall.id,
+              name: presentationInvocation?.entry.name ?? toolCall.name,
               status: resultStatus,
               contentPreview: resultContent.slice(0, 1000),
             },
           })
-          // ConversationStep accumulation for this tool invocation —
-          // the host re-uses cursor-grpc.service's
-          // buildToolCallConversationStep so background and foreground
-          // sub-agents project structurally identical step blobs.
-          conversationSteps.push(
-            args.host.buildToolCallStep({
-              toolName: tc.name,
-              callId: tc.id,
-              parsedInput,
-              resultContent,
-            })
+          // Unknown calls have no frozen Cursor owner and cannot be guessed
+          // into a ToolCall case. Every such terminal instead carries its
+          // strict rejection fact; a known owner whose schema rejected input
+          // carries the corresponding exact error ToolCall fact.
+          const presentation = presentationInvocation
+            ? args.host.buildToolCallStep({
+                invocation: presentationInvocation,
+                callId: toolCall.id,
+                parsedInput,
+                resultContent,
+                outcome: { status: resultStatus },
+              })
+            : undefined
+          if (presentation) {
+            conversationSteps.push(presentation.conversationStep)
+          }
+          this.contextState.appendSubagentGraphMessage(
+            args.conversationId,
+            args.branch,
+            "user",
+            [
+              {
+                type: "tool_result",
+                tool_use_id: toolCall.id,
+                content: resultContent,
+                is_error: resultStatus === "error",
+              },
+            ],
+            presentation || rejectionMetadata
+              ? {
+                  toolResultMetadata: new Map([
+                    [
+                      toolCall.id,
+                      presentation?.toolResultMetadata ?? rejectionMetadata!,
+                    ],
+                  ]),
+                }
+              : undefined
           )
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: tc.id,
-            content: resultContent,
-          })
+          completedToolCalls += 1
         }
-        messages.push({ role: "user", content: toolResults })
-        this.transcriptStore.appendTranscript(agentId, {
+
+        this.transcriptStore.appendTranscript(args.run.agentId, {
           ts: Date.now(),
           kind: "turn_end",
-          data: { turnIndex: turn + 1, toolCallCount: toolResults.length },
+          data: {
+            turnIndex: persistedTurnCount + 1,
+            toolCallCount: completedToolCalls,
+          },
         })
-
-        // Incremental metadata sync: write out turnCount /
-        // toolCallCount / conversationSteps after every turn so an
-        // external read_file metadata.json mid-run sees live progress
-        // instead of the stale "running, 0 turns" snapshot from spawn.
-        this.transcriptStore.updateMetadata(agentId, (current) => ({
-          ...current,
-          turnCount,
-          toolCallCount,
-          conversationSteps: [...conversationSteps],
-        }))
-      }
-
-      if (
-        terminalStatus === "failed" &&
-        conversationSteps.length > 0 &&
-        !abortController.signal.aborted
-      ) {
-        finalText = ""
-        this.logger.warn(
-          `[BackgroundSubAgent] ${agentId} recovering completed work after: ${errorMessage}`
-        )
-        await runFinalSynthesis(
-          "The previous assistant response was interrupted by a transport error. " +
-            "Do not call tools. Using only the completed tool_results already " +
-            "in this conversation, write a single final assistant message that " +
-            "synthesizes the findings and clearly notes that it was reconstructed " +
-            "after a transport interruption.",
-          "synthesis turn (transport recovery)"
+        const durableMetrics = this.readDurableGraphMetrics(args)
+        this.exportProgress(
+          args.run.agentId,
+          durableMetrics.turnCount,
+          durableMetrics.toolCallCount,
+          conversationSteps
         )
       }
 
-      if (turnCount >= MAX_TURNS && !errorMessage) {
-        if (!abortController.signal.aborted) {
-          this.logger.log(
-            `[BackgroundSubAgent] ${agentId} reached MAX_TURNS=${MAX_TURNS}; ` +
-              `running final synthesis turn (no tools)`
-          )
-          await runFinalSynthesis(
-            "You have reached your turn limit. Stop calling tools. " +
-              "Using only the tool_results already in this conversation, " +
-              "write a single final assistant message that synthesizes " +
-              "your findings into a clear answer. This is your last turn.",
-            "synthesis turn (max turns reached)"
-          )
-        }
-
-        if (!finalText) {
-          finalText =
-            "[background sub-agent reached max turns without final answer]"
-        }
+      const finalText = findLastSubagentAssistantText(
+        this.contextState.getSubagentGraphMessages(
+          args.conversationId,
+          args.branch
+        )
+      )
+      if (!finalText?.trim()) {
+        throw new Error(
+          "Sub-agent exhausted its explicit turn limit without an assistant answer."
+        )
+      }
+      return {
+        status: "completed",
+        finalText,
+        ...this.readDurableGraphMetrics(args),
+        conversationSteps,
       }
     } catch (error) {
-      terminalStatus = "failed"
-      errorMessage = String(error)
-    } finally {
-      if (terminalStatus === "failed" && finalText.trim().length === 0) {
-        finalText = buildFailedBackgroundResult({
-          agentId,
-          turnCount,
-          toolCallCount,
-          errorMessage: errorMessage || "unknown background sub-agent failure",
-        })
-      }
-
-      const completedAt = Date.now()
-      this.transcriptStore.writeResult(agentId, finalText)
-      this.transcriptStore.updateMetadata(agentId, (current) => ({
-        ...current,
-        status: terminalStatus,
-        completedAt,
-        durationMs: completedAt - startedAt,
-        turnCount,
-        toolCallCount,
-        finalText,
-        errorMessage,
-        conversationSteps: [...conversationSteps],
-      }))
-      this.transcriptStore.appendTranscript(agentId, {
-        ts: completedAt,
-        kind: terminalStatus === "completed" ? "completed" : terminalStatus,
-        data: {
-          durationMs: completedAt - startedAt,
-          turnCount,
-          toolCallCount,
-          errorMessage,
-        },
-      })
-      this.logger.log(
-        `[BackgroundSubAgent] ${agentId} ${terminalStatus} ` +
-          `(${turnCount} turns, ${toolCallCount} tool calls, ` +
-          `${completedAt - startedAt}ms)`
+      const aborted = args.signal.aborted
+      const errorMessage = aborted
+        ? args.signal.reason instanceof Error
+          ? args.signal.reason.message
+          : "Sub-agent execution was interrupted."
+        : error instanceof Error
+          ? error.message
+          : String(error)
+      this.logger[aborted ? "warn" : "error"](
+        `[BackgroundSubAgent] ${args.run.agentId} ${aborted ? "interrupted" : "failed"}: ${errorMessage}`
       )
+      return {
+        status: aborted ? "aborted" : "failed",
+        errorMessage,
+        ...this.readDurableGraphMetrics(args),
+        conversationSteps,
+      }
     }
+  }
+
+  private exportAssistantText(
+    args: RunBackgroundWorkerArgs,
+    text: string,
+    conversationSteps: unknown[]
+  ): void {
+    this.transcriptStore.appendTranscript(args.run.agentId, {
+      ts: Date.now(),
+      kind: "assistant_text",
+      data: { text },
+    })
+    conversationSteps.push(args.host.buildAssistantStep(text))
+  }
+
+  private exportProgress(
+    agentId: string,
+    turnCount: number,
+    toolCallCount: number,
+    conversationSteps: unknown[]
+  ): void {
+    this.transcriptStore.updateMetadata(agentId, (current) => ({
+      ...current,
+      turnCount,
+      toolCallCount,
+      conversationSteps: [...conversationSteps],
+    }))
+  }
+
+  /**
+   * A handoff never carries counters from an ephemeral foreground context.
+   * The immutable child graph is the complete execution history across
+   * foreground and background leases, so it is the only source for budgets
+   * and terminal counts.
+   */
+  private readDurableGraphMetrics(
+    args: Pick<RunBackgroundWorkerArgs, "conversationId" | "branch">
+  ): DurableBackgroundGraphMetrics {
+    let turnCount = 0
+    let toolCallCount = 0
+    for (const message of this.contextState.getSubagentGraphMessages(
+      args.conversationId,
+      args.branch
+    )) {
+      if (message.type !== "assistant") continue
+      turnCount += 1
+      const content = message.message.content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (
+          block &&
+          typeof block === "object" &&
+          (block as { type?: unknown }).type === "tool_use"
+        ) {
+          toolCallCount += 1
+        }
+      }
+    }
+    return { turnCount, toolCallCount }
   }
 }
 
-/** Surface the inline-only set as well so callers can include it in
- * task tool prompts. */
-export { BACKGROUND_INLINE_ONLY_TOOLS }
-
-/** Convenience: build the inline tool list a background sub-agent
- * actually receives, applied as a sanity check. */
-export function buildBackgroundToolNames(agent: SubagentDefinition): string[] {
-  return clampToBackgroundInlineSurface(
-    resolveSubagentToolSurface(agent).toolNames
-  ).filter((name) => SUB_AGENT_SAFE_TOOL_NAMES.includes(name))
+function formatFrozenCapabilityToolError(
+  result: Exclude<
+    ReturnType<FrozenCapabilityInvocationResolver["resolve"]>,
+    ResolvedFrozenCapabilityInvocation
+  >
+): string {
+  return `[tool error] ${result.code}: ${result.message}`
 }

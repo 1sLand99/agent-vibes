@@ -1,7 +1,7 @@
 import { projectCodexNativeRequest } from "./codex-native-projector"
 import type {
-  CodexExecutionRequest,
   CodexInputItem,
+  CodexProviderExecutionRequest,
   CodexRequest,
   CodexTool,
 } from "./codex-native-types"
@@ -36,6 +36,8 @@ export type {
   CodexInputItem,
   CodexInputMessage,
   CodexLocalShellCallInputItem,
+  CodexNativeInputExecutionRequest,
+  CodexProviderExecutionRequest,
   CodexRequest,
   CodexReasoningInputItem,
   CodexSystemTextBlock,
@@ -46,7 +48,7 @@ export type {
 } from "./codex-native-types"
 
 export function buildCodexRequest(
-  request: CodexExecutionRequest,
+  request: CodexProviderExecutionRequest,
   modelName: string = request.model,
   capabilities: CodexRequestCapabilities | null = resolveCodexRequestCapabilities(
     modelName
@@ -100,7 +102,7 @@ export function buildCodexRequest(
 
   if (responsesPayload.tools && responsesPayload.tools.length > 0) {
     codexRequest.tools = responsesPayload.tools
-    codexRequest.tool_choice = "auto"
+    codexRequest.tool_choice = request.toolChoice ?? "auto"
     codexRequest.parallel_tool_calls = resolveParallelToolCallsForRequest(
       request.parallelToolCalls,
       effectiveCapabilities

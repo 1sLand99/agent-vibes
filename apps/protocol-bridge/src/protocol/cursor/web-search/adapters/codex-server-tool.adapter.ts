@@ -12,14 +12,10 @@ import {
 } from "../types"
 
 /**
- * OpenAI Codex Responses-API `web_search` server-tool adapter.
+ * OpenAI Codex standalone web-search adapter.
  *
- * Mirrors the wire-shape used inside codex-rs proper: the Responses
- * API exposes `web_search` as a top-level entry in `tools[]`, the
- * model emits `web_search_call` items, and the SSE stream carries
- * `url_citation` annotations alongside the assistant text. The
- * existing `CodexService.executeWebSearch` does exactly that and
- * hands us back `{ text, references }`.
+ * Mirrors codex-rs standalone web search: one typed `alpha/search` request
+ * returns structured result DTOs out-of-band from the model-facing output.
  *
  * Selected for official `codex` backend sessions by default. OpenAI-
  * compatible / reverse endpoints default to Exa MCP instead because they
@@ -49,6 +45,9 @@ export class CodexServerToolAdapter implements WebSearchAdapter {
       model: options.model,
       conversationId: options.conversationId,
       signal: options.signal,
+      allowedDomains: options.allowedDomains,
+      blockedDomains: options.blockedDomains,
+      searchType: options.searchType,
     })
 
     throwIfAborted(options.signal)
@@ -83,8 +82,8 @@ export class CodexServerToolAdapter implements WebSearchAdapter {
         this.name,
         query,
         summaryText.length > 0
-          ? "codex-server-tool returned a text-only summary without sources"
-          : "codex-server-tool returned no results (empty web_search_call response)"
+          ? "codex-server-tool returned output without structured search results"
+          : "codex-server-tool returned no structured search results"
       )
     }
 

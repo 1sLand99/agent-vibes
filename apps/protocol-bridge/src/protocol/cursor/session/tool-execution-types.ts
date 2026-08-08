@@ -13,6 +13,8 @@ export type ToolExecutionRecoveryReason =
   | "retry"
   | "stream_fallback"
   | "abort"
+  | "interrupted_pending_resolution"
+  | "subagent_restart"
   | "session_restore"
 
 export interface PendingToolExecutionState {

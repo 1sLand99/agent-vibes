@@ -57,18 +57,11 @@ export default tseslint.config(
     },
   },
   {
-    // Phase B–G new architecture: turn-runner interfaces and tests
-    // declare async methods that satisfy a contract and may not
-    // themselves use `await`. Likewise async generators are used
-    // for backend-event streams that are scripted in tests. These
-    // are inherent to the interface shapes, not bugs.
+    // Turn-runner interfaces declare async methods that satisfy a contract
+    // and may not themselves use `await`.
     files: [
       "src/protocol/cursor/turn/**/*.ts",
       "src/protocol/cursor/bidi/**/*.ts",
-      "src/protocol/cursor/backend/backend-stream.ts",
-      "src/protocol/cursor/backend/backend-stream.spec.ts",
-      "src/protocol/cursor/context-bridge/**/*.ts",
-      "src/protocol/cursor/subagents-bridge/**/*.ts",
     ],
     rules: {
       "@typescript-eslint/require-await": "off",

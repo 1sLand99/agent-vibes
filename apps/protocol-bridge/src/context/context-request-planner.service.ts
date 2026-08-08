@@ -10,12 +10,20 @@ import {
   resolveContextModelProfile,
 } from "./context-model-profile"
 import {
+  ContextBudgetEnforcement,
   ContextCompactionResult,
   ContextCompactionService,
+  ContextProjectionBudgetBoundary,
 } from "./context-compaction.service"
 import { ContextManagerService } from "./context-manager.service"
 import { TokenCounterService } from "./token-counter.service"
-import { ContextConversationState, UnifiedMessage } from "./types"
+import {
+  ClaudeProjectionCapabilitySnapshot,
+  ClaudeProjectionRecipe,
+  ContextConversationState,
+  DurableGraphProjectionMessage,
+  UnifiedMessage,
+} from "./types"
 
 export interface ContextRequestBudgetInput {
   backend: string
@@ -57,6 +65,13 @@ export interface ContextRequestBudgetDecision {
   toolDefinitionTokens: number
   backendSystemPromptTokens: number
   fixedOverheadTokens: number
+  /**
+   * Request overhead that is not represented inside a provider-native input
+   * projection.  Unlike `systemPromptTokens`, this deliberately excludes
+   * protected context because Codex projects that context as native input
+   * items and measures it there.
+   */
+  providerRequestOverheadTokens: number
   systemPromptTokens: number
   maxOutputTokens: number
   requestedServiceTier?: string
@@ -67,7 +82,13 @@ export interface ContextRequestBudgetDecision {
 
 export interface ContextRequestBudget {
   maxTokens: number
+  /**
+   * Complete reservation used while projecting graph history.  This includes
+   * protected context plus provider request overhead.
+   */
   systemPromptTokens: number
+  /** Tokens outside an exact provider-native input projection. */
+  providerRequestOverheadTokens: number
   maxOutputTokens: number
   contextProfile: ContextModelProfile
   autoCompactTokenLimit?: number
@@ -82,13 +103,27 @@ export interface ContextProjectionOptions {
   pendingToolUseIds?: Iterable<string>
   strategy?: "auto" | "manual" | "reactive"
   dryRun?: boolean
-  codexAppendOnlyAttachments?: boolean
+  /**
+   * `measure` is only valid with `dryRun: true` and returns the complete
+   * candidate projection even above the request window. A final send must
+   * rebuild through the default `strict` mode.
+   */
+  budgetEnforcement?: ContextBudgetEnforcement
+  /** Explicit owner of the final strict budget gate. */
+  budgetBoundary?: ContextProjectionBudgetBoundary
+  dynamicAttachmentMode?: "history" | "provider-native"
+  claudeCapability?: ClaudeProjectionCapabilitySnapshot
+  /** Provider-owned Claude checkpoint selected by the active head. */
+  claudeRecipe?: ClaudeProjectionRecipe
+  /** Exact source records already installed in a provider-native history. */
+  visibleSessionMemorySourceRecordUuids?: Iterable<string>
 }
 
 export type ContextProjectionBudget = Pick<
   ContextRequestBudget,
   | "maxTokens"
   | "systemPromptTokens"
+  | "providerRequestOverheadTokens"
   | "autoCompactTokenLimit"
   | "predictiveCompactTokenLimit"
   | "contextProfile"
@@ -168,12 +203,13 @@ export class ContextRequestPlannerService {
       this.normalizePositiveInteger(input.backendSystemPromptTokens) ?? 0
     const fixedOverheadTokens =
       this.normalizePositiveInteger(input.fixedOverheadTokens) ?? 0
-    const systemPromptTokens =
-      protectedContextTokens +
+    const providerRequestOverheadTokens =
       promptSystemTokens +
       toolDefinitionTokens +
       backendSystemPromptTokens +
       fixedOverheadTokens
+    const systemPromptTokens =
+      protectedContextTokens + providerRequestOverheadTokens
 
     const maxOutputTokens =
       this.normalizePositiveInteger(input.maxOutputTokens) ?? 0
@@ -193,6 +229,7 @@ export class ContextRequestPlannerService {
     return {
       maxTokens,
       systemPromptTokens,
+      providerRequestOverheadTokens,
       maxOutputTokens,
       contextProfile,
       autoCompactTokenLimit,
@@ -213,6 +250,7 @@ export class ContextRequestPlannerService {
         toolDefinitionTokens,
         backendSystemPromptTokens,
         fixedOverheadTokens,
+        providerRequestOverheadTokens,
         systemPromptTokens,
         maxOutputTokens,
         requestedServiceTier: input.requestedServiceTier,
@@ -223,6 +261,11 @@ export class ContextRequestPlannerService {
     }
   }
 
+  /**
+   * Project transport/raw messages that have no durable graph identity. The
+   * manager mints transient record ids here and rejects any supplied
+   * `sourceUuid`; graph-backed callers must use `projectDurableGraphMessages`.
+   */
   projectMessages(
     messages: UnifiedMessage[],
     snapshot: ContextAttachmentSnapshot,
@@ -230,6 +273,24 @@ export class ContextRequestPlannerService {
     options?: ContextProjectionOptions
   ): ContextCompactionResult {
     return this.contextManager.buildBackendMessagesFromMessages(
+      messages,
+      snapshot,
+      this.buildCompactionOptions(budget, options)
+    )
+  }
+
+  /**
+   * Project graph-backed messages without replacing their durable source
+   * identities. This is the only raw-message projection entry point allowed
+   * to feed a provider-native incremental history.
+   */
+  projectDurableGraphMessages(
+    messages: readonly DurableGraphProjectionMessage[],
+    snapshot: ContextAttachmentSnapshot,
+    budget: ContextProjectionBudget,
+    options?: ContextProjectionOptions
+  ): ContextCompactionResult {
+    return this.contextManager.buildBackendMessagesFromDurableGraphMessages(
       messages,
       snapshot,
       this.buildCompactionOptions(budget, options)
@@ -263,7 +324,13 @@ export class ContextRequestPlannerService {
       pendingToolUseIds: options?.pendingToolUseIds,
       strategy: options?.strategy || "auto",
       dryRun: options?.dryRun,
-      codexAppendOnlyAttachments: options?.codexAppendOnlyAttachments,
+      budgetEnforcement: options?.budgetEnforcement,
+      budgetBoundary: options?.budgetBoundary,
+      dynamicAttachmentMode: options?.dynamicAttachmentMode,
+      claudeCapability: options?.claudeCapability,
+      claudeRecipe: options?.claudeRecipe,
+      visibleSessionMemorySourceRecordUuids:
+        options?.visibleSessionMemorySourceRecordUuids,
     }
   }
 

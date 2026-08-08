@@ -44,7 +44,7 @@ export function parseCodexRateLimitWindow(
 }
 
 export function formatCodexRateLimitWindow(
-  tier: CodexRateLimitTier,
+  label: string,
   window: CodexRateLimitWindow
 ): string {
   const left = Math.max(0, 100 - window.usedPercent).toFixed(0)
@@ -58,5 +58,5 @@ export function formatCodexRateLimitWindow(
       ? new Date(window.resetsAt * 1000).toISOString()
       : "unknown"
 
-  return `${tier}=${left}% left (window=${windowMinutes}, resetAt=${resetAt})`
+  return `${label}=${left}% left (window=${windowMinutes}, resetAt=${resetAt})`
 }

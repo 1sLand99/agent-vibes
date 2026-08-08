@@ -2,19 +2,19 @@ import { forwardRef, Inject, Injectable, Logger } from "@nestjs/common"
 import {
   type SessionRecord,
   type SessionStreamRecord,
-  type PendingToolCall,
   type QueuedEditDispatch,
   type SessionBackgroundCommand,
   SessionLifecycleService,
+  requireCanonicalIdentifier,
 } from "./session-lifecycle.service"
-import { ConversationId } from "../turn/turn.types"
 import type { TurnId } from "../turn/turn.types"
+import {
+  BackgroundCommandStore,
+  type DurableBackgroundCommand,
+} from "./background-command-store.service"
 
 /**
- * SessionStreamService — step 4 真正拆解 product.
- *
- * Owns the streaming-side state and methods that previously lived
- * directly on SessionLifecycleService:
+ * Sole owner of per-conversation streaming and client-execution state:
  *
  *   - shell stream stdout/stderr accumulation
  *   - background command lifecycle
@@ -23,30 +23,22 @@ import type { TurnId } from "../turn/turn.types"
  *   - currentStreamId rotation + pending rebind
  *   - cross-session sweeps for overdue deadlines and async-ask followups
  *
- * Field storage (backgroundCommands map, edit-path holders/queues,
- * pendingInteractionQueries, currentStreamId) is still attached to
- * the legacy `SessionRecord` object owned by SessionLifecycleService;
- * the methods reach into those fields through `sessionLifecycle.getSession(cid)`
- * and through the `iterateSessions` accessor for cross-session sweeps.
- *
- * forwardRef breaks the bidirectional cycle: lifecycle ↔ stream both
- * resolve through @Inject(forwardRef(...)). markSessionDirty +
- * lastActivityAt updates flow back into the lifecycle so the v1 blob
- * persistence cadence is preserved.
+ * Records live only in `streamRecords`. Lifecycle callbacks provide session
+ * metadata and dirty scheduling without duplicating stream state.
  */
 @Injectable()
 export class SessionStreamService {
   private readonly logger = new Logger(SessionStreamService.name)
 
-  // Step 4 物理拆: 独立持有 SessionStreamRecord 对象。
   private readonly streamRecords = new Map<string, SessionStreamRecord>()
 
   constructor(
     @Inject(forwardRef(() => SessionLifecycleService))
-    private readonly sessionLifecycle: SessionLifecycleService
+    private readonly sessionLifecycle: SessionLifecycleService,
+    private readonly backgroundCommands: BackgroundCommandStore
   ) {}
 
-  // ── Record lifecycle (step 4 物理拆) ─────────────────────────
+  // ── Record lifecycle ──────────────────────────────────────────
 
   getStreamRecord(conversationId: string): SessionStreamRecord | undefined {
     return this.streamRecords.get(conversationId)
@@ -104,11 +96,6 @@ export class SessionStreamService {
     if (pendingCall?.shellStreamOutput) {
       session.lastActivityAt = new Date()
       pendingCall.shellStreamOutput.stdout.push(data)
-      this.sessionLifecycle.refreshPendingToolDeadline(
-        conversationId,
-        toolCallId,
-        "shell stdout"
-      )
       this.logger.debug(`Appended ${data.length} chars stdout to ${toolCallId}`)
     }
   }
@@ -128,11 +115,6 @@ export class SessionStreamService {
     if (pendingCall?.shellStreamOutput) {
       session.lastActivityAt = new Date()
       pendingCall.shellStreamOutput.stderr.push(data)
-      this.sessionLifecycle.refreshPendingToolDeadline(
-        conversationId,
-        toolCallId,
-        "shell stderr"
-      )
       this.logger.debug(`Appended ${data.length} chars stderr to ${toolCallId}`)
     }
   }
@@ -148,11 +130,6 @@ export class SessionStreamService {
     if (pendingCall?.shellStreamOutput) {
       session.lastActivityAt = new Date()
       pendingCall.shellStreamOutput.started = true
-      this.sessionLifecycle.refreshPendingToolDeadline(
-        conversationId,
-        toolCallId,
-        "shell start"
-      )
       this.logger.debug(`Marked shell started for ${toolCallId}`)
     }
   }
@@ -226,54 +203,26 @@ export class SessionStreamService {
       stderr?: string
       msToWait?: number
       backgroundReason?: number
+      startedAt?: number
     }
   ): SessionBackgroundCommand | undefined {
     const session = this.sessionLifecycle.getSession(conversationId)
-    const stream = this.streamRecords.get(conversationId)
     if (!session) return undefined
 
-    const normalizedCommandId =
-      typeof command.commandId === "string" ? command.commandId.trim() : ""
-    if (!normalizedCommandId) return undefined
+    const commandId = requireCanonicalIdentifier(
+      command.commandId,
+      "background commandId"
+    )
+    const originToolCallId = requireCanonicalIdentifier(
+      command.originToolCallId,
+      "background originToolCallId"
+    )
 
-    const backgroundCommand: SessionBackgroundCommand = {
-      commandId: normalizedCommandId,
-      originToolCallId: command.originToolCallId,
-      execIds: Array.from(command.execIds || [])
-        .filter(
-          (value): value is number =>
-            typeof value === "number" && Number.isFinite(value) && value > 0
-        )
-        .map((value) => Math.floor(value)),
-      command: command.command,
-      cwd: command.cwd,
-      pid:
-        typeof command.pid === "number" && Number.isFinite(command.pid)
-          ? Math.max(0, Math.floor(command.pid))
-          : undefined,
-      terminalsFolder:
-        typeof command.terminalsFolder === "string" &&
-        command.terminalsFolder.trim() !== ""
-          ? command.terminalsFolder.trim()
-          : undefined,
-      status: "running",
-      stdout: command.stdout ? [command.stdout] : [],
-      stderr: command.stderr ? [command.stderr] : [],
-      msToWait:
-        typeof command.msToWait === "number" &&
-        Number.isFinite(command.msToWait)
-          ? Math.max(0, Math.floor(command.msToWait))
-          : undefined,
-      backgroundReason:
-        typeof command.backgroundReason === "number" &&
-        Number.isFinite(command.backgroundReason)
-          ? Math.floor(command.backgroundReason)
-          : undefined,
-      startedAt: Date.now(),
-      updatedAt: Date.now(),
-    }
-
-    stream!.backgroundCommands.set(normalizedCommandId, backgroundCommand)
+    const backgroundCommand = this.backgroundCommands.register(conversationId, {
+      ...command,
+      commandId,
+      originToolCallId,
+    })
     session.lastActivityAt = new Date()
     this.sessionLifecycle.markSessionDirty(conversationId)
     return backgroundCommand
@@ -284,9 +233,12 @@ export class SessionStreamService {
     commandId: string
   ): SessionBackgroundCommand | undefined {
     const session = this.sessionLifecycle.getSession(conversationId)
-    const stream = this.streamRecords.get(conversationId)
     if (!session) return undefined
-    return stream!.backgroundCommands.get(commandId.trim())
+    const canonicalCommandId = requireCanonicalIdentifier(
+      commandId,
+      "background commandId"
+    )
+    return this.backgroundCommands.get(conversationId, canonicalCommandId)
   }
 
   findBackgroundCommandByToolCallId(
@@ -294,14 +246,15 @@ export class SessionStreamService {
     toolCallId: string
   ): SessionBackgroundCommand | undefined {
     const session = this.sessionLifecycle.getSession(conversationId)
-    const stream = this.streamRecords.get(conversationId)
     if (!session) return undefined
-    for (const command of stream!.backgroundCommands.values()) {
-      if (command.originToolCallId === toolCallId) {
-        return command
-      }
-    }
-    return undefined
+    const canonicalToolCallId = requireCanonicalIdentifier(
+      toolCallId,
+      "background originToolCallId"
+    )
+    return this.backgroundCommands.findByToolCallId(
+      conversationId,
+      canonicalToolCallId
+    )
   }
 
   markPendingShellToolBackgrounded(
@@ -312,26 +265,31 @@ export class SessionStreamService {
     const session = this.sessionLifecycle.getSession(conversationId)
     if (!session) return undefined
 
-    const normalizedToolCallId = toolCallId.trim()
-    const normalizedCommandId = commandId.trim() || normalizedToolCallId
-    if (!normalizedToolCallId || !normalizedCommandId) return undefined
+    const canonicalToolCallId = requireCanonicalIdentifier(
+      toolCallId,
+      "background originToolCallId"
+    )
+    const canonicalCommandId = requireCanonicalIdentifier(
+      commandId,
+      "background commandId"
+    )
 
     const existing = this.findBackgroundCommandByToolCallId(
       conversationId,
-      normalizedToolCallId
+      canonicalToolCallId
     )
     if (existing) return existing
 
     const pendingToolCall = this.sessionLifecycle.getPendingToolCall(
       session.conversationId,
-      normalizedToolCallId
+      canonicalToolCallId
     )
     if (!pendingToolCall) return undefined
 
     const output = pendingToolCall.shellStreamOutput
     return this.registerBackgroundCommand(conversationId, {
-      commandId: normalizedCommandId,
-      originToolCallId: normalizedToolCallId,
+      commandId: canonicalCommandId,
+      originToolCallId: canonicalToolCallId,
       execIds: pendingToolCall.execIds,
       command:
         typeof pendingToolCall.toolInput.command === "string"
@@ -356,13 +314,11 @@ export class SessionStreamService {
     execIdNumber: number
   ): SessionBackgroundCommand | undefined {
     const session = this.sessionLifecycle.getSession(conversationId)
-    const stream = this.streamRecords.get(conversationId)
-    if (!session || !Number.isFinite(execIdNumber) || execIdNumber <= 0) {
+    if (!session || !Number.isSafeInteger(execIdNumber) || execIdNumber <= 0) {
       return undefined
     }
-    const normalizedExecId = Math.floor(execIdNumber)
-    for (const command of stream!.backgroundCommands.values()) {
-      if (command.execIds.includes(normalizedExecId)) {
+    for (const command of this.backgroundCommands.list(conversationId)) {
+      if (command.execIds.includes(execIdNumber)) {
         return command
       }
     }
@@ -375,12 +331,30 @@ export class SessionStreamService {
     stream: "stdout" | "stderr",
     data: string
   ): boolean {
-    const command = this.getBackgroundCommand(conversationId, commandId)
-    if (!command || !data) return false
-    command[stream].push(data)
-    command.updatedAt = Date.now()
-    this.sessionLifecycle.markSessionDirty(conversationId)
-    return true
+    const updated = this.backgroundCommands.appendOutput(
+      conversationId,
+      commandId,
+      stream,
+      data
+    )
+    if (updated) this.sessionLifecycle.markSessionDirty(conversationId)
+    return updated
+  }
+
+  replaceBackgroundCommandOutput(
+    conversationId: string,
+    commandId: string,
+    stdout: string,
+    stderr: string
+  ): boolean {
+    const updated = this.backgroundCommands.replaceOutput(
+      conversationId,
+      commandId,
+      stdout,
+      stderr
+    )
+    if (updated) this.sessionLifecycle.markSessionDirty(conversationId)
+    return updated
   }
 
   updateBackgroundCommandTerminalFileLength(
@@ -388,12 +362,13 @@ export class SessionStreamService {
     commandId: string,
     length: number
   ): boolean {
-    const command = this.getBackgroundCommand(conversationId, commandId)
-    if (!command || !Number.isFinite(length) || length < 0) return false
-    command.lastTerminalFileLength = Math.floor(length)
-    command.updatedAt = Date.now()
-    this.sessionLifecycle.markSessionDirty(conversationId)
-    return true
+    const updated = this.backgroundCommands.setTerminalFileLength(
+      conversationId,
+      commandId,
+      length
+    )
+    if (updated) this.sessionLifecycle.markSessionDirty(conversationId)
+    return updated
   }
 
   setBackgroundCommandExit(
@@ -402,18 +377,14 @@ export class SessionStreamService {
     exitCode: number,
     aborted = false
   ): boolean {
-    const command = this.getBackgroundCommand(conversationId, commandId)
-    if (!command) return false
-    command.exitCode = Math.floor(exitCode)
-    command.status = aborted
-      ? "aborted"
-      : exitCode === 0
-        ? "completed"
-        : "failed"
-    command.updatedAt = Date.now()
-    command.completedAt = Date.now()
-    this.sessionLifecycle.markSessionDirty(conversationId)
-    return true
+    const updated = this.backgroundCommands.setExit(
+      conversationId,
+      commandId,
+      exitCode,
+      aborted
+    )
+    if (updated) this.sessionLifecycle.markSessionDirty(conversationId)
+    return updated
   }
 
   // ── per-path edit serialisation ───────────────────────────────
@@ -428,6 +399,13 @@ export class SessionStreamService {
     if (!session) {
       return { acquired: true }
     }
+    if (
+      typeof path !== "string" ||
+      path.length === 0 ||
+      path.includes("\u0000")
+    ) {
+      throw new Error("edit path must be a non-empty local path")
+    }
     const pending = this.sessionLifecycle.getPendingToolCall(
       session.conversationId,
       toolCallId
@@ -436,14 +414,9 @@ export class SessionStreamService {
       pending.editPath = path
     }
 
-    const normalizedPath = (path || "").trim()
-    if (!normalizedPath) {
-      return { acquired: true }
-    }
-
-    const holder = stream!.editPathHolderByPath.get(normalizedPath)
+    const holder = stream!.editPathHolderByPath.get(path)
     if (!holder) {
-      stream!.editPathHolderByPath.set(normalizedPath, toolCallId)
+      stream!.editPathHolderByPath.set(path, toolCallId)
       return { acquired: true }
     }
 
@@ -452,15 +425,15 @@ export class SessionStreamService {
       return { acquired: true }
     }
 
-    let queue = stream!.editPathQueueByPath.get(normalizedPath)
+    let queue = stream!.editPathQueueByPath.get(path)
     if (!queue) {
       queue = []
-      stream!.editPathQueueByPath.set(normalizedPath, queue)
+      stream!.editPathQueueByPath.set(path, queue)
     }
     if (!queue.some((item) => item.toolCallId === toolCallId)) {
       queue.push({
         toolCallId,
-        path: normalizedPath,
+        path,
         enqueuedAt: Date.now(),
       })
     }
@@ -475,25 +448,30 @@ export class SessionStreamService {
     const stream = this.streamRecords.get(conversationId)
     if (!session) return undefined
 
-    const normalizedPath = (path || "").trim()
-    if (!normalizedPath) return undefined
+    if (
+      typeof path !== "string" ||
+      path.length === 0 ||
+      path.includes("\u0000")
+    ) {
+      throw new Error("edit path must be a non-empty local path")
+    }
 
-    if (stream!.editPathHolderByPath.has(normalizedPath)) {
+    if (stream!.editPathHolderByPath.has(path)) {
       // 上一持有者尚未释放，调用方应等待。
       return undefined
     }
 
-    const queue = stream!.editPathQueueByPath.get(normalizedPath)
+    const queue = stream!.editPathQueueByPath.get(path)
     if (!queue || queue.length === 0) {
-      stream!.editPathQueueByPath.delete(normalizedPath)
+      stream!.editPathQueueByPath.delete(path)
       return undefined
     }
 
     const next = queue.shift()!
     if (queue.length === 0) {
-      stream!.editPathQueueByPath.delete(normalizedPath)
+      stream!.editPathQueueByPath.delete(path)
     }
-    stream!.editPathHolderByPath.set(normalizedPath, next.toolCallId)
+    stream!.editPathHolderByPath.set(path, next.toolCallId)
     return next
   }
 
@@ -541,27 +519,25 @@ export class SessionStreamService {
     for (const [, pending] of this.sessionLifecycle.listPendingToolCallEntries(
       session.conversationId
     )) {
-      const streamChanged = pending.streamId !== currentStreamId
-      // Pending tools that input-EOF parked in `awaitingClientResult`
-      // are exactly what resumeAction was designed to reattach. Move
-      // them back to `running` so the lifecycle state machine matches
-      // wall-clock reality (the IDE is once again in a position to
-      // deliver the tool result), and reset the sweeper deadline so
-      // the new BiDi gets the same fresh 90s window the original
-      // dispatch did. Any other status is left untouched: a tool that
-      // settled to `completed` / `aborted` between EOF and reattach
-      // is already done and must not be revived.
-      const statusChanged = pending.executionStatus === "awaitingClientResult"
+      // Only an input-EOF recovery is replayable on resumeAction. A cold
+      // interrupted-pending resolution and a recovered sidechain terminal are
+      // intentionally still awaiting their exact client acknowledgement.
+      // Moving either entry to the generic stream path would make a terminal
+      // route look runnable again and could feed it into a parent continuation.
+      const resumeEligible =
+        pending.executionStatus === "awaitingClientResult" &&
+        pending.executionRecoveryReason === "input_eof"
+      const streamChanged =
+        pending.streamId !== currentStreamId &&
+        pending.executionRecoveryReason !== "interrupted_pending_resolution" &&
+        pending.executionRecoveryReason !== "subagent_restart"
+      const statusChanged = resumeEligible
       if (streamChanged) {
         pending.streamId = currentStreamId
       }
       if (statusChanged) {
         pending.executionStatus = "running"
         pending.executionRecoveryReason = undefined
-        this.sessionLifecycle.resetPendingToolDeadline(
-          conversationId,
-          pending.toolCallId
-        )
       }
       if (streamChanged || statusChanged) {
         reboundCount++
@@ -723,28 +699,14 @@ export class SessionStreamService {
     }
   }
 
-  // ── cross-session sweeps (deadline / async-ask followups) ────
+  // ── cross-session interaction-query sweeps ────
 
-  listOverdueDeadlines(now: number = Date.now()): {
-    tools: Array<{
-      conversationId: string
-      toolCallId: string
-      toolName: string
-      deadline: number
-    }>
-    interactionQueries: Array<{
-      conversationId: string
-      queryId: number
-      kind: string | undefined
-      deadline: number
-    }>
-  } {
-    const tools: Array<{
-      conversationId: string
-      toolCallId: string
-      toolName: string
-      deadline: number
-    }> = []
+  listOverdueInteractionQueries(now: number = Date.now()): Array<{
+    conversationId: string
+    queryId: number
+    kind: string | undefined
+    deadline: number
+  }> {
     const interactionQueries: Array<{
       conversationId: string
       queryId: number
@@ -753,38 +715,6 @@ export class SessionStreamService {
     }> = []
 
     for (const [conversationId, stream] of this.streamRecords.entries()) {
-      const pendingTools =
-        this.sessionLifecycle.pendingToolSnapshotForConversation(
-          ConversationId.of(conversationId)
-        )
-      for (const entry of pendingTools) {
-        const payload = entry.payload as PendingToolCall | undefined
-        const deadline = payload?.deadline
-        if (typeof deadline !== "number") continue
-        if (deadline > now) continue
-        // Tools whose BiDi was torn down by the IDE (Premature close,
-        // network drop, IDE restart) are parked in
-        // `executionStatus="awaitingClientResult"` by the input-EOF
-        // recovery path so a future `resumeAction` can re-attach and
-        // complete them. The deadline timer must NOT expire those —
-        // that would emit an inline error result on a sealed outbound
-        // (drops with `emit dropped: no active turn or umbrella`) and
-        // simultaneously destroy the pending state that resumeAction
-        // depends on. Two contradictory recovery strategies cannot
-        // both fire on the same toolCall; awaitingClientResult wins
-        // because the IDE has already taken ownership of the resume
-        // path. Other statuses ("pending", "running") still expire so
-        // a stalled live IDE attachment cannot leak forever — the
-        // 2026-05-31 list_directory hang is the canonical case.
-        if (payload?.executionStatus === "awaitingClientResult") continue
-        tools.push({
-          conversationId,
-          toolCallId: entry.toolCallId,
-          toolName: entry.toolName,
-          deadline,
-        })
-      }
-
       for (const [queryId, iq] of stream.pendingInteractionQueries) {
         if (typeof iq.deadline !== "number") continue
         if (iq.deadline > now) continue
@@ -797,79 +727,26 @@ export class SessionStreamService {
       }
     }
 
-    return { tools, interactionQueries }
+    return interactionQueries
   }
 
-  listAsyncAskFollowups(conversationFilter?: string): Array<{
-    conversationId: string
-    queryId: number
-    followupId: string
-    text: string
-    createdAtMs: number
-  }> {
-    const out: Array<{
-      conversationId: string
-      queryId: number
-      followupId: string
-      text: string
-      createdAtMs: number
-    }> = []
-    for (const conversationId of this.streamRecords.keys()) {
-      if (
-        conversationFilter !== undefined &&
-        conversationId !== conversationFilter
-      ) {
-        continue
-      }
-      const stream = this.streamRecords.get(conversationId)
-      if (!stream) continue
-      for (const [queryId, iq] of stream.pendingInteractionQueries) {
-        if (iq.kind !== "async_ask") continue
-        const payload = iq.payload as
-          | { toolInput?: Record<string, unknown> }
-          | undefined
-        const toolInput = payload?.toolInput
-        const text =
-          (typeof toolInput?.title === "string" && toolInput.title.length > 0
-            ? toolInput.title
-            : typeof toolInput?.question === "string"
-              ? toolInput.question
-              : "") || ""
-        out.push({
-          conversationId,
-          queryId,
-          followupId: queryId.toString(),
-          text,
-          createdAtMs: iq.createdAt,
-        })
-      }
-    }
-    return out
-  }
-
-  findAsyncAskFollowupById(
-    followupId: string
-  ): { conversationId: string; queryId: number } | undefined {
-    const queryId = Number.parseInt(followupId, 10)
-    if (!Number.isFinite(queryId)) return undefined
-    for (const [conversationId, stream] of this.streamRecords.entries()) {
-      const iq = stream.pendingInteractionQueries.get(queryId)
-      if (iq && iq.kind === "async_ask") {
-        return { conversationId, queryId }
-      }
-    }
-    return undefined
-  }
-
-  // ─── Field accessors (step 4 终结) ─────────────────────────────
+  // ─── Field accessors ──────────────────────────────────────────
 
   getBackgroundCommands(
     conversationId: string
   ): Map<string, SessionBackgroundCommand> {
-    return (
-      this.streamRecords.get(conversationId)?.backgroundCommands ??
-      new Map<never, never>()
+    return new Map(
+      this.backgroundCommands
+        .list(conversationId)
+        .map((command) => [command.commandId, command])
     )
+  }
+
+  getDurableBackgroundCommand(
+    conversationId: string,
+    commandId: string
+  ): DurableBackgroundCommand | undefined {
+    return this.backgroundCommands.get(conversationId, commandId)
   }
   getPendingToolCallByExecId(conversationId: string): Map<number, string> {
     return (

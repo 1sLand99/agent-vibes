@@ -13,12 +13,6 @@
  *       * `inherit`  — explicitly inherit the parent (top-level chat) model
  *       * `disabled` — the subagent type is opted out of LLM-backed runs
  *
- *   - `selected_subagent_models` (field 14): repeated RequestedModel.
- *     Legacy / shorthand list of pinned models, used by older Cursor
- *     clients that didn't yet support the override oneof. The proto layer
- *     keeps both for compatibility; this module reads the override list
- *     when present and falls back to legacy list-only handling.
- *
  * Bridge consumers:
  *   - `ToolUseSummaryService` (one-line label per tool batch).
  *     Treats the implicit "tool_use_summary" subagent type as a
@@ -121,34 +115,48 @@ const EMPTY: SubagentModelOverridesMap = {
 export const EMPTY_SUBAGENT_MODEL_OVERRIDES: SubagentModelOverridesMap = EMPTY
 
 /**
- * Project a single proto `SubagentModelOverride` to the bridge-side
- * union. Returns `undefined` for malformed entries so the caller can
- * skip them without bringing down the whole map build.
+ * Project one official `SubagentModelOverride` oneof into the bridge-side
+ * union. A malformed arm is a protocol error; silently dropping it could
+ * enable a disabled agent or route it to a different model.
  */
 function projectOverride(
-  override: SubagentModelOverride
-): ResolvedSubagentOverride | undefined {
+  override: SubagentModelOverride,
+  subagentType: string
+): ResolvedSubagentOverride {
   const selection = override.selection
-  if (!selection || !selection.case) return undefined
+  if (!selection.case) {
+    throw new Error(`Subagent model override has no selection: ${subagentType}`)
+  }
   switch (selection.case) {
     case "inherit": {
-      // Cursor sets the bool to `true` when "Inherit from parent" is
-      // selected. If a future client variant flips the bool to `false`
-      // to mean "explicitly NOT inherit" we still treat it as inherit:
-      // the only sensible neutral default is parent inheritance, and
-      // `disabled` exists to opt out.
+      if (selection.value !== true) {
+        throw new Error(
+          `Subagent model override inherit selection must be true: ${subagentType}`
+        )
+      }
       return { kind: "inherit" }
     }
     case "disabled": {
-      // Same reasoning: if the bool is false here we still treat the
-      // override as disabled because the case branch itself encoded
-      // intent. Cursor's UI never sends `disabled: false` today.
+      if (selection.value !== true) {
+        throw new Error(
+          `Subagent model override disabled selection must be true: ${subagentType}`
+        )
+      }
       return { kind: "disabled" }
     }
     case "model": {
       const requested: RequestedModel | undefined = selection.value
-      const modelId = requested?.modelId?.trim()
-      if (!modelId) return undefined
+      const modelId = requested?.modelId
+      if (!modelId || modelId.trim().length === 0) {
+        throw new Error(
+          `Subagent model override model id is required: ${subagentType}`
+        )
+      }
+      if (modelId.trim() !== modelId) {
+        throw new Error(
+          `Subagent model override model id must not contain leading or trailing whitespace: ${subagentType}`
+        )
+      }
       return {
         kind: "model",
         modelId,
@@ -159,12 +167,10 @@ function projectOverride(
       }
     }
     default: {
-      // Exhaustiveness: a future proto evolution that adds a new
-      // selection case forces a compile error here so we don't silently
-      // drop user intent.
       const _exhaustive: never = selection
-      void _exhaustive
-      return undefined
+      throw new Error(
+        `Unsupported subagent model override selection: ${String(_exhaustive)}`
+      )
     }
   }
 }
@@ -174,10 +180,10 @@ function projectOverride(
  * proto layer guarantees the field exists (empty array when absent),
  * so callers never need to null-check before calling.
  *
- * Last-write-wins on duplicate `subagentType` entries: Cursor today
- * emits at most one entry per type, but mirroring lenient behaviour
- * keeps us robust against future client variants that might emit
- * multiple (e.g. layered project + user overrides).
+ * The official oneof is authoritative. Empty identities, missing/false
+ * selections, empty model ids and duplicate identities are protocol errors;
+ * silently skipping any of them could enable an agent the user disabled or
+ * route it to a different model.
  */
 export function parseSubagentModelOverrides(
   req: AgentRunRequest
@@ -187,10 +193,19 @@ export function parseSubagentModelOverrides(
 
   const table = new Map<string, ResolvedSubagentOverride>()
   for (const entry of overrides) {
-    const subagentType = entry.subagentType?.trim()
-    if (!subagentType) continue
-    const projected = projectOverride(entry)
-    if (!projected) continue
+    const subagentType = entry.subagentType
+    if (!subagentType || subagentType.trim().length === 0) {
+      throw new Error("Subagent model override subagent_type is required")
+    }
+    if (subagentType.trim() !== subagentType) {
+      throw new Error(
+        "Subagent model override subagent_type must not contain leading or trailing whitespace"
+      )
+    }
+    if (table.has(subagentType)) {
+      throw new Error(`Duplicate subagent model override: ${subagentType}`)
+    }
+    const projected = projectOverride(entry, subagentType)
     table.set(subagentType, projected)
   }
 
@@ -258,8 +273,9 @@ export function applySubagentOverride(
       }
     default: {
       const _exhaustive: never = override
-      void _exhaustive
-      return { kind: "proceed-inherit" }
+      throw new Error(
+        `Unsupported resolved subagent override: ${String(_exhaustive)}`
+      )
     }
   }
 }

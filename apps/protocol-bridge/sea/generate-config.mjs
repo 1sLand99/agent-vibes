@@ -7,7 +7,7 @@ const __dirname = path.dirname(__filename)
 
 const projectDir = path.resolve(__dirname, "..")
 const distDir = path.join(projectDir, "dist")
-const migrationsDir = path.join(distDir, "persistence", "migrations")
+const migrationsDir = path.join(projectDir, "src", "persistence", "migrations")
 const outputPath = path.join(distDir, "sea-config.generated.json")
 
 if (!fs.existsSync(migrationsDir)) {
@@ -24,7 +24,7 @@ if (migrationFiles.length === 0) {
 }
 
 const assets = Object.fromEntries(
-  migrationFiles.map((file) => [file, `dist/persistence/migrations/${file}`])
+  migrationFiles.map((file) => [file, `src/persistence/migrations/${file}`])
 )
 
 const config = {

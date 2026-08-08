@@ -1,3 +1,4 @@
+import { requireExactDurableIdentifier } from "../../context/durable-identifier"
 import { CodexConversationSessionStore } from "./codex-conversation-session-store"
 import type { CodexRuntimeCacheStore } from "./codex-runtime-cache-store"
 import type { CodexInputItem } from "./codex-native-types"
@@ -11,13 +12,15 @@ import {
 } from "./codex-turn-context"
 import {
   captureCodexTurnResponse,
+  commitCodexTurnStateRequest,
   hasCodexTurnContinuationState,
-  prepareCodexTurnStateRequest,
+  planCodexFullTurnStateRequest,
+  planCodexTurnStateRequest,
   resetCodexTurnContinuationState,
   startCodexFullResponseChain,
   type CodexPreparedTurnRequest,
 } from "./codex-turn-state"
-import { hashCodexIdentityPart } from "./codex-slot-identity"
+import { hashCodexIdentityPart, type CodexSlotKey } from "./codex-slot-identity"
 
 export interface CodexTurnContextManagerOptions {
   runtimeCache: CodexRuntimeCacheStore
@@ -26,7 +29,7 @@ export interface CodexTurnContextManagerOptions {
 }
 
 export interface CodexTurnContextCacheScope {
-  slotKey: string
+  slotKey: CodexSlotKey
   modelName: string
   conversationId?: string
 }
@@ -39,7 +42,7 @@ export interface CodexGetOrCreateTurnContextInput extends CodexTurnContextCacheS
 export interface CodexResetContinuationInput {
   conversationId: string | undefined
   modelName?: string
-  slotKeys?: string[]
+  slotKeys?: CodexSlotKey[]
 }
 
 export interface CodexResetContinuationResult {
@@ -52,7 +55,7 @@ export interface CodexResetContinuationResult {
 export interface CodexClearContinuationBaselineInput {
   conversationId: string | undefined
   modelName?: string
-  slotKeys?: string[]
+  slotKeys?: CodexSlotKey[]
 }
 
 export interface CodexClearContinuationBaselineResult {
@@ -62,24 +65,26 @@ export interface CodexClearContinuationBaselineResult {
   discardedPreviousResponseId: string | undefined
 }
 
-export interface CodexTransportReconnectInput extends CodexTurnContextCacheScope {
+/** Transport routing evidence observed from a failed physical attempt. */
+export interface CodexHttpFallbackTransportInput extends CodexTurnContextCacheScope {
   conversationId: string | undefined
+  /** The upstream rejected the account header for this exact session scope. */
+  omitAccountId?: boolean
 }
 
-export interface CodexTransportReconnectResult {
-  conversationId: string | undefined
-  hadContinuationBaseline: boolean
-  discardedPreviousResponseId: string | undefined
-}
-
-export interface CodexHttpTransportTurnInput extends CodexTurnContextCacheScope {
-  conversationId: string | undefined
-  persistHttpFallback?: boolean
-}
-
-export interface CodexHttpTransportTurnResult {
+export interface CodexHttpFallbackTransportResult {
   conversationId: string | undefined
   httpFallbackActivated: boolean
+  omitAccountId: boolean
+}
+
+/** A successful HTTP attempt may now retire its old WebSocket baseline. */
+export interface CodexCommittedHttpTransportInput extends CodexTurnContextCacheScope {
+  conversationId: string | undefined
+}
+
+export interface CodexCommittedHttpTransportResult {
+  conversationId: string | undefined
   clearedActiveContext: boolean
   deletedCachedContext: boolean
   discardedPreviousResponseId: string | undefined
@@ -121,6 +126,10 @@ export class CodexTurnContextManager {
   private readonly sessions =
     new CodexConversationSessionStore<CodexTurnContext>()
   private readonly httpFallbackTransports = new Set<string>()
+  private readonly httpFallbackTransportOptions = new Map<
+    string,
+    { omitAccountId: boolean }
+  >()
   private readonly runtimeCache: CodexRuntimeCacheStore
   private readonly closeWsSession: (sessionId: string) => void
   private readonly now: () => number
@@ -136,22 +145,47 @@ export class CodexTurnContextManager {
   }
 
   isHttpFallbackTransport(input: CodexTurnContextCacheScope): boolean {
-    const cacheKey = this.buildHttpFallbackTransportKey(input)
-    return cacheKey ? this.httpFallbackTransports.has(cacheKey) : false
+    const conversationId = this.requireOptionalConversationId(
+      input.conversationId
+    )
+    if (conversationId === undefined) return false
+    return this.httpFallbackTransports.has(
+      this.buildHttpFallbackTransportKey({ ...input, conversationId })
+    )
   }
 
-  beginHttpTransportTurn(
-    input: CodexHttpTransportTurnInput
-  ): CodexHttpTransportTurnResult {
-    const conversationId = this.normalizeConversationId(input.conversationId)
-    if (!conversationId) {
+  shouldOmitAccountIdForHttpTransport(
+    input: CodexTurnContextCacheScope
+  ): boolean {
+    const conversationId = this.requireOptionalConversationId(
+      input.conversationId
+    )
+    if (conversationId === undefined) return false
+    const cacheKey = this.buildHttpFallbackTransportKey({
+      ...input,
+      conversationId,
+    })
+    return (
+      this.httpFallbackTransportOptions.get(cacheKey)?.omitAccountId === true
+    )
+  }
+
+  /**
+   * Persist routing evidence without touching the response chain. A failed
+   * WebSocket/HTTP attempt may prove the preferred next transport, but it
+   * cannot publish or discard a continuation baseline.
+   */
+  recordHttpFallbackTransport(
+    input: CodexHttpFallbackTransportInput
+  ): CodexHttpFallbackTransportResult {
+    const conversationId = this.requireOptionalConversationId(
+      input.conversationId
+    )
+    if (conversationId === undefined) {
       return {
         conversationId: undefined,
         httpFallbackActivated: false,
-        clearedActiveContext: false,
-        deletedCachedContext: false,
-        discardedPreviousResponseId: undefined,
-        closedSessionIds: [],
+        omitAccountId: false,
       }
     }
 
@@ -160,11 +194,42 @@ export class CodexTurnContextManager {
       slotKey: input.slotKey,
       modelName: input.modelName,
     })
-    const httpFallbackActivated =
-      !!input.persistHttpFallback &&
-      !this.httpFallbackTransports.has(fallbackKey)
-    if (input.persistHttpFallback) {
-      this.httpFallbackTransports.add(fallbackKey)
+    const httpFallbackActivated = !this.httpFallbackTransports.has(fallbackKey)
+    this.httpFallbackTransports.add(fallbackKey)
+    const existing = this.httpFallbackTransportOptions.get(fallbackKey)
+    this.httpFallbackTransportOptions.set(fallbackKey, {
+      omitAccountId:
+        existing?.omitAccountId === true || input.omitAccountId === true,
+    })
+
+    return {
+      conversationId,
+      httpFallbackActivated,
+      omitAccountId:
+        this.httpFallbackTransportOptions.get(fallbackKey)?.omitAccountId ===
+        true,
+    }
+  }
+
+  /**
+   * Publish the HTTP transport transition after that exact attempt is
+   * accepted. This is the only path that clears an active/cached response
+   * chain merely because a full-input HTTP request superseded it.
+   */
+  commitHttpTransportTurn(
+    input: CodexCommittedHttpTransportInput
+  ): CodexCommittedHttpTransportResult {
+    const conversationId = this.requireOptionalConversationId(
+      input.conversationId
+    )
+    if (conversationId === undefined) {
+      return {
+        conversationId: undefined,
+        clearedActiveContext: false,
+        deletedCachedContext: false,
+        discardedPreviousResponseId: undefined,
+        closedSessionIds: [],
+      }
     }
 
     let discardedPreviousResponseId: string | undefined
@@ -194,15 +259,12 @@ export class CodexTurnContextManager {
       closedSessionIds.add(cached.wsSessionId)
     }
 
-    this.runtimeCache.deleteWarmupPayload(conversationId)
-
     for (const sessionId of closedSessionIds) {
       this.closeWsSession(sessionId)
     }
 
     return {
       conversationId,
-      httpFallbackActivated,
       clearedActiveContext,
       deletedCachedContext: !!cached,
       discardedPreviousResponseId,
@@ -213,31 +275,43 @@ export class CodexTurnContextManager {
   prepareWarmupContext(
     input: CodexTurnContextCacheScope & { turnKey?: string }
   ): CodexPreparedWarmupContext {
-    const conversationId = this.normalizeConversationId(input.conversationId)
-    const turnKey = input.turnKey?.trim() || undefined
+    const conversationId = this.requireOptionalConversationId(
+      input.conversationId
+    )
+    const turnKey =
+      input.turnKey === undefined
+        ? undefined
+        : requireExactDurableIdentifier(input.turnKey, "Codex warmup turn key")
     const cacheKey = this.buildWsCacheKey({
       slotKey: input.slotKey,
       modelName: input.modelName,
-      conversationId: conversationId || undefined,
+      conversationId,
     })
     let cached = this.runtimeCache.getWs(cacheKey)
     if (cached && cached.turnKey !== turnKey) {
       cached = {
         ...cached,
+        modelClientSessionId:
+          conversationId === undefined
+            ? cacheKey
+            : buildCodexTurnWsSessionId(conversationId, turnKey),
         turnKey,
         turnState: undefined,
+        lastRequest: undefined,
+        lastResponse: undefined,
       }
       this.runtimeCache.setWs(cacheKey, cached)
     }
     const sessionId =
       cached?.wsSessionId ||
-      (conversationId
+      (conversationId !== undefined
         ? buildCodexTurnWsSessionId(conversationId, turnKey)
         : cacheKey)
 
     if (!cached) {
       this.runtimeCache.setWs(cacheKey, {
         wsSessionId: sessionId,
+        modelClientSessionId: sessionId,
         turnKey,
         turnState: undefined,
         lastResponse: undefined,
@@ -283,19 +357,6 @@ export class CodexTurnContextManager {
     return { available: false }
   }
 
-  setWarmupPayload(
-    conversationId: string,
-    payload: Record<string, unknown>
-  ): void {
-    this.runtimeCache.setWarmupPayload(conversationId, payload)
-  }
-
-  getWarmupPayload(
-    conversationId: string | undefined
-  ): Record<string, unknown> | undefined {
-    return this.runtimeCache.getWarmupPayload(conversationId)
-  }
-
   pruneRuntimeState(): void {
     this.runtimeCache.prune()
   }
@@ -303,16 +364,20 @@ export class CodexTurnContextManager {
   getOrCreateContext(
     input: CodexGetOrCreateTurnContextInput
   ): CodexTurnContext {
-    const conversationId = this.normalizeConversationId(input.conversationId)
+    const conversationId = this.requireConversationId(input.conversationId)
+    const turnKey =
+      input.turnKey === undefined
+        ? undefined
+        : requireExactDurableIdentifier(input.turnKey, "Codex turn key")
     this.sessions.getOrCreate(conversationId)
 
     const existing = this.sessions.getActive(conversationId)
     if (existing) {
-      if (existing.turnKey === input.turnKey) {
+      if (existing.turnKey === turnKey) {
         return existing
       }
 
-      return reuseCodexActiveTurnContext(existing, input.turnKey)
+      return reuseCodexActiveTurnContext(existing, conversationId, turnKey)
     }
 
     const cacheKey = this.buildWsCacheKey({
@@ -330,8 +395,9 @@ export class CodexTurnContextManager {
     )
     const context = createCodexTurnContext({
       conversationId,
-      turnKey: input.turnKey,
+      turnKey,
       takenCache,
+      reuseCachedLogicalSession: takenCache?.cacheKey === cacheKey,
     })
 
     this.sessions.setActive(conversationId, context)
@@ -341,30 +407,21 @@ export class CodexTurnContextManager {
   getActiveContext(
     conversationId: string | undefined
   ): CodexTurnContext | undefined {
-    const normalizedConversationId =
-      this.normalizeConversationId(conversationId)
-    return normalizedConversationId
-      ? this.sessions.getActive(normalizedConversationId)
+    const exactConversationId =
+      this.requireOptionalConversationId(conversationId)
+    return exactConversationId !== undefined
+      ? this.sessions.getActive(exactConversationId)
       : undefined
   }
 
   disposeContext(input: CodexTurnContextCacheScope): void {
-    const conversationId = this.normalizeConversationId(input.conversationId)
-    if (!conversationId) return
+    const conversationId = this.requireOptionalConversationId(
+      input.conversationId
+    )
+    if (conversationId === undefined) return
 
     const context = this.sessions.getActive(conversationId)
     if (!context) return
-
-    if (
-      this.isHttpFallbackTransport({
-        conversationId,
-        slotKey: input.slotKey,
-        modelName: input.modelName,
-      })
-    ) {
-      this.sessions.clearActive(conversationId)
-      return
-    }
 
     this.runtimeCache.setWs(
       this.buildWsCacheKey({
@@ -377,12 +434,43 @@ export class CodexTurnContextManager {
     this.sessions.clearActive(conversationId)
   }
 
-  prepareRequest(
+  /**
+   * Build a request-local continuation receipt. This does not mutate the
+   * active context; the caller publishes it through `commitPreparedRequest`
+   * only after its physical provider lifecycle has accepted.
+   */
+  planRequest(
     request: Record<string, unknown>,
     context: CodexTurnContext,
     allowEmptyDelta: boolean = true
   ): CodexPreparedTurnRequest {
-    return prepareCodexTurnStateRequest(request, context, allowEmptyDelta)
+    return planCodexTurnStateRequest(request, context, allowEmptyDelta)
+  }
+
+  planFullRequest(
+    request: Record<string, unknown>,
+    context: CodexTurnContext
+  ): CodexPreparedTurnRequest {
+    return planCodexFullTurnStateRequest(request, context)
+  }
+
+  commitPreparedRequest(
+    context: CodexTurnContext,
+    prepared: CodexPreparedTurnRequest
+  ): void {
+    commitCodexTurnStateRequest(context, prepared)
+  }
+
+  captureResponseForContext(
+    context: CodexTurnContext,
+    responseId: string,
+    itemsAdded: CodexInputItem[]
+  ): void {
+    captureCodexTurnResponse(
+      context,
+      requireExactDurableIdentifier(responseId, "Codex response id"),
+      itemsAdded
+    )
   }
 
   beginFullResponseChain(
@@ -397,37 +485,39 @@ export class CodexTurnContextManager {
     responseId: string,
     itemsAdded: CodexInputItem[]
   ): boolean {
-    const normalizedConversationId =
-      this.normalizeConversationId(conversationId)
-    if (!normalizedConversationId || !responseId) return false
+    const exactConversationId = this.requireConversationId(conversationId)
+    const exactResponseId = requireExactDurableIdentifier(
+      responseId,
+      "Codex response id"
+    )
 
-    const context = this.sessions.getActive(normalizedConversationId)
+    const context = this.sessions.getActive(exactConversationId)
     if (!context) return false
 
-    captureCodexTurnResponse(context, responseId, itemsAdded)
-    this.sessions.touch(normalizedConversationId)
+    captureCodexTurnResponse(context, exactResponseId, itemsAdded)
+    this.sessions.touch(exactConversationId)
     return true
   }
 
   resetResponseState(conversationId: string): string | undefined {
-    const normalizedConversationId =
-      this.normalizeConversationId(conversationId)
-    if (!normalizedConversationId) return undefined
+    const exactConversationId = this.requireConversationId(conversationId)
 
-    const context = this.sessions.getActive(normalizedConversationId)
+    const context = this.sessions.getActive(exactConversationId)
     if (!context) return undefined
 
     const previousResponseId = resetCodexTurnContinuationState(context)
-    this.sessions.touch(normalizedConversationId)
+    this.sessions.touch(exactConversationId)
     return previousResponseId
   }
 
   clearContinuationBaseline(
     input: CodexClearContinuationBaselineInput
   ): CodexClearContinuationBaselineResult {
-    const conversationId = this.normalizeConversationId(input.conversationId)
-    const modelName = input.modelName?.trim() || undefined
-    if (!conversationId) {
+    const conversationId = this.requireOptionalConversationId(
+      input.conversationId
+    )
+    const modelName = input.modelName
+    if (conversationId === undefined) {
       return {
         conversationId: undefined,
         modelName,
@@ -451,7 +541,8 @@ export class CodexTurnContextManager {
       }
     }
 
-    const hasExactCacheScope = !!modelName && (input.slotKeys?.length ?? 0) > 0
+    const hasExactCacheScope =
+      modelName !== undefined && (input.slotKeys?.length ?? 0) > 0
     if (hasExactCacheScope) {
       for (const slotKey of input.slotKeys ?? []) {
         const cacheKey = this.buildWsCacheKey({
@@ -487,8 +578,6 @@ export class CodexTurnContextManager {
       resetCount += cleared.clearedCount
     }
 
-    this.runtimeCache.deleteWarmupPayload(conversationId)
-
     return {
       conversationId,
       modelName,
@@ -497,80 +586,16 @@ export class CodexTurnContextManager {
     }
   }
 
-  recordTransportReconnect(
-    input: CodexTransportReconnectInput
-  ): CodexTransportReconnectResult {
-    const conversationId = this.normalizeConversationId(input.conversationId)
-    if (!conversationId) {
-      return {
-        conversationId: undefined,
-        hadContinuationBaseline: false,
-        discardedPreviousResponseId: undefined,
-      }
-    }
-
-    const activeContext = this.sessions.getActive(conversationId)
-    if (activeContext) {
-      const hadContinuationBaseline =
-        !!activeContext.lastRequest || !!activeContext.lastResponse
-      const discardedPreviousResponseId =
-        resetCodexTurnContinuationState(activeContext)
-      activeContext.connectionReused = false
-      this.sessions.touch(conversationId)
-      return {
-        conversationId,
-        hadContinuationBaseline,
-        discardedPreviousResponseId,
-      }
-    }
-
-    const cacheKey = this.buildWsCacheKey({
-      conversationId,
-      slotKey: input.slotKey,
-      modelName: input.modelName,
-    })
-    const cached = this.runtimeCache.getWs(cacheKey)
-    if (!cached) {
-      return {
-        conversationId,
-        hadContinuationBaseline: false,
-        discardedPreviousResponseId: undefined,
-      }
-    }
-
-    const hadContinuationBaseline =
-      !!cached.lastRequest || !!cached.lastResponse
-    if (!hadContinuationBaseline) {
-      return {
-        conversationId,
-        hadContinuationBaseline: false,
-        discardedPreviousResponseId: undefined,
-      }
-    }
-
-    const discardedPreviousResponseId = cached.lastResponse?.responseId
-    this.runtimeCache.setWs(cacheKey, {
-      ...cached,
-      lastRequest: undefined,
-      lastResponse: undefined,
-      updatedAt: this.now(),
-    })
-
-    return {
-      conversationId,
-      hadContinuationBaseline: true,
-      discardedPreviousResponseId,
-    }
-  }
-
   resetContinuationState(
     input: CodexResetContinuationInput
   ): CodexResetContinuationResult {
-    const conversationId = this.normalizeConversationId(input.conversationId)
-    if (!conversationId) {
+    const conversationId = this.requireOptionalConversationId(
+      input.conversationId
+    )
+    if (conversationId === undefined) {
       return {
         conversationId: undefined,
-        modelName: input.modelName?.trim() || undefined,
+        modelName: input.modelName,
         resetCount: 0,
         discardedActivePreviousResponseId: undefined,
       }
@@ -587,8 +612,9 @@ export class CodexTurnContextManager {
       resetCount++
     }
 
-    const modelName = input.modelName?.trim() || undefined
-    const hasExactCacheScope = !!modelName && (input.slotKeys?.length ?? 0) > 0
+    const modelName = input.modelName
+    const hasExactCacheScope =
+      modelName !== undefined && (input.slotKeys?.length ?? 0) > 0
     if (hasExactCacheScope) {
       for (const slotKey of input.slotKeys ?? []) {
         const cached = this.runtimeCache.deleteWs(
@@ -613,8 +639,6 @@ export class CodexTurnContextManager {
       }
     }
 
-    this.runtimeCache.deleteWarmupPayload(conversationId)
-
     return {
       conversationId,
       modelName,
@@ -631,15 +655,11 @@ export class CodexTurnContextManager {
     conversationId: string,
     scope?: Omit<CodexTurnContextCacheScope, "conversationId">
   ): boolean {
-    const normalizedConversationId =
-      this.normalizeConversationId(conversationId)
-    if (!normalizedConversationId) {
-      return false
-    }
+    const exactConversationId = this.requireConversationId(conversationId)
 
     if (
       hasCodexTurnContinuationState(
-        this.sessions.getActive(normalizedConversationId)
+        this.sessions.getActive(exactConversationId)
       )
     ) {
       return true
@@ -654,53 +674,60 @@ export class CodexTurnContextManager {
         this.buildWsCacheKey({
           slotKey: scope.slotKey,
           modelName: scope.modelName,
-          conversationId: normalizedConversationId,
+          conversationId: exactConversationId,
         })
       )
     )
   }
 
   acquireStreamLock(conversationId: string): Promise<() => void> {
-    return this.sessions.acquireStreamLock(conversationId)
+    return this.sessions.acquireStreamLock(
+      this.requireConversationId(conversationId)
+    )
   }
 
   clearActiveContext(conversationId: string): void {
-    const normalizedConversationId =
-      this.normalizeConversationId(conversationId)
-    if (!normalizedConversationId) return
-    this.sessions.clearActive(normalizedConversationId)
+    this.sessions.clearActive(this.requireConversationId(conversationId))
   }
 
   deleteConversation(conversationId: string): void {
-    const normalizedConversationId =
-      this.normalizeConversationId(conversationId)
-    if (!normalizedConversationId) return
+    const exactConversationId = this.requireConversationId(conversationId)
 
-    const activeContext = this.sessions.getActive(normalizedConversationId)
+    const activeContext = this.sessions.getActive(exactConversationId)
     if (activeContext) {
       this.closeWsSession(activeContext.wsSessionId)
     }
-    this.sessions.delete(normalizedConversationId)
-    this.runtimeCache.deleteWarmupPayload(normalizedConversationId)
+    this.sessions.delete(exactConversationId)
     for (const entry of this.runtimeCache.takeWsEntriesByConversationHash(
-      hashCodexIdentityPart(normalizedConversationId)
+      hashCodexIdentityPart(exactConversationId)
     )) {
       this.closeWsSession(entry.wsSessionId)
     }
-    this.deleteHttpFallbackTransports(normalizedConversationId)
+    this.deleteHttpFallbackTransports(exactConversationId)
   }
 
-  private normalizeConversationId(conversationId: string | undefined): string {
-    return conversationId?.trim() || ""
+  private requireConversationId(conversationId: string): string {
+    return requireExactDurableIdentifier(
+      conversationId,
+      "Codex conversation id"
+    )
+  }
+
+  private requireOptionalConversationId(
+    conversationId: string | undefined
+  ): string | undefined {
+    return conversationId === undefined
+      ? undefined
+      : this.requireConversationId(conversationId)
   }
 
   private buildHttpFallbackTransportKey(
-    input: CodexTurnContextCacheScope
+    input: Omit<CodexTurnContextCacheScope, "conversationId"> & {
+      conversationId: string
+    }
   ): string {
-    const conversationId = this.normalizeConversationId(input.conversationId)
-    if (!conversationId) return ""
     return this.buildWsCacheKey({
-      conversationId,
+      conversationId: this.requireConversationId(input.conversationId),
       slotKey: input.slotKey,
       modelName: input.modelName,
     })
@@ -711,6 +738,7 @@ export class CodexTurnContextManager {
     for (const key of Array.from(this.httpFallbackTransports)) {
       if (key.endsWith(suffix)) {
         this.httpFallbackTransports.delete(key)
+        this.httpFallbackTransportOptions.delete(key)
       }
     }
   }

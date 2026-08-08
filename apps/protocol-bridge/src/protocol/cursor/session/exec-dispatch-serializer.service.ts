@@ -1,216 +1,182 @@
 import { Injectable, Logger } from "@nestjs/common"
+import { requireExactDurableIdentifier } from "../../../context/durable-identifier"
+import { ConversationId } from "../turn/turn.types"
 
 const EXEC_DISPATCH_QUEUE_PRESSURE_THRESHOLD = 8
 
+export interface SerializedExecDispatch {
+  execId: number
+  /** Exact opaque Cursor exec id needed for durable outbox transitions. */
+  protocolExecId: string
+  frame: Buffer
+  label: string
+}
+
 /**
- * Per-conversation queue that ensures only one ExecServerMessage is in
- * flight to the Cursor IDE at a time.
+ * The writer must report whether the frame reached its owning outbound. The
+ * callback owns the durable outbox transitions around that write:
  *
- * # Why this exists
+ *   beginDelivery → write → markDelivered
  *
- * Empirically, the Cursor IDE accepts AgentServerMessage frames over the
- * `agent.v1.AgentService/Run` BiDi stream sequentially: when the bridge
- * pushes two ExecServerMessage envelopes back-to-back (e.g. a model
- * batch with two parallel `list_directory` tool_use blocks), the IDE
- * only ever returns the result + streamClose for the **last** one. The
- * earlier dispatches are silently dropped — the corresponding pending
- * tool call hangs indefinitely on the bridge side until the user
- * cancels the turn. This was observed on Cursor 3.4.16 with bridge
- * ExecServerMessage.id values 1 and 2 dispatched within ~10ms of each
- * other; the IDE replied only with `id=2` ls_result + streamClose, and
- * never closed exec stream id=1.
+ * Returning `not_written` means the caller has already restored the durable
+ * row to `queued` (or cancelled it through an explicit teardown path).
+ */
+export type ExecDispatchWriteOutcome = "written" | "not_written"
+
+export type ExecDispatchWriter = (
+  dispatch: SerializedExecDispatch
+) => ExecDispatchWriteOutcome
+
+export type ExecDispatchSerializerOutcome =
+  | { kind: "queued"; execId: number }
+  | { kind: "written"; execId: number }
+  | { kind: "not_written"; execId: number }
+  | { kind: "released"; execId: number }
+  | { kind: "ignored"; execId: number }
+
+/**
+ * Per-conversation, per-BiDi in-memory serializer for durable outbox entries.
  *
- * The fix is to gate the bridge → IDE direction on the IDE's own
- * confirmation that the previous exec slot has closed:
- *
- *   1. Every ExecServerMessage emit is routed through `enqueueAndEmit`.
- *   2. If no exec is in flight for the conversation, the frame is
- *      forwarded to the outbound writer immediately and the slot is
- *      marked busy.
- *   3. Otherwise the frame is parked on a FIFO queue and emitted later.
- *   4. When the IDE sends `ExecClientControlMessage.stream_close` (or
- *      the equivalent terminal `throw`) for the in-flight execId,
- *      `release` is called: the slot is cleared and the next queued
- *      frame is flushed.
- *
- * Edit's read→write protocol is naturally compatible: the IDE's
- * read_result + streamClose for the readArgs slot triggers `release`
- * before the bridge emits the matching writeArgs. If the bridge emits
- * writeArgs synchronously inside the read_result handler (i.e. before
- * the streamClose for the read slot has been parsed), the writeArgs is
- * queued and flushed the moment streamClose arrives — at most a few
- * milliseconds later, and on the same single-threaded event loop turn
- * that processed the read_result.
- *
- * # Lifecycle
- *
- * - `enqueueAndEmit`: dispatch site (replaces a raw `emit(frame)` call
- *   that carries an ExecServerMessage payload).
- * - `release`: called from the inbound parser when an
- *   `execStreamClose` or `execThrow` arrives.
- * - `clearConversation`: called when the BiDi stream tears down or the
- *   conversation is discarded; drops any queued frames so they are not
- *   leaked into a fresh BiDi attachment.
- *
- * # Invariants
- *
- * - Only one in-flight execId per conversation. The serializer never
- *   emits a queued frame while another is in flight; release is the
- *   only path to advance the queue.
- * - `release` for a non-matching execId is a no-op (logged at debug),
- *   so duplicate streamClose / out-of-order throws don't double-flush.
- * - All bookkeeping is per `conversationId`. The serializer never
- *   mixes state across conversations even when the supervisor races
- *   two BiDi attachments for the same cid.
+ * It never decides whether a frame was sent: the supplied writer must return
+ * an explicit outcome after moving the corresponding durable outbox row. On a
+ * `not_written` outcome this serializer drops only its in-memory schedule;
+ * durable queued entries remain available for explicit replay.
  */
 @Injectable()
 export class ExecDispatchSerializerService {
   private readonly logger = new Logger(ExecDispatchSerializerService.name)
 
-  private readonly stateByConversation = new Map<
+  private readonly stateByStream = new Map<
     string,
     {
-      inFlight?: { execId: number; label: string; sentAt: Date }
-      queue: Array<{
-        execId: number
-        frame: Buffer
-        label: string
-        queuedAt: number
-      }>
+      inFlight?: SerializedExecDispatch & { sentAt: Date }
+      queue: Array<SerializedExecDispatch & { queuedAt: number }>
+      writer: ExecDispatchWriter
       queuePressureNotified?: boolean
     }
   >()
 
   /**
-   * Dispatch an ExecServerMessage frame for `conversationId`. If no
-   * other ExecServerMessage is currently in flight on this
-   * conversation, the frame is emitted immediately via `emit`.
-   * Otherwise it is parked until the in-flight slot is released.
-   *
-   * Returns `true` if the frame was emitted synchronously, `false` if
-   * it was queued. This is used purely for tracing — both paths are
-   * functionally correct.
+   * Schedule one durable outbox entry. The first entry is offered to the
+   * writer immediately; later entries stay FIFO until the prior exact slot is
+   * released.
    */
-  enqueueAndEmit(
+  enqueueAndDispatch(
     conversationId: string,
-    execId: number,
-    frame: Buffer,
-    label: string,
-    emit: (frame: Buffer) => void
-  ): boolean {
-    if (!Number.isFinite(execId) || execId <= 0) {
-      this.logger.warn(
-        `enqueueAndEmit: skipping serialization for invalid execId=${execId} (label=${label}); emitting directly`
-      )
-      emit(frame)
-      return true
+    streamEpoch: string,
+    dispatch: SerializedExecDispatch,
+    writer: ExecDispatchWriter
+  ): ExecDispatchSerializerOutcome {
+    this.assertDispatch(dispatch, "enqueueAndDispatch")
+    const state = this.getOrCreateState(conversationId, streamEpoch, writer)
+    state.writer = writer
+    if (state.inFlight) {
+      this.assertNotScheduled(state, dispatch, "enqueueAndDispatch")
+      state.queue.push({ ...this.copyDispatch(dispatch), queuedAt: Date.now() })
+      this.logQueued(conversationId, streamEpoch, dispatch, state)
+      return { kind: "queued", execId: dispatch.execId }
     }
 
-    const state = this.getOrCreateState(conversationId)
-    if (!state.inFlight) {
-      state.inFlight = { execId, label, sentAt: new Date() }
-      this.logger.debug(
-        `ExecDispatch dispatch: conversation=${conversationId} execId=${execId} label=${label}`
-      )
-      emit(frame)
-      return true
-    }
-
-    state.queue.push({ execId, frame, label, queuedAt: Date.now() })
-    this.logger.debug(
-      `ExecDispatch queued: conversation=${conversationId} execId=${execId} label=${label} ` +
-        `(in-flight execId=${state.inFlight.execId} label=${state.inFlight.label}, queueDepth=${state.queue.length})`
+    return this.dispatchNow(
+      conversationId,
+      streamEpoch,
+      state,
+      dispatch,
+      writer
     )
-    if (
-      !state.queuePressureNotified &&
-      state.queue.length >= EXEC_DISPATCH_QUEUE_PRESSURE_THRESHOLD
-    ) {
-      state.queuePressureNotified = true
-      this.logger.warn(
-        `ExecDispatch queue pressure: conversation=${conversationId} queueDepth=${state.queue.length} ` +
-          `inFlightExecId=${state.inFlight.execId}`
-      )
-    }
-    return false
   }
 
   /**
-   * Mark the in-flight slot as released and flush the next queued
-   * frame, if any. The caller passes the same `emit` it used when
-   * enqueuing so the serializer doesn't have to capture writer state.
-   *
-   * Returns the execId of the frame that was flushed (if any), or
-   * undefined when nothing was queued.
+   * Replay an explicit, already-persisted queued set after reattachment. The
+   * caller supplies the durable order (normally `listQueuedForReplay` order).
+   * Existing in-memory scheduling is rejected rather than merged heuristically.
+   */
+  replayQueued(
+    conversationId: string,
+    streamEpoch: string,
+    dispatches: readonly SerializedExecDispatch[],
+    writer: ExecDispatchWriter
+  ): ExecDispatchSerializerOutcome[] {
+    const key = this.streamKey(conversationId, streamEpoch)
+    if (dispatches.length === 0) return []
+    if (this.stateByStream.has(key)) {
+      throw new Error(
+        `ExecDispatchSerializerService.replayQueued: stream already has in-memory scheduling ` +
+          `conversation=${conversationId} streamEpoch=${streamEpoch}`
+      )
+    }
+
+    const outcomes: ExecDispatchSerializerOutcome[] = []
+    for (const dispatch of dispatches) {
+      const outcome = this.enqueueAndDispatch(
+        conversationId,
+        streamEpoch,
+        dispatch,
+        writer
+      )
+      outcomes.push(outcome)
+      if (outcome.kind === "not_written") {
+        // The writer has explicitly preserved durable recovery state. Do not
+        // make later entries appear ordered behind a transport that is gone.
+        this.clearStream(conversationId, streamEpoch)
+        break
+      }
+    }
+    return outcomes
+  }
+
+  /**
+   * Release the exact in-flight slot after its protocol control/result path
+   * has completed. If a queued frame is next, it is offered to the writer.
    */
   release(
     conversationId: string,
+    streamEpoch: string,
     execId: number,
-    emit: (frame: Buffer) => void
-  ): number | undefined {
-    if (!Number.isFinite(execId) || execId <= 0) return undefined
-
-    const state = this.stateByConversation.get(conversationId)
-    if (!state) return undefined
-
-    if (!state.inFlight || state.inFlight.execId !== execId) {
-      // Either we never tracked this execId (e.g. inline tool that
-      // bypassed the serializer) or release has already been called
-      // for it. Both are benign and expected when result and stream-close
-      // arrive out of order, so avoid emitting one log line per duplicate.
-      return undefined
+    writer: ExecDispatchWriter
+  ): ExecDispatchSerializerOutcome {
+    this.assertExecId(execId, "release")
+    const state = this.stateByStream.get(
+      this.streamKey(conversationId, streamEpoch)
+    )
+    if (!state || !state.inFlight || state.inFlight.execId !== execId) {
+      return { kind: "ignored", execId }
     }
+    state.writer = writer
 
     const released = state.inFlight
     state.inFlight = undefined
     this.logger.debug(
-      `ExecDispatch released: conversation=${conversationId} execId=${released.execId} label=${released.label} ` +
+      `ExecDispatch released: conversation=${conversationId} streamEpoch=${streamEpoch} ` +
+        `execId=${released.execId} label=${released.label} ` +
         `held_ms=${Date.now() - released.sentAt.getTime()} queueDepth=${state.queue.length}`
     )
-
-    const next = state.queue.shift()
-    if (state.queue.length < EXEC_DISPATCH_QUEUE_PRESSURE_THRESHOLD) {
-      state.queuePressureNotified = false
-    }
-    if (!next) {
-      this.maybeCleanup(conversationId, state)
-      return undefined
-    }
-
-    const queueWaitMs = Date.now() - next.queuedAt
-    state.inFlight = {
-      execId: next.execId,
-      label: next.label,
-      sentAt: new Date(),
-    }
-    this.logger.debug(
-      `ExecDispatch dispatch (after release): conversation=${conversationId} execId=${next.execId} ` +
-        `label=${next.label} queueWaitMs=${queueWaitMs}`
-    )
-    emit(next.frame)
-    return next.execId
+    return this.dispatchNext(conversationId, streamEpoch, state, execId, writer)
   }
 
   /**
-   * Cancel one or more exec ids that will never receive an IDE-side
-   * terminal control message. Unlike repeatedly calling `release`, this
-   * first drops matching queued frames, so cancelling a whole interrupted
-   * turn cannot accidentally flush another stale frame from that same
-   * turn before its pending state is cleared.
+   * Remove exact cancelled slots from this stream's in-memory schedule. The
+   * caller must first move the matching durable rows to `cancelled`.
    */
   cancel(
     conversationId: string,
+    streamEpoch: string,
     execIds: Iterable<number>,
-    emit: (frame: Buffer) => void
-  ): number | undefined {
+    writer: ExecDispatchWriter
+  ): ExecDispatchSerializerOutcome {
+    const key = this.streamKey(conversationId, streamEpoch)
     const ids = new Set<number>()
     for (const execId of execIds) {
       if (!Number.isFinite(execId) || execId <= 0) continue
       ids.add(Math.floor(execId))
     }
-    if (ids.size === 0) return undefined
+    if (ids.size === 0) {
+      return { kind: "ignored", execId: 0 }
+    }
 
-    const state = this.stateByConversation.get(conversationId)
-    if (!state) return undefined
+    const state = this.stateByStream.get(key)
+    if (!state) return { kind: "ignored", execId: Array.from(ids)[0]! }
+    state.writer = writer
 
     const beforeQueueDepth = state.queue.length
     state.queue = state.queue.filter((entry) => !ids.has(entry.execId))
@@ -219,101 +185,274 @@ export class ExecDispatchSerializerService {
     if (!state.inFlight || !ids.has(state.inFlight.execId)) {
       if (droppedQueued > 0) {
         this.logger.debug(
-          `ExecDispatch cancel queued: conversation=${conversationId} ` +
-            `execIds=${Array.from(ids).join(",")} droppedQueued=${droppedQueued} ` +
-            `queueDepth=${state.queue.length}`
+          `ExecDispatch cancelled queued: conversation=${conversationId} ` +
+            `streamEpoch=${streamEpoch} execIds=${Array.from(ids).join(",")} ` +
+            `droppedQueued=${droppedQueued} queueDepth=${state.queue.length}`
         )
       }
-      this.maybeCleanup(conversationId, state)
-      return undefined
+      this.maybeCleanup(conversationId, streamEpoch, state)
+      return { kind: "ignored", execId: Array.from(ids)[0]! }
     }
 
     const cancelled = state.inFlight
     state.inFlight = undefined
     this.logger.debug(
-      `ExecDispatch cancelled: conversation=${conversationId} execId=${cancelled.execId} ` +
-        `label=${cancelled.label} held_ms=${Date.now() - cancelled.sentAt.getTime()} ` +
+      `ExecDispatch cancelled: conversation=${conversationId} streamEpoch=${streamEpoch} ` +
+        `execId=${cancelled.execId} label=${cancelled.label} ` +
+        `held_ms=${Date.now() - cancelled.sentAt.getTime()} ` +
         `droppedQueued=${droppedQueued} queueDepth=${state.queue.length}`
     )
-
-    const next = state.queue.shift()
-    if (!next) {
-      this.maybeCleanup(conversationId, state)
-      return undefined
-    }
-
-    state.inFlight = {
-      execId: next.execId,
-      label: next.label,
-      sentAt: new Date(),
-    }
-    this.logger.debug(
-      `ExecDispatch dispatch (after cancel): conversation=${conversationId} execId=${next.execId} label=${next.label}`
+    return this.dispatchNext(
+      conversationId,
+      streamEpoch,
+      state,
+      cancelled.execId,
+      writer
     )
-    emit(next.frame)
-    return next.execId
   }
 
   /**
-   * Drop everything tracked for a conversation. Called on BiDi
-   * teardown, supersede, or session deletion. Frames currently parked
-   * on the queue are NOT emitted — the IDE has either gone away or is
-   * about to receive a fresh stream where their original execIds no
-   * longer make sense.
+   * Remove slots whose durable cancellation already committed with graph
+   * cleanup. The stream's registered writer is reused so an unaffected FIFO
+   * successor can be delivered without giving the cleanup layer transport
+   * ownership.
    */
-  clearConversation(conversationId: string): void {
-    const state = this.stateByConversation.get(conversationId)
+  cancelCommitted(
+    conversationId: string,
+    streamEpoch: string,
+    execIds: Iterable<number>
+  ): ExecDispatchSerializerOutcome {
+    const state = this.stateByStream.get(
+      this.streamKey(conversationId, streamEpoch)
+    )
+    if (!state) {
+      return { kind: "ignored", execId: 0 }
+    }
+    try {
+      return this.cancel(conversationId, streamEpoch, execIds, state.writer)
+    } catch (error) {
+      // The durable cancellation is already terminal. dispatchNow removes the
+      // ephemeral schedule and the writer re-queues an unwritten successor in
+      // the outbox, so surfacing this error would only misreport the committed
+      // graph cleanup as retryable.
+      this.logger.error(
+        `ExecDispatch post-commit cancellation reconciliation failed: ` +
+          `conversation=${conversationId} streamEpoch=${streamEpoch} ` +
+          `${String(error)}`
+      )
+      return { kind: "not_written", execId: 0 }
+    }
+  }
+
+  /** Drop ephemeral scheduling only; durable outbox rows remain untouched. */
+  clearStream(conversationId: string, streamEpoch: string): void {
+    const key = this.streamKey(conversationId, streamEpoch)
+    const state = this.stateByStream.get(key)
     if (!state) return
     if (state.inFlight || state.queue.length > 0) {
       this.logger.debug(
-        `ExecDispatch clear: conversation=${conversationId} ` +
+        `ExecDispatch clear: conversation=${conversationId} streamEpoch=${streamEpoch} ` +
           `dropped in-flight=${state.inFlight ? state.inFlight.execId : "(none)"} ` +
           `queueDepth=${state.queue.length}`
       )
     }
-    this.stateByConversation.delete(conversationId)
+    this.stateByStream.delete(key)
   }
 
-  /**
-   * Diagnostic snapshot — used by tests and turn telemetry to verify
-   * the serializer is in the expected state. Returns `undefined` when
-   * the conversation has no tracked state.
-   */
-  snapshot(conversationId: string):
+  snapshot(
+    conversationId: string,
+    streamEpoch: string
+  ):
     | {
         inFlight?: { execId: number; label: string; sentAt: Date }
         queueDepth: number
         queuedExecIds: number[]
       }
     | undefined {
-    const state = this.stateByConversation.get(conversationId)
+    const state = this.stateByStream.get(
+      this.streamKey(conversationId, streamEpoch)
+    )
     if (!state) return undefined
     return {
       inFlight: state.inFlight
-        ? { ...state.inFlight, sentAt: new Date(state.inFlight.sentAt) }
+        ? {
+            execId: state.inFlight.execId,
+            label: state.inFlight.label,
+            sentAt: new Date(state.inFlight.sentAt),
+          }
         : undefined,
       queueDepth: state.queue.length,
       queuedExecIds: state.queue.map((entry) => entry.execId),
     }
   }
 
+  private dispatchNext(
+    conversationId: string,
+    streamEpoch: string,
+    state: NonNullable<ReturnType<typeof this.stateByStream.get>>,
+    releasedExecId: number,
+    writer: ExecDispatchWriter
+  ): ExecDispatchSerializerOutcome {
+    const next = state.queue.shift()
+    if (state.queue.length < EXEC_DISPATCH_QUEUE_PRESSURE_THRESHOLD) {
+      state.queuePressureNotified = false
+    }
+    if (!next) {
+      this.maybeCleanup(conversationId, streamEpoch, state)
+      return { kind: "released", execId: releasedExecId }
+    }
+    return this.dispatchNow(conversationId, streamEpoch, state, next, writer)
+  }
+
+  private dispatchNow(
+    conversationId: string,
+    streamEpoch: string,
+    state: NonNullable<ReturnType<typeof this.stateByStream.get>>,
+    dispatch: SerializedExecDispatch,
+    writer: ExecDispatchWriter
+  ): ExecDispatchSerializerOutcome {
+    const copied = this.copyDispatch(dispatch)
+    state.inFlight = { ...copied, sentAt: new Date() }
+    this.logger.debug(
+      `ExecDispatch dispatch: conversation=${conversationId} streamEpoch=${streamEpoch} ` +
+        `execId=${copied.execId} label=${copied.label}`
+    )
+    let outcome: ExecDispatchWriteOutcome
+    try {
+      outcome = writer(copied)
+    } catch (error) {
+      this.stateByStream.delete(this.streamKey(conversationId, streamEpoch))
+      throw error
+    }
+    if (outcome === "written") {
+      return { kind: "written", execId: copied.execId }
+    }
+    if (outcome !== "not_written") {
+      this.stateByStream.delete(this.streamKey(conversationId, streamEpoch))
+      throw new Error(
+        `ExecDispatchSerializerService writer returned invalid outcome for ` +
+          `conversation=${conversationId} streamEpoch=${streamEpoch} execId=${copied.execId}`
+      )
+    }
+
+    // Do not retain later in-memory queue entries after an explicit failed
+    // write. Their durable rows are still queued and an explicit replay owns
+    // the next attempt.
+    this.stateByStream.delete(this.streamKey(conversationId, streamEpoch))
+    return { kind: "not_written", execId: copied.execId }
+  }
+
+  private logQueued(
+    conversationId: string,
+    streamEpoch: string,
+    dispatch: SerializedExecDispatch,
+    state: NonNullable<ReturnType<typeof this.stateByStream.get>>
+  ): void {
+    this.logger.debug(
+      `ExecDispatch queued: conversation=${conversationId} streamEpoch=${streamEpoch} ` +
+        `execId=${dispatch.execId} label=${dispatch.label} ` +
+        `(in-flight execId=${state.inFlight?.execId ?? "(none)"}, ` +
+        `queueDepth=${state.queue.length})`
+    )
+    if (
+      !state.queuePressureNotified &&
+      state.queue.length >= EXEC_DISPATCH_QUEUE_PRESSURE_THRESHOLD
+    ) {
+      state.queuePressureNotified = true
+      this.logger.warn(
+        `ExecDispatch queue pressure: conversation=${conversationId} ` +
+          `streamEpoch=${streamEpoch} queueDepth=${state.queue.length} ` +
+          `inFlightExecId=${state.inFlight?.execId ?? "(none)"}`
+      )
+    }
+  }
+
+  private assertNotScheduled(
+    state: NonNullable<ReturnType<typeof this.stateByStream.get>>,
+    dispatch: SerializedExecDispatch,
+    operation: string
+  ): void {
+    if (
+      state.inFlight?.execId === dispatch.execId ||
+      state.queue.some((entry) => entry.execId === dispatch.execId)
+    ) {
+      throw new Error(
+        `ExecDispatchSerializerService.${operation}: execId=${dispatch.execId} ` +
+          "is already scheduled for this stream"
+      )
+    }
+  }
+
+  private assertDispatch(
+    dispatch: SerializedExecDispatch,
+    operation: string
+  ): void {
+    this.assertExecId(dispatch.execId, operation)
+    requireExactDurableIdentifier(
+      dispatch.protocolExecId,
+      `ExecDispatchSerializerService.${operation}: protocolExecId`
+    )
+    if (!Buffer.isBuffer(dispatch.frame) || dispatch.frame.length === 0) {
+      throw new Error(
+        `ExecDispatchSerializerService.${operation}: frame must be a non-empty Buffer`
+      )
+    }
+    if (!dispatch.label.trim()) {
+      throw new Error(
+        `ExecDispatchSerializerService.${operation}: label is required`
+      )
+    }
+  }
+
+  private assertExecId(execId: number, operation: string): void {
+    if (!Number.isFinite(execId) || execId <= 0 || !Number.isInteger(execId)) {
+      throw new Error(
+        `ExecDispatchSerializerService.${operation}: execId must be a positive integer`
+      )
+    }
+  }
+
+  private copyDispatch(
+    dispatch: SerializedExecDispatch
+  ): SerializedExecDispatch {
+    return {
+      execId: dispatch.execId,
+      protocolExecId: dispatch.protocolExecId,
+      frame: Buffer.from(dispatch.frame),
+      label: dispatch.label,
+    }
+  }
+
   private getOrCreateState(
-    conversationId: string
-  ): NonNullable<ReturnType<typeof this.stateByConversation.get>> {
-    let state = this.stateByConversation.get(conversationId)
+    conversationId: string,
+    streamEpoch: string,
+    writer: ExecDispatchWriter
+  ): NonNullable<ReturnType<typeof this.stateByStream.get>> {
+    const key = this.streamKey(conversationId, streamEpoch)
+    let state = this.stateByStream.get(key)
     if (!state) {
-      state = { queue: [] }
-      this.stateByConversation.set(conversationId, state)
+      state = { queue: [], writer }
+      this.stateByStream.set(key, state)
     }
     return state
   }
 
   private maybeCleanup(
     conversationId: string,
+    streamEpoch: string,
     state: { inFlight?: unknown; queue: unknown[] }
   ): void {
     if (!state.inFlight && state.queue.length === 0) {
-      this.stateByConversation.delete(conversationId)
+      this.stateByStream.delete(this.streamKey(conversationId, streamEpoch))
     }
+  }
+
+  private streamKey(conversationId: string, streamEpoch: string): string {
+    const exactConversationId = ConversationId.of(conversationId)
+    const exactStreamEpoch = requireExactDurableIdentifier(
+      streamEpoch,
+      "ExecDispatchSerializerService streamEpoch"
+    )
+    return `${exactConversationId}\u0000${exactStreamEpoch}`
   }
 }

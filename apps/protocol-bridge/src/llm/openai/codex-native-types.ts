@@ -1,9 +1,26 @@
 import type { ProviderMessageContent } from "../../shared/provider-content"
 import type { ThinkingIntent } from "../shared/thinking-types"
+import type { CodexProviderIdentity } from "./codex-provider-identity"
+import type { CodexProjectionState } from "./codex-projection-state"
+
+/**
+ * Bridge-local ownership of the native Responses continuation chain.
+ *
+ * This is intentionally not a wire field. A physical provider attempt must
+ * decide its input shape before dispatch, while the shared response baseline
+ * is published only after that attempt crosses its acceptance boundary.
+ */
+export type CodexContinuationPolicy = "auto" | "full" | "isolated"
 
 export interface CodexConversationMessage {
   role: "user" | "assistant" | "developer"
   content: ProviderMessageContent
+  /**
+   * Durable session-graph identity used by the bridge projection layer.
+   * The Codex wire encoder deliberately ignores this field; history
+   * projection must retain it until the native input item is bound.
+   */
+  sourceUuid?: string
   /**
    * Split-sibling assistant message id. Main Cursor streaming persists each
    * content block separately while sharing this id; Codex projection uses it
@@ -36,28 +53,95 @@ export interface CodexSystemTextBlock {
   text?: string
 }
 
-export interface CodexExecutionRequest {
+/**
+ * Fields shared by every request sent to the native Codex Responses
+ * transport. These values are deliberately independent of how the prompt
+ * itself is sourced.
+ */
+interface CodexExecutionRequestBase {
   model: string
   system?: string | CodexSystemTextBlock[]
-  contextMessages?: CodexConversationMessage[]
-  messages: CodexConversationMessage[]
   tools?: CodexConversationTool[]
-  conversationId?: string
-  pendingToolUseIds?: string[]
-  inputToolIntegrity?: "sanitize" | "preserve"
+  /**
+   * Formal Responses-native identity. This is deliberately distinct from the
+   * local projection key below. Upstream cache/account policy may use the
+   * native session id but must never derive it from that local key.
+   */
+  upstreamIdentity: CodexProviderIdentity
+  /**
+   * Bridge-only continuation/projection scope. It never crosses the native
+   * identity boundary as a session id, thread id, or prompt-cache key.
+   */
+  localProjectionKey: string
+  /**
+   * `auto` derives a candidate-local incremental request from the last
+   * accepted response. `full` always sends the complete native input and
+   * replaces that baseline only after acceptance. `isolated` sends a complete
+   * input without reading or publishing the shared response chain.
+   */
+  continuationPolicy?: CodexContinuationPolicy
   thinkingIntent?: ThinkingIntent | null
   includeThinkingSummary?: boolean
   serviceTier?: string
+  /** Exact Responses tool-selection policy for this physical request. */
+  toolChoice?: string | Record<string, unknown>
   parallelToolCalls?: boolean
-  cacheUserId?: string
-  /**
-   * @deprecated previous_response_id 现在由 CodexService.streamViaWebSocket() 在 transport 层自动注入，
-   * 由 strict incremental delta 校验保护。不再从外部传入。该字段不参与请求构建。
-   * 保留字段声明以避免现有调用方的编译错误。
-   */
-  previousResponseId?: string
   clientMetadata?: Record<string, string>
   textVerbosity?: string
+}
+
+/**
+ * A normal bridge execution starts from durable conversation messages and is
+ * projected to Responses input at the Codex boundary.
+ */
+export interface CodexExecutionRequest extends CodexExecutionRequestBase {
+  contextMessages?: CodexConversationMessage[]
+  messages: CodexConversationMessage[]
+  nativeInput?: never
+  /**
+   * Provider-native active history. When supplied, `messages` and
+   * `contextMessages` are the current-step reinjection tail; the projection
+   * state owns prior Codex ResponseItems and compaction replacements.
+   */
+  projectionState?: CodexProjectionState
+}
+
+/**
+ * A native rollout request bypasses conversation-message projection entirely.
+ * It exists for paths such as Remote Compaction V2 whose input is already an
+ * exact Responses rollout. `never` fields make mixed prompt sources a type
+ * error for bridge callers; the projector retains a runtime boundary check
+ * for untyped external input.
+ */
+export interface CodexNativeInputExecutionRequest extends CodexExecutionRequestBase {
+  nativeInput: readonly CodexInputItem[]
+  messages?: never
+  contextMessages?: never
+  projectionState?: never
+}
+
+/**
+ * The only two native Codex prompt sources. Transport receives this union so
+ * a rollout-native request is never forced through an empty-message adapter.
+ */
+export type CodexProviderExecutionRequest =
+  | CodexExecutionRequest
+  | CodexNativeInputExecutionRequest
+
+/**
+ * Remote Compaction V2 receives the exact native prompt history before the
+ * trailing `compaction_trigger` is appended. Keeping this separate from a
+ * normal execution request makes it impossible for callers to accidentally
+ * rebuild the history through UnifiedMessage projection.
+ */
+export type CodexRemoteCompactionV2Request = Omit<
+  CodexNativeInputExecutionRequest,
+  "nativeInput"
+> & {
+  /** Full provider-native prompt input before the new trigger item. */
+  nativeInput: readonly CodexInputItem[]
+  /** The owning turn cancels this request when it is superseded. */
+  signal: AbortSignal
 }
 
 export interface CodexInputMessage {

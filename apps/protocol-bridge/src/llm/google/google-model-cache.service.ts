@@ -94,8 +94,8 @@ export class GoogleModelCacheService implements OnModuleInit {
         )
       }
     } else {
-      this.logger.warn(
-        "Antigravity not configured, using default Gemini models"
+      this.logger.log(
+        "Native Google worker is not ready during model-cache initialization; using the default Gemini model catalog until the worker loads"
       )
     }
   }

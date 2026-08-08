@@ -4,8 +4,6 @@ import {
   isAccountDisabled,
 } from "../shared/account-cooldown"
 
-export type CodexQuotaTier = "primary" | "secondary"
-
 export interface CodexSlotAvailabilityOptions<
   TSlot extends CooldownableAccount,
 > {
@@ -13,11 +11,7 @@ export interface CodexSlotAvailabilityOptions<
   model: string
   now: number
   isRateLimitExhausted: (slot: TSlot, model: string) => boolean
-  getQuotaCooldownUntil: (
-    slot: TSlot,
-    tier: CodexQuotaTier,
-    model: string
-  ) => number
+  getWeeklyQuotaCooldownUntil: (slot: TSlot, model: string) => number
 }
 
 export interface CodexSlotRecoveryTimeOptions<
@@ -27,11 +21,7 @@ export interface CodexSlotRecoveryTimeOptions<
   model: string
   now: number
   isModelSupported: (slot: TSlot, model: string) => boolean
-  getQuotaCooldownUntil: (
-    slot: TSlot,
-    tier: CodexQuotaTier,
-    model: string
-  ) => number
+  getWeeklyQuotaCooldownUntil: (slot: TSlot, model: string) => number
 }
 
 export function isCodexSlotAvailableForModel<TSlot extends CooldownableAccount>(
@@ -43,21 +33,11 @@ export function isCodexSlotAvailableForModel<TSlot extends CooldownableAccount>(
     return false
   }
 
-  const weeklyQuotaCooldownUntil = options.getQuotaCooldownUntil(
+  const weeklyQuotaCooldownUntil = options.getWeeklyQuotaCooldownUntil(
     slot,
-    "secondary",
     model
   )
   if (weeklyQuotaCooldownUntil > now) {
-    return false
-  }
-
-  const primaryQuotaCooldownUntil = options.getQuotaCooldownUntil(
-    slot,
-    "primary",
-    model
-  )
-  if (primaryQuotaCooldownUntil > now) {
     return false
   }
 
@@ -84,18 +64,8 @@ export function getCodexSlotRecoveryTimeForModel<
     recoveryCandidates.push(modelState.cooldownUntil)
   }
 
-  const primaryQuotaCooldownUntil = options.getQuotaCooldownUntil(
+  const weeklyQuotaCooldownUntil = options.getWeeklyQuotaCooldownUntil(
     slot,
-    "primary",
-    model
-  )
-  if (primaryQuotaCooldownUntil > now) {
-    recoveryCandidates.push(primaryQuotaCooldownUntil)
-  }
-
-  const weeklyQuotaCooldownUntil = options.getQuotaCooldownUntil(
-    slot,
-    "secondary",
     model
   )
   if (weeklyQuotaCooldownUntil > now) {

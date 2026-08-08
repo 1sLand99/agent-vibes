@@ -56,12 +56,9 @@ export interface ToolUseSummaryInput {
   parentModel: string
   /**
    * Backend that served the parent turn.  Plumbed through so the haiku
-   * summary call lands on the same backend pool the parent's accounts
-   * are configured on (Kiro-only deployments would otherwise route to
-   * Claude API and fail with "no configured account").  Optional —
-   * absent means use the historical Claude-API default.
+   * summary call lands on the same accepted backend as its parent.
    */
-  parentBackend?: BackendType
+  parentBackend: BackendType
   /**
    * Per-subagent override (looked up against
    * `TOOL_USE_SUMMARY_SUBAGENT_TYPE`) captured from the active
@@ -89,7 +86,7 @@ export interface ToolUseSummaryInput {
   lastAssistantText?: string
   abortSignal?: AbortSignal
   /** For telemetry attribution; not part of the prompt. */
-  conversationId?: string
+  conversationId: string
 }
 
 @Injectable()
@@ -137,6 +134,7 @@ export class ToolUseSummaryService {
         maxOutputTokens: 64,
         abortSignal: input.abortSignal,
         parentBackend: input.parentBackend,
+        parentSessionId: input.conversationId,
         // Undefined here means the fork helper inherits the parent
         // model verbatim (cache-friendly). When the user pinned a
         // specific model in the settings UI we hand its id through.

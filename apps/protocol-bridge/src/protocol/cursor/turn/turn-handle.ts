@@ -1,4 +1,5 @@
 import type { TurnOutbound } from "../bidi/bidi-outbound"
+import type { ProjectionOwner } from "../session/projection-owner"
 import type {
   CancelReason,
   ConversationId,
@@ -29,6 +30,8 @@ export interface TurnHandle {
   readonly turnId: TurnId
   readonly turnKind: TurnKind
   readonly conversationId: ConversationId
+  /** Exact durable projection owner for all work and audit emitted by this turn. */
+  readonly projectionOwner: ProjectionOwner
   readonly streamId: StreamId
 
   /**
@@ -60,9 +63,10 @@ export interface TurnHandle {
   recordPhase(phase: TurnPhase, detail?: string): void
 
   /**
-   * Report the terminal result. Calling this twice is a programmer
-   * error — the second call throws. The supervisor resolves the
-   * `awaitTerminal()` promise off this report.
+   * Nominate the terminal result. Calling this twice is a programmer
+   * error — the second call throws. The lifecycle publishes the result only
+   * after its required finalization succeeds; if that finalization fails,
+   * `awaitTerminal()` resolves with `failed` instead of this proposal.
    */
   reportTerminal(result: TurnTerminalResult): void
 

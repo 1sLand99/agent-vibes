@@ -122,13 +122,15 @@ export function createCodexApiErrorFromBody(
     options.nowSeconds
   )
   const details = summarizeCodexErrorBody(errorBody, options.maxDetailsLength)
+  const providerCode = extractCodexErrorCode(errorBody) ?? undefined
 
   if (retryAfter != null) {
     const suffix = details ? ` ${details}` : ""
     return new CodexApiError(
       statusCode,
       `Codex rate limited. Retry after ${retryAfter} seconds.${suffix}`,
-      retryAfter
+      retryAfter,
+      providerCode
     )
   }
 
@@ -136,7 +138,7 @@ export function createCodexApiErrorFromBody(
     ? `Codex API error ${statusCode}: ${details}`
     : `Codex API error ${statusCode}`
 
-  return new CodexApiError(statusCode, message)
+  return new CodexApiError(statusCode, message, undefined, providerCode)
 }
 
 function parseJsonObject(value: string): Record<string, unknown> | null {

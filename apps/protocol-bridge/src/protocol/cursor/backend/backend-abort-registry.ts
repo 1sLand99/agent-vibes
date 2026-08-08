@@ -4,18 +4,10 @@ export interface RegisteredBackendAbortController {
 }
 
 /**
- * Per-conversation, per-stream registry of in-flight backend HTTP
- * AbortControllers. The registry is the lone owner of cancellation tokens for
- * already-opened streaming LLM calls; it is *not* responsible for abortable
- * work that has not yet reached the network (e.g. an LLM compaction call
- * scheduled inside `prepareContextWithCompactRunner`). Those callers must
- * obtain an AbortSignal from the per-turn AbortController on
- * `SessionRecord.currentTurnAbortController` and combine it with whatever
- * signal this registry hands out at register-time.
- *
- * Moved from `cursor/session/backend-stream-abort-registry.ts` as part of
- * Phase A of the cursor-namespace rewrite. Behaviour is unchanged; the old
- * path remains as a re-export shim for the duration of the rewrite.
+ * Per-conversation, per-stream owner of cancellation for already-opened
+ * provider HTTP streams. Request preparation and compaction are bounded by
+ * the exact turn signal before a stream is registered; once open, this
+ * registry composes that signal with stream supersede and consumer-close.
  */
 export class BackendAbortRegistry {
   private readonly controllersByConversation = new Map<

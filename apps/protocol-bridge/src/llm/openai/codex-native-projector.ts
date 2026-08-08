@@ -1,10 +1,16 @@
-import { codexResponseOutputItemToInputItem } from "./codex-response-items"
-import { sanitizeResponsesToolCallIntegrity } from "../shared/openai-tool-call-integrity"
-import { CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE } from "../../shared/provider-content"
+import {
+  assertCodexPromptToolPairs,
+  projectCodexPrompt,
+  type CodexProjectionManifest,
+} from "./codex-projection-state"
+import { requireExactDurableIdentifier } from "../../context/durable-identifier"
 import {
   type CodexConversationTool,
+  type CodexConversationMessage,
   type CodexExecutionRequest,
   type CodexInputItem,
+  type CodexNativeInputExecutionRequest,
+  type CodexProviderExecutionRequest,
   type CodexRequest,
   type CodexReasoningInputItem,
   type CodexSystemTextBlock,
@@ -19,6 +25,8 @@ export interface CodexNativeProjection {
   tools?: CodexTool[]
   serviceTier?: string
   reasoning: CodexRequest["reasoning"]
+  /** Provider-native provenance for a request built from Codex rollout state. */
+  manifest?: CodexProjectionManifest
 }
 
 export interface CodexNativeProjectionOptions {
@@ -34,6 +42,18 @@ type CodexProjectableMessage = {
   messageId?: string
 }
 
+/** One durable source record and the exact Cursor message it contributes. */
+export interface CodexInputProjectionSource {
+  sourceRecordId: string
+  message: CodexConversationMessage
+}
+
+/** Exact source-to-native-items output for Codex projection persistence. */
+export interface CodexProjectedInputBinding {
+  sourceRecordId: string
+  items: CodexInputItem[]
+}
+
 type CodexProjectableBlock = {
   type?: string
   text?: string
@@ -41,6 +61,7 @@ type CodexProjectableBlock = {
   name?: string
   input?: unknown
   tool_use_id?: string
+  structuredContent?: Record<string, unknown>
   item?: unknown
   thinking?: string
   signature?: string
@@ -86,16 +107,134 @@ const TOOL_SCHEMA_DOC_KEYS = new Set([
 ])
 
 export function projectCodexNativeRequest(
-  request: CodexExecutionRequest,
+  request: CodexProviderExecutionRequest,
   modelName: string = request.model,
   options: CodexNativeProjectionOptions = {}
 ): CodexNativeProjection {
+  if (request.nativeInput !== undefined) {
+    assertExclusiveCodexNativeInputRequest(request)
+    return {
+      instructions: buildCodexInstructions(request),
+      input: cloneCodexNativeInput(request.nativeInput),
+      tools: projectCodexTools(request.tools),
+      serviceTier: normalizeCodexServiceTier(request.serviceTier),
+      reasoning: buildCodexReasoning(request, modelName),
+    }
+  }
+
+  const tools = projectCodexTools(request.tools)
+  const projectedInput = projectCodexInputItems(request, options)
+  const projection = request.projectionState
+    ? projectCodexPrompt(request.projectionState, {
+        reinjectedItems: projectedInput,
+        tools,
+        settings: buildCodexProjectionSettings(request, modelName),
+      })
+    : undefined
+  if (!projection) {
+    assertCodexPromptToolPairs(projectedInput)
+  }
   return {
     instructions: buildCodexInstructions(request),
-    input: projectCodexInputItems(request, options),
-    tools: projectCodexTools(request.tools),
+    input: projection?.input ?? projectedInput,
+    tools,
     serviceTier: normalizeCodexServiceTier(request.serviceTier),
     reasoning: buildCodexReasoning(request, modelName),
+    manifest: projection?.manifest,
+  }
+}
+
+/**
+ * Native rollout input is a separate source of truth. In particular, a
+ * Remote Compaction V2 request must not silently append UnifiedMessage output
+ * or a stale projection-state history to the exact provider-native prompt.
+ * The native request contract excludes projected fields at compile time; this
+ * check protects the same boundary when a caller crosses it with untyped data.
+ */
+function assertExclusiveCodexNativeInputRequest(
+  request: CodexNativeInputExecutionRequest
+): void {
+  if (!Array.isArray(request.nativeInput)) {
+    throw new Error("Codex native input must be an array")
+  }
+  const untypedRequest: {
+    messages?: unknown
+    contextMessages?: unknown
+    projectionState?: unknown
+  } = request
+  const messages = untypedRequest.messages
+  if (Array.isArray(messages) && messages.length > 0) {
+    throw new Error(
+      "Codex native input cannot be combined with projected messages"
+    )
+  }
+  const contextMessages = untypedRequest.contextMessages
+  if (Array.isArray(contextMessages) && contextMessages.length > 0) {
+    throw new Error(
+      "Codex native input cannot be combined with projected context messages"
+    )
+  }
+  if (untypedRequest.projectionState !== undefined) {
+    throw new Error(
+      "Codex native input cannot be combined with a projection state"
+    )
+  }
+}
+
+/**
+ * Responses input is JSON wire data. Clone it before request assembly so the
+ * transport, retry, or sanitizer path cannot mutate the persisted rollout
+ * source owned by the caller. Non-JSON input is a protocol error rather than
+ * an opportunity to synthesize a replacement representation.
+ */
+function cloneCodexNativeInput(
+  input: readonly CodexInputItem[]
+): CodexInputItem[] {
+  return input.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`Codex native input item ${index} must be an object`)
+    }
+    assertExactNativeInputIdentifiers(item, index)
+    try {
+      return JSON.parse(JSON.stringify(item)) as CodexInputItem
+    } catch (error) {
+      throw new Error(
+        `Codex native input item ${index} is not JSON-serializable: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+  })
+}
+
+function assertExactNativeInputIdentifiers(
+  item: CodexInputItem,
+  index: number
+): void {
+  const record = item as Record<string, unknown>
+  if (record.id !== undefined) {
+    requireExactDurableIdentifier(
+      record.id,
+      `Codex native input item ${index} id`
+    )
+  }
+  if (record.call_id !== undefined) {
+    requireExactDurableIdentifier(
+      record.call_id,
+      `Codex native input item ${index} call_id`
+    )
+  }
+  if (record.sourceUuid !== undefined) {
+    requireExactDurableIdentifier(
+      record.sourceUuid,
+      `Codex native input item ${index} sourceUuid`
+    )
+  }
+  if (record.messageId !== undefined) {
+    requireExactDurableIdentifier(
+      record.messageId,
+      `Codex native input item ${index} messageId`
+    )
   }
 }
 
@@ -108,124 +247,131 @@ export function buildCodexInstructions(
 export function projectCodexInputItems(
   request: Pick<
     CodexExecutionRequest,
-    | "contextMessages"
-    | "messages"
-    | "tools"
-    | "pendingToolUseIds"
-    | "inputToolIntegrity"
+    "contextMessages" | "messages" | "tools"
   >,
   options: CodexNativeProjectionOptions = {}
 ): CodexInputItem[] {
+  const entries = projectCodexInputEntries(
+    request,
+    [
+      ...(request.contextMessages || []).map((message) => ({ message })),
+      ...request.messages.map((message) => ({ message })),
+    ],
+    options
+  )
+  return entries.map(({ item }) => item)
+}
+
+/**
+ * Projects all sources in one pass so tool-call/output typing remains shared
+ * across message boundaries, while preserving an exact binding for every
+ * generated native item. This deliberately skips prompt-only normalization.
+ */
+export function projectCodexInputBindings(
+  request: Pick<CodexExecutionRequest, "tools">,
+  sources: readonly CodexInputProjectionSource[],
+  options: CodexNativeProjectionOptions = {}
+): CodexProjectedInputBinding[] {
+  const exactSources = sources.map((source, index) => ({
+    ...source,
+    sourceRecordId: requireExactDurableIdentifier(
+      source.sourceRecordId,
+      `Codex input projection sourceRecordId at index ${index}`
+    ),
+  }))
+  const seenSourceIds = new Set<string>()
+  for (const source of exactSources) {
+    const sourceRecordId = source.sourceRecordId
+    if (seenSourceIds.has(sourceRecordId)) {
+      throw new Error(
+        `Codex input projection has duplicate sourceRecordId ${sourceRecordId}`
+      )
+    }
+    seenSourceIds.add(sourceRecordId)
+  }
+
+  const entries = projectCodexInputEntries(
+    request,
+    exactSources.map((source) => ({
+      sourceRecordId: source.sourceRecordId,
+      message: source.message,
+    })),
+    options
+  )
+  return exactSources.map((source) => {
+    const sourceRecordId = source.sourceRecordId
+    const items = entries
+      .filter((entry) => entry.sourceRecordId === sourceRecordId)
+      .map((entry) => entry.item)
+    if (items.length === 0) {
+      throw new Error(
+        `Codex source record ${sourceRecordId} produced no native input items`
+      )
+    }
+    return { sourceRecordId, items }
+  })
+}
+
+function projectCodexInputEntries(
+  request: Pick<CodexExecutionRequest, "tools">,
+  sources: readonly {
+    sourceRecordId?: string
+    message: CodexProjectableMessage
+  }[],
+  options: CodexNativeProjectionOptions
+): Array<{ item: CodexInputItem; sourceRecordId?: string }> {
   const shortenName = buildToolNameShortener(request.tools)
   const toolTypeByName = buildToolTypeLookup(request.tools)
   const toolCallTypeById = new Map<string, CodexProjectedToolCallType>()
   const input: CodexInputItem[] = []
+  const sourceRecordIds: Array<string | undefined> = []
 
-  const appendMessages = (messages: CodexProjectableMessage[]) => {
-    const assistantMessageIdsWithRawItems = new Set<string>()
-    const assistantMessageIndexesInRawRuns = new Set<number>()
-    let currentAssistantRunIndexes: number[] = []
-    let currentAssistantRunHasRawItems = false
-    const flushAssistantRun = () => {
-      if (currentAssistantRunHasRawItems) {
-        for (const index of currentAssistantRunIndexes) {
-          assistantMessageIndexesInRawRuns.add(index)
-        }
+  for (const source of sources) {
+    if (source.sourceRecordId !== undefined) {
+      requireExactDurableIdentifier(
+        source.sourceRecordId,
+        "Codex projected source record id"
+      )
+    }
+    const msg = source.message
+    const initialItemCount = input.length
+    const role = msg.role
+    const messageContent: Array<Record<string, unknown>> = []
+    let hasContent = false
+
+    const flushMessage = () => {
+      if (!hasContent) {
+        return
       }
-      currentAssistantRunIndexes = []
-      currentAssistantRunHasRawItems = false
+      input.push({
+        type: "message",
+        role,
+        content: [...messageContent],
+      })
+      messageContent.length = 0
+      hasContent = false
     }
 
-    for (let index = 0; index < messages.length; index++) {
-      const msg = messages[index]!
-      if (msg.role !== "assistant") {
-        flushAssistantRun()
-        continue
-      }
-      currentAssistantRunIndexes.push(index)
-      const messageId =
-        typeof msg.messageId === "string" ? msg.messageId.trim() : ""
-      if (messageHasRawCodexResponseItems(msg)) {
-        currentAssistantRunHasRawItems = true
-        if (messageId) {
-          assistantMessageIdsWithRawItems.add(messageId)
-        }
-      }
+    const appendTextContent = (text: string) => {
+      const partType = role === "assistant" ? "output_text" : "input_text"
+      messageContent.push({ type: partType, text })
+      hasContent = true
     }
-    flushAssistantRun()
 
-    for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
-      const msg = messages[messageIndex]!
-      const role = msg.role
-      const messageContent: Array<Record<string, unknown>> = []
-      let hasContent = false
+    const appendProjectedContent = (part: Record<string, unknown>) => {
+      messageContent.push(part)
+      hasContent = true
+    }
 
-      const flushMessage = () => {
-        if (!hasContent) {
-          return
-        }
-        input.push({
-          type: "message",
-          role,
-          content: [...messageContent],
-        })
-        messageContent.length = 0
-        hasContent = false
+    if (typeof msg.content === "string") {
+      if (msg.content) {
+        appendTextContent(msg.content)
       }
-
-      const appendTextContent = (text: string) => {
-        const partType = role === "assistant" ? "output_text" : "input_text"
-        messageContent.push({ type: partType, text })
-        hasContent = true
-      }
-
-      const appendProjectedContent = (part: Record<string, unknown>) => {
-        messageContent.push(part)
-        hasContent = true
-      }
-
-      if (typeof msg.content === "string") {
-        if (msg.content) {
-          appendTextContent(msg.content)
-        }
-        flushMessage()
-        continue
-      }
-
-      if (!Array.isArray(msg.content)) {
-        continue
-      }
-
+      flushMessage()
+    } else if (Array.isArray(msg.content)) {
       const blocks = msg.content as CodexProjectableBlock[]
-      const hasRawResponseItems =
-        role === "assistant" && blocks.some(isRawCodexResponseItemBlock)
-      const messageId =
-        typeof msg.messageId === "string" ? msg.messageId.trim() : ""
-      if (
-        role === "assistant" &&
-        messageId &&
-        assistantMessageIdsWithRawItems.has(messageId) &&
-        !hasRawResponseItems
-      ) {
-        continue
-      }
-      if (
-        role === "assistant" &&
-        !messageId &&
-        assistantMessageIndexesInRawRuns.has(messageIndex) &&
-        !hasRawResponseItems
-      ) {
-        continue
-      }
 
       for (const block of blocks) {
-        if (
-          hasRawResponseItems &&
-          block.type !== CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE
-        ) {
-          continue
-        }
-
         switch (block.type) {
           case "text":
             if (block.text) {
@@ -265,19 +411,10 @@ export function projectCodexInputItems(
             }
             break
 
-          case CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE:
-            flushMessage()
-            {
-              const rawItem =
-                block.item && typeof block.item === "object"
-                  ? codexResponseOutputItemToInputItem(
-                      block.item as Record<string, unknown>
-                    )
-                  : undefined
-              if (rawItem) {
-                input.push(rawItem)
-              }
-            }
+          // Raw Codex ResponseItems belong to CodexProjectionState. Older
+          // bridge sessions can still contain this block, but it is never
+          // promoted into the next prompt through a UnifiedMessage fallback.
+          case "codex_response_item":
             break
 
           default:
@@ -287,20 +424,19 @@ export function projectCodexInputItems(
             break
         }
       }
-
       flushMessage()
     }
+
+    for (let index = initialItemCount; index < input.length; index++) {
+      sourceRecordIds[index] = source.sourceRecordId
+    }
   }
-
-  appendMessages((request.contextMessages || []) as CodexProjectableMessage[])
-  appendMessages(request.messages as CodexProjectableMessage[])
-
-  if (request.inputToolIntegrity === "preserve") {
-    return input
-  }
-
-  return sanitizeResponsesToolCallIntegrity(input, request.pendingToolUseIds)
-    .items
+  return input.map((item, index) => ({
+    item,
+    ...(sourceRecordIds[index]
+      ? { sourceRecordId: sourceRecordIds[index] }
+      : {}),
+  }))
 }
 
 function projectReasoningItemFromThinkingBlock(
@@ -317,23 +453,6 @@ function projectReasoningItemFromThinkingBlock(
     summary: thinking ? [{ type: "summary_text", text: thinking }] : [],
     encrypted_content: signature || null,
   }
-}
-
-function messageHasRawCodexResponseItems(
-  message: CodexProjectableMessage
-): boolean {
-  return (
-    Array.isArray(message.content) &&
-    (message.content as CodexProjectableBlock[]).some(
-      isRawCodexResponseItemBlock
-    )
-  )
-}
-
-function isRawCodexResponseItemBlock(
-  block: CodexProjectableBlock | undefined
-): boolean {
-  return block?.type === CODEX_RAW_RESPONSE_ITEM_BLOCK_TYPE
 }
 
 export function projectCodexTools(
@@ -446,7 +565,10 @@ function appendToolCallItem(
   const toolType =
     options.toolTypeByName.get(originalName) ||
     normalizeToolCallTypeHint((block as Record<string, unknown>).tool_call_type)
-  const callId = block.id || ""
+  const callId = requireExactDurableIdentifier(
+    block.id,
+    "Codex tool-use block id"
+  )
 
   if (toolType === "tool_search" || originalName === "tool_search") {
     input.push({
@@ -490,7 +612,10 @@ function appendToolOutputItem(
   options: CodexNativeProjectionOptions
 ): void {
   const output = projectToolResultOutput(block.content, options)
-  const callId = block.tool_use_id || ""
+  const callId = requireExactDurableIdentifier(
+    block.tool_use_id,
+    "Codex tool-result block tool_use_id"
+  )
   const callType =
     toolCallTypeById.get(callId) ||
     normalizeToolCallTypeHint((block as Record<string, unknown>).tool_call_type)
@@ -501,7 +626,7 @@ function appendToolOutputItem(
       call_id: callId,
       status: "completed",
       execution: "client",
-      tools: projectToolSearchOutputTools(block.content),
+      tools: projectToolSearchOutputTools(block),
     })
     return
   }
@@ -553,34 +678,15 @@ function projectToolResultOutput(
   return parts.length > 0 ? parts : ""
 }
 
-function projectToolSearchOutputTools(
-  content: CodexProjectableBlock["content"]
-): unknown[] {
-  if (Array.isArray(content)) {
-    for (const part of content) {
-      if (
-        part &&
-        typeof part === "object" &&
-        (part as Record<string, unknown>).type === "tool_search_output" &&
-        Array.isArray((part as Record<string, unknown>).tools)
-      ) {
-        return [...((part as Record<string, unknown>).tools as unknown[])]
-      }
-    }
+function projectToolSearchOutputTools(block: CodexProjectableBlock): unknown[] {
+  const structuredContent = block.structuredContent
+  if (!structuredContent || !Array.isArray(structuredContent.tools)) {
+    throw new Error(
+      "Codex tool_search result requires durable structuredContent.tools"
+    )
   }
-
-  if (typeof content === "string") {
-    try {
-      const parsed = JSON.parse(content) as Record<string, unknown>
-      if (Array.isArray(parsed.tools)) {
-        return [...(parsed.tools as unknown[])]
-      }
-    } catch {
-      return []
-    }
-  }
-
-  return []
+  const tools: unknown[] = structuredContent.tools
+  return tools.slice()
 }
 
 function projectImageContent(
@@ -828,18 +934,23 @@ function serializeCustomToolInput(input: unknown): string {
   if (typeof input === "string") {
     return input
   }
-
-  if (input && typeof input === "object") {
-    const record = input as Record<string, unknown>
-    for (const key of ["patch", "input", "content", "text"]) {
-      const value = record[key]
-      if (typeof value === "string") {
-        return value
-      }
-    }
-  }
-
+  // A custom tool's input is a freeform provider payload. Do not infer a
+  // bridge-private patch grammar from object keys such as `patch` or `text`.
   return JSON.stringify(input ?? {})
+}
+
+function buildCodexProjectionSettings(
+  request: CodexExecutionRequest,
+  modelName: string
+): Record<string, unknown> {
+  return {
+    model: modelName,
+    instructions: buildCodexInstructions(request),
+    serviceTier: normalizeCodexServiceTier(request.serviceTier),
+    reasoning: buildCodexReasoning(request, modelName),
+    parallelToolCalls: request.parallelToolCalls !== false,
+    textVerbosity: request.textVerbosity?.trim() || undefined,
+  }
 }
 
 function serializeCustomToolOutput(

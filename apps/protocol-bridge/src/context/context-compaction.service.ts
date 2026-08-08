@@ -1,9 +1,14 @@
 import { Injectable, Logger } from "@nestjs/common"
 import { randomUUID } from "crypto"
 import { fingerprintAttachments } from "./attachment-fingerprint"
+import { ClaudeConversationProjector } from "./claude-conversation-projector"
+import type { ContextProjectionResult } from "./context-projection.service"
 import { CompactWarningHookService } from "./compact-warning-hook.service"
 import { CompactWarningStateService } from "./compact-warning-state.service"
-import { PostCompactCleanupService } from "./post-compact-cleanup.service"
+import {
+  CONTEXT_COMPACT_MAX_OUTPUT_TOKENS,
+  type ContextCompactionMode,
+} from "./context-compact-prompt"
 import {
   ContextAttachmentBuilderService,
   ContextAttachmentSnapshot,
@@ -22,25 +27,33 @@ import {
   createHookResultRecord,
   deriveCompactionHistoryFromTranscript,
   getRecordsAfterCompactBoundary,
-  isContextCollapseSummaryRecord,
   isCompactSummaryRecord,
   isMessageRecord,
+  isSnipBoundaryRecord,
 } from "./context-transcript-events"
-import { ContextCollapseService } from "./context-collapse.service"
 import { ContextUsageLedgerService } from "./context-usage-ledger.service"
-import { SessionMemoryCompactionService } from "./session-memory-compaction.service"
+import { requireExactDurableIdentifier } from "./durable-identifier"
+import {
+  assertTerminalSessionMemoryProvenance,
+  SessionMemoryService,
+} from "./session-memory.service"
 import { TokenCounterService } from "./token-counter.service"
 import { ToolIntegrityService } from "./tool-integrity.service"
 import {
   ContextCompactionCommit,
   ContextConversationState,
-  ContextSessionMemoryEntry,
+  ContextToolResultReplacementState,
+  ClaudeProjectionCapabilitySnapshot,
+  ClaudeProjectionRecipe,
   ContextTranscriptRecord,
   ProjectedContextMessage,
   ContextProjectionAttachment,
+  ProjectionManifest,
   UnifiedMessage,
+  isToolResultBlock,
+  isToolUseBlock,
+  normalizeContent,
 } from "./types"
-import { repairOrphanedToolPairs } from "./orphan-tool-pair-repair"
 
 export class ContextProjectionBudgetExceededError extends Error {
   constructor(
@@ -54,6 +67,15 @@ export class ContextProjectionBudgetExceededError extends Error {
   }
 }
 
+export class StaleContextCompactionCandidateError extends Error {
+  constructor() {
+    super(
+      "Context graph changed while its compaction summary was being generated"
+    )
+    this.name = "StaleContextCompactionCandidateError"
+  }
+}
+
 export interface ContextCompactionPlan {
   commit: ContextCompactionCommit
   projectedMessages: ProjectedContextMessage[]
@@ -61,25 +83,303 @@ export interface ContextCompactionPlan {
   attachmentFingerprint: string
   recordCount: number
   retainedRecords: ContextTranscriptRecord[]
+  boundaryRecord: ContextTranscriptRecord
+  summaryRecord: ContextTranscriptRecord
+  orderedProjectionRecords: ContextTranscriptRecord[]
   attachmentRecords?: ContextTranscriptRecord[]
   hookResultRecords?: ContextTranscriptRecord[]
-  sessionMemoryEntries?: ContextSessionMemoryEntry[]
+  /** Exact provider-owned Claude layout staged from this compact plan. */
+  claudeProjection?: {
+    recipe: ClaudeProjectionRecipe
+    manifest: ProjectionManifest
+  }
+  /** Main-graph head frozen by the candidate that produced this plan. */
+  graphWatermarkUuid: string
+}
+
+export interface ContextCompactionInstallInput {
+  summary: string
+  hookUserMessage?: string
+  emitTelemetry?: boolean
+}
+
+interface PreparedContextCompactionState {
+  records: ContextTranscriptRecord[]
+  graphWatermarkUuid: string
+  compactionHistory: ContextCompactionCommit[]
+  activeCompactionId: string
+  compactionEpoch: number
+  lastAppliedCompaction: NonNullable<
+    ContextConversationState["lastAppliedCompaction"]
+  >
+  compactWarningState: NonNullable<
+    ContextConversationState["compactWarningState"]
+  >
+}
+
+/**
+ * Complete hot-state transition prepared before a durable projection commit.
+ * Applying this receipt performs no graph validation, history derivation, or
+ * provider lookup; those operations must all succeed before persistence.
+ */
+export interface PreparedContextCompactionInstall {
+  readonly state: ContextConversationState
+  readonly next: PreparedContextCompactionState
+  readonly telemetry?: {
+    readonly archivedMessageCount: number
+    readonly sourceTokenCount: number
+    readonly summaryTokenCount: number
+    readonly epoch: number
+  }
 }
 
 export interface ContextCompactionCandidate {
+  mode: ContextCompactionMode
   commitId: string
   strategy: ContextCompactionCommit["strategy"]
   createdAt: number
   nextEpoch: number
   archivedRecords: ContextTranscriptRecord[]
   retainedRecords: ContextTranscriptRecord[]
-  summaryBudget: number
+  /** Exact ordered native source records sent to the compact summary model. */
+  summaryInputRecords: ContextTranscriptRecord[]
+  summaryOutputTokenLimit: number
   contextProfile?: ContextModelProfile
+  claudeCapability?: ClaudeProjectionCapabilitySnapshot
+  /** Exact Claude checkpoint selected by the provider head for this input. */
+  claudeRecipe?: ClaudeProjectionRecipe
   attachmentFingerprint: string
   liveAttachments: ContextProjectionAttachment[]
   sourceTokenCount: number
   retainedTokenCount: number
+  /** Array identity of the exact context revision summarized by this candidate. */
+  sourceStateRecords: readonly ContextTranscriptRecord[]
+  /**
+   * Exact replacement-state revision used to construct the summary input.
+   * Tool-result replacement is immutable at the projection boundary, so an
+   * accepted graph result cannot silently alter a candidate while its summary
+   * request is in flight.
+   */
+  sourceToolResultReplacementState?: ContextToolResultReplacementState
+  /** Main-graph head mounted when this candidate was prepared. */
+  graphWatermarkUuid: string
 }
+
+export interface ContextCompactionSplit {
+  archivedRecords: ContextTranscriptRecord[]
+  retainedRecords: ContextTranscriptRecord[]
+}
+
+/**
+ * Restrict provider-neutral audit records to the native source boundary that
+ * is actually being compacted. The complete prefix is retained so attachment,
+ * hook, and memory records remain ordered with their mapped graph messages.
+ */
+export function sliceContextRecordsThroughMappedSources(
+  records: readonly ContextTranscriptRecord[],
+  sourceRecordIds: readonly string[]
+): ContextTranscriptRecord[] {
+  const mapped = new Set(
+    sourceRecordIds.map((sourceRecordId) =>
+      requireExactDurableIdentifier(
+        sourceRecordId,
+        "provider compaction source record id"
+      )
+    )
+  )
+  let lastMappedIndex = -1
+  records.forEach((record, index) => {
+    if (mapped.has(record.id)) lastMappedIndex = index
+  })
+  if (lastMappedIndex < 0) return []
+  let boundaryIndex = lastMappedIndex + 1
+  while (
+    boundaryIndex < records.length &&
+    !isMessageRecord(records[boundaryIndex]!)
+  ) {
+    boundaryIndex += 1
+  }
+  return records.slice(0, boundaryIndex)
+}
+
+export function orderContextCompactionProjectionRecords(
+  mode: ContextCompactionMode,
+  boundaryRecord: ContextTranscriptRecord,
+  summaryRecord: ContextTranscriptRecord,
+  retainedRecords: readonly ContextTranscriptRecord[],
+  trailingRecords: readonly ContextTranscriptRecord[]
+): ContextTranscriptRecord[] {
+  return mode === "from"
+    ? [boundaryRecord, ...retainedRecords, summaryRecord, ...trailingRecords]
+    : [boundaryRecord, summaryRecord, ...retainedRecords, ...trailingRecords]
+}
+
+/**
+ * Replay mounted Snip boundaries into a compact projection using the current
+ * canonical state order. A Snip whose graph anchor was compacted away sits
+ * immediately before the first later graph message that survived; when no
+ * later graph message survives it follows the complete synthetic projection.
+ */
+export function rebaseSnipBoundariesIntoCompactProjection(
+  canonicalRecords: readonly ContextTranscriptRecord[],
+  compactProjectionRecords: readonly ContextTranscriptRecord[],
+  retainedRecords: readonly ContextTranscriptRecord[]
+): ContextTranscriptRecord[] {
+  const result = [...compactProjectionRecords]
+  const retainedGraphIds = new Set(
+    retainedRecords.filter(isMessageRecord).map((record) => record.id)
+  )
+  const seenIds = new Set<string>()
+  for (const record of result) {
+    if (seenIds.has(record.id)) {
+      throw new Error(
+        `Compact projection contains duplicate record ${record.id}`
+      )
+    }
+    seenIds.add(record.id)
+  }
+
+  for (let index = 0; index < canonicalRecords.length; index++) {
+    const boundary = canonicalRecords[index]!
+    if (!isSnipBoundaryRecord(boundary)) continue
+    if (seenIds.has(boundary.id)) {
+      throw new Error(
+        `Compact projection contains duplicate Snip ${boundary.id}`
+      )
+    }
+    const successor = canonicalRecords
+      .slice(index + 1)
+      .find(
+        (record) => isMessageRecord(record) && retainedGraphIds.has(record.id)
+      )
+    const successorIndex = successor
+      ? result.findIndex((record) => record.id === successor.id)
+      : -1
+    if (successor && successorIndex < 0) {
+      throw new Error(
+        `Retained Snip successor ${successor.id} is absent from compact projection`
+      )
+    }
+    result.splice(
+      successorIndex >= 0 ? successorIndex : result.length,
+      0,
+      boundary
+    )
+    seenIds.add(boundary.id)
+  }
+  return result
+}
+
+/**
+ * Split an active compact source without cutting through one provider response
+ * or a tool_use/tool_result chain. Ordinary message pivots remain exact; a
+ * pivot inside a structured API round moves to the first record of that round.
+ */
+export function splitContextCompactionRecords(
+  sourceRecords: readonly ContextTranscriptRecord[],
+  mode: ContextCompactionMode,
+  pivotRecordId?: string
+): ContextCompactionSplit | null {
+  if (sourceRecords.length === 0) return null
+  if (mode === "full") {
+    return { archivedRecords: [...sourceRecords], retainedRecords: [] }
+  }
+  if (!pivotRecordId) return null
+  const pivotIndex = sourceRecords.findIndex(
+    (record) => record.id === pivotRecordId
+  )
+  if (pivotIndex < 0) return null
+  const boundaryIndex = resolveStructuredRoundStart(sourceRecords, pivotIndex)
+  const archivedRecords =
+    mode === "up_to"
+      ? sourceRecords.slice(0, boundaryIndex)
+      : sourceRecords.slice(boundaryIndex)
+  const retainedRecords =
+    mode === "up_to"
+      ? sourceRecords.slice(boundaryIndex)
+      : sourceRecords.slice(0, boundaryIndex)
+  if (archivedRecords.length === 0 || retainedRecords.length === 0) return null
+  return { archivedRecords, retainedRecords }
+}
+
+function resolveStructuredRoundStart(
+  records: readonly ContextTranscriptRecord[],
+  pivotIndex: number
+): number {
+  const toolUseIndex = new Map<string, number>()
+  const toolResultIndex = new Map<string, number>()
+  for (let index = 0; index < records.length; index++) {
+    for (const block of normalizeContent(records[index]!.content)) {
+      if (isToolUseBlock(block)) toolUseIndex.set(block.id, index)
+      if (isToolResultBlock(block)) {
+        toolResultIndex.set(block.tool_use_id, index)
+      }
+    }
+  }
+
+  let boundaryIndex = pivotIndex
+  let changed = true
+  while (changed) {
+    changed = false
+    const boundaryRecord = records[boundaryIndex]
+    const providerMessageId =
+      boundaryRecord?.role === "assistant"
+        ? boundaryRecord.messageId || boundaryRecord.providerMessageId
+        : undefined
+    if (providerMessageId) {
+      for (let index = 0; index < boundaryIndex; index++) {
+        const record = records[index]!
+        if (
+          record.role === "assistant" &&
+          (record.messageId || record.providerMessageId) === providerMessageId
+        ) {
+          boundaryIndex = index
+          changed = true
+          break
+        }
+      }
+    }
+
+    for (const [toolUseId, useIndex] of toolUseIndex) {
+      const resultIndex = toolResultIndex.get(toolUseId)
+      if (
+        resultIndex !== undefined &&
+        useIndex < boundaryIndex &&
+        resultIndex >= boundaryIndex
+      ) {
+        boundaryIndex = useIndex
+        changed = true
+      }
+    }
+  }
+  return boundaryIndex
+}
+
+/**
+ * The request-window pressure limit after system-prompt and configured
+ * auto/predictive thresholds are accounted for.  This is deliberately
+ * independent from any transcript projection so provider-native history can
+ * make the trigger decision without being influenced by another provider's
+ * representation of the same conversation.
+ */
+export interface ContextCompactionPressureBudget {
+  hardMaxTokens: number
+  effectiveMaxTokens: number
+}
+
+/**
+ * `strict` enforces the budget when this projection is itself the provider
+ * payload. A provider-native adapter may use the generic projection only to
+ * derive source-bound deltas; its final native assembler owns the strict wire
+ * gate. `measure` exists solely for a dry-run request candidate so the caller
+ * can decide whether to compact before rebuilding from the resulting state.
+ */
+export type ContextBudgetEnforcement = "strict" | "measure"
+
+/** The layer whose materialized payload owns the final request budget gate. */
+export type ContextProjectionBudgetBoundary =
+  | "projected-messages"
+  | "provider-native-request"
 
 export interface ContextSnipCompactionResult {
   changed: boolean
@@ -99,6 +399,12 @@ export interface ContextCompactionResult {
   projectedMessages: ProjectedContextMessage[]
   estimatedTokens: number
   wasCompacted: boolean
+  /**
+   * Exact provider manifest emitted by this projection. Measurement callers
+   * receive a clone from their dry-run state so accepting the candidate never
+   * requires a second projection merely to install Claude's active window.
+   */
+  projectionManifest?: ProjectionManifest
   snipCompaction?: ContextSnipCompactionResult
   microCompaction?: ContextMicroCompactionResult
 }
@@ -107,33 +413,8 @@ export interface ContextCompactionResult {
 export class ContextCompactionService {
   private readonly logger = new Logger(ContextCompactionService.name)
   private readonly MIN_REQUEST_BUDGET = 256
-  private readonly MIN_SUMMARY_TOKENS = 64
   private readonly MIN_ATTACHMENT_TOKENS = 128
-  // Max output budget handed to the summary model when compacting history.
-  // Aligned with Claude Code's compaction output reserve (cc reserves
-  // min(maxOutputTokens, 20K) of the window for the compact summary — see
-  // docs/context/token-budget.mdx "有效上下文 = 窗口 - min(maxOutputTokens, 20K)").
-  //
-  // The previous value (2_400) was the root cause of catastrophic detail
-  // loss: regardless of how much history was being compacted, the summary
-  // was hard-capped at ~2.4K tokens. A real session compacted 154_315 source
-  // tokens into a 2_894-token summary (~53:1) — entire investigation threads
-  // were flattened to a sentence. cc instead lets the summary model spend up
-  // to ~20K output tokens so large histories retain their structure. The
-  // effective cap is still further bounded by resolveSummaryBudgetCap's
-  // 0.22 * effectiveMaxTokens term, so small budgets scale down naturally.
-  private readonly SUMMARY_TOKEN_BUDGET = 20_000
   private readonly ATTACHMENT_TOKEN_BUDGET = 2200
-  /**
-   * Full compaction must reset active model context to a small replacement
-   * window. Codex keeps at most ~20K of user messages beside the summary, and
-   * Claude Code full auto-compact keeps no large suffix at all. Retaining a
-   * percentage of a 272K window leaves 100K+ live history after compaction,
-   * which defeats the context-window boundary and causes stale-topic drift.
-   */
-  private readonly POST_COMPACT_TARGET_TOKENS = 40_000
-  private readonly POST_COMPACT_TARGET_RATIO = 0.35
-  private readonly INVESTIGATION_MEMORY_ATTACHMENT_BONUS = 320
   private readonly SNIP_MIN_REMOVED_RECORDS = 2
   /**
    * cc-faithful microcompact tuning. Older tool results from read-only /
@@ -168,12 +449,11 @@ export class ContextCompactionService {
     private readonly projection: ContextProjectionService,
     private readonly attachments: ContextAttachmentBuilderService,
     private readonly usageLedger: ContextUsageLedgerService,
-    private readonly sessionMemory: SessionMemoryCompactionService,
-    private readonly contextCollapse: ContextCollapseService,
+    private readonly sessionMemory: SessionMemoryService,
     private readonly telemetry: ContextTelemetryService,
     private readonly compactWarningState: CompactWarningStateService,
     private readonly compactWarningHook: CompactWarningHookService,
-    private readonly postCompactCleanup: PostCompactCleanupService
+    private readonly claudeProjector: ClaudeConversationProjector
   ) {}
 
   ensureWithinBudget(
@@ -189,9 +469,27 @@ export class ContextCompactionService {
       pendingToolUseIds?: Iterable<string>
       strategy?: ContextCompactionCommit["strategy"]
       dryRun?: boolean
-      codexAppendOnlyAttachments?: boolean
+      /**
+       * Strict is the default. Measurement must be paired with `dryRun: true`;
+       * a provider-native source projection is independently gated after its
+       * final native request has been assembled.
+       */
+      budgetEnforcement?: ContextBudgetEnforcement
+      budgetBoundary?: ContextProjectionBudgetBoundary
+      dynamicAttachmentMode?: "history" | "provider-native"
+      claudeCapability?: ClaudeProjectionCapabilitySnapshot
+      claudeRecipe?: ClaudeProjectionRecipe
+      visibleSessionMemorySourceRecordUuids?: Iterable<string>
     }
   ): ContextCompactionResult {
+    const budgetEnforcement = this.resolveBudgetEnforcement(
+      options.budgetEnforcement
+    )
+    if (budgetEnforcement === "measure" && options.dryRun !== true) {
+      throw new Error(
+        "Context projection measurement requires dryRun: true; final provider requests must use strict enforcement"
+      )
+    }
     const hardMaxTokens = Math.max(
       options.maxTokens - options.systemPromptTokens,
       this.MIN_REQUEST_BUDGET
@@ -199,10 +497,7 @@ export class ContextCompactionService {
     const tokenizer = this.resolveTokenizer(options.contextProfile)
     const targetMaxTokens = this.resolvePressureBudget(hardMaxTokens, options)
     const workingState = options.dryRun ? this.cloneState(state) : state
-    const attachmentTokenBudget = this.resolveAttachmentBudget(
-      hardMaxTokens,
-      (snapshot.investigationSummaries?.length ?? 0) > 0
-    )
+    const attachmentTokenBudget = this.resolveAttachmentBudget(hardMaxTokens)
 
     // cc parity: each new compaction round starts by clearing the
     // warning suppression so the predictive hook can re-evaluate.
@@ -212,12 +507,13 @@ export class ContextCompactionService {
       this.compactWarningState.clearCompactWarningSuppression(workingState)
     }
 
-    let projected = this.buildProjectedMessages(
+    const projection = this.buildProjectedMessages(
       workingState,
       snapshot,
       attachmentTokenBudget,
       options
     )
+    let projected = projection.messages
     const estimated = this.countProjected(
       projected,
       this.resolveTokenizer(options.contextProfile)
@@ -225,7 +521,10 @@ export class ContextCompactionService {
     let snipCompaction: ContextSnipCompactionResult | undefined
     let microCompaction: ContextMicroCompactionResult | undefined
 
-    if (this.shouldCompact(estimated, hardMaxTokens, targetMaxTokens)) {
+    if (
+      budgetEnforcement === "strict" &&
+      this.shouldCompact(estimated, hardMaxTokens, targetMaxTokens)
+    ) {
       // Diagnostics: count snip boundaries and the union of removed ids so
       // we can tell whether the projection is actually filtering out the
       // already-snipped tail. Without this, a 410K estimator reading is
@@ -286,7 +585,9 @@ export class ContextCompactionService {
     // boundary compactions without the over-aggressive whole-history
     // stripping that once collapsed the model's own findings
     // (~133K -> ~33K). True size reduction still comes from
-    // compactIfNeeded; the hard-fit below is the last-resort fit.
+    // compactIfNeeded. If the provider projection still exceeds its window,
+    // the caller must run the provider-owned compaction path; this read model
+    // never drops an arbitrary transcript prefix to force a request through.
     if (this.shouldCompact(estimated, hardMaxTokens, targetMaxTokens)) {
       const microcompacted = this.microcompactProjectedToolResults(
         projected,
@@ -304,29 +605,24 @@ export class ContextCompactionService {
     const messages = this.sanitizeProjectedMessages(projected, {
       integrityMode: options.integrityMode,
       pendingToolUseIds: options.pendingToolUseIds,
+      provider:
+        options.contextProfile?.family === "claude" && options.claudeCapability
+          ? "claude"
+          : options.dynamicAttachmentMode === "provider-native"
+            ? "codex"
+            : "generic",
     })
-    let finalMessages = messages
-    let messageTokens = this.tokenCounter.countMessages(
-      finalMessages,
+    const finalMessages = messages
+    const messageTokens = this.tokenCounter.countMessages(
+      messages,
       true,
       tokenizer
     )
-    if (messageTokens > hardMaxTokens && !options.dryRun) {
-      const hardFit = this.buildHardFitProjection(
-        finalMessages,
-        hardMaxTokens,
-        options.integrityMode,
-        options.pendingToolUseIds,
-        tokenizer
-      )
-      if (hardFit) {
-        finalMessages = hardFit.messages
-        projected = hardFit.projectedMessages
-        messageTokens = hardFit.estimatedTokens
-        snipCompaction = hardFit.snipCompaction
-      }
-    }
-    if (messageTokens > hardMaxTokens) {
+    if (
+      messageTokens > hardMaxTokens &&
+      budgetEnforcement === "strict" &&
+      (options.budgetBoundary ?? "projected-messages") === "projected-messages"
+    ) {
       this.telemetry.recordEvent({
         event: "compaction.projection_budget_exceeded",
         metadata: {
@@ -340,106 +636,23 @@ export class ContextCompactionService {
       )
     }
 
-    this.recordResultTelemetry(snipCompaction)
+    const projectionManifest = projection.claudeManifest
+      ? structuredClone(projection.claudeManifest)
+      : undefined
+
+    if (budgetEnforcement === "strict") {
+      this.recordResultTelemetry(snipCompaction)
+    }
 
     return {
       messages: finalMessages,
       projectedMessages: projected,
       estimatedTokens: messageTokens,
       wasCompacted: false,
+      projectionManifest,
       snipCompaction,
       microCompaction,
     }
-  }
-
-  private buildHardFitProjection(
-    messages: UnifiedMessage[],
-    hardMaxTokens: number,
-    integrityMode?: "strict-adjacent" | "global",
-    _pendingToolUseIds?: Iterable<string>,
-    tokenizer: ContextTokenizer = "claude"
-  ):
-    | {
-        messages: UnifiedMessage[]
-        projectedMessages: ProjectedContextMessage[]
-        estimatedTokens: number
-        snipCompaction: ContextSnipCompactionResult
-      }
-    | undefined {
-    if (messages.length <= 1) return undefined
-
-    const targetTokens = Math.max(
-      this.MIN_REQUEST_BUDGET,
-      Math.floor(hardMaxTokens * 0.92)
-    )
-    const mode = integrityMode ?? "global"
-    const roundAlignedIndex =
-      this.toolIntegrity.findRoundAlignedTruncationPoint(
-        messages,
-        targetTokens,
-        {
-          mode,
-          tokenizer,
-        }
-      )
-    const candidateIndexes = [
-      roundAlignedIndex,
-      this.toolIntegrity.findBudgetSafeTruncationPointWithIntegrity(
-        messages,
-        targetTokens,
-        { mode, tokenizer }
-      ),
-    ]
-
-    for (const truncationIndex of candidateIndexes) {
-      if (truncationIndex <= 0 || truncationIndex >= messages.length) {
-        continue
-      }
-
-      // findBudgetSafeTruncationPointWithIntegrity already aligns the
-      // truncation index so the surviving slice keeps every tool_use
-      // adjacent to its tool_result. The ledger guarantees no orphan
-      // tool_use exists in the source, so direct slice is sufficient.
-      const candidate = messages.slice(truncationIndex)
-      if (candidate.length === 0) continue
-
-      const estimatedTokens = this.tokenCounter.countMessages(
-        candidate,
-        true,
-        tokenizer
-      )
-      if (estimatedTokens > hardMaxTokens) continue
-
-      return {
-        messages: candidate,
-        projectedMessages: candidate.map((message) => ({
-          role: message.role === "assistant" ? "assistant" : "user",
-          content: message.content,
-          source: message.source ?? "snip",
-          // Snip is a tail-truncate (no merging / re-wrapping); the
-          // messageId on each retained record stays valid, so propagate
-          // it for downstream send-time sibling merge.
-          ...(message.messageId ? { messageId: message.messageId } : {}),
-          // Same for isMeta — snip preserves the meta semantics of the
-          // surviving messages (e.g. a retained compaction summary
-          // stays meta, a retained user turn stays not-meta).
-          ...(message.isMeta ? { isMeta: true } : {}),
-          ...(message.attachmentKind
-            ? { attachmentKind: message.attachmentKind }
-            : {}),
-        })),
-        estimatedTokens,
-        snipCompaction: {
-          changed: true,
-          removedRecords: truncationIndex,
-          retainedRecords: candidate.length,
-          summaryTokenCount: 0,
-          estimatedTokens,
-        },
-      }
-    }
-
-    return undefined
   }
 
   prepareCompactionCandidate(
@@ -451,61 +664,66 @@ export class ContextCompactionService {
       contextProfile?: ContextModelProfile
       autoCompactTokenLimit?: number
       predictiveCompactTokenLimit?: number
-      projectedTokenOverride?: number
+      /**
+       * Exact provider-visible context count from an already-built request
+       * candidate, excluding `systemPromptTokens`. Zero is valid. This is
+       * deliberately a direct measurement, never an estimate derived from
+       * another provider's projection.
+       */
+      projectedTokenCount?: number
       strategy?: ContextCompactionCommit["strategy"]
       integrityMode?: "strict-adjacent" | "global"
-      codexAppendOnlyAttachments?: boolean
+      dynamicAttachmentMode?: "history" | "provider-native"
+      claudeCapability?: ClaudeProjectionCapabilitySnapshot
+      claudeRecipe?: ClaudeProjectionRecipe
+      visibleSessionMemorySourceRecordUuids?: Iterable<string>
+      force?: boolean
     }
   ): ContextCompactionCandidate | null {
-    const hardMaxTokens = Math.max(
-      options.maxTokens - options.systemPromptTokens,
-      this.MIN_REQUEST_BUDGET
+    const { hardMaxTokens, effectiveMaxTokens } =
+      this.resolveCompactionPressureBudget(options)
+    const exactProviderTokenCount = this.validateProviderProjectedTokenCount(
+      options.projectedTokenCount
     )
-    const effectiveMaxTokens = this.resolvePressureBudget(
-      hardMaxTokens,
-      options
-    )
-    const attachmentTokenBudget = this.resolveAttachmentBudget(
-      hardMaxTokens,
-      (snapshot.investigationSummaries?.length ?? 0) > 0
-    )
-    const projected = this.buildProjectedMessages(
-      state,
-      snapshot,
-      attachmentTokenBudget,
-      options
-    )
-    const measuredProjectedTokens = this.countProjected(
-      projected,
-      this.resolveTokenizer(options.contextProfile)
-    )
-    const projectedTokens = Math.max(
-      measuredProjectedTokens,
-      options.projectedTokenOverride || 0
-    )
-    if (projectedTokens <= effectiveMaxTokens) {
+    const projectedTokens =
+      exactProviderTokenCount ??
+      this.countProjected(
+        this.buildProjectedMessages(
+          state,
+          snapshot,
+          this.resolveAttachmentBudget(hardMaxTokens),
+          options
+        ).messages,
+        this.resolveTokenizer(options.contextProfile)
+      )
+    if (!options.force && projectedTokens <= effectiveMaxTokens) {
       this.logger.debug(
         `prepareCompactionCandidate: skipped (projected=${projectedTokens} <= effective=${effectiveMaxTokens}, ` +
-          (options.projectedTokenOverride
-            ? `localProjected=${measuredProjectedTokens}, override=${options.projectedTokenOverride}, `
-            : "") +
+          (exactProviderTokenCount !== undefined
+            ? "source=prepared-provider-request, "
+            : "source=context-projection, ") +
           `hardMax=${hardMaxTokens}, sysPrompt=${options.systemPromptTokens}, ` +
           `auto=${options.autoCompactTokenLimit ?? "(none)"}, pred=${options.predictiveCompactTokenLimit ?? "(none)"})`
       )
       return null
     }
-    const candidate = this.prepareCandidateForBudget(
+    // Building attachments belongs to the candidate, not the pressure gate.
+    // In the common healthy path with a provider-exact measurement this work
+    // must not happen at all; the already-built provider request is reused.
+    const attachmentTokenBudget = this.resolveAttachmentBudget(hardMaxTokens)
+    const candidate = this.prepareFullCandidate(
       state,
       snapshot,
-      effectiveMaxTokens,
       attachmentTokenBudget,
       options.strategy || "auto",
       options.contextProfile,
-      options.integrityMode
+      options.integrityMode,
+      options.claudeCapability,
+      options.claudeRecipe
     )
     if (!candidate) {
       this.logger.debug(
-        `prepareCompactionCandidate: prepareCandidateForBudget returned null ` +
+        `prepareCompactionCandidate: prepareFullCandidate returned null ` +
           `(projected=${projectedTokens}, effective=${effectiveMaxTokens}, ` +
           `attachmentBudget=${attachmentTokenBudget}, strategy=${options.strategy || "auto"})`
       )
@@ -513,28 +731,87 @@ export class ContextCompactionService {
     return candidate
   }
 
-  applyGeneratedSummaryCompaction(
+  /**
+   * Build the generic graph/source metadata for a compaction already selected
+   * by a provider-native projection.  Unlike prepareCompactionCandidate(),
+   * this method intentionally does not inspect or measure the generic
+   * transcript to decide whether compaction should happen.  Callers must make
+   * that decision from their provider's exact prompt representation first.
+   */
+  prepareCompactionMappingCandidate(
+    state: ContextConversationState,
+    snapshot: ContextAttachmentSnapshot,
+    options: {
+      maxTokens: number
+      systemPromptTokens: number
+      contextProfile?: ContextModelProfile
+      autoCompactTokenLimit?: number
+      predictiveCompactTokenLimit?: number
+      strategy?: ContextCompactionCommit["strategy"]
+      integrityMode?: "strict-adjacent" | "global"
+      claudeCapability?: ClaudeProjectionCapabilitySnapshot
+      claudeRecipe?: ClaudeProjectionRecipe
+      /**
+       * Provider-native sources installed in the compact request. Records
+       * appended after the last mapped source belong to the pending turn and
+       * must stay outside a pre-turn compaction.
+       */
+      sourceRecordIds?: readonly string[]
+    }
+  ): ContextCompactionCandidate | null {
+    const { hardMaxTokens } = this.resolveCompactionPressureBudget(options)
+    const attachmentTokenBudget = this.resolveAttachmentBudget(hardMaxTokens)
+    return this.prepareFullCandidate(
+      state,
+      snapshot,
+      attachmentTokenBudget,
+      options.strategy || "auto",
+      options.contextProfile,
+      options.integrityMode,
+      options.claudeCapability,
+      options.claudeRecipe,
+      options.sourceRecordIds
+    )
+  }
+
+  /**
+   * Resolve a compaction pressure budget without projecting transcript data.
+   * Provider-specific compactors use this to compare their exact wire/native
+   * prompt token count against the shared configured limits.
+   */
+  resolveCompactionPressureBudget(options: {
+    maxTokens: number
+    systemPromptTokens: number
+    autoCompactTokenLimit?: number
+    predictiveCompactTokenLimit?: number
+  }): ContextCompactionPressureBudget {
+    const hardMaxTokens = Math.max(
+      options.maxTokens - options.systemPromptTokens,
+      this.MIN_REQUEST_BUDGET
+    )
+    return {
+      hardMaxTokens,
+      effectiveMaxTokens: this.resolvePressureBudget(hardMaxTokens, options),
+    }
+  }
+
+  /**
+   * Build an exact post-compact projection without mutating the mounted
+   * context. Durable projection owners use this to commit their immutable
+   * layout first, then install the same plan into hot state in the caller's
+   * single ContextPipeline mutation.
+   */
+  buildGeneratedSummaryCompactionPlan(
     state: ContextConversationState,
     snapshot: ContextAttachmentSnapshot,
     candidate: ContextCompactionCandidate,
-    input: {
-      summary: string
-      hookUserMessage?: string
-      emitTelemetry?: boolean
-      meta?: {
-        sessionId?: string
-        conversationId?: string
-        agentId?: string
-        querySource?: string
-        notifyPromptCacheCompaction?: () => void
-      }
-    }
+    input: Pick<ContextCompactionInstallInput, "summary" | "hookUserMessage">
   ): ContextCompactionPlan {
+    this.assertCandidateStillCurrent(state, candidate)
     const attachmentTokenBudget = this.resolveAttachmentBudget(
       candidate.retainedTokenCount +
         candidate.sourceTokenCount +
-        candidate.summaryBudget,
-      (snapshot.investigationSummaries?.length ?? 0) > 0
+        candidate.summaryOutputTokenLimit
     )
     const plan = this.buildPlanFromCandidate(
       state,
@@ -544,13 +821,57 @@ export class ContextCompactionService {
       input.summary,
       input.hookUserMessage
     )
-    this.applyCompactionPlan(
-      state,
-      plan,
-      input.emitTelemetry ?? true,
-      input.meta
-    )
     return plan
+  }
+
+  /**
+   * Validate and materialize the complete hot-state transition before the
+   * durable provider-neutral/provider-native projection commit.
+   */
+  prepareGeneratedSummaryCompactionInstall(
+    state: ContextConversationState,
+    candidate: ContextCompactionCandidate,
+    plan: ContextCompactionPlan,
+    input: Omit<ContextCompactionInstallInput, "summary" | "hookUserMessage">
+  ): PreparedContextCompactionInstall {
+    this.assertCandidateStillCurrent(state, candidate)
+    if (plan.commit.id !== candidate.commitId) {
+      throw new Error(
+        `Compaction plan ${plan.commit.id} does not belong to candidate ${candidate.commitId}`
+      )
+    }
+    const next = this.prepareCompactionState(state, plan, Date.now())
+    return {
+      state,
+      next,
+      ...((input.emitTelemetry ?? true)
+        ? {
+            telemetry: {
+              archivedMessageCount: plan.commit.archivedMessageCount,
+              sourceTokenCount: plan.commit.sourceTokenCount,
+              summaryTokenCount: plan.commit.summaryTokenCount,
+              epoch: next.compactionEpoch,
+            },
+          }
+        : {}),
+    }
+  }
+
+  /**
+   * Transfer a prevalidated compaction receipt after its durable commit.
+   * This method deliberately contains assignments and best-effort telemetry
+   * only; it must never discover a new reason to reject the accepted commit.
+   */
+  applyPreparedGeneratedSummaryCompaction(
+    prepared: PreparedContextCompactionInstall
+  ): void {
+    this.applyPreparedCompactionState(prepared.state, prepared.next)
+    if (prepared.telemetry) {
+      this.telemetry.recordEvent({
+        event: "compaction.boundary_applied",
+        metadata: prepared.telemetry,
+      })
+    }
   }
 
   /**
@@ -580,6 +901,8 @@ export class ContextCompactionService {
       maxTokens: number
       systemPromptTokens: number
       contextProfile?: ContextModelProfile
+      claudeCapability?: ClaudeProjectionCapabilitySnapshot
+      claudeRecipe?: ClaudeProjectionRecipe
       strategy?: ContextCompactionCommit["strategy"]
       integrityMode?: "strict-adjacent" | "global"
     }
@@ -601,6 +924,8 @@ export class ContextCompactionService {
       maxTokens: number
       systemPromptTokens: number
       contextProfile?: ContextModelProfile
+      claudeCapability?: ClaudeProjectionCapabilitySnapshot
+      claudeRecipe?: ClaudeProjectionRecipe
       strategy?: ContextCompactionCommit["strategy"]
       integrityMode?: "strict-adjacent" | "global"
     }
@@ -623,6 +948,8 @@ export class ContextCompactionService {
       maxTokens: number
       systemPromptTokens: number
       contextProfile?: ContextModelProfile
+      claudeCapability?: ClaudeProjectionCapabilitySnapshot
+      claudeRecipe?: ClaudeProjectionRecipe
       strategy?: ContextCompactionCommit["strategy"]
       integrityMode?: "strict-adjacent" | "global"
     }
@@ -632,90 +959,37 @@ export class ContextCompactionService {
       options.maxTokens - options.systemPromptTokens,
       this.MIN_REQUEST_BUDGET
     )
-    const attachmentTokenBudget = this.resolveAttachmentBudget(
-      hardMaxTokens,
-      (snapshot.investigationSummaries?.length ?? 0) > 0
-    )
-    const activeSlice = this.contextCollapse.projectRecords(
-      state,
-      getRecordsAfterCompactBoundary(state.records)
-    )
+    const attachmentTokenBudget = this.resolveAttachmentBudget(hardMaxTokens)
+    const activeSlice = getRecordsAfterCompactBoundary(state.records)
     const sourceRecords = this.compactionSourceRecords(activeSlice)
     if (sourceRecords.length === 0) {
       return null
     }
-
-    const pivotIndex = sourceRecords.findIndex(
-      (record) => record.id === pivotRecordId
+    const mode: ContextCompactionMode = direction
+    const split = splitContextCompactionRecords(
+      sourceRecords,
+      mode,
+      pivotRecordId
     )
-    if (pivotIndex < 0) {
-      return null
-    }
-
-    let archivedRecords: ContextTranscriptRecord[]
-    let retainedRecords: ContextTranscriptRecord[]
-    if (direction === "up_to") {
-      archivedRecords = sourceRecords.slice(0, pivotIndex)
-      retainedRecords = sourceRecords.slice(pivotIndex).filter(isMessageRecord)
-    } else {
-      archivedRecords = sourceRecords.slice(pivotIndex + 1)
-      retainedRecords = sourceRecords
-        .slice(0, pivotIndex + 1)
-        .filter(isMessageRecord)
-    }
-
-    if (archivedRecords.length === 0 || retainedRecords.length === 0) {
-      return null
-    }
-
-    // Ensure the slice boundary does not split a tool_use / tool_result pair
-    // by walking the archived/retained boundary one record outward in the
-    // archive direction. The toolIntegrity service exposes
-    // findBudgetSafeTruncationPointWithIntegrity, but here we want the
-    // pivot-anchored variant: just check whether the surviving
-    // tool_use/tool_result references resolve, and reject if they don't.
-    const safeArchive =
-      this.toolIntegrity.findBudgetSafeTruncationPointWithIntegrity(
-        sourceRecords.map((record) => ({
-          role: record.role,
-          content: record.content,
-        })) as UnifiedMessage[],
-        direction === "up_to"
-          ? this.tokenCounter.countMessages(
-              sourceRecords.slice(pivotIndex).map((record) => ({
-                role: record.role,
-                content: record.content,
-              })) as UnifiedMessage[],
-              true,
-              tokenizer
-            )
-          : this.tokenCounter.countMessages(
-              sourceRecords.slice(0, pivotIndex + 1).map((record) => ({
-                role: record.role,
-                content: record.content,
-              })) as UnifiedMessage[],
-              true,
-              tokenizer
-            ),
-        { mode: options.integrityMode, tokenizer }
-      )
+    if (!split) return null
+    const { archivedRecords, retainedRecords } = split
     if (
-      direction === "up_to" &&
-      safeArchive > 0 &&
-      safeArchive !== pivotIndex
+      !archivedRecords.some(isMessageRecord) ||
+      !this.compactionSlicesHaveIntegrity(
+        archivedRecords,
+        retainedRecords,
+        options.integrityMode
+      )
     ) {
-      // Toolchain integrity nudged the boundary; recompute archived/retained.
-      archivedRecords = sourceRecords.slice(0, safeArchive)
-      retainedRecords = sourceRecords.slice(safeArchive).filter(isMessageRecord)
-    }
-
-    const messageRecordsInArchive = archivedRecords.filter(isMessageRecord)
-    if (messageRecordsInArchive.length === 0 || retainedRecords.length === 0) {
       return null
     }
 
     const liveAttachments = this.attachments.buildAttachments(
-      this.buildProjectionSnapshot(state, snapshot),
+      this.buildAttachmentSnapshotForRetainedRecords(
+        state,
+        snapshot,
+        retainedRecords
+      ),
       { maxTokens: attachmentTokenBudget }
     )
     const attachmentFingerprint = fingerprintAttachments(liveAttachments)
@@ -735,143 +1009,78 @@ export class ContextCompactionService {
       true,
       tokenizer
     )
-    const summaryBudget = Math.max(
-      this.MIN_SUMMARY_TOKENS,
-      Math.min(
-        this.resolveSummaryBudgetCap(hardMaxTokens),
-        Math.floor(sourceTokenCount / 2)
-      )
+    const graphWatermarkUuid = requireMountedGraphWatermark(
+      state.graphWatermarkUuid
     )
 
     return {
+      mode,
       commitId: randomUUID(),
       strategy: options.strategy || "manual",
       createdAt: Date.now(),
       nextEpoch: (state.compactionEpoch || 0) + 1,
       archivedRecords,
       retainedRecords,
-      summaryBudget,
+      summaryInputRecords:
+        mode === "from" ? [...sourceRecords] : [...archivedRecords],
+      summaryOutputTokenLimit: CONTEXT_COMPACT_MAX_OUTPUT_TOKENS,
       contextProfile: options.contextProfile,
+      claudeCapability: options.claudeCapability,
+      claudeRecipe: options.claudeRecipe,
       attachmentFingerprint,
       liveAttachments,
       sourceTokenCount,
       retainedTokenCount,
+      sourceStateRecords: state.records,
+      sourceToolResultReplacementState: state.toolResultReplacementState,
+      graphWatermarkUuid,
     }
   }
 
-  private prepareCandidateForBudget(
+  private prepareFullCandidate(
     state: ContextConversationState,
     snapshot: ContextAttachmentSnapshot,
-    effectiveMaxTokens: number,
     attachmentTokenBudget: number,
     strategy: ContextCompactionCommit["strategy"],
     contextProfile?: ContextModelProfile,
-    integrityMode?: "strict-adjacent" | "global"
+    _integrityMode?: "strict-adjacent" | "global",
+    claudeCapability?: ClaudeProjectionCapabilitySnapshot,
+    claudeRecipe?: ClaudeProjectionRecipe,
+    sourceRecordIds?: readonly string[]
   ): ContextCompactionCandidate | null {
     const commitId = randomUUID()
     const tokenizer = this.resolveTokenizer(contextProfile)
-    const activeSlice = getRecordsAfterCompactBoundary(state.records)
+    const completeActiveSlice = getRecordsAfterCompactBoundary(state.records)
+    const activeSlice = sourceRecordIds
+      ? sliceContextRecordsThroughMappedSources(
+          completeActiveSlice,
+          sourceRecordIds
+        )
+      : completeActiveSlice
     const sourceRecords = this.compactionSourceRecords(activeSlice)
     const messageRecords = sourceRecords.filter(isMessageRecord)
     if (sourceRecords.length <= 1 || messageRecords.length === 0) {
       this.logger.debug(
-        `prepareCandidateForBudget: too few source records ` +
+        `prepareFullCandidate: too few source records ` +
           `(source=${sourceRecords.length}, message=${messageRecords.length})`
       )
       return null
     }
-
+    const split = splitContextCompactionRecords(sourceRecords, "full")
+    if (!split) return null
+    const archivedRecords = split.archivedRecords
+    const retainedRecords = split.retainedRecords
     const liveAttachments = this.attachments.buildAttachments(
-      this.buildProjectionSnapshot(state, snapshot),
+      this.buildAttachmentSnapshotForRetainedRecords(
+        state,
+        snapshot,
+        retainedRecords
+      ),
       {
         maxTokens: attachmentTokenBudget,
       }
     )
     const attachmentFingerprint = fingerprintAttachments(liveAttachments)
-    const attachmentTokens = this.tokenCounter.countMessages(
-      liveAttachments.map((attachment) => ({
-        role: "user",
-        content: attachment.content,
-      })) as UnifiedMessage[],
-      true,
-      tokenizer
-    )
-    const summaryBudgetCap = this.resolveSummaryBudgetCap(effectiveMaxTokens)
-    const envelopeTokens =
-      this.estimateBoundaryTokens(commitId, tokenizer) +
-      this.estimateSummaryEnvelopeTokens(commitId, tokenizer) +
-      attachmentTokens
-    // Full auto compaction should leave a small active window, not a suffix
-    // proportional to the model's full context window. The budget below is
-    // the total post-compaction target before subtracting boundary, summary
-    // reserve, and live attachments.
-    const retentionBudget =
-      this.resolvePostCompactRetentionBudget(effectiveMaxTokens)
-    const targetRecentTokens = Math.max(
-      0,
-      retentionBudget - envelopeTokens - summaryBudgetCap
-    )
-    const sourceMessages = sourceRecords.map((record) => ({
-      role: record.role,
-      content: record.content,
-    })) as UnifiedMessage[]
-    // Budget-only recent window: the smallest archive that lets the retained
-    // suffix fit targetRecentTokens.
-    const budgetTruncationIndex = this.tokenCounter.findTruncationIndex(
-      sourceMessages,
-      targetRecentTokens,
-      tokenizer
-    )
-    // Integrity-safe point. Compaction owns the durable transcript boundary,
-    // so the retained suffix must already be protocol-valid; send-time repair
-    // remains only a migration guard for older compacted states.
-    const integrityTruncationIndex =
-      this.toolIntegrity.findBudgetSafeTruncationPointWithIntegrity(
-        sourceMessages,
-        targetRecentTokens,
-        { mode: integrityMode, tokenizer }
-      )
-    const truncationIndex = integrityTruncationIndex
-    if (truncationIndex <= 0 || truncationIndex > sourceRecords.length) {
-      this.logger.debug(
-        `prepareCandidateForBudget: truncationIndex out of range ` +
-          `(idx=${truncationIndex}, budgetIdx=${budgetTruncationIndex}, ` +
-          `integrityIdx=${integrityTruncationIndex}, sourceLen=${sourceRecords.length}, ` +
-          `targetRecent=${targetRecentTokens}, effectiveMax=${effectiveMaxTokens}, ` +
-          `envelope=${envelopeTokens}, summaryCap=${summaryBudgetCap}, ` +
-          `attachmentTokens=${attachmentTokens})`
-      )
-      return null
-    }
-
-    const archivedRecords = sourceRecords.slice(0, truncationIndex)
-    const retainedRecords = sourceRecords
-      .slice(truncationIndex)
-      .filter(isMessageRecord)
-    if (archivedRecords.length === 0) {
-      this.logger.debug(
-        `prepareCandidateForBudget: empty side after split ` +
-          `(archived=${archivedRecords.length}, retained=${retainedRecords.length})`
-      )
-      return null
-    }
-
-    const summaryBudget = Math.min(
-      summaryBudgetCap,
-      Math.max(
-        this.MIN_SUMMARY_TOKENS,
-        effectiveMaxTokens -
-          envelopeTokens -
-          this.tokenCounter.countMessages(
-            retainedRecords.map((record) => ({
-              role: record.role,
-              content: record.content,
-            })) as UnifiedMessage[],
-            true,
-            tokenizer
-          )
-      )
-    )
     const sourceTokenCount = this.tokenCounter.countMessages(
       archivedRecords.map((record) => ({
         role: record.role,
@@ -888,20 +1097,30 @@ export class ContextCompactionService {
       true,
       tokenizer
     )
+    const graphWatermarkUuid = requireMountedGraphWatermark(
+      state.graphWatermarkUuid
+    )
 
     return {
+      mode: "full",
       commitId,
       strategy,
       createdAt: Date.now(),
       nextEpoch: (state.compactionEpoch || 0) + 1,
       archivedRecords,
       retainedRecords,
-      summaryBudget,
+      summaryInputRecords: [...archivedRecords],
+      summaryOutputTokenLimit: CONTEXT_COMPACT_MAX_OUTPUT_TOKENS,
       contextProfile,
+      claudeCapability,
+      claudeRecipe,
       attachmentFingerprint,
       liveAttachments,
       sourceTokenCount,
       retainedTokenCount,
+      sourceStateRecords: state.records,
+      sourceToolResultReplacementState: state.toolResultReplacementState,
+      graphWatermarkUuid,
     }
   }
 
@@ -924,19 +1143,12 @@ export class ContextCompactionService {
     const commitId = candidate.commitId
     const archivedThroughRecordId =
       archivedRecords[archivedRecords.length - 1]!.id
-    const sessionMemoryEntries = this.sessionMemory.buildEntries(
-      archivedRecords.filter(isMessageRecord),
-      {
-        sourceCompactionId: candidate.commitId,
-        archivedThroughRecordId,
-      }
-    )
     const commit: ContextCompactionCommit = {
       id: commitId,
       strategy: candidate.strategy,
       createdAt: candidate.createdAt,
       epoch: candidate.nextEpoch,
-      parentCompactionId: undefined,
+      parentCompactionId: state.activeCompactionId,
       archivedThroughRecordId,
       projectionAnchorRecordId: retainedRecords[0]?.id,
       archivedMessageCount: archivedRecords.filter(isMessageRecord).length,
@@ -968,27 +1180,78 @@ export class ContextCompactionService {
           ),
         ]
       : []
-    const simulatedState = this.cloneState(state)
-    this.applyCompactionPlan(
-      simulatedState,
-      {
-        commit,
-        projectedMessages: [],
-        estimatedTokens: 0,
-        attachmentFingerprint: candidate.attachmentFingerprint,
-        recordCount: state.records.length,
-        retainedRecords,
-        attachmentRecords,
-        hookResultRecords,
-        sessionMemoryEntries,
-      },
-      false
+    const boundaryRecord = createCompactBoundaryRecord(commit, createdAt)
+    const summaryRecord = createCompactSummaryRecord(commit, createdAt + 1)
+    const compactProjectionRecords = orderContextCompactionProjectionRecords(
+      candidate.mode,
+      boundaryRecord,
+      summaryRecord,
+      retainedRecords,
+      [...attachmentRecords, ...hookResultRecords]
     )
-    const projectedMessages = this.buildProjectedMessages(
+    const orderedProjectionRecords = rebaseSnipBoundariesIntoCompactProjection(
+      state.records,
+      compactProjectionRecords,
+      retainedRecords
+    )
+    const claudeRecipe =
+      candidate.contextProfile?.family === "claude" &&
+      candidate.claudeCapability
+        ? this.claudeProjector.buildRecipe({
+            commitId: commit.id,
+            createdAt: commit.createdAt,
+            boundaryRecordId: boundaryRecord.id,
+            summaryRecordId: summaryRecord.id,
+            orderedRecords: orderedProjectionRecords,
+            archivedRecords,
+            attachmentRecordIds: attachmentRecords.map((record) => record.id),
+            hookResultRecordIds: hookResultRecords.map((record) => record.id),
+            capability: candidate.claudeCapability,
+          })
+        : undefined
+    const simulatedState = this.cloneState(state)
+    const simulatedPlan: ContextCompactionPlan = {
+      commit,
+      projectedMessages: [],
+      estimatedTokens: 0,
+      attachmentFingerprint: candidate.attachmentFingerprint,
+      recordCount: state.records.length,
+      retainedRecords,
+      boundaryRecord,
+      summaryRecord,
+      orderedProjectionRecords,
+      attachmentRecords,
+      hookResultRecords,
+      graphWatermarkUuid: candidate.graphWatermarkUuid,
+    }
+    this.applyPreparedCompactionState(
+      simulatedState,
+      this.prepareCompactionState(simulatedState, simulatedPlan, Date.now())
+    )
+    const projection = this.buildProjectedMessages(
       simulatedState,
       snapshot,
-      attachmentTokenBudget
+      attachmentTokenBudget,
+      {
+        contextProfile: candidate.contextProfile,
+        claudeCapability: candidate.claudeCapability,
+        claudeRecipe,
+      }
     )
+    const projectedMessages = projection.messages
+    const claudeProjection = claudeRecipe
+      ? (() => {
+          if (!projection.claudeManifest) {
+            throw new Error(
+              `Claude compaction plan ${commit.id} produced no provider manifest`
+            )
+          }
+          return {
+            recipe: structuredClone(claudeRecipe),
+            manifest: structuredClone(projection.claudeManifest),
+          }
+        })()
+      : undefined
     commit.projectedTokenCount = this.countProjected(
       projectedMessages,
       this.resolveTokenizer(candidate.contextProfile)
@@ -1001,86 +1264,101 @@ export class ContextCompactionService {
       attachmentFingerprint: candidate.attachmentFingerprint,
       recordCount: state.records.length,
       retainedRecords,
+      boundaryRecord,
+      summaryRecord,
+      orderedProjectionRecords,
       attachmentRecords,
       hookResultRecords,
-      sessionMemoryEntries,
+      claudeProjection,
+      graphWatermarkUuid: candidate.graphWatermarkUuid,
     }
   }
 
-  private applyCompactionPlan(
+  private assertCandidateStillCurrent(
+    state: ContextConversationState,
+    candidate: ContextCompactionCandidate
+  ): void {
+    const mountedWatermark =
+      state.graphWatermarkUuid === undefined
+        ? undefined
+        : requireExactDurableIdentifier(
+            state.graphWatermarkUuid,
+            "Context compaction mounted main-graph watermark"
+          )
+    if (
+      state.records !== candidate.sourceStateRecords ||
+      state.toolResultReplacementState !==
+        candidate.sourceToolResultReplacementState ||
+      mountedWatermark !== candidate.graphWatermarkUuid ||
+      (state.compactionEpoch || 0) + 1 !== candidate.nextEpoch
+    ) {
+      throw new StaleContextCompactionCandidateError()
+    }
+  }
+
+  private prepareCompactionState(
     state: ContextConversationState,
     plan: ContextCompactionPlan,
-    emitTelemetry = true,
-    meta?: {
-      sessionId?: string
-      conversationId?: string
-      agentId?: string
-      querySource?: string
-      notifyPromptCacheCompaction?: () => void
+    appliedAt: number
+  ): PreparedContextCompactionState {
+    let graphWatermarkUuid: string
+    try {
+      graphWatermarkUuid = requireExactDurableIdentifier(
+        plan.graphWatermarkUuid,
+        `Context compaction plan ${plan.commit.id} main-graph watermark`
+      )
+    } catch {
+      throw new Error(
+        `Context compaction plan ${plan.commit.id} has an invalid main-graph watermark`
+      )
     }
+    const compactionEpoch = plan.commit.epoch
+    if (
+      typeof compactionEpoch !== "number" ||
+      !Number.isSafeInteger(compactionEpoch) ||
+      compactionEpoch <= 0
+    ) {
+      throw new Error(
+        `Context compaction plan ${plan.commit.id} has an invalid epoch`
+      )
+    }
+    if (!Number.isSafeInteger(appliedAt) || appliedAt <= 0) {
+      throw new Error(
+        `Context compaction plan ${plan.commit.id} has an invalid install time`
+      )
+    }
+    const records = [...plan.orderedProjectionRecords]
+    return {
+      records,
+      graphWatermarkUuid,
+      compactionHistory: deriveCompactionHistoryFromTranscript(records),
+      activeCompactionId: plan.commit.id,
+      compactionEpoch,
+      lastAppliedCompaction: {
+        recordCount: records.length,
+        attachmentFingerprint: plan.attachmentFingerprint,
+        appliedAt,
+        compactionId: plan.commit.id,
+        epoch: compactionEpoch,
+      },
+      compactWarningState: {
+        ...state.compactWarningState,
+        suppressed: true,
+      },
+    }
+  }
+
+  private applyPreparedCompactionState(
+    state: ContextConversationState,
+    next: PreparedContextCompactionState
   ): void {
-    const createdAt = Date.now()
-    state.records = [
-      createCompactBoundaryRecord(plan.commit, createdAt),
-      createCompactSummaryRecord(plan.commit, createdAt + 1),
-      ...plan.retainedRecords,
-      ...(plan.attachmentRecords || []),
-      ...(plan.hookResultRecords || []),
-    ]
-    state.sessionMemory = this.sessionMemory.mergeEntries(
-      state.sessionMemory,
-      plan.sessionMemoryEntries || []
-    )
-    state.compactionHistory = deriveCompactionHistoryFromTranscript(
-      state.records
-    )
-    state.activeCompactionId = plan.commit.id
-    state.compactionEpoch =
-      plan.commit.epoch ?? (state.compactionEpoch || 0) + 1
-    state.lastAppliedCompaction = {
-      recordCount: state.records.length,
-      attachmentFingerprint: plan.attachmentFingerprint,
-      appliedAt: createdAt,
-      compactionId: plan.commit.id,
-      epoch: state.compactionEpoch,
-    }
-    // cc parity: replaced the in-line resetDerivedCompactionState
-    // helper with a multi-phase service so cache-edit lifecycle, warn
-    // suppression, and prompt-cache baselines all reset together. The
-    // service is best-effort per phase — see PostCompactCleanupService
-    // for the rationale on why each phase swallows its own failures.
-    this.postCompactCleanup.run(state, {
-      conversationId: meta?.conversationId,
-      sessionId: meta?.sessionId,
-      agentId: meta?.agentId,
-      querySource: meta?.querySource,
-      notifyPromptCacheCompaction: meta?.notifyPromptCacheCompaction,
-    })
-    // cc parity: a successful boundary compaction is the loudest "I
-    // already handled the pressure" signal — suppress the next round
-    // of warning telemetry until the predictive hook re-evaluates.
-    this.compactWarningState.suppressCompactWarning(state)
-    if (emitTelemetry) {
-      this.telemetry.recordEvent({
-        event: "compaction.boundary_applied",
-        metadata: {
-          archivedMessageCount: plan.commit.archivedMessageCount,
-          sourceTokenCount: plan.commit.sourceTokenCount,
-          summaryTokenCount: plan.commit.summaryTokenCount,
-          epoch: state.compactionEpoch,
-        },
-      })
-      if (plan.sessionMemoryEntries?.length) {
-        this.telemetry.recordEvent({
-          event: "compaction.session_memory_updated",
-          delta: plan.sessionMemoryEntries.length,
-          metadata: {
-            entries: plan.sessionMemoryEntries.length,
-            totalEntries: state.sessionMemory.length,
-          },
-        })
-      }
-    }
+    state.records = next.records
+    state.graphWatermarkUuid = next.graphWatermarkUuid
+    state.compactionHistory = next.compactionHistory
+    state.activeCompactionId = next.activeCompactionId
+    state.compactionEpoch = next.compactionEpoch
+    state.lastAppliedCompaction = next.lastAppliedCompaction
+    state.compactWarningState = next.compactWarningState
   }
 
   private buildProjectedMessages(
@@ -1088,13 +1366,28 @@ export class ContextCompactionService {
     snapshot: ContextAttachmentSnapshot,
     attachmentTokenBudget: number,
     options?: {
-      codexAppendOnlyAttachments?: boolean
+      dynamicAttachmentMode?: "history" | "provider-native"
+      contextProfile?: ContextModelProfile
+      claudeCapability?: ClaudeProjectionCapabilitySnapshot
+      claudeRecipe?: ClaudeProjectionRecipe
+      pendingToolUseIds?: Iterable<string>
+      visibleSessionMemorySourceRecordUuids?: Iterable<string>
     }
-  ): ProjectedContextMessage[] {
+  ): ContextProjectionResult {
     return this.projection.project(state, {
       attachmentSnapshot: this.buildProjectionSnapshot(state, snapshot),
       attachmentTokenBudget,
-      codexAppendOnlyAttachments: options?.codexAppendOnlyAttachments,
+      dynamicAttachmentMode: options?.dynamicAttachmentMode,
+      claudeCapability:
+        options?.contextProfile?.family === "claude"
+          ? options.claudeCapability
+          : undefined,
+      claudeRecipe:
+        options?.contextProfile?.family === "claude"
+          ? options.claudeRecipe
+          : undefined,
+      visibleSessionMemorySourceRecordUuids:
+        options?.visibleSessionMemorySourceRecordUuids,
     })
   }
 
@@ -1104,22 +1397,88 @@ export class ContextCompactionService {
   ): ContextAttachmentSnapshot {
     return {
       ...snapshot,
-      sessionMemory:
-        state.sessionMemory.length > 0
-          ? this.sessionMemory.toAttachmentSummaries(state.sessionMemory)
-          : snapshot.sessionMemory,
+      // Session memory is materialized only from the durable event state.
+      // An attachment snapshot belongs to the current request and must never
+      // become a second, external memory authority when the durable stream is
+      // empty or unavailable.
+      sessionMemory: this.sessionMemory.toAttachmentSummaries(
+        state.sessionMemory
+      ),
     }
+  }
+
+  /**
+   * A compacted session-memory attachment is a projection of durable events,
+   * not an independent summary. Before persisting that projection, remove a
+   * terminal-delivery memory only when its exact graph source survives in the
+   * candidate's retained provider-visible slice. An empty retained slice
+   * intentionally removes nothing, so full compaction keeps the memory.
+   */
+  private buildAttachmentSnapshotForRetainedRecords(
+    state: ContextConversationState,
+    snapshot: ContextAttachmentSnapshot,
+    retainedRecords: readonly ContextTranscriptRecord[]
+  ): ContextAttachmentSnapshot {
+    const projectedSnapshot = this.buildProjectionSnapshot(state, snapshot)
+    const visibleRecordIds = new Set(
+      retainedRecords.filter(isMessageRecord).map((record) => record.id)
+    )
+    if (
+      visibleRecordIds.size === 0 ||
+      !projectedSnapshot.sessionMemory ||
+      projectedSnapshot.sessionMemory.length === 0
+    ) {
+      return projectedSnapshot
+    }
+    const sessionMemory = projectedSnapshot.sessionMemory.filter(
+      (memory, index) => {
+        assertTerminalSessionMemoryProvenance(
+          memory,
+          `ContextCompactionService: sessionMemory[${index}]`
+        )
+        return !visibleRecordIds.has(memory.sourceRecordUuid)
+      }
+    )
+    if (sessionMemory.length === projectedSnapshot.sessionMemory.length) {
+      return projectedSnapshot
+    }
+    return { ...projectedSnapshot, sessionMemory }
   }
 
   private compactionSourceRecords(
     activeSlice: readonly ContextTranscriptRecord[]
   ): ContextTranscriptRecord[] {
     return activeSlice.filter(
-      (record) =>
-        isMessageRecord(record) ||
-        isCompactSummaryRecord(record) ||
-        isContextCollapseSummaryRecord(record)
+      (record) => isMessageRecord(record) || isCompactSummaryRecord(record)
     )
+  }
+
+  private compactionSlicesHaveIntegrity(
+    archivedRecords: readonly ContextTranscriptRecord[],
+    retainedRecords: readonly ContextTranscriptRecord[],
+    integrityMode?: "strict-adjacent" | "global"
+  ): boolean {
+    try {
+      for (const records of [archivedRecords, retainedRecords]) {
+        if (records.length === 0) continue
+        this.toolIntegrity.assertProjectionIntegrity(
+          records.map((record) => ({
+            role: record.role,
+            content: record.content,
+            ...(record.messageId ? { messageId: record.messageId } : {}),
+          })) as UnifiedMessage[],
+          { mode: integrityMode }
+        )
+      }
+      return true
+    } catch (error) {
+      this.logger.debug(
+        `Rejected partial compaction boundary: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+      return false
+    }
   }
 
   private sanitizeProjectedMessages(
@@ -1127,6 +1486,7 @@ export class ContextCompactionService {
     options?: {
       pendingToolUseIds?: Iterable<string>
       integrityMode?: "strict-adjacent" | "global"
+      provider?: "claude" | "codex" | "generic"
     }
   ): UnifiedMessage[] {
     const unified = projected.map((message) => ({
@@ -1143,19 +1503,22 @@ export class ContextCompactionService {
       // true; absent on real user/assistant turns.
       ...(message.isMeta ? { isMeta: true } : {}),
       ...(message.source ? { source: message.source } : {}),
+      ...(message.sourceUuid ? { sourceUuid: message.sourceUuid } : {}),
       ...(message.attachmentKind
         ? { attachmentKind: message.attachmentKind }
         : {}),
     })) as UnifiedMessage[]
-    // Migration/defense guard for legacy compacted states or external
-    // truncation paths that already contain split tool pairs. New compaction
-    // candidates choose a tool-safe durable boundary before records are
-    // installed, so this must not be the normal repair path. The
-    // pendingToolUseIds set protects genuinely in-flight tool_uses from
-    // being synthesised over.
-    return repairOrphanedToolPairs(unified, {
-      pendingToolUseIds: options?.pendingToolUseIds,
-    })
+    // Codex owns the fail-closed pair assertion after UnifiedMessages become
+    // native RolloutItems, including the installed rollout plus reinjected
+    // delta. Other providers can validate this provider-neutral projection
+    // directly. Neither path fabricates or drops transcript blocks.
+    if (options?.provider !== "codex") {
+      this.toolIntegrity.assertProjectionIntegrity(unified, {
+        mode: options?.integrityMode,
+        pendingToolUseIds: options?.pendingToolUseIds,
+      })
+    }
+    return unified
   }
 
   /**
@@ -1314,18 +1677,6 @@ export class ContextCompactionService {
       : hardMaxTokens
   }
 
-  private resolvePostCompactRetentionBudget(
-    effectiveMaxTokens: number
-  ): number {
-    const scaledTarget = Math.floor(
-      effectiveMaxTokens * this.POST_COMPACT_TARGET_RATIO
-    )
-    return Math.max(
-      this.MIN_REQUEST_BUDGET,
-      Math.min(this.POST_COMPACT_TARGET_TOKENS, scaledTarget)
-    )
-  }
-
   private shouldCompact(
     estimated: number,
     hardMaxTokens: number,
@@ -1399,47 +1750,13 @@ export class ContextCompactionService {
       records: state.records.map((record) => ({ ...record })),
       compactionHistory: state.compactionHistory.map((commit) => ({
         ...commit,
-        codexReplacementHistory: commit.codexReplacementHistory
-          ? {
-              ...commit.codexReplacementHistory,
-              items: commit.codexReplacementHistory.items.map((item) => ({
-                ...item,
-              })),
-            }
-          : undefined,
       })),
       usageLedger: { ...state.usageLedger },
-      codexContext: state.codexContext
-        ? {
-            ...state.codexContext,
-            tokenInfo: state.codexContext.tokenInfo
-              ? { ...state.codexContext.tokenInfo }
-              : undefined,
-            referenceContextItem: state.codexContext.referenceContextItem
-              ? {
-                  ...state.codexContext.referenceContextItem,
-                  truncationPolicy: {
-                    ...state.codexContext.referenceContextItem.truncationPolicy,
-                  },
-                }
-              : undefined,
-            activeWindow: state.codexContext.activeWindow
-              ? {
-                  ...state.codexContext.activeWindow,
-                  replacementHistory: state.codexContext.activeWindow
-                    .replacementHistory
-                    ? {
-                        ...state.codexContext.activeWindow.replacementHistory,
-                        items:
-                          state.codexContext.activeWindow.replacementHistory.items.map(
-                            (item) => ({ ...item })
-                          ),
-                      }
-                    : undefined,
-                }
-              : undefined,
-            truncationPolicy: { ...state.codexContext.truncationPolicy },
-          }
+      lastAppliedCompaction: state.lastAppliedCompaction
+        ? { ...state.lastAppliedCompaction }
+        : undefined,
+      compactWarningState: state.compactWarningState
+        ? { ...state.compactWarningState }
         : undefined,
       toolResultReplacementState: state.toolResultReplacementState
         ? {
@@ -1455,100 +1772,17 @@ export class ContextCompactionService {
             records: [...(state.toolResultReplacementState.records || [])],
           }
         : undefined,
-      investigationMemory: state.investigationMemory.map((entry) => ({
-        ...entry,
-      })),
       sessionMemory: state.sessionMemory.map((entry) => ({ ...entry })),
-      contextCollapseState: state.contextCollapseState
-        ? {
-            updatedAt: state.contextCollapseState.updatedAt,
-            commits: state.contextCollapseState.commits.map((commit) => ({
-              ...commit,
-              archivedRecordIds: [...commit.archivedRecordIds],
-            })),
-          }
-        : undefined,
     }
   }
 
-  private resolveAttachmentBudget(
-    effectiveMaxTokens: number,
-    hasInvestigationMemory: boolean
-  ): number {
-    const baseBudget = Math.min(
+  private resolveAttachmentBudget(effectiveMaxTokens: number): number {
+    return Math.min(
       this.ATTACHMENT_TOKEN_BUDGET,
       Math.max(
         this.MIN_ATTACHMENT_TOKENS,
         Math.floor(effectiveMaxTokens * 0.18)
       )
-    )
-    if (!hasInvestigationMemory) return baseBudget
-    const proportionalBonus = Math.min(
-      this.INVESTIGATION_MEMORY_ATTACHMENT_BONUS,
-      Math.floor(effectiveMaxTokens * 0.03)
-    )
-    return Math.min(
-      this.ATTACHMENT_TOKEN_BUDGET + proportionalBonus,
-      baseBudget + proportionalBonus
-    )
-  }
-
-  private resolveSummaryBudgetCap(effectiveMaxTokens: number): number {
-    return Math.min(
-      this.SUMMARY_TOKEN_BUDGET,
-      Math.max(this.MIN_SUMMARY_TOKENS, Math.floor(effectiveMaxTokens * 0.22))
-    )
-  }
-
-  private estimateBoundaryTokens(
-    commitId: string,
-    tokenizer: ContextTokenizer
-  ): number {
-    return this.tokenCounter.countMessages(
-      [
-        {
-          role: "user",
-          content: this.projection.renderCompactionBoundary({
-            id: commitId,
-            strategy: "auto",
-            createdAt: Date.now(),
-            archivedThroughRecordId: commitId,
-            archivedMessageCount: 0,
-            sourceTokenCount: 0,
-            summary: "",
-            summaryTokenCount: 0,
-            projectedTokenCount: 0,
-          }),
-        },
-      ],
-      true,
-      tokenizer
-    )
-  }
-
-  private estimateSummaryEnvelopeTokens(
-    commitId: string,
-    tokenizer: ContextTokenizer
-  ): number {
-    return this.tokenCounter.countMessages(
-      [
-        {
-          role: "user",
-          content: this.projection.renderCompactionSummary({
-            id: commitId,
-            strategy: "auto",
-            createdAt: Date.now(),
-            archivedThroughRecordId: commitId,
-            archivedMessageCount: 0,
-            sourceTokenCount: 0,
-            summary: "",
-            summaryTokenCount: 0,
-            projectedTokenCount: 0,
-          }),
-        },
-      ],
-      true,
-      tokenizer
     )
   }
 
@@ -1556,6 +1790,26 @@ export class ContextCompactionService {
     if (typeof value !== "number") return undefined
     if (!Number.isFinite(value) || value <= 0) return undefined
     return Math.floor(value)
+  }
+
+  private resolveBudgetEnforcement(
+    value: ContextBudgetEnforcement | undefined
+  ): ContextBudgetEnforcement {
+    if (value === undefined || value === "strict") return "strict"
+    if (value === "measure") return "measure"
+    throw new Error(`Unknown context budget enforcement mode: ${String(value)}`)
+  }
+
+  private validateProviderProjectedTokenCount(
+    value: number | undefined
+  ): number | undefined {
+    if (value === undefined) return undefined
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(
+        "Provider projected token count must be a non-negative safe integer"
+      )
+    }
+    return value
   }
 
   private countTextRecords(
@@ -1574,5 +1828,18 @@ export class ContextCompactionService {
           block.text.trim().length > 0
       )
     }).length
+  }
+}
+
+function requireMountedGraphWatermark(value: unknown): string {
+  try {
+    return requireExactDurableIdentifier(
+      value,
+      "Context compaction mounted main-graph watermark"
+    )
+  } catch {
+    throw new Error(
+      "Context compaction candidate requires a mounted main-graph watermark"
+    )
   }
 }

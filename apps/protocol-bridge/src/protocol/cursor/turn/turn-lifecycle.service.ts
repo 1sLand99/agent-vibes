@@ -2,6 +2,10 @@ import { forwardRef, Inject, Injectable, Logger } from "@nestjs/common"
 import type { StatementSync } from "node:sqlite"
 import type { TurnOutbound } from "../bidi/bidi-outbound"
 import { OutboundForbiddenError } from "../bidi/bidi-outbound"
+import {
+  assertProjectionOwner,
+  type ProjectionOwner,
+} from "../session/projection-owner"
 import { PersistenceService } from "../../../persistence"
 import { SessionLifecycleService } from "../session/session-lifecycle.service"
 import { TurnHandleImpl, withWriter } from "./turn-handle-impl"
@@ -35,35 +39,52 @@ import {
  * AND that owns an outbound; chat parent / foreground sub-agent turns
  * always set `parentTurnId` to the umbrella's id (or its descendant)
  * so cancel-cascade and writer-stack invariants flow through one
- * spine. `bidiId` is `undefined` only for `synthetic-compaction`
- * turns, which run outside any BiDi.
+ * spine. `control` retains that same top-level user-request owner for a typed
+ * ConversationAction. `synthetic-compaction` and `background-subagent` turns
+ * have no outbound/BiDi writer, but still belong to their real conversation
+ * and are auditable turns.
  */
 interface TurnRecord {
   readonly handle: TurnHandleImpl
   readonly runner: TurnRunner
   readonly turnKind: TurnKind
   readonly conversationId: ConversationId
+  readonly projectionOwner: ProjectionOwner
   readonly streamId: StreamId
   readonly bidiId: BidiId | undefined
   readonly parentTurnId: TurnId | undefined
   readonly children: Set<TurnId>
   readonly outbound: TurnOutbound | undefined
-  /** Resolves with the runner's terminal result. */
+  /** Resolves with the lifecycle's committed terminal result. */
   readonly terminalPromise: Promise<TurnTerminalResult>
-  /** Set when the supervisor force-resolves the terminal promise on a cancel race. */
+  /** Resolves after lifecycle finalization and registry cleanup complete. */
   resolveTerminal: (r: TurnTerminalResult) => void
   /** Finalize hook (transcript-anchor commit/abort) — see TurnSpawnRequest.onFinalize. */
-  onFinalize?: (result: TurnTerminalResult, handle: TurnHandle) => void
+  onFinalize?: (
+    result: TurnTerminalResult,
+    handle: TurnHandle
+  ) => void | Promise<void>
 }
 
 export interface TurnSpawnRequest {
   turnKind: TurnKind
+  /**
+   * The caller must name the durable owner before work starts. This prevents
+   * detached child work (especially compact turns) from inheriting the root
+   * conversation merely because the SQL audit table is conversation-keyed.
+   */
+  projectionOwner: ProjectionOwner
   conversationId: ConversationId
+  /**
+   * Preallocated identity for flows whose branch owner is derived from the
+   * execution turn id. Ordinary callers may omit it and use `reserveTurnId`.
+   */
+  turnId?: TurnId
   streamId: StreamId
   /**
    * The BiDi attachment this turn runs under. Required for every
-   * outbound-owning kind (`user`, `foreground-subagent`, `recovery`).
-   * `synthetic-compaction` is the only kind that may omit it — those
+   * outbound-owning kind (`user`, `control`, `foreground-subagent`, `recovery`).
+   * `synthetic-compaction` and `background-subagent` may omit it — those
    * turns run outside any BiDi and produce no outbound frames.
    */
   bidiId?: BidiId
@@ -87,17 +108,40 @@ export interface TurnSpawnRequest {
    *
    * Receives the turn's `handle` explicitly so callers don't depend on
    * a `handle` binding that is only assigned after `spawn` returns.
-   * Must not throw: `driveRunner` guards it, but a leaked anchor is the
-   * exact failure this hook exists to prevent — do error handling
-   * inside the hook.
+   * The hook may return a promise and is awaited before terminal state is
+   * published. A throw rejects the proposed terminal outcome: the lifecycle
+   * publishes `failed` rather than reporting a completed turn whose durable
+   * graph ownership was not actually finalized.
    */
-  onFinalize?: (result: TurnTerminalResult, handle: TurnHandle) => void
+  onFinalize?: (
+    result: TurnTerminalResult,
+    handle: TurnHandle
+  ) => void | Promise<void>
 }
 
 export interface TurnLifecycleObserver {
   onSpawn?(turnId: TurnId, kind: TurnKind, parent: TurnId | undefined): void
   onTerminal?(turnId: TurnId, result: TurnTerminalResult): void
   onCancel?(turnId: TurnId, reason: CancelReason): void
+}
+
+/**
+ * Marks a terminal failure whose proposed result could not be committed by
+ * the lifecycle finalizer. This is intentionally distinct from a runner
+ * failure: a runner can fail while its finalizer successfully releases graph
+ * ownership, whereas a finalization failure leaves that ownership uncertain
+ * and must block a superseding turn.
+ */
+export class TurnFinalizationError extends Error {
+  readonly finalizationError: Error
+
+  constructor(turnId: TurnId, finalizationError: Error) {
+    super(
+      `turn finalization failed for ${turnId}: ${finalizationError.message}`
+    )
+    this.name = TurnFinalizationError.name
+    this.finalizationError = finalizationError
+  }
 }
 
 /**
@@ -171,8 +215,17 @@ export class TurnLifecycle {
   }
 
   /**
+   * Reserve a turn id before branch construction. A child branch owns its
+   * execution id, so its projection owner must be known before `spawn()`
+   * persists the first audit event.
+   */
+  reserveTurnId(turnKind: TurnKind): TurnId {
+    return TurnIdMint.generate(turnKind)
+  }
+
+  /**
    * Spawn a new turn. Returns the handle and a promise that
-   * resolves with the terminal result. The runner is invoked
+   * resolves with the committed terminal result. The runner is invoked
    * asynchronously — this method returns immediately so callers can
    * subscribe to `awaitTerminal` without blocking the caller's
    * stack frame.
@@ -186,7 +239,16 @@ export class TurnLifecycle {
     handle: TurnHandle
     awaitTerminal: Promise<TurnTerminalResult>
   } {
-    const turnId = TurnIdMint.generate(req.turnKind)
+    assertProjectionOwner(req.projectionOwner, "TurnLifecycle.spawn")
+    if (req.projectionOwner.conversationId !== req.conversationId) {
+      throw new Error(
+        `TurnLifecycle.spawn: projection owner belongs to ${req.projectionOwner.conversationId}, not ${req.conversationId}`
+      )
+    }
+    const turnId = req.turnId ?? this.reserveTurnId(req.turnKind)
+    if (this.turns.has(turnId)) {
+      throw new Error(`TurnLifecycle.spawn: turn ${turnId} is already active`)
+    }
     const parentRecord = req.parentTurnId
       ? this.turns.get(req.parentTurnId)
       : undefined
@@ -196,12 +258,29 @@ export class TurnLifecycle {
       )
     }
 
-    // Validate bidi expectations for the kind. `synthetic-compaction`
-    // is the only kind that legitimately runs outside a BiDi. Any
-    // other kind without a bidiId is a wiring bug — fail loud.
-    if (req.turnKind !== "synthetic-compaction" && !req.bidiId) {
+    const detached =
+      req.turnKind === "synthetic-compaction" ||
+      req.turnKind === "background-subagent"
+    if (!detached && !req.bidiId) {
       throw new Error(
         `TurnLifecycle.spawn: turnKind=${req.turnKind} requires bidiId`
+      )
+    }
+    // Synthetic/background work is detached from outbound delivery, not from
+    // its causal turn. It may attach to a parent so supersede/cancel cascades
+    // reach its transport AbortSignal; it simply never owns a BiDi writer.
+    if (detached && (req.bidiId || req.outbound)) {
+      throw new Error(
+        `TurnLifecycle.spawn: detached turnKind=${req.turnKind} cannot own bidi or outbound`
+      )
+    }
+    if (
+      detached &&
+      parentRecord &&
+      parentRecord.conversationId !== req.conversationId
+    ) {
+      throw new Error(
+        `TurnLifecycle.spawn: detached turnKind=${req.turnKind} parent belongs to another conversation`
       )
     }
     // Child turns must inherit their parent's bidi — having a child
@@ -221,6 +300,7 @@ export class TurnLifecycle {
       turnId,
       turnKind: req.turnKind,
       conversationId: req.conversationId,
+      projectionOwner: req.projectionOwner,
       streamId: req.streamId,
       outbound: req.outbound,
       parentSignal: parentRecord?.handle.signal,
@@ -240,6 +320,7 @@ export class TurnLifecycle {
       runner,
       turnKind: req.turnKind,
       conversationId: req.conversationId,
+      projectionOwner: req.projectionOwner,
       streamId: req.streamId,
       bidiId: req.bidiId,
       parentTurnId: req.parentTurnId,
@@ -259,21 +340,16 @@ export class TurnLifecycle {
     // appendEvent's INSERT fail with FOREIGN KEY constraint failed. We
     // synchronously flush here so the FK is satisfied at insert time.
     //
-    // Two kinds of turn legitimately have no parent `sessions` row to
-    // flush:
-    //   - `synthetic-compaction`: runs outside any conversation by
-    //     design.
-    //   - The BiDi umbrella turn (which spawns under a provisional
-    //     `pending:<bidiId>` cid before the IDE has sent the first
-    //     message carrying the real conversation_id). The umbrella's
-    //     audit trail belongs to the BiDi attachment, not to a
-    //     conversation; persisting it would dangle a FK forever.
-    // Both cases skip the flush; appendEvent is paired below so it
-    // also skips the SQL INSERT under those same conditions.
-    if (
-      req.turnKind !== "synthetic-compaction" &&
-      !ConversationId.isProvisional(req.conversationId)
-    ) {
+    // The only non-persistable case is a BiDi umbrella turn under the
+    // provisional `pending:<bidiId>` conversation id, before the IDE has
+    // supplied a real conversation id. Its audit trail is BiDi-scoped, so a
+    // turn_events row would dangle a foreign key forever.
+    // Provisional turns skip the flush; appendEvent is paired below so it
+    // also skips the SQL INSERT under that same condition. A synthetic
+    // compaction is intentionally different: it has a real conversation id
+    // and therefore receives the same durable turn audit as any other
+    // conversation-owned backend request.
+    if (!ConversationId.isProvisional(req.conversationId)) {
       this.sessionLifecycle.flushPersistImmediate(req.conversationId)
     }
     this.appendEvent(turnId, {
@@ -346,11 +422,37 @@ export class TurnLifecycle {
         : { status: "failed", error: e }
     }
 
-    // If the runner did not call reportTerminal, do it on its
-    // behalf so awaitTerminal resolves and observers fire.
-    if (!record.handle.hasTerminal()) {
-      record.handle.forceTerminal(result)
+    // A runner can nominate a terminal result with reportTerminal(), but that
+    // proposal is not externally visible until required graph/session
+    // finalization has committed. Prefer the explicit report to preserve the
+    // runner contract; otherwise use the result returned from run().
+    result = record.handle.reportedTerminal() ?? result
+
+    // Finalize the turn's transcript anchor (commit on success / abort on
+    // cancel|fail) BEFORE publishing terminal state or resolving
+    // terminalPromise. This is the happens-before that lets a superseding turn
+    // observe a fully settled ownership boundary after cancelTurnAndAwait
+    // returns. A finalization error is not merely telemetry: it means the
+    // proposed terminal result was not durably realized, so fail closed.
+    if (record.onFinalize) {
+      try {
+        await record.onFinalize(result, record.handle)
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err))
+        this.logger.error(
+          `onFinalize failed for turn=${record.handle.turnId} ` +
+            `conversation=${record.conversationId}: ${error.message}`
+        )
+        result = {
+          status: "failed",
+          error: new TurnFinalizationError(record.handle.turnId, error),
+        }
+      }
     }
+
+    // Publish only the final, finalized result. In particular, an onFinalize
+    // failure must never leave observers or awaitTerminal with `completed`.
+    record.handle.commitTerminal(result)
 
     // Append the terminal event to the audit log before tearing down
     // the in-memory log so the persisted row carries the final result.
@@ -379,30 +481,6 @@ export class TurnLifecycle {
       }
       if (this.umbrellaByBidi.get(record.bidiId) === record.handle.turnId) {
         this.umbrellaByBidi.delete(record.bidiId)
-      }
-    }
-
-    // Finalize the turn's transcript anchor (commit on success / abort
-    // on cancel|fail) BEFORE resolving terminalPromise. The anchor is
-    // owned by the turn lifecycle, not the caller's post-await flow:
-    // running it here is the happens-before that guarantees a
-    // superseding turn sees a settled (cleared) anchor the instant
-    // cancelTurnAndAwait returns. Doing it after resolve — as the old
-    // business-flow code did — let an abort race resolve the terminal
-    // while the anchor was still open, leaking it into the next turn's
-    // beginTurn ("supersede serializer leaked a turn").
-    if (record.onFinalize) {
-      try {
-        record.onFinalize(result, record.handle)
-      } catch (err) {
-        // onFinalize must not throw (it owns the anchor it is meant to
-        // clear). If it does, log loudly — a leaked anchor is exactly
-        // the failure this hook prevents — but still resolve so the
-        // superseding turn is not blocked forever.
-        this.logger.error(
-          `onFinalize threw for turn=${record.handle.turnId} ` +
-            `conversation=${record.conversationId}: ${(err as Error).message}`
-        )
       }
     }
 
@@ -505,6 +583,11 @@ export class TurnLifecycle {
    */
   hasTurn(turnId: TurnId): boolean {
     return this.turns.has(turnId)
+  }
+
+  /** Await one exact active turn without exposing its internal record. */
+  awaitTurn(turnId: TurnId): Promise<TurnTerminalResult> | undefined {
+    return this.turns.get(turnId)?.terminalPromise
   }
 
   /**
@@ -712,31 +795,27 @@ export class TurnLifecycle {
     const log = this.auditByTurn.get(turnId)
     if (log) log.push(event)
 
-    // Turns that legitimately have no parent `sessions` row keep an
-    // in-memory audit log only; the SQL INSERT would dangle the FK
-    // forever. Two cases qualify:
-    //   - `synthetic-compaction` runs outside any conversation.
-    //   - The BiDi umbrella turn lives under the provisional
+    // A turn that has no parent `sessions` row keeps an in-memory audit log
+    // only; the SQL INSERT would dangle the FK forever. That is exclusively
+    // the BiDi umbrella turn under the provisional
     //     `pending:<bidiId>` cid: its lifecycle is BiDi-scoped, not
     //     conversation-scoped, and the IDE never sends a real cid for
     //     it. Pre-fix this used to spew "FOREIGN KEY constraint
     //     failed" on every BiDi attach + cancel.
-    if (
-      record.turnKind === "synthetic-compaction" ||
-      ConversationId.isProvisional(record.conversationId)
-    ) {
+    if (ConversationId.isProvisional(record.conversationId)) {
       return
     }
 
     try {
       const stmt = (this.stmtAppendTurnEvent ??= this.persistence.prepare(
         `INSERT INTO turn_events (
-           conversation_id, turn_id, seq, ts, event_kind, event_json
-         ) VALUES (?, ?, ?, ?, ?, ?)`
+           conversation_id, owner_key, turn_id, seq, ts, event_kind, event_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`
       ))
       const seq = this.nextTurnEventSeq(record.conversationId, turnId)
       stmt.run(
         record.conversationId,
+        record.projectionOwner.ownerKey,
         turnId,
         seq,
         event.ts,

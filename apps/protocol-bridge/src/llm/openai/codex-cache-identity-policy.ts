@@ -1,67 +1,13 @@
-import { buildCodexOAuthCacheIdentity } from "./codex-slot-identity"
+import { requireExactDurableIdentifier } from "../../context/durable-identifier"
 
-export type CodexPromptCacheIdentityDecision =
-  | {
-      kind: "conversation"
-      cacheId: string
-    }
-  | {
-      kind: "user"
-      model: string
-      userId: string
-    }
-  | {
-      kind: "api_key"
-      apiKey: string
-    }
-  | {
-      kind: "oauth"
-      identity: string
-    }
-
-export interface ResolveCodexPromptCacheIdentityOptions {
-  model: string
-  conversationId?: string
-  cacheUserId?: string
-  apiKey?: string
-  slotKey: string
-}
-
-export function resolveCodexPromptCacheIdentity(
-  options: ResolveCodexPromptCacheIdentityOptions
-): CodexPromptCacheIdentityDecision {
-  const conversationId = options.conversationId?.trim() || ""
-  if (conversationId) {
-    return {
-      kind: "conversation",
-      cacheId: conversationId,
-    }
-  }
-
-  const userId = options.cacheUserId?.trim()
-  if (userId) {
-    return {
-      kind: "user",
-      model: options.model,
-      userId,
-    }
-  }
-
-  const apiKey = options.apiKey
-  if (apiKey) {
-    return {
-      kind: "api_key",
-      apiKey,
-    }
-  }
-
-  return {
-    kind: "oauth",
-    identity: buildCodexOAuthCacheIdentity({
-      slotKey: options.slotKey,
-      model: options.model,
-      conversationId,
-      includeConversationId: false,
-    }),
-  }
+/**
+ * The native Codex client scopes prompt caching to Responses metadata's
+ * session id. A bridge-local projection key, user id, account id, or OAuth
+ * identity is not an interchangeable cache namespace.
+ */
+export function resolveCodexPromptCacheKey(sessionId: string): string {
+  return requireExactDurableIdentifier(
+    sessionId,
+    "Codex prompt cache upstream sessionId"
+  )
 }

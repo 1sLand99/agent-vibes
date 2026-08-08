@@ -3,6 +3,7 @@ export type ContextTokenLimitSource = "requested" | "conversation_state"
 export interface SessionContextWindowState {
   model: string
   contextTokenLimit?: number
+  contextTokenLimitSource?: ContextTokenLimitSource
   contextMaxMode?: boolean
 }
 
@@ -24,6 +25,19 @@ export interface SessionContextWindowTransitionResult extends SessionContextWind
   modelChanged: boolean
 }
 
+export function assertContextTokenLimitProvenance(input: {
+  contextTokenLimit?: number
+  contextTokenLimitSource?: ContextTokenLimitSource
+}): void {
+  const hasLimit = input.contextTokenLimit !== undefined
+  const hasSource = input.contextTokenLimitSource !== undefined
+  if (hasLimit !== hasSource) {
+    throw new Error(
+      "A context token limit and its protocol source must be provided together"
+    )
+  }
+}
+
 function normalizeModel(model: string | undefined): string | undefined {
   const normalized = model?.trim()
   return normalized || undefined
@@ -37,9 +51,12 @@ export function resolveSessionContextWindowTransition(
       model: input.current.model,
       modelChanged: false,
       contextTokenLimit: input.current.contextTokenLimit,
+      contextTokenLimitSource: input.current.contextTokenLimitSource,
       contextMaxMode: input.current.contextMaxMode,
     }
   }
+
+  assertContextTokenLimitProvenance(input.incoming)
 
   const model = normalizeModel(input.incoming.model) ?? input.current.model
   const modelChanged = model !== input.current.model
@@ -54,16 +71,26 @@ export function resolveSessionContextWindowTransition(
       model,
       modelChanged,
       contextTokenLimit: incomingLimit,
+      contextTokenLimitSource: incomingLimit
+        ? input.incoming.contextTokenLimitSource
+        : undefined,
       contextMaxMode: input.incoming.contextMaxMode,
     }
   }
 
+  const contextTokenLimit = modelChanged
+    ? incomingLimit
+    : (incomingLimit ?? input.current.contextTokenLimit)
+
   return {
     model,
     modelChanged,
-    contextTokenLimit: modelChanged
-      ? incomingLimit
-      : (incomingLimit ?? input.current.contextTokenLimit),
+    contextTokenLimit,
+    contextTokenLimitSource: contextTokenLimit
+      ? incomingLimit !== undefined
+        ? input.incoming.contextTokenLimitSource
+        : input.current.contextTokenLimitSource
+      : undefined,
     contextMaxMode: modelChanged
       ? (input.incoming.contextMaxMode ?? false)
       : (input.incoming.contextMaxMode ?? input.current.contextMaxMode),

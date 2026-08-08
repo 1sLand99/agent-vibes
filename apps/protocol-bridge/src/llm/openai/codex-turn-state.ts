@@ -1,5 +1,7 @@
 import type { CodexInputItem } from "./codex-native-types"
 import {
+  getCodexContinuationEligibility,
+  prepareCodexFullTurnLedgerRequest,
   prepareCodexTurnLedgerRequest,
   type CodexContinuationDecision,
   type CodexInputMismatchItemDetail,
@@ -9,6 +11,8 @@ import {
 export interface CodexTurnContinuationState {
   lastResponse: CodexTurnLedgerResponse | undefined
   lastRequest: Record<string, unknown> | undefined
+  /** Exact identity of the live upstream ModelClientSession. */
+  modelClientSessionId: string
 }
 
 export interface CodexPreparedTurnRequest {
@@ -16,7 +20,14 @@ export interface CodexPreparedTurnRequest {
   decision: CodexContinuationDecision
 }
 
-export function prepareCodexTurnStateRequest(
+/**
+ * Derive one physical request from the last accepted continuation state.
+ *
+ * This is deliberately pure: a failed or abandoned transport must not
+ * consume the prior response chain. Call `commitCodexTurnStateRequest` only
+ * after the owning provider lifecycle has accepted the physical attempt.
+ */
+export function planCodexTurnStateRequest(
   request: Record<string, unknown>,
   state: CodexTurnContinuationState,
   allowEmptyDelta: boolean
@@ -26,15 +37,40 @@ export function prepareCodexTurnStateRequest(
     {
       lastRequest: state.lastRequest,
       lastResponse: state.lastResponse,
+      modelClientSessionId: state.modelClientSessionId,
     },
     allowEmptyDelta
   )
-  state.lastRequest = decision.nextState.lastRequest
-  state.lastResponse = decision.nextState.lastResponse
   return {
     request: decision.request,
     decision,
   }
+}
+
+/** Build an explicit complete-input candidate without consuming a baseline. */
+export function planCodexFullTurnStateRequest(
+  request: Record<string, unknown>,
+  state: CodexTurnContinuationState
+): CodexPreparedTurnRequest {
+  const decision = prepareCodexFullTurnLedgerRequest(request, {
+    lastRequest: state.lastRequest,
+    lastResponse: state.lastResponse,
+    modelClientSessionId: state.modelClientSessionId,
+  })
+  return {
+    request: decision.request,
+    decision,
+  }
+}
+
+/** Publish a previously planned continuation transition after acceptance. */
+export function commitCodexTurnStateRequest(
+  state: CodexTurnContinuationState,
+  prepared: CodexPreparedTurnRequest
+): void {
+  state.lastRequest = prepared.decision.nextState.lastRequest
+  state.lastResponse = prepared.decision.nextState.lastResponse
+  state.modelClientSessionId = prepared.decision.nextState.modelClientSessionId
 }
 
 export function buildCodexContinuationDecisionLogLine(
@@ -49,20 +85,22 @@ export function buildCodexContinuationDecisionLogLine(
     const detail =
       decision.reason === "static_fields_changed"
         ? ` keys=${decision.changedStaticKeys.join(",") || "unknown"}`
-        : ` baseline=${decision.inputMismatch.baselineLength} request=${decision.inputMismatch.requestLength}` +
-          (typeof decision.inputMismatch.mismatchIndex === "number"
-            ? ` mismatch_index=${decision.inputMismatch.mismatchIndex}` +
-              ` baseline_type=${decision.inputMismatch.baselineType || "unknown"}` +
-              ` request_type=${decision.inputMismatch.requestType || "unknown"}` +
-              formatCodexInputMismatchDetail(
-                "baseline",
-                decision.inputMismatch.baselineDetail
-              ) +
-              formatCodexInputMismatchDetail(
-                "request",
-                decision.inputMismatch.requestDetail
-              )
-            : "")
+        : decision.reason === "input_not_extension"
+          ? ` baseline=${decision.inputMismatch.baselineLength} request=${decision.inputMismatch.requestLength}` +
+            (typeof decision.inputMismatch.mismatchIndex === "number"
+              ? ` mismatch_index=${decision.inputMismatch.mismatchIndex}` +
+                ` baseline_type=${decision.inputMismatch.baselineType || "unknown"}` +
+                ` request_type=${decision.inputMismatch.requestType || "unknown"}` +
+                formatCodexInputMismatchDetail(
+                  "baseline",
+                  decision.inputMismatch.baselineDetail
+                ) +
+                formatCodexInputMismatchDetail(
+                  "request",
+                  decision.inputMismatch.requestDetail
+                )
+              : "")
+          : ""
     return (
       `[Codex][TurnContext] Incremental request unavailable: ${decision.reason}${detail}; ` +
       `resetting response chain for ${conversationId}`
@@ -90,7 +128,14 @@ export function captureCodexTurnResponse(
   responseId: string,
   itemsAdded: CodexInputItem[]
 ): void {
-  state.lastResponse = { responseId, itemsAdded }
+  state.lastResponse = {
+    responseId,
+    itemsAdded,
+    ...(state.lastRequest
+      ? { eligibility: getCodexContinuationEligibility(state.lastRequest) }
+      : {}),
+    modelClientSessionId: state.modelClientSessionId,
+  }
 }
 
 export function resetCodexTurnContinuationState(

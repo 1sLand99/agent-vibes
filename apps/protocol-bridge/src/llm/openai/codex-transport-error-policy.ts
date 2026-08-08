@@ -34,28 +34,6 @@ export function isCodexStaleResponseIdError(error: unknown): boolean {
   return false
 }
 
-export interface ShouldReplayCodexRequestWithoutPreviousResponseIdOptions {
-  conversationId?: string
-  currentRequest: Record<string, unknown>
-  originalRequest: Record<string, unknown>
-}
-
-export function shouldReplayCodexRequestWithoutPreviousResponseId(
-  error: unknown,
-  options: ShouldReplayCodexRequestWithoutPreviousResponseIdOptions
-): boolean {
-  const previousResponseId =
-    typeof options.currentRequest.previous_response_id === "string"
-      ? options.currentRequest.previous_response_id.trim()
-      : ""
-  return (
-    !!options.conversationId?.trim() &&
-    !!previousResponseId &&
-    options.currentRequest !== options.originalRequest &&
-    isCodexStaleResponseIdError(error)
-  )
-}
-
 export function shouldFallbackToHttpAfterCodexWebSocketError(
   error: unknown
 ): boolean {

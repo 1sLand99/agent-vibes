@@ -1,150 +1,334 @@
-/**
- * In-memory registry of in-flight background sub-agent tasks.
- *
- * Mirrors claude-code's `~/.claude/sub-agents/` registry but slimmer —
- * the bridge process is single-host so we don't need cross-process
- * coordination. The registry's purpose:
- *
- *   - Lets `task` tool dispatcher know an `agentId` is currently running
- *     so duplicate spawns / status queries don't race.
- *   - Holds the AbortController used to kill a running background
- *     sub-agent (e.g. when the parent conversation is closed).
- *   - Survives across BiDi streams within the same bridge process so a
- *     parent agent that spawned a background sub-agent in turn N can
- *     still query its status from turn N+1.
- *
- * Persistent state (transcript / metadata / final result) lives in
- * `SubagentTranscriptStore` on disk. The registry only owns the
- * runtime handles.
- */
-
-import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common"
+import { Injectable, Logger, type OnModuleDestroy } from "@nestjs/common"
 
 import {
-  SubagentTaskMetadata,
-  SubagentTaskStatus,
-  SubagentTranscriptStore,
-} from "./subagent-transcript-store.service"
+  SubagentRunStore,
+  type SubagentRunMode,
+  type SubagentRunRecord,
+} from "../session/subagent-run-store.service"
+import { TurnLifecycle } from "../turn/turn-lifecycle.service"
+import {
+  ConversationId,
+  type TurnId,
+  type TurnTerminalResult,
+} from "../turn/turn.types"
 
-interface BackgroundTaskHandle {
+export interface SubagentRuntimeHandle {
+  conversationId: ConversationId
   agentId: string
-  parentConversationId: string
-  abortController: AbortController
-  /** Promise that resolves when the worker exits (success / fail /
-   * killed). Callers can `await` it to block on completion without
-   * polling metadata. */
-  donePromise: Promise<void>
-  startedAt: number
+  executionTurnId: TurnId
+  mode: SubagentRunMode
 }
 
+/**
+ * Process-local handles for durable sub-agent runs.
+ *
+ * SQLite is the sole lifecycle authority. This registry only connects the
+ * current execution turn to cancellation and structured waiting; it never
+ * infers status from transcript files or from the presence of a Map entry.
+ */
 @Injectable()
 export class SubagentTaskRegistry implements OnModuleDestroy {
   private readonly logger = new Logger(SubagentTaskRegistry.name)
-  private readonly handles = new Map<string, BackgroundTaskHandle>()
+  private readonly handles = new Map<string, SubagentRuntimeHandle>()
 
-  constructor(private readonly transcriptStore: SubagentTranscriptStore) {}
+  constructor(
+    private readonly runs: SubagentRunStore,
+    private readonly turns: TurnLifecycle
+  ) {}
 
-  onModuleDestroy(): void {
-    // Best-effort kill of every still-running background sub-agent on
-    // bridge shutdown. The transcript store still has the partial
-    // record for inspection.
-    for (const [agentId, handle] of this.handles) {
-      try {
-        handle.abortController.abort()
-      } catch (error) {
-        this.logger.warn(
-          `Abort failed for background sub-agent ${agentId} on shutdown: ${String(error)}`
-        )
-      }
+  async onModuleDestroy(): Promise<void> {
+    const active = [...this.handles.values()]
+    for (const handle of active) {
+      this.turns.cancelTurn(handle.executionTurnId, { kind: "shutdown" })
     }
+    await Promise.all(
+      active.map(
+        (handle) =>
+          this.turns.awaitTurn(handle.executionTurnId) ?? Promise.resolve()
+      )
+    )
     this.handles.clear()
   }
 
-  /**
-   * Register a freshly spawned background sub-agent. Persists initial
-   * metadata to disk so external readers can see the task immediately.
-   */
-  register(handle: BackgroundTaskHandle, metadata: SubagentTaskMetadata): void {
-    this.handles.set(handle.agentId, handle)
-    this.transcriptStore.initMetadata(metadata)
-    // When the worker finishes (cleanly or via abort), evict the runtime
-    // handle. Metadata file remains on disk for status queries.
-    handle.donePromise
-      .catch((error) => {
-        this.logger.warn(
-          `Background sub-agent ${handle.agentId} done-promise rejected: ${String(error)}`
-        )
-      })
-      .finally(() => {
-        this.handles.delete(handle.agentId)
-      })
-  }
-
-  /** Whether a runtime handle exists. False does NOT mean the task
-   * doesn't exist — it may have completed; check metadata on disk. */
-  isRunning(agentId: string): boolean {
-    return this.handles.has(agentId)
-  }
-
-  /** Return current status: prefer the in-memory registry (most recent
-   * truth) and fall back to on-disk metadata. */
-  getStatus(agentId: string): SubagentTaskStatus | undefined {
-    if (this.handles.has(agentId)) {
-      return "running"
-    }
-    return this.transcriptStore.readMetadata(agentId)?.status
-  }
-
-  /** Read the full metadata snapshot for a task. */
-  getMetadata(agentId: string): SubagentTaskMetadata | undefined {
-    return this.transcriptStore.readMetadata(agentId)
-  }
-
-  /** Abort a running background sub-agent. Returns true when a runtime
-   * handle was found and aborted, false when the task is not running
-   * (already completed / never registered). */
-  kill(agentId: string, reason = "external kill"): boolean {
-    const handle = this.handles.get(agentId)
-    if (!handle) return false
-    try {
-      handle.abortController.abort()
-    } catch (error) {
-      this.logger.warn(
-        `Abort failed for background sub-agent ${agentId} (${reason}): ${String(error)}`
+  register(handle: SubagentRuntimeHandle): void {
+    const key = this.key(handle.conversationId, handle.agentId)
+    if (this.handles.has(key)) {
+      throw new Error(
+        `SubagentTaskRegistry.register: duplicate runtime handle ` +
+          `conversation=${handle.conversationId} agentId=${handle.agentId}`
       )
     }
-    return true
+    this.assertDurableOwner(handle)
+    const terminal = this.requireActiveExecution(handle, "register")
+    this.handles.set(key, { ...handle })
+    this.observe(handle, terminal)
   }
 
-  /** Get the AbortSignal for a running task — used by the worker
-   * itself to bail out of long awaits. */
-  getAbortSignal(agentId: string): AbortSignal | undefined {
-    return this.handles.get(agentId)?.abortController.signal
+  /** Replace the foreground execution only after the durable handoff commits. */
+  replaceExecution(
+    expectedExecutionTurnId: TurnId,
+    next: SubagentRuntimeHandle
+  ): void {
+    const key = this.key(next.conversationId, next.agentId)
+    const current = this.handles.get(key)
+    if (!current || current.executionTurnId !== expectedExecutionTurnId) {
+      throw new Error(
+        `SubagentTaskRegistry.replaceExecution: runtime owner mismatch ` +
+          `conversation=${next.conversationId} agentId=${next.agentId}`
+      )
+    }
+    this.assertDurableOwner(next)
+    const terminal = this.requireActiveExecution(next, "replaceExecution")
+    this.handles.set(key, { ...next })
+    this.observe(next, terminal)
   }
 
-  /** Iterate runtime handles for diagnostic / status-query tools. */
-  listRunning(): Array<{
+  getRun(
+    conversationId: ConversationId,
     agentId: string
-    parentConversationId: string
-    startedAt: number
-  }> {
-    return Array.from(this.handles.values()).map((h) => ({
-      agentId: h.agentId,
-      parentConversationId: h.parentConversationId,
-      startedAt: h.startedAt,
-    }))
+  ): SubagentRunRecord | undefined {
+    return this.runs.get(conversationId, agentId)
   }
 
-  /**
-   * Promise that resolves when a running background sub-agent finishes
-   * (success / failure / killed). Resolves immediately when the agent is
-   * already terminal. Used by the `await_task` / `wait_agent` tool to
-   * block the parent agent's LLM turn on real completion instead of
-   * polling the metadata file.
-   */
-  awaitDone(agentId: string): Promise<void> {
-    const handle = this.handles.get(agentId)
-    if (!handle) return Promise.resolve()
-    return handle.donePromise
+  isRunning(conversationId: ConversationId, agentId: string): boolean {
+    return this.runs.get(conversationId, agentId)?.status === "running"
+  }
+
+  listRunning(conversationId?: ConversationId): SubagentRuntimeHandle[] {
+    return [...this.handles.values()]
+      .filter(
+        (handle) =>
+          conversationId === undefined ||
+          handle.conversationId === conversationId
+      )
+      .map((handle) => ({ ...handle }))
+  }
+
+  kill(
+    conversationId: ConversationId,
+    agentId: string
+  ): "cancelled" | "already_terminal" | "missing_runtime" | "missing" {
+    // A foreground → background handoff swaps the durable execution and the
+    // process-local handle in adjacent synchronous operations. Re-read once
+    // if we observe that boundary so `kill_agent` never reports a missing
+    // handle for a live successor.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const run = this.runs.get(conversationId, agentId)
+      if (!run) return "missing"
+      if (run.status !== "running") return "already_terminal"
+      const handle = this.handles.get(this.key(conversationId, agentId))
+      if (handle && handle.executionTurnId === run.executionTurnId) {
+        this.turns.cancelTurn(handle.executionTurnId, {
+          kind: "subagent-killed",
+          agentId,
+        })
+        return "cancelled"
+      }
+
+      const afterMismatch = this.runs.get(conversationId, agentId)
+      if (
+        !afterMismatch ||
+        afterMismatch.status !== "running" ||
+        afterMismatch.executionTurnId === run.executionTurnId
+      ) {
+        return afterMismatch?.status === "running"
+          ? "missing_runtime"
+          : afterMismatch
+            ? "already_terminal"
+            : "missing"
+      }
+    }
+    return "missing_runtime"
+  }
+
+  async awaitDone(
+    conversationId: ConversationId,
+    agentId: string,
+    signal: AbortSignal
+  ): Promise<SubagentRunRecord> {
+    // This loop follows the *durable* execution owner. It is intentionally
+    // not a single await on whichever TurnHandle was current at entry: a
+    // legal foreground → background handoff terminalizes the foreground turn
+    // while the logical run remains running on its replacement turn.
+    for (;;) {
+      signal.throwIfAborted()
+      const observed = this.runs.get(conversationId, agentId)
+      if (!observed) {
+        throw new Error(`Unknown sub-agent: ${agentId}`)
+      }
+      if (observed.status !== "running") return observed
+
+      const handle = this.handles.get(this.key(conversationId, agentId))
+      if (!handle || handle.executionTurnId !== observed.executionTurnId) {
+        const afterLookup = this.runs.get(conversationId, agentId)
+        if (afterLookup && afterLookup.status !== "running") return afterLookup
+        if (
+          afterLookup &&
+          afterLookup.executionTurnId !== observed.executionTurnId
+        ) {
+          // The handoff committed between the durable read and registry read.
+          continue
+        }
+        throw new Error(
+          `Sub-agent ${agentId} is durably running without its execution handle`
+        )
+      }
+
+      const terminal = this.turns.awaitTurn(handle.executionTurnId)
+      if (!terminal) {
+        const afterLookup = this.runs.get(conversationId, agentId)
+        if (afterLookup && afterLookup.status !== "running") return afterLookup
+        if (
+          afterLookup &&
+          afterLookup.executionTurnId !== observed.executionTurnId
+        ) {
+          continue
+        }
+        throw new Error(`Sub-agent ${agentId} execution turn is not active`)
+      }
+
+      await this.waitForTerminalOrAbort(terminal, signal)
+      const afterTerminal = this.runs.get(conversationId, agentId)
+      if (!afterTerminal) {
+        throw new Error(
+          `Sub-agent ${agentId} disappeared after execution ended`
+        )
+      }
+      if (afterTerminal.status !== "running") return afterTerminal
+      if (afterTerminal.executionTurnId !== observed.executionTurnId) {
+        // The foreground terminal was the official handoff boundary. Await
+        // the newly installed background execution rather than treating a
+        // healthy successor as an orphaned run.
+        continue
+      }
+      throw new Error(
+        `Sub-agent ${agentId} execution ended without a durable terminal outcome`
+      )
+    }
+  }
+
+  private requireActiveExecution(
+    handle: SubagentRuntimeHandle,
+    operation: "register" | "replaceExecution"
+  ): Promise<TurnTerminalResult> {
+    const terminal = this.turns.awaitTurn(handle.executionTurnId)
+    if (!terminal) {
+      throw new Error(
+        `SubagentTaskRegistry.${operation}: execution turn is not active: ${handle.executionTurnId}`
+      )
+    }
+    return terminal
+  }
+
+  private observe(
+    handle: SubagentRuntimeHandle,
+    terminal: Promise<TurnTerminalResult>
+  ): void {
+    // `terminalPromise` itself never rejects, but the durable orphan guard
+    // can. Do not create an unowned rejected promise during a shutdown or a
+    // malformed runner path; logging is the only safe action once the turn
+    // has already reached its lifecycle terminal state.
+    void terminal.then(
+      (result) => {
+        try {
+          this.onExecutionTerminal(handle, result)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          this.logger.error(
+            `Sub-agent terminal reconciliation failed: ` +
+              `conversation=${handle.conversationId} agentId=${handle.agentId} ` +
+              `turn=${handle.executionTurnId} error=${message}`
+          )
+        }
+      },
+      (error) => {
+        // Defensive only: TurnLifecycle promises are specified not to reject.
+        this.logger.error(
+          `Sub-agent terminal promise rejected: conversation=${handle.conversationId} ` +
+            `agentId=${handle.agentId} turn=${handle.executionTurnId} ` +
+            `error=${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+    )
+  }
+
+  private onExecutionTerminal(
+    observed: SubagentRuntimeHandle,
+    result: TurnTerminalResult
+  ): void {
+    const key = this.key(observed.conversationId, observed.agentId)
+    const current = this.handles.get(key)
+    // A foreground-to-background handoff installs its successor before the
+    // old turn unwinds. The old observer must not delete or terminalize it.
+    if (!current || current.executionTurnId !== observed.executionTurnId) {
+      return
+    }
+    this.handles.delete(key)
+
+    const run = this.runs.get(observed.conversationId, observed.agentId)
+    if (
+      !run ||
+      run.status !== "running" ||
+      run.executionTurnId !== observed.executionTurnId
+    ) {
+      return
+    }
+
+    // Do not synthesize a durable terminal state here. A terminal run must
+    // commit in the same graph transaction as either its parent `task`
+    // tool_result or its explicit background notification. This observer has
+    // neither graph ownership nor a delivery slot, so using it as a fallback
+    // would create a second lifecycle authority and an unpaired terminal.
+    //
+    // The turn finalizer is required to perform that atomic transition. If it
+    // did not, preserve the running record for the explicit graph-recovery
+    // path and make the invariant violation visible rather than fabricating a
+    // plausible failure result.
+    this.logger.error(
+      `Sub-agent turn ended without an atomic durable terminal transition: ` +
+        `conversation=${observed.conversationId} agentId=${observed.agentId} ` +
+        `turn=${observed.executionTurnId} lifecycleStatus=${result.status}`
+    )
+  }
+
+  private assertDurableOwner(handle: SubagentRuntimeHandle): void {
+    const run = this.runs.get(handle.conversationId, handle.agentId)
+    if (
+      !run ||
+      run.status !== "running" ||
+      run.executionTurnId !== handle.executionTurnId ||
+      run.mode !== handle.mode
+    ) {
+      throw new Error(
+        `SubagentTaskRegistry: durable execution owner mismatch ` +
+          `conversation=${handle.conversationId} agentId=${handle.agentId}`
+      )
+    }
+  }
+
+  private async waitForTerminalOrAbort(
+    terminal: Promise<TurnTerminalResult>,
+    signal: AbortSignal
+  ): Promise<void> {
+    signal.throwIfAborted()
+    let abortListener: (() => void) | undefined
+    const aborted = new Promise<never>((_resolve, reject) => {
+      abortListener = () =>
+        reject(
+          signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException("Aborted", "AbortError")
+        )
+      signal.addEventListener("abort", abortListener, { once: true })
+    })
+    try {
+      await Promise.race([terminal, aborted])
+    } finally {
+      if (abortListener) signal.removeEventListener("abort", abortListener)
+    }
+  }
+
+  private key(conversationId: ConversationId, agentId: string): string {
+    return `${conversationId}\u0000${agentId}`
   }
 }

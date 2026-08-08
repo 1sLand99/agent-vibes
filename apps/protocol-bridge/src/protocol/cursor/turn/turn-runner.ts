@@ -24,9 +24,10 @@ export interface TurnRunner {
   readonly displayName: string
 
   /**
-   * Execute the turn against the supplied handle. Resolves with the
-   * terminal result. The supervisor is responsible for invoking
-   * `handle.reportTerminal()` if the runner did not already.
+   * Execute the turn against the supplied handle. Resolves with the proposed
+   * terminal result. The lifecycle uses an explicit `handle.reportTerminal()`
+   * proposal when present, then commits the final externally-visible result
+   * only after required finalization completes.
    */
   run(handle: TurnHandle): Promise<TurnTerminalResult>
 }

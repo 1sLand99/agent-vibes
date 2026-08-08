@@ -99,7 +99,10 @@ function formatSseEvent(event: string, data: Record<string, unknown>): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 }
 
-function startThinkingBlock(state: CodexStreamState): string[] {
+function startThinkingBlock(
+  state: CodexStreamState,
+  itemId?: string
+): string[] {
   if (state.thinkingBlockOpen) return []
 
   state.thinkingBlockOpen = true
@@ -108,6 +111,7 @@ function startThinkingBlock(state: CodexStreamState): string[] {
     formatSseEvent("content_block_start", {
       type: "content_block_start",
       index: state.blockIndex,
+      ...(itemId ? { item_id: itemId } : {}),
       content_block: { type: "thinking", thinking: "" },
     }),
   ]
@@ -144,10 +148,13 @@ function finalizeThinkingBlock(state: CodexStreamState): string[] {
   return results
 }
 
-function finalizeSignatureOnlyThinkingBlock(state: CodexStreamState): string[] {
+function finalizeSignatureOnlyThinkingBlock(
+  state: CodexStreamState,
+  itemId?: string
+): string[] {
   if (!state.thinkingSignature) return []
 
-  return [...startThinkingBlock(state), ...finalizeThinkingBlock(state)]
+  return [...startThinkingBlock(state, itemId), ...finalizeThinkingBlock(state)]
 }
 
 function extractReasoningText(item: Record<string, unknown>): string {
@@ -259,7 +266,12 @@ export function translateCodexSseEvent(
         results.push(...finalizeThinkingBlock(state))
       }
       state.thinkingSummarySeen = true
-      results.push(...startThinkingBlock(state))
+      results.push(
+        ...startThinkingBlock(
+          state,
+          typeof event.item_id === "string" ? event.item_id : undefined
+        )
+      )
       break
     }
 
@@ -290,6 +302,9 @@ export function translateCodexSseEvent(
         formatSseEvent("content_block_start", {
           type: "content_block_start",
           index: state.blockIndex,
+          ...(typeof event.item_id === "string"
+            ? { item_id: event.item_id }
+            : {}),
           content_block: { type: "text", text: "" },
         })
       )
@@ -363,6 +378,7 @@ export function translateCodexSseEvent(
         formatSseEvent("content_block_start", {
           type: "content_block_start",
           index: state.blockIndex,
+          ...(typeof item.id === "string" ? { item_id: item.id } : {}),
           content_block: {
             type: "tool_use",
             id: sanitizeClaudeToolId((item.call_id as string) || ""),
@@ -465,6 +481,7 @@ export function translateCodexSseEvent(
             formatSseEvent("content_block_start", {
               type: "content_block_start",
               index: state.blockIndex,
+              ...(typeof item.id === "string" ? { item_id: item.id } : {}),
               content_block: { type: "text", text: "" },
             })
           )
@@ -498,7 +515,12 @@ export function translateCodexSseEvent(
         if (state.thinkingSummarySeen) {
           results.push(...finalizeThinkingBlock(state))
         } else {
-          results.push(...finalizeSignatureOnlyThinkingBlock(state))
+          results.push(
+            ...finalizeSignatureOnlyThinkingBlock(
+              state,
+              typeof item.id === "string" ? item.id : undefined
+            )
+          )
         }
         state.thinkingSummarySeen = false
         break
@@ -524,6 +546,7 @@ export function translateCodexSseEvent(
             formatSseEvent("content_block_start", {
               type: "content_block_start",
               index: state.blockIndex,
+              ...(typeof item.id === "string" ? { item_id: item.id } : {}),
               content_block: { type: "text", text: "" },
             })
           )
@@ -650,17 +673,11 @@ export function translateCodexSseEvent(
       const errorMessage = (errorObj?.message as string) || "Response failed"
       const errorCode = (errorObj?.code as string) || "unknown_error"
 
-      // 映射已知错误码到标准 stop_reason
-      let stopReason = "error"
-      if (errorCode === "context_length_exceeded") {
-        stopReason = "max_tokens"
-      }
-
       results.push(
         formatSseEvent("message_delta", {
           type: "message_delta",
           delta: {
-            stop_reason: stopReason,
+            stop_reason: "error",
             stop_sequence: null,
             error: { type: errorCode, message: errorMessage },
           },
@@ -680,15 +697,17 @@ export function translateCodexSseEvent(
       >
       const reason = (incompleteDetails?.reason as string) || "unknown"
 
-      let stopReason = "max_tokens"
-      if (reason === "max_output_tokens") {
-        stopReason = "max_tokens"
-      }
+      const stopReason =
+        reason === "max_output_tokens" ? "max_tokens" : "incomplete"
 
       results.push(
         formatSseEvent("message_delta", {
           type: "message_delta",
-          delta: { stop_reason: stopReason, stop_sequence: null },
+          delta: {
+            stop_reason: stopReason,
+            stop_sequence: null,
+            incomplete_reason: reason,
+          },
           usage: { input_tokens: 0, output_tokens: 0 },
         })
       )
@@ -699,7 +718,12 @@ export function translateCodexSseEvent(
     // ── reasoning 原始内容 — 对齐 Codex 官方 response.reasoning_text.delta ──
     // 当服务端不提供 summary 而是发送原始 reasoning content 时使用。
     case "response.reasoning_text.delta": {
-      results.push(...startThinkingBlock(state))
+      results.push(
+        ...startThinkingBlock(
+          state,
+          typeof event.item_id === "string" ? event.item_id : undefined
+        )
+      )
       const delta = event.delta as string
       if (delta != null) {
         results.push(

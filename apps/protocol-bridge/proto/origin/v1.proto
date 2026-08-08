@@ -1,0 +1,2857 @@
+syntax = "proto3";
+package origin.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/value.proto";
+
+enum AuthorizedNamespaceAccessReason {
+  AUTHORIZED_NAMESPACE_ACCESS_REASON_UNSPECIFIED = 0;
+  AUTHORIZED_NAMESPACE_ACCESS_REASON_TEAM_OWNERSHIP = 1;
+}
+
+enum AuthPolicyAppliesTo {
+  AUTH_POLICY_APPLIES_TO_UNSPECIFIED = 0;
+  AUTH_POLICY_APPLIES_TO_REPOSITORY = 1;
+  AUTH_POLICY_APPLIES_TO_NAMESPACE = 2;
+}
+
+enum ChangeAssignmentCreatedVia {
+  CHANGE_ASSIGNMENT_CREATED_VIA_UNSPECIFIED = 0;
+  CHANGE_ASSIGNMENT_CREATED_VIA_HUMAN = 1;
+  CHANGE_ASSIGNMENT_CREATED_VIA_CODEOWNERS = 2;
+  CHANGE_ASSIGNMENT_CREATED_VIA_SYSTEM = 3;
+}
+
+enum ChangeAssignmentKind {
+  CHANGE_ASSIGNMENT_KIND_UNSPECIFIED = 0;
+  CHANGE_ASSIGNMENT_KIND_REVIEW_REQUEST = 1;
+  CHANGE_ASSIGNMENT_KIND_ASSIGNEE = 2;
+}
+
+enum ChangeStatus {
+  CHANGE_STATUS_UNSPECIFIED = 0;
+  CHANGE_STATUS_DRAFT = 1;
+  CHANGE_STATUS_OPEN = 2;
+  CHANGE_STATUS_MERGED = 3;
+  CHANGE_STATUS_CLOSED = 4;
+}
+
+enum CheckRunConclusion {
+  CHECK_RUN_CONCLUSION_UNSPECIFIED = 0;
+  success = 1;
+  failure = 2;
+  neutral = 3;
+  cancelled = 4;
+  skipped = 5;
+  timed_out = 6;
+  action_required = 7;
+  stale = 8;
+}
+
+enum CheckRunLifecycleStatus {
+  CHECK_RUN_LIFECYCLE_STATUS_UNSPECIFIED = 0;
+  queued = 1;
+  in_progress = 2;
+  completed = 3;
+}
+
+enum CommentSide {
+  COMMENT_SIDE_UNSPECIFIED = 0;
+  COMMENT_SIDE_LEFT = 1;
+  COMMENT_SIDE_RIGHT = 2;
+}
+
+enum CommentThreadPortingStatus {
+  COMMENT_THREAD_PORTING_STATUS_UNSPECIFIED = 0;
+  COMMENT_THREAD_PORTING_STATUS_PORTED = 1;
+  COMMENT_THREAD_PORTING_STATUS_ORPHANED = 2;
+}
+
+enum ListHostedReposOrderBy {
+  LIST_HOSTED_REPOS_ORDER_BY_UNSPECIFIED = 0;
+  LIST_HOSTED_REPOS_ORDER_BY_NAME_ASC = 1;
+  LIST_HOSTED_REPOS_ORDER_BY_NAME_DESC = 2;
+  LIST_HOSTED_REPOS_ORDER_BY_LAST_PUSHED_DESC = 3;
+  LIST_HOSTED_REPOS_ORDER_BY_LAST_PUSHED_ASC = 4;
+  LIST_HOSTED_REPOS_ORDER_BY_ID_ASC = 5;
+  LIST_HOSTED_REPOS_ORDER_BY_ID_DESC = 6;
+}
+
+enum MergeabilityScope {
+  MERGEABILITY_SCOPE_UNSPECIFIED = 0;
+  MERGEABILITY_SCOPE_STACK = 1;
+  MERGEABILITY_SCOPE_SINGLE_CHANGE = 2;
+}
+
+enum MirrorStatus {
+  MIRROR_STATUS_UNSPECIFIED = 0;
+  MIRROR_STATUS_TRANSITIONING_TO_INBOUND = 1;
+  MIRROR_STATUS_INBOUND = 2;
+  MIRROR_STATUS_OUTBOUND = 3;
+  MIRROR_STATUS_TRANSITIONING_INBOUND_TO_OUTBOUND = 4;
+  MIRROR_STATUS_TRANSITIONING_OUTBOUND_TO_INBOUND = 5;
+  MIRROR_STATUS_INITIAL_SYNC_PENDING = 6;
+}
+
+enum OriginNamespaceOwnerType {
+  ORIGIN_NAMESPACE_OWNER_TYPE_UNSPECIFIED = 0;
+  ORIGIN_NAMESPACE_OWNER_TYPE_TEAM = 1;
+  ORIGIN_NAMESPACE_OWNER_TYPE_USER = 2;
+}
+
+enum PullRequestViewedCursor {
+  PULL_REQUEST_VIEWED_CURSOR_UNSPECIFIED = 0;
+  PULL_REQUEST_VIEWED_CURSOR_OPENED = 1;
+  PULL_REQUEST_VIEWED_CURSOR_TIMELINE = 2;
+}
+
+enum RepoKind {
+  REPO_KIND_UNSPECIFIED = 0;
+  REPO_KIND_STANDARD = 1;
+  REPO_KIND_CURSOR_MARKETPLACE = 2;
+}
+
+enum RepoMirrorTransition {
+  REPO_MIRROR_TRANSITION_UNSPECIFIED = 0;
+  REPO_MIRROR_TRANSITION_INBOUND_TO_OUTBOUND = 1;
+  REPO_MIRROR_TRANSITION_OUTBOUND_TO_INBOUND = 2;
+  REPO_MIRROR_TRANSITION_INITIAL_TO_INBOUND = 3;
+}
+
+enum RepoMirrorTransitionJobPhase {
+  REPO_MIRROR_TRANSITION_JOB_PHASE_UNSPECIFIED = 0;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_QUEUED = 1;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_STARTING = 2;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_DRAINING_WRITES = 3;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_FINALIZING_MIRROR_FETCH = 4;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_FINALIZING_MIRROR_PUSH = 5;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_COMMITTING_TARGET_STATUS = 6;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_ROLLING_BACK = 7;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_COMPLETED = 8;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_INITIALIZING_MIRROR_FETCH = 9;
+}
+
+enum RepoMirrorTransitionJobStatus {
+  REPO_MIRROR_TRANSITION_JOB_STATUS_UNSPECIFIED = 0;
+  REPO_MIRROR_TRANSITION_JOB_STATUS_QUEUED = 1;
+  REPO_MIRROR_TRANSITION_JOB_STATUS_RUNNING = 2;
+  REPO_MIRROR_TRANSITION_JOB_STATUS_SUCCEEDED = 3;
+  REPO_MIRROR_TRANSITION_JOB_STATUS_FAILED_ROLLED_BACK = 4;
+  REPO_MIRROR_TRANSITION_JOB_STATUS_REQUIRES_ATTENTION = 5;
+}
+
+enum RepoSelectionMode {
+  REPO_SELECTION_MODE_UNSPECIFIED = 0;
+  REPO_SELECTION_MODE_ALL = 1;
+  REPO_SELECTION_MODE_SELECTED = 2;
+}
+
+enum RepoVisibility {
+  REPO_VISIBILITY_UNSPECIFIED = 0;
+  REPO_VISIBILITY_INTERNAL = 1;
+  REPO_VISIBILITY_PRIVATE = 2;
+}
+
+enum ReviewRequestEventAction {
+  REVIEW_REQUEST_EVENT_ACTION_UNSPECIFIED = 0;
+  REVIEW_REQUEST_EVENT_ACTION_REQUESTED = 1;
+  REVIEW_REQUEST_EVENT_ACTION_REMOVED = 2;
+}
+
+enum ReviewVerdict {
+  REVIEW_VERDICT_UNSPECIFIED = 0;
+  REVIEW_VERDICT_APPROVE = 1;
+  REVIEW_VERDICT_REQUEST_CHANGES = 2;
+  REVIEW_VERDICT_COMMENT = 3;
+}
+
+enum RulesetBypassActorKind {
+  RULESET_BYPASS_ACTOR_KIND_UNSPECIFIED = 0;
+  RULESET_BYPASS_ACTOR_KIND_USER = 1;
+  RULESET_BYPASS_ACTOR_KIND_TEAM = 2;
+  RULESET_BYPASS_ACTOR_KIND_APP = 3;
+  RULESET_BYPASS_ACTOR_KIND_ORGANIZATION_ADMIN = 4;
+  RULESET_BYPASS_ACTOR_KIND_REPOSITORY_ROLE = 5;
+}
+
+enum RulesetBypassMode {
+  RULESET_BYPASS_MODE_UNSPECIFIED = 0;
+  RULESET_BYPASS_MODE_ALWAYS = 1;
+  RULESET_BYPASS_MODE_PULL_REQUEST_ONLY = 2;
+}
+
+enum RulesetEnforcement {
+  RULESET_ENFORCEMENT_UNSPECIFIED = 0;
+  RULESET_ENFORCEMENT_ACTIVE = 1;
+  RULESET_ENFORCEMENT_EVALUATE = 2;
+  RULESET_ENFORCEMENT_DISABLED = 3;
+}
+
+enum RulesetKind {
+  RULESET_KIND_UNSPECIFIED = 0;
+  RULESET_KIND_MERGE_BRANCH = 1;
+  RULESET_KIND_PUSH_BRANCH = 2;
+  RULESET_KIND_PUSH_TAG = 3;
+  RULESET_KIND_PUSH_REPOSITORY = 4;
+}
+
+enum SectionOfChangesReviewStatusState {
+  SECTION_OF_CHANGES_REVIEW_STATUS_STATE_UNSPECIFIED = 0;
+  SECTION_OF_CHANGES_REVIEW_STATUS_STATE_ONE_OR_MORE_APPROVALS = 1;
+  SECTION_OF_CHANGES_REVIEW_STATUS_STATE_IS_FULLY_APPROVED = 2;
+  SECTION_OF_CHANGES_REVIEW_STATUS_STATE_HAS_ACTIVE_REVIEW = 3;
+  SECTION_OF_CHANGES_REVIEW_STATUS_STATE_HAS_REQUESTED_REVIEWERS = 4;
+  SECTION_OF_CHANGES_REVIEW_STATUS_STATE_HAS_REREQUESTED_REVIEW = 5;
+  SECTION_OF_CHANGES_REVIEW_STATUS_STATE_HAS_UNADDRESSED_CHANGES_REQUESTED = 6;
+  SECTION_OF_CHANGES_REVIEW_STATUS_STATE_HAS_CHANGES_REQUESTED = 7;
+}
+
+enum SectionOfChangesSortField {
+  SECTION_OF_CHANGES_SORT_FIELD_UNSPECIFIED = 0;
+  SECTION_OF_CHANGES_SORT_FIELD_UPDATED_AT = 1;
+  SECTION_OF_CHANGES_SORT_FIELD_CREATED_AT = 2;
+  SECTION_OF_CHANGES_SORT_FIELD_TITLE = 3;
+  SECTION_OF_CHANGES_SORT_FIELD_LINES_CHANGED = 4;
+}
+
+enum SectionOfChangesStatus {
+  SECTION_OF_CHANGES_STATUS_UNSPECIFIED = 0;
+  SECTION_OF_CHANGES_STATUS_DRAFT = 1;
+  SECTION_OF_CHANGES_STATUS_OPEN = 2;
+  SECTION_OF_CHANGES_STATUS_MERGED = 3;
+  SECTION_OF_CHANGES_STATUS_CLOSED = 4;
+}
+
+enum SectionOfChangesVerdict {
+  SECTION_OF_CHANGES_VERDICT_UNSPECIFIED = 0;
+  SECTION_OF_CHANGES_VERDICT_APPROVE = 1;
+  SECTION_OF_CHANGES_VERDICT_COMMENT = 2;
+  SECTION_OF_CHANGES_VERDICT_REQUEST_CHANGES = 3;
+}
+
+enum TeamGroupKind {
+  TEAM_GROUP_KIND_UNSPECIFIED = 0;
+  TEAM_GROUP_KIND_ADMINS = 1;
+  TEAM_GROUP_KIND_MEMBERS = 2;
+}
+
+enum UpdateChangeBranchMethod {
+  UPDATE_CHANGE_BRANCH_METHOD_UNSPECIFIED = 0;
+  UPDATE_CHANGE_BRANCH_METHOD_MERGE_COMMIT = 1;
+}
+
+message ActorWithDisplay {
+  string id = 1;
+  string kind = 2;
+  string display_name = 3;
+  string avatar_url = 4;
+}
+
+message AddAssigneeRequest {
+  oneof target {
+    string auth_id = 2;
+    string group_id = 3;
+  }
+  ChangeIdentifier change = 1;
+}
+
+message AddAssigneeResponse {
+  ChangeAssignment assignment = 1;
+}
+
+message AddCommentToThreadRequest {
+  ChangeIdentifier change = 1;
+  string thread_id = 2;
+  string body = 3;
+}
+
+message AddCommentToThreadResponse {
+  Comment comment = 1;
+}
+
+message AddLabelToChangeRequest {
+  ChangeIdentifier change = 1;
+  string label_id = 2;
+}
+
+message AddLabelToChangeResponse {
+}
+
+message AddSshPublicKeyRequest {
+  string public_key = 1;
+  string name = 2;
+}
+
+message AddSshPublicKeyResponse {
+  SshPublicKey ssh_public_key = 1;
+}
+
+message App {
+  string id = 1;
+  string slug = 2;
+  string display_name = 3;
+  string webhook_url = 4;
+  string public_key = 5;
+  bool is_public = 6;
+  string namespace_slug = 7;
+  repeated string events = 8;
+  repeated AppAuthPolicyStatement auth_policy_statements = 9;
+  string created_at = 10;
+  string updated_at = 11;
+  repeated string installation_redirect_uris = 12;
+  string icon_url = 13;
+  string description = 14;
+  string website_url = 15;
+}
+
+message AppAuthPolicyStatement {
+  string resource_kind = 1;
+  string action = 2;
+}
+
+message AppAuthPolicyStatementsReplace {
+  repeated AppAuthPolicyStatement statements = 1;
+}
+
+message AppEventsReplace {
+  repeated string events = 1;
+}
+
+message AppInstallationRedirectUrisReplace {
+  repeated string installation_redirect_uris = 1;
+}
+
+message ApplyReviewRequestChangesRequest {
+  ChangeIdentifier change = 1;
+  repeated ReviewRequestTarget additions = 2;
+  repeated ReviewRequestTarget removals = 3;
+}
+
+message ApplyReviewRequestChangesResponse {
+}
+
+message AppMetadata {
+  string id = 1;
+  string slug = 2;
+  string display_name = 3;
+  string namespace_slug = 4;
+  string icon_url = 5;
+  string description = 6;
+  string website_url = 7;
+}
+
+message AuthorizedNamespace {
+  OriginNamespace namespace = 1;
+  AuthorizedNamespaceAccessReason access_reason = 2;
+}
+
+message AuthPolicyStatement {
+  string resource_kind = 1;
+  string action = 2;
+}
+
+message AuthPolicySummary {
+  string name = 1;
+  string display_name = 2;
+  string description = 3;
+  AuthPolicyAppliesTo applies_to = 4;
+  bool is_origin_managed = 5;
+  bool is_custom = 6;
+  repeated AuthPolicyStatement statements = 7;
+  int32 user_facing_scope_count = 8;
+}
+
+message BatchGetChangesRequest {
+  ClientRepoIdentifier identifier = 1;
+  repeated uint64 change_numbers = 2;
+  repeated string head_refs = 3;
+}
+
+message BatchGetChangesResponse {
+  repeated ChangeWithLatestVersion changes = 1;
+}
+
+message BuildkiteBranchFilters {
+  repeated string patterns = 1;
+}
+
+message BuildkiteTrigger {
+  string id = 1;
+  ClientRepoIdentifier repo = 2;
+  string buildkite_org_slug = 3;
+  string pipeline_slug = 4;
+  bool enabled = 5;
+  bool trigger_on_prs = 6;
+  repeated string branch_filters = 7;
+}
+
+message CanMergeClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string ours = 2;
+  string theirs = 3;
+}
+
+message Change {
+  string id = 1;
+  string repo_uuid = 2;
+  uint64 number = 3;
+  string title = 4;
+  string description = 5;
+  string head_ref = 6;
+  string base_ref = 7;
+  string author_id = 8;
+  ChangeStatus status = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  optional google.protobuf.Timestamp merged_at = 12;
+  optional google.protobuf.Timestamp closed_at = 13;
+  optional string parent_change_id = 14;
+  optional string stack_id = 15;
+  optional string merge_commit_sha = 16;
+  string author_kind = 17;
+  string author_display_name = 18;
+  string author_avatar_url = 19;
+  optional string merged_by_id = 20;
+  optional string merged_by_kind = 21;
+  ActorWithDisplay author = 22;
+  ActorWithDisplay merged_by = 23;
+}
+
+message ChangeAssignment {
+  string id = 1;
+  string change_id = 2;
+  ChangeAssignmentKind kind = 3;
+  string assigned_auth_id = 4;
+  string assigned_group_id = 5;
+  ChangeAssignmentCreatedVia created_via = 6;
+  string created_by_auth_id = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+message ChangeIdentifier {
+  ClientRepoIdentifier identifier = 1;
+  uint64 change_number = 2;
+}
+
+message ChangeLabel {
+  string id = 1;
+  string name = 2;
+  string color = 3;
+  optional string description = 4;
+}
+
+message ChangeMergeWhenReady {
+  string id = 1;
+  string change_id = 2;
+  string repo_uuid = 3;
+  uint64 change_number = 4;
+  string enabling_user_id = 5;
+  string status = 6;
+  string source = 7;
+  string trunk_branch = 8;
+  optional google.protobuf.Timestamp lock_expires_at = 9;
+  int32 consecutive_failed_attempts = 10;
+  bool dev = 11;
+  optional string repo_org = 12;
+  optional string repo_name = 13;
+}
+
+message ChangesetMergeability {
+  string verdict = 1;
+  repeated ChangesetRuleEvaluation evaluations = 2;
+  repeated ChangesetMergeBlocker blockers = 3;
+  repeated ChangesetRuleConfigurationDiagnostic configuration_diagnostics = 4;
+}
+
+message ChangesetMergeBlocker {
+  string kind = 1;
+  optional ChangesetRuleEvaluation rule_failure = 2;
+  optional string merge_ref_sha = 3;
+  optional string base_tip_sha_at_computation = 4;
+  optional string current_base_tip_sha = 5;
+  optional string ruleset_id = 6;
+  optional string rule_id = 7;
+  optional string enforcement = 8;
+  optional string message = 9;
+  optional uint64 change_number = 10;
+  optional string merge_commit_oid = 11;
+  repeated uint64 merged_change_numbers = 12;
+  repeated uint64 open_change_numbers = 13;
+  optional uint64 top_change_number = 14;
+  optional uint64 downstack_change_number = 15;
+  optional string top_head_sha = 16;
+  optional string downstack_head_sha = 17;
+  optional string compare_status = 18;
+  optional string topology_reason = 19;
+  optional string root_base_ref = 20;
+  repeated string conflicted_paths = 21;
+  optional bool conflict_inherited_from_downstack = 22;
+  optional string recorded_base_sha = 23;
+  optional string target_base_ref = 24;
+}
+
+message ChangesetRuleActionableSignal {
+  string kind = 1;
+  repeated string check_names = 2;
+  optional int32 required_count = 3;
+  optional int32 actual_count = 4;
+  repeated string owner_labels = 5;
+  repeated string paths = 6;
+}
+
+message ChangesetRuleConfigurationDiagnostic {
+  string kind = 1;
+  string severity = 2;
+  string message = 3;
+  optional string ruleset_id = 4;
+  optional string rule_id = 5;
+  optional string bypass_actor_id = 6;
+  optional string enforcement = 7;
+}
+
+message ChangesetRuleEvaluation {
+  string rule_type = 1;
+  string ruleset_id = 2;
+  string ruleset_name = 3;
+  string rule_id = 4;
+  string enforcement = 5;
+  string result = 6;
+  string message = 7;
+  string category = 8;
+  repeated ChangesetRuleViolation violations = 9;
+}
+
+message ChangesetRuleViolation {
+  string rule_type = 1;
+  string detail = 2;
+  optional string remediation = 3;
+  optional ChangesetRuleActionableSignal actionable_signal = 4;
+}
+
+message ChangeStackPageItem {
+  Change change = 1;
+  repeated Version versions = 2;
+  repeated ChangeAssignment assignments = 3;
+  repeated Review reviews = 4;
+  GetChangesetMergeabilityResponse mergeability = 5;
+  int32 total_thread_count = 6;
+  int32 unresolved_thread_count = 7;
+}
+
+message ChangeSyncTarget {
+  ClientRepoIdentifier identifier = 1;
+  uint64 change_number = 2;
+}
+
+message ChangeWithLatestVersion {
+  Change change = 1;
+  optional Version latest_version = 2;
+}
+
+message CheckChangeCreationAccessRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message CheckChangeCreationAccessResponse {
+}
+
+message CheckRunActor {
+  string kind = 1;
+  string id = 2;
+  string display_name = 3;
+  string slug = 4;
+  string icon_url = 5;
+}
+
+message CheckRunGroup {
+  string id = 1;
+  string name = 2;
+  optional string app_name = 3;
+  optional string details_url = 4;
+  repeated CheckRunStatus check_runs = 5;
+  CheckRunActor actor = 6;
+  string external_id = 7;
+}
+
+message CheckRunGroupInput {
+  string key = 1;
+  string name = 2;
+  string external_id = 3;
+  optional string details_url = 4;
+}
+
+message CheckRunInput {
+  string key = 1;
+  string name = 2;
+  string external_id = 3;
+  CheckRunLifecycleStatus status = 4;
+  optional CheckRunConclusion conclusion = 5;
+  int64 external_updated_at_unix_ms = 6;
+  optional int64 started_at_unix_ms = 7;
+  optional int64 completed_at_unix_ms = 8;
+  optional string details_url = 10;
+  optional CheckRunOutput output = 11;
+}
+
+message CheckRunOutput {
+  optional string title = 1;
+  optional string summary = 2;
+  optional string text = 3;
+}
+
+message CheckRunStatus {
+  string id = 1;
+  string name = 2;
+  optional string details_url = 4;
+  CheckRunLifecycleStatus status = 5;
+  optional CheckRunConclusion conclusion = 6;
+  optional int64 started_at_unix_ms = 7;
+  optional int64 completed_at_unix_ms = 8;
+  string external_id = 9;
+  optional bool required = 10;
+  optional CheckRunOutput output = 11;
+}
+
+message CiState {
+  repeated CheckRunGroup check_run_groups = 1;
+}
+
+message ClaimInboundConvergenceIntentRequest {
+  ClientRepoIdentifier identifier = 1;
+  uint64 top_change_number = 2;
+  string intent_token = 3;
+  repeated string authorized_author_ids = 4;
+  repeated string authorized_change_ids = 5;
+}
+
+message ClaimInboundConvergenceIntentResponse {
+}
+
+message ClaimInboundMirrorGithubMergeOperationRequest {
+  ChangeIdentifier change = 1;
+  string requested_merge_method = 2;
+  optional string commit_title = 3;
+  optional string commit_message = 4;
+  string initiated_by_user_id = 5;
+  bool include_stack = 6;
+}
+
+message ClaimInboundMirrorGithubMergeOperationResponse {
+  InboundMirrorGithubMergeOperation operation = 1;
+  bool lease_acquired = 2;
+  InboundMirrorMergeStack merge_stack = 3;
+}
+
+message ClientRepoIdentifier {
+  string org = 1;
+  string name = 2;
+}
+
+message CloseReviewRequestRequest {
+  oneof target {
+    string auth_id = 2;
+    string group_id = 3;
+  }
+  ChangeIdentifier change = 1;
+}
+
+message CloseReviewRequestResponse {
+}
+
+message CodeownersOwners {
+  repeated string owners = 1;
+}
+
+message CollectedFileDiff {
+  string path = 1;
+  optional string old_path = 2;
+  PH_git_forge_v1_ChangeKind change_kind = 3;
+  bool is_binary = 4;
+  string patch = 5;
+  int32 additions = 6;
+  int32 deletions = 7;
+  optional bool is_generated = 8;
+}
+
+message Comment {
+  string id = 1;
+  string change_id = 2;
+  string version_id = 3;
+  uint64 version_number = 4;
+  string author_id = 5;
+  string body = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+  string thread_id = 9;
+  string author_kind = 10;
+  string author_display_name = 11;
+  string author_avatar_url = 12;
+  repeated CommentReactionGroup reaction_groups = 13;
+  ActorWithDisplay author = 14;
+}
+
+message CommentReaction {
+  string emoji = 1;
+  string reactor_id = 2;
+  string reactor_kind = 3;
+  string reactor_display_name = 4;
+  string reactor_avatar_url = 5;
+  bool viewer_is_reactor = 6;
+  ActorWithDisplay reactor = 7;
+}
+
+message CommentReactionGroup {
+  string emoji = 1;
+  uint32 count = 2;
+  bool viewer_has_reacted = 3;
+}
+
+message CommentThread {
+  string id = 1;
+  string change_id = 2;
+  string version_id = 3;
+  uint64 version_number = 4;
+  string review_id = 5;
+  google.protobuf.Timestamp resolved_at = 6;
+  string resolved_by_id = 7;
+  string path = 8;
+  CommentSide side = 9;
+  uint32 start_line = 10;
+  uint32 end_line = 11;
+  string external_id = 12;
+  google.protobuf.Timestamp created_at = 13;
+  google.protobuf.Timestamp updated_at = 14;
+  repeated Comment comments = 15;
+  string resolved_by_kind = 16;
+  string resolved_by_display_name = 17;
+  string resolved_by_avatar_url = 18;
+  ActorWithDisplay resolved_by = 19;
+  uint64 ported_to_version_number = 20;
+  CommentThreadPortingStatus porting_status = 21;
+  string ported_path = 22;
+  uint32 ported_start_line = 23;
+  uint32 ported_end_line = 24;
+}
+
+message CompareCommitsClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string base_revision = 2;
+  string head_revision = 3;
+}
+
+message CreateAppRequest {
+  string slug = 1;
+  string display_name = 2;
+  string webhook_url = 3;
+  bool is_public = 5;
+  string namespace_slug = 6;
+  string public_key = 7;
+  repeated string events = 8;
+  repeated AppAuthPolicyStatement auth_policy_statements = 9;
+  repeated string installation_redirect_uris = 10;
+  string description = 11;
+  string website_url = 12;
+}
+
+message CreateAppResponse {
+  App app = 1;
+}
+
+message CreateChangeRequest {
+  ClientRepoIdentifier identifier = 1;
+  string title = 2;
+  string description = 3;
+  string head_ref = 4;
+  string base_ref = 5;
+  ChangeStatus status = 6;
+  ChangeIdentifier parent_change = 7;
+}
+
+message CreateChangeResponse {
+  Change change = 1;
+  Version initial_version = 2;
+}
+
+message CreateCommentRequest {
+  ChangeIdentifier change = 1;
+  string body = 2;
+  uint64 version_number = 3;
+}
+
+message CreateCommentResponse {
+  Comment comment = 1;
+}
+
+message CreateCommentThreadRequest {
+  ChangeIdentifier change = 1;
+  string body = 2;
+  uint64 version_number = 3;
+  string path = 4;
+  CommentSide side = 5;
+  uint32 start_line = 6;
+  uint32 end_line = 7;
+  string review_id = 8;
+}
+
+message CreateCommentThreadResponse {
+  CommentThread thread = 1;
+}
+
+message CreateCommitFromFilesClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string branch = 2;
+  optional string expected_head_sha = 3;
+  string message = 4;
+  PH_git_forge_v1_Signature author = 5;
+  optional PH_git_forge_v1_Signature committer = 6;
+  repeated PH_git_forge_v1_CommitFileOperation files = 7;
+}
+
+message CreateCommitFromFilesClientResponse {
+  string commit_sha = 1;
+  string tree_sha = 2;
+  string old_head_sha = 3;
+  bool reverse_mirror_push_failed = 4;
+}
+
+message CreateGithubPrForReverseMirroredRepoRequest {
+  ClientRepoIdentifier identifier = 1;
+  string head_ref = 2;
+  string title = 3;
+  string description = 4;
+}
+
+message CreateGithubPrForReverseMirroredRepoResponse {
+  string pr_url = 1;
+  int32 pr_number = 2;
+  bool created = 3;
+}
+
+message CreateInstallationRequest {
+  string app_id = 1;
+  string namespace_slug = 2;
+  repeated string repo_ids = 3;
+  repeated string requested_scopes = 4;
+}
+
+message CreateInstallationResponse {
+  Installation installation = 1;
+}
+
+message CreateLabelRequest {
+  ClientRepoIdentifier repo = 1;
+  string name = 2;
+  string color = 3;
+  optional string description = 4;
+}
+
+message CreateLabelResponse {
+  Label label = 1;
+}
+
+message CreateMergeCommitBypassingChecksClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  optional string ours_sha = 2;
+  optional string theirs_sha = 3;
+  string ours_ref = 4;
+  string theirs_ref = 5;
+  string message = 6;
+  PH_git_forge_v1_Signature author = 7;
+  PH_git_forge_v1_Signature committer = 8;
+  PH_git_forge_v1_MergeMode mode = 9;
+}
+
+message CreateMergeCommitBypassingChecksResponse {
+  string merge_commit_sha = 1;
+  string wal_entry_key = 2;
+  bool reverse_mirror_push_failed = 3;
+}
+
+message CreateMirroredRepoRequest {
+  GithubRepoIdentifier github_source = 1;
+  string target_namespace = 2;
+  optional string forge_environment = 3;
+  optional RepoKind repo_kind = 4;
+}
+
+message CreateOriginNamespaceRequest {
+  OriginNamespaceOwnerType owner_type = 1;
+  int64 owner_entity_id = 2;
+  string namespace = 3;
+}
+
+message CreateOriginNamespaceResponse {
+  OriginNamespace origin_namespace = 1;
+}
+
+message CreateRepoRequest {
+  ClientRepoIdentifier identifier = 1;
+  optional string default_branch = 2;
+  optional string forge_environment = 6;
+  optional RepoKind repo_kind = 7;
+  optional RepoVisibility visibility = 8;
+}
+
+message CreateRepoResponse {
+  Repo repository = 3;
+}
+
+message CreateReviewRequest {
+  ChangeIdentifier change = 1;
+  ReviewVerdict verdict = 2;
+  string body = 3;
+  uint64 version_number = 4;
+}
+
+message CreateReviewResponse {
+  Review review = 1;
+}
+
+message DeleteBuildkiteTriggerRequest {
+  ClientRepoIdentifier repo = 1;
+  string trigger_id = 2;
+}
+
+message DeleteBuildkiteTriggerResponse {
+  string trigger_id = 1;
+}
+
+message DeleteCommentRequest {
+  string comment_id = 1;
+}
+
+message DeleteCommentResponse {
+}
+
+message DeleteInstallationRequest {
+  string id = 1;
+}
+
+message DeleteInstallationResponse {
+}
+
+message DeleteLabelRequest {
+  ClientRepoIdentifier repo = 1;
+  string label_id = 2;
+}
+
+message DeleteLabelResponse {
+}
+
+message DeleteMirroredRepoRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message DeleteMirroredRepoResponse {
+  string repo_uuid = 1;
+}
+
+message DeleteRepoClientRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message DeleteRepoClientResponse {
+  string repo_uuid = 1;
+}
+
+message DeleteRulesetRequest {
+  ClientRepoIdentifier repo = 1;
+  string ruleset_id = 2;
+}
+
+message DeleteRulesetResponse {
+  string ruleset_id = 1;
+}
+
+message DeleteVercelTriggerRequest {
+  ClientRepoIdentifier repo = 1;
+  string trigger_id = 2;
+}
+
+message DeleteVercelTriggerResponse {
+  string trigger_id = 1;
+}
+
+message DetachRepoMirrorRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message DetachRepoMirrorResponse {
+}
+
+message DisableChangeMergeWhenReadyRequest {
+  ChangeIdentifier change = 1;
+}
+
+message DisableChangeMergeWhenReadyResponse {
+}
+
+message DiscardPendingReviewRequest {
+  ChangeIdentifier change = 1;
+  string review_id = 2;
+}
+
+message DiscardPendingReviewResponse {
+}
+
+message DismissReviewRequest {
+  ChangeIdentifier change = 1;
+  string review_id = 2;
+  string reason = 3;
+}
+
+message DismissReviewResponse {
+  Review review = 1;
+}
+
+message DoesNamespaceExistForTeamRequest {
+  int64 team_id = 1;
+}
+
+message DoesNamespaceExistForTeamResponse {
+  bool exists = 1;
+}
+
+message EnableChangeMergeWhenReadyRequest {
+  ChangeIdentifier change = 1;
+  string trunk_branch = 2;
+  optional string source = 3;
+  optional bool dev = 4;
+}
+
+message EnableChangeMergeWhenReadyResponse {
+  ChangeMergeWhenReady record = 1;
+}
+
+message ExistingInstallation {
+  string installation_id = 1;
+  RepoSelectionMode repo_selection_mode = 2;
+  repeated string repo_ids = 3;
+}
+
+message FastForwardBranchClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string branch = 2;
+  string expected_head_sha = 3;
+  string new_head_sha = 4;
+}
+
+message FastForwardBranchClientResponse {
+  string old_head_sha = 1;
+  string new_head_sha = 2;
+  bool unchanged = 3;
+  bool reverse_mirror_push_failed = 4;
+}
+
+message FileViewedState {
+  string file_path = 1;
+  string version_id = 2;
+  optional bool stale = 3;
+}
+
+message FilterMirrorableGithubReposRequest {
+  repeated GithubRepoIdentifier repos = 1;
+}
+
+message FilterMirrorableGithubReposResponse {
+  repeated GithubRepoIdentifier mirrorable_repos = 1;
+}
+
+message GeneratedCodeTour {
+  string id = 1;
+  string storage_key = 2;
+  string result = 3;
+  optional string agentic_markdown = 4;
+  optional string agentic_error_message = 5;
+}
+
+message GetActiveMirrorTransitionJobRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message GetActiveMirrorTransitionJobResponse {
+  RepoMirrorTransitionJob active_job_info = 1;
+  RepoMirrorTransitionJob last_job_info = 2;
+}
+
+message GetAppMetadataRequest {
+  string id = 1;
+}
+
+message GetAppMetadataResponse {
+  AppMetadata app = 1;
+}
+
+message GetAppRequest {
+  string id = 1;
+}
+
+message GetAppResponse {
+  App app = 1;
+}
+
+message GetAuthorizedNamespacesRequest {
+}
+
+message GetAuthorizedNamespacesResponse {
+  repeated AuthorizedNamespace namespaces = 1;
+}
+
+message GetBlameClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string start_commit_sha = 2;
+  string path = 3;
+}
+
+message GetBlobClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string blob_sha = 2;
+}
+
+message GetChangeMergeWhenReadyRequest {
+  ChangeIdentifier change = 1;
+  optional string status = 2;
+}
+
+message GetChangeMergeWhenReadyResponse {
+  optional ChangeMergeWhenReady record = 1;
+}
+
+message GetChangeRequest {
+  ChangeIdentifier change = 1;
+}
+
+message GetChangeResponse {
+  Change change = 1;
+  repeated Version versions = 2;
+  repeated ChangeAssignment assignments = 3;
+  repeated ChangeLabel labels = 4;
+  optional google.protobuf.Timestamp viewer_last_viewed_at = 5;
+  optional google.protobuf.Timestamp viewer_timeline_viewed_at = 6;
+}
+
+message GetChangesetMergeabilityRequest {
+  ClientRepoIdentifier identifier = 1;
+  uint64 change_number = 2;
+  optional string expected_head_sha = 3;
+  MergeabilityScope scope = 4;
+}
+
+message GetChangesetMergeabilityResponse {
+  bool mergeable = 1;
+  bool ci_passing = 2;
+  CiState ci_state = 3;
+  bool meets_approval_requirements = 4;
+  bool has_merge_conflicts = 5;
+  ChangesetMergeability mergeability = 6;
+  optional StackMergeability stack_mergeability = 7;
+  repeated string conflicted_paths = 8;
+}
+
+message GetChangeStackPageDataRequest {
+  ChangeIdentifier change = 1;
+}
+
+message GetChangeStackPageDataResponse {
+  MirrorStatus mirror_status = 1;
+  repeated ChangeStackPageItem items = 2;
+  ListOriginRepoReviewerCandidatesResponse reviewer_candidates = 3;
+}
+
+message GetChangeStackRequest {
+  ChangeIdentifier change = 1;
+}
+
+message GetChangeStackResponse {
+  repeated Change changes = 1;
+  optional string convergence_state = 2;
+  optional uint64 convergence_conflicted_change_number = 3;
+  repeated string convergence_conflicted_paths = 4;
+  optional string convergence_blocked_reason = 5;
+  optional string stack_id = 6;
+}
+
+message GetCheckRunRequest {
+  ClientRepoIdentifier identifier = 1;
+  string check_run_id = 2;
+}
+
+message GetCheckRunResponse {
+  CheckRunStatus check_run = 1;
+}
+
+message GetCiStateRequest {
+  ClientRepoIdentifier identifier = 1;
+  string sha = 2;
+  optional uint64 change_number = 3;
+}
+
+message GetCiStateResponse {
+  repeated CheckRunGroup check_run_groups = 1;
+  repeated MissingRequiredCheck missing_required_checks = 2;
+}
+
+message GetCollectedPullRequestDiffRequest {
+  ClientRepoIdentifier identifier = 1;
+  string head_commit_sha = 2;
+  string base_commit_sha = 3;
+  optional bool include_patches = 4;
+  optional bool include_file_stats = 5;
+  optional uint32 page_size = 6;
+  optional string page_cursor = 7;
+}
+
+message GetCollectedPullRequestDiffResponse {
+  string merge_base_sha = 1;
+  repeated CollectedFileDiff files = 2;
+  optional string next_page_cursor = 4;
+}
+
+message GetCommitClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string commit_sha = 2;
+}
+
+message GetCommitDiffClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string commit_sha = 2;
+  optional string base_commit_sha = 3;
+  bool include_patches = 4;
+  repeated string paths = 5;
+  optional uint32 page_size = 6;
+  optional string page_cursor = 7;
+}
+
+message GetFileHistoryClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string start_commit_sha = 2;
+  optional string path = 3;
+  uint32 max_commits = 4;
+}
+
+message GetFileHistoryPageClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string start_commit_sha = 2;
+  optional string path = 3;
+  uint32 page_size = 4;
+  optional string next_cursor = 5;
+}
+
+message GetFileHistoryPageResponse {
+  repeated PH_git_forge_v1_ShortCommit commits = 1;
+  bool has_more = 2;
+  optional string next_cursor = 3;
+}
+
+message GetFileHistoryPageWithDiffStatsClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string start_commit_sha = 2;
+  optional string path = 3;
+  uint32 page_size = 4;
+  optional string next_cursor = 5;
+}
+
+message GetFuzzyPathsClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string commit_sha = 2;
+  string query = 3;
+  uint32 limit = 4;
+}
+
+message GetGeneratedCodeTourRequest {
+  ChangeIdentifier change = 1;
+  string storage_key = 2;
+}
+
+message GetGeneratedCodeTourResponse {
+  optional GeneratedCodeTour tour = 1;
+}
+
+message GetInstallationRequest {
+  string id = 1;
+}
+
+message GetInstallationResponse {
+  Installation installation = 1;
+}
+
+message GetLabelByNameRequest {
+  ClientRepoIdentifier repo = 1;
+  string name = 2;
+}
+
+message GetLabelByNameResponse {
+  optional Label label = 1;
+}
+
+message GetMirrorTransitionJobRequest {
+  ClientRepoIdentifier identifier = 1;
+  string job_id = 2;
+}
+
+message GetMirrorTransitionJobResponse {
+  RepoMirrorTransitionJob job = 1;
+  Repo repository = 2;
+}
+
+message GetNamespaceTeamAccessRequest {
+  string namespace_slug = 1;
+}
+
+message GetNamespaceTeamAccessResponse {
+  OriginNamespace namespace = 1;
+  NamespaceTeamGroupAccess team_admins = 2;
+  NamespaceTeamGroupAccess team_members = 3;
+}
+
+message GetPendingReviewRequest {
+  ChangeIdentifier change = 1;
+}
+
+message GetPendingReviewResponse {
+  optional Review review = 1;
+  uint32 thread_count = 2;
+}
+
+message GetProjectedLatestVersionsRequest {
+  ClientRepoIdentifier identifier = 1;
+  repeated uint64 change_numbers = 2;
+}
+
+message GetProjectedLatestVersionsResponse {
+  repeated ProjectedLatestVersionEntry entries = 1;
+}
+
+message GetPullRequestDiffClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string head_commit_sha = 2;
+  string base_commit_sha = 3;
+  optional bool include_patches = 4;
+  optional bool include_file_stats = 5;
+  optional uint32 page_size = 6;
+  optional string page_cursor = 7;
+}
+
+message GetRepoByGithubMirrorRequest {
+  string github_node_id = 1;
+  optional string github_enterprise_id = 2;
+}
+
+message GetRepoCodeownersClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string base_ref = 2;
+  repeated string paths = 3;
+}
+
+message GetRepoCodeownersResponse {
+  map<string, CodeownersOwners> codeowners_by_path = 1;
+}
+
+message GetRepoContentAtShaClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  PH_git_forge_v1_PathIdentifier path_identifier = 2;
+}
+
+message GetRepoContentClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string ref_path = 2;
+}
+
+message GetRepoContentDetailsAtShaClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  PH_git_forge_v1_PathIdentifier path_identifier = 2;
+}
+
+message GetRepoNamespaceRequest {
+  OriginNamespaceOwnerType owner_type = 1;
+  int64 owner_entity_id = 2;
+}
+
+message GetRepoNamespaceResponse {
+  OriginNamespace origin_namespace = 1;
+}
+
+message GetRepoRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message GetRepoResponse {
+  Repo repository = 1;
+}
+
+message GetRepoTeamAccessRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message GetRepoTeamAccessResponse {
+  OriginNamespace namespace = 1;
+  TeamGroupAccess team_admins = 2;
+  TeamGroupAccess team_members = 3;
+}
+
+message GetRepoWithMirrorInfoResponse {
+  Repo repository = 1;
+  RepoGithubMirrorInfo github_mirror_info = 2;
+  optional bool viewer_can_write_changes = 3;
+}
+
+message GetRulesetRequest {
+  ClientRepoIdentifier repo = 1;
+  string ruleset_id = 2;
+}
+
+message GetRulesetResponse {
+  Ruleset ruleset = 1;
+}
+
+message GetSectionOfChangesRequest {
+  repeated ClientRepoIdentifier repos = 1;
+  SectionOfChangesFilter filter = 2;
+  optional string cursor = 3;
+  int32 limit = 4;
+  SectionOfChangesSortField sort_field = 5;
+  bool sort_is_asc = 6;
+  bool skip_total_count = 7;
+}
+
+message GetSectionOfChangesResponse {
+  repeated SectionOfChanges changes = 1;
+  bool has_more = 2;
+  int32 total_count = 3;
+}
+
+message GetTagClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string tag_sha = 2;
+}
+
+message GetTreeBlameClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string start_commit_sha = 2;
+  string path = 3;
+}
+
+message GetTreeClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string tree_sha = 2;
+  bool recursive = 3;
+}
+
+message GithubRepoIdentifier {
+  string owner = 1;
+  string repo = 2;
+  optional string enterprise_id = 3;
+}
+
+message GrantPolicyRef {
+  string name = 1;
+  string display_name = 2;
+}
+
+message GrantPrincipal {
+  string kind = 1;
+  string external_id = 2;
+  string display_name = 3;
+  string email = 4;
+  int32 group_admin_count = 5;
+  int32 group_member_count = 6;
+}
+
+message GrepRepoClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string revision = 2;
+  string query = 3;
+  PH_git_forge_v1_GrepSearchOptions options = 4;
+  uint32 max_results = 5;
+}
+
+message HasOriginPermissionRequest {
+  oneof resource {
+    string namespace_slug = 2;
+    ClientRepoIdentifier repository = 3;
+  }
+  string scope = 1;
+}
+
+message HasOriginPermissionResponse {
+  bool allowed = 1;
+}
+
+message InboundMirrorGithubMergeOperation {
+  string id = 1;
+  ChangeIdentifier change = 2;
+  string status = 3;
+  optional string lease_token = 4;
+  optional string lease_expires_at = 5;
+  optional string github_pull_request_node_id = 6;
+  optional uint64 github_pull_request_number = 7;
+  optional string github_pull_request_url = 8;
+  optional string merge_commit_sha = 9;
+  string requested_merge_method = 10;
+  optional string commit_title = 11;
+  optional string commit_message = 12;
+  string initiated_by_user_id = 13;
+  optional string last_error_message = 14;
+  optional string last_error_at = 15;
+  string created_at = 16;
+  string updated_at = 17;
+}
+
+message InboundMirrorMergeStack {
+  repeated uint64 change_numbers = 1;
+  string root_base_ref = 2;
+  string target_head_ref = 3;
+  string target_head_sha = 4;
+}
+
+message Installation {
+  string id = 1;
+  string app_id = 2;
+  string namespace_slug = 3;
+  string created_at = 4;
+  string updated_at = 5;
+  RepoSelectionMode repo_selection_mode = 6;
+  repeated string repo_ids = 7;
+  repeated string accepted_scopes = 8;
+  optional string suspended_at = 9;
+}
+
+message InstallationReference {
+  string id = 1;
+  string app_id = 2;
+}
+
+message Label {
+  string id = 1;
+  string repo_uuid = 2;
+  string name = 3;
+  string color = 4;
+  optional string description = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message ListBuildkiteTriggersRequest {
+  ClientRepoIdentifier repo = 1;
+}
+
+message ListBuildkiteTriggersResponse {
+  repeated BuildkiteTrigger triggers = 1;
+}
+
+message ListChangeCommitsRequest {
+  ChangeIdentifier change = 1;
+  uint64 version_number = 2;
+  optional uint32 max_commits = 3;
+}
+
+message ListChangeCommitsResponse {
+  repeated PH_git_forge_v1_Commit commits = 1;
+  string merge_base_sha = 2;
+  bool truncated = 3;
+}
+
+message ListChangesByHeadRefRequest {
+  ClientRepoIdentifier identifier = 1;
+  string head_ref = 2;
+  bool include_inactive = 3;
+}
+
+message ListChangesByHeadRefResponse {
+  repeated Change changes = 1;
+}
+
+message ListChangesRequest {
+  ClientRepoIdentifier identifier = 1;
+  optional string status = 2;
+  optional uint64 cursor = 3;
+  optional int32 limit = 4;
+  optional string author_id = 5;
+  optional string base_ref = 6;
+  optional string head_ref = 7;
+}
+
+message ListChangesResponse {
+  repeated ChangeWithLatestVersion changes = 1;
+  optional uint64 next_cursor = 2;
+}
+
+message ListCommentReactionsRequest {
+  string comment_id = 1;
+}
+
+message ListCommentReactionsResponse {
+  repeated CommentReaction reactions = 1;
+}
+
+message ListCommentsRequest {
+  ChangeIdentifier change = 1;
+}
+
+message ListCommentsResponse {
+  repeated Comment comments = 1;
+}
+
+message ListCommentThreadsRequest {
+  ChangeIdentifier change = 1;
+  uint64 version_number = 2;
+}
+
+message ListCommentThreadsResponse {
+  repeated CommentThread threads = 1;
+}
+
+message ListCommitsClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string revision = 2;
+  int32 page = 3;
+  int32 per_page = 4;
+}
+
+message ListCommitsInRangeClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string base_revision = 2;
+  string head_revision = 3;
+  optional int32 max_commits = 4;
+  bool oldest_first = 5;
+}
+
+message ListFileViewedStatesRequest {
+  ChangeIdentifier change = 1;
+}
+
+message ListFileViewedStatesResponse {
+  repeated FileViewedState file_viewed_states = 1;
+  optional string head_version_id = 2;
+}
+
+message ListHostedReposRequest {
+  uint32 page_size = 1;
+  string page_token = 2;
+  string search = 3;
+  ListHostedReposOrderBy order_by = 4;
+  string namespace = 5;
+}
+
+message ListHostedReposResponse {
+  repeated RepoSummary repositories = 1;
+  string next_page_token = 2;
+  uint32 total_count = 3;
+}
+
+message ListLabelsRequest {
+  ClientRepoIdentifier repo = 1;
+  optional string cursor = 2;
+  optional int32 limit = 3;
+  optional string search_query = 4;
+}
+
+message ListLabelsResponse {
+  repeated Label labels = 1;
+  optional string next_cursor = 2;
+}
+
+message ListNamespaceAppsRequest {
+  string namespace_slug = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListNamespaceAppsResponse {
+  repeated App apps = 1;
+  string next_page_token = 2;
+}
+
+message ListNamespaceAssignablePoliciesRequest {
+  string namespace_slug = 1;
+}
+
+message ListNamespaceAssignablePoliciesResponse {
+  repeated AuthPolicySummary policies = 1;
+}
+
+message ListNamespaceGrantsRequest {
+  string namespace_slug = 1;
+  int32 page = 2;
+  int32 page_size = 3;
+  string search = 4;
+}
+
+message ListNamespaceGrantsResponse {
+  repeated NamespaceGrantRow rows = 1;
+  int32 total_count = 2;
+  bool list_truncated = 3;
+}
+
+message ListNamespaceInstallationsRequest {
+  string namespace_slug = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListNamespaceInstallationsResponse {
+  repeated Installation installations = 1;
+  string next_page_token = 2;
+  repeated InstallationReference installation_references = 3;
+}
+
+message ListOriginRepoReviewerCandidatesRequest {
+  ClientRepoIdentifier repo = 1;
+}
+
+message ListOriginRepoReviewerCandidatesResponse {
+  repeated OriginReviewerCandidateUser users = 1;
+  repeated OriginReviewerCandidateGroup groups = 2;
+}
+
+message ListRefsClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  PH_git_forge_v1_ListRefsFilter filter = 2;
+  bool names_only = 3;
+  string prefix = 4;
+}
+
+message ListRepoAssignablePoliciesRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message ListRepoAssignablePoliciesResponse {
+  repeated AuthPolicySummary policies = 1;
+}
+
+message ListRepoGrantsRequest {
+  ClientRepoIdentifier identifier = 1;
+  int32 page = 2;
+  int32 page_size = 3;
+  string search = 4;
+}
+
+message ListRepoGrantsResponse {
+  repeated RepoGrantRow rows = 1;
+  int32 total_count = 2;
+  bool list_truncated = 3;
+}
+
+message ListRepoPathsClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string revision = 2;
+  repeated string includes = 3;
+  repeated string excludes = 4;
+  uint32 limit = 5;
+}
+
+message ListReviewRequestEventsRequest {
+  ChangeIdentifier change = 1;
+}
+
+message ListReviewRequestEventsResponse {
+  repeated ReviewRequestEvent events = 1;
+}
+
+message ListReviewsRequest {
+  ChangeIdentifier change = 1;
+}
+
+message ListReviewsResponse {
+  repeated Review reviews = 1;
+}
+
+message ListRulesetsRequest {
+  ClientRepoIdentifier repo = 1;
+}
+
+message ListRulesetsResponse {
+  repeated Ruleset rulesets = 1;
+}
+
+message ListVercelTriggersRequest {
+  ClientRepoIdentifier repo = 1;
+}
+
+message ListVercelTriggersResponse {
+  repeated VercelTrigger triggers = 1;
+}
+
+message MarkAllFilesAsViewedRequest {
+  ChangeIdentifier change = 1;
+  repeated string file_paths = 2;
+  string version_id = 3;
+}
+
+message MarkAllFilesAsViewedResponse {
+}
+
+message MarkDirectoryAsViewedRequest {
+  ChangeIdentifier change = 1;
+  string directory_path = 2;
+  repeated string file_paths = 3;
+  string version_id = 4;
+}
+
+message MarkDirectoryAsViewedResponse {
+}
+
+message MarkFileAsViewedRequest {
+  ChangeIdentifier change = 1;
+  string file_path = 2;
+  string version_id = 3;
+  string head_commit_sha = 4;
+}
+
+message MarkFileAsViewedResponse {
+}
+
+message MarkPullRequestAsViewedRequest {
+  ChangeIdentifier change = 1;
+  google.protobuf.Timestamp viewed_at = 2;
+  PullRequestViewedCursor cursor = 3;
+}
+
+message MarkPullRequestAsViewedResponse {
+  google.protobuf.Timestamp viewed_at = 1;
+  optional google.protobuf.Timestamp timeline_viewed_at = 2;
+}
+
+message MergeChangesetRequest {
+  ClientRepoIdentifier identifier = 1;
+  uint64 change_number = 2;
+}
+
+message MergeChangesetResponse {
+}
+
+message MergeStackRequest {
+  ClientRepoIdentifier identifier = 1;
+  uint64 top_change_number = 2;
+  PH_git_forge_v1_MergeMode mode = 3;
+}
+
+message MergeStackResponse {
+  string merge_commit_sha = 1;
+  repeated uint64 merged_change_numbers = 2;
+}
+
+message MintRawRepoFileLinkClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string ref_path = 2;
+}
+
+message MintRawRepoFileLinkClientResponse {
+  string token = 1;
+  PH_git_forge_v1_PathIdentifier path_identifier = 2;
+  string raw_origin = 3;
+}
+
+message MissingRequiredCheck {
+  string display_name = 1;
+  string identity_path = 2;
+}
+
+message NamespaceGrantRow {
+  GrantPrincipal principal = 1;
+  GrantPolicyRef policy = 2;
+}
+
+message NamespaceTeamGroupAccess {
+  GrantPolicyRef policy = 1;
+}
+
+message OriginNamespace {
+  string id = 1;
+  OriginNamespaceOwnerType owner_type = 2;
+  int64 owner_entity_id = 3;
+  string namespace = 4;
+}
+
+message OriginReviewerCandidateGroup {
+  string group_public_id = 1;
+  string organization_slug = 2;
+  string group_slug = 3;
+  string name = 4;
+  repeated string member_auth_ids = 5;
+}
+
+message OriginReviewerCandidateUser {
+  string auth_id = 1;
+  string first_name = 3;
+  string last_name = 4;
+  string email = 5;
+  string avatar_url = 6;
+}
+
+message PostCheckRunRequest {
+  ClientRepoIdentifier identifier = 1;
+  string head_sha = 2;
+  CheckRunGroupInput group = 3;
+  CheckRunInput check = 4;
+}
+
+message PostCheckRunResponse {
+  string repo_id = 1;
+  string sha = 2;
+  string check_run_group_id = 3;
+  string check_run_id = 4;
+}
+
+message PrepareInboundStackMergeCommitRequest {
+  ChangeIdentifier change = 1;
+  string operation_id = 2;
+  string lease_token = 3;
+  string ours_sha = 4;
+  string message = 5;
+  optional string author_name = 6;
+  optional string author_email = 7;
+}
+
+message PrepareInboundStackMergeCommitResponse {
+  string merge_commit_sha = 1;
+  string exported_ref = 2;
+}
+
+message PreviewAppInstallationOptions {
+  bool include_granted_scopes = 1;
+}
+
+message PreviewAppInstallationRequest {
+  string namespace_slug = 1;
+  string app_id = 2;
+  repeated string requested_scopes = 3;
+  string summary = 4;
+  optional string redirect_uri = 5;
+  PreviewAppInstallationOptions options = 6;
+}
+
+message PreviewAppInstallationResponse {
+  string app_id = 1;
+  string app_slug = 2;
+  string app_display_name = 3;
+  string app_logo_url = 4;
+  string summary = 5;
+  repeated PreviewAppInstallationScope requested_scopes = 6;
+  repeated PreviewAppInstallationScope granted_scopes = 7;
+  ExistingInstallation existing_installation = 8;
+  string app_description = 9;
+  string app_website_url = 10;
+}
+
+message PreviewAppInstallationScope {
+  string scope = 1;
+}
+
+message ProjectedLatestVersionEntry {
+  uint64 change_number = 1;
+  Version projected_latest_version = 2;
+}
+
+message RebuildBuildkiteCheckRunRequest {
+  ChangeIdentifier change = 1;
+  string check_run_id = 2;
+}
+
+message RebuildBuildkiteCheckRunResponse {
+}
+
+message RecordInboundMirrorExternalGithubMergeRequest {
+  ChangeIdentifier change = 1;
+  string github_merge_commit_sha = 2;
+  string operation_id = 3;
+  string lease_token = 4;
+}
+
+message RecordInboundMirrorExternalGithubMergeResponse {
+  Change change = 1;
+}
+
+message RecordInboundMirrorGithubMergeErrorRequest {
+  ChangeIdentifier change = 1;
+  string operation_id = 2;
+  string lease_token = 3;
+  string error_message = 4;
+}
+
+message RecordInboundMirrorGithubMergeErrorResponse {
+  InboundMirrorGithubMergeOperation operation = 1;
+}
+
+message RecordInboundMirrorGithubMergeGithubPrRequest {
+  ChangeIdentifier change = 1;
+  string operation_id = 2;
+  string lease_token = 3;
+  string github_pull_request_node_id = 4;
+  uint64 github_pull_request_number = 5;
+  string github_pull_request_url = 6;
+}
+
+message RecordInboundMirrorGithubMergeGithubPrResponse {
+  InboundMirrorGithubMergeOperation operation = 1;
+}
+
+message RecordInboundMirrorGithubMergeGithubResultRequest {
+  ChangeIdentifier change = 1;
+  string operation_id = 2;
+  string lease_token = 3;
+  string merge_commit_sha = 4;
+}
+
+message RecordInboundMirrorGithubMergeGithubResultResponse {
+  InboundMirrorGithubMergeOperation operation = 1;
+}
+
+message RemoveAssigneeRequest {
+  oneof target {
+    string auth_id = 2;
+    string group_id = 3;
+  }
+  ChangeIdentifier change = 1;
+}
+
+message RemoveAssigneeResponse {
+}
+
+message RemoveLabelFromChangeRequest {
+  ChangeIdentifier change = 1;
+  string label_id = 2;
+}
+
+message RemoveLabelFromChangeResponse {
+}
+
+message ReopenCommentThreadRequest {
+  ChangeIdentifier change = 1;
+  string thread_id = 2;
+}
+
+message ReopenCommentThreadResponse {
+  CommentThread thread = 1;
+}
+
+message Repo {
+  ClientRepoIdentifier identifier = 1;
+  string default_branch = 2;
+  optional string github_node_id = 4;
+  optional string github_enterprise_id = 5;
+  MirrorStatus mirror_status = 6;
+  optional string active_mirror_transition_job_id = 7;
+  string repo_uuid = 8;
+  optional uint64 github_installation_id = 9;
+  optional google.protobuf.Timestamp created_at = 10;
+  optional google.protobuf.Timestamp updated_at = 11;
+  optional google.protobuf.Timestamp last_pushed_at = 12;
+  optional int64 owner_entity_id = 13;
+  optional string owner_type = 14;
+  string forge_environment = 15;
+  string origin_namespace_id = 16;
+  bool allow_merge_commit = 17;
+  bool allow_squash_merge = 18;
+  RepoVisibility visibility = 19;
+  bool delete_branch_on_merge = 20;
+}
+
+message RepoGithubMirrorInfo {
+  string github_owner = 1;
+  string github_repo = 2;
+  string github_repo_url = 3;
+}
+
+message RepoGrantRow {
+  GrantPrincipal principal = 1;
+  GrantPolicyRef namespace_policy = 2;
+  GrantPolicyRef repo_policy = 3;
+  GrantPolicyRef effective_policy = 4;
+  bool is_namespace_owned = 5;
+}
+
+message RepoMirrorTransitionJob {
+  string id = 1;
+  ClientRepoIdentifier identifier = 2;
+  RepoMirrorTransition transition = 3;
+  MirrorStatus mirror_status = 4;
+  RepoMirrorTransitionJobStatus status = 5;
+  RepoMirrorTransitionJobPhase phase = 6;
+  uint32 attempt_count = 7;
+  optional string drain_until = 11;
+  optional string last_error_code = 12;
+  optional string last_error_message = 13;
+  optional string started_at = 15;
+  optional string completed_at = 16;
+  string created_at = 17;
+  string updated_at = 18;
+}
+
+message RepoSummary {
+  string org = 1;
+  string name = 2;
+  string clone_url = 3;
+  string default_branch = 4;
+  optional string github_node_id = 6;
+  optional string github_enterprise_id = 7;
+  string repo_uuid = 8;
+  MirrorStatus mirror_status = 9;
+  optional google.protobuf.Timestamp last_pushed_at = 10;
+  string forge_environment = 11;
+  string origin_namespace_id = 12;
+  bool allow_merge_commit = 13;
+  bool allow_squash_merge = 14;
+  RepoVisibility visibility = 15;
+}
+
+message RequestReviewRequest {
+  oneof target {
+    string auth_id = 2;
+    string group_id = 3;
+  }
+  ChangeIdentifier change = 1;
+}
+
+message RequestReviewResponse {
+  ChangeAssignment assignment = 1;
+}
+
+message RequestReviewsRequest {
+  ChangeIdentifier change = 1;
+  repeated ReviewRequestTarget targets = 2;
+}
+
+message RequestReviewsResponse {
+  repeated ChangeAssignment assignments = 1;
+}
+
+message ResolveCommentThreadRequest {
+  ChangeIdentifier change = 1;
+  string thread_id = 2;
+}
+
+message ResolveCommentThreadResponse {
+  CommentThread thread = 1;
+}
+
+message ResolveOriginPullRequestRedirectRequest {
+  ClientRepoIdentifier identifier = 1;
+  int64 pull_number = 2;
+}
+
+message ResolveOriginPullRequestRedirectResponse {
+  string pull_request_url = 1;
+}
+
+message ResolveRepoPathClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string ref_path = 2;
+}
+
+message RestackStackRequest {
+  ClientRepoIdentifier identifier = 1;
+  uint64 top_change_number = 2;
+}
+
+message RestackStackResponse {
+  repeated uint64 restacked_change_numbers = 1;
+}
+
+message RetargetChangeRequest {
+  ChangeIdentifier change = 1;
+  string base_ref = 2;
+}
+
+message RetargetChangeResponse {
+  Change change = 1;
+  Version latest_version = 2;
+  bool unchanged = 3;
+}
+
+message Review {
+  string id = 1;
+  string change_id = 2;
+  string version_id = 3;
+  uint64 version_number = 4;
+  string author_id = 5;
+  ReviewVerdict verdict = 6;
+  string body = 7;
+  google.protobuf.Timestamp created_at = 8;
+  string author_kind = 9;
+  string author_display_name = 10;
+  string author_avatar_url = 11;
+  optional google.protobuf.Timestamp submitted_at = 12;
+  optional ReviewDismissal dismissal = 13;
+  ActorWithDisplay author = 14;
+}
+
+message ReviewDismissal {
+  google.protobuf.Timestamp dismissed_at = 1;
+  string dismissed_by_id = 2;
+  string dismissed_by_kind = 3;
+  string dismissal_message = 4;
+}
+
+message ReviewRequestEvent {
+  string id = 1;
+  string change_id = 2;
+  ChangeAssignmentKind kind = 3;
+  ReviewRequestEventAction action = 4;
+  string assigned_auth_id = 5;
+  string assigned_group_id = 6;
+  ChangeAssignmentCreatedVia created_via = 7;
+  string actor_auth_id = 8;
+  google.protobuf.Timestamp created_at = 9;
+  ActorWithDisplay actor = 10;
+}
+
+message ReviewRequestTarget {
+  oneof target {
+    string auth_id = 1;
+    string group_id = 2;
+  }
+}
+
+message Ruleset {
+  string id = 1;
+  ClientRepoIdentifier repo = 2;
+  string name = 3;
+  string description = 4;
+  RulesetEnforcement enforcement = 5;
+  RulesetKind kind = 6;
+  repeated string included_ref_names = 7;
+  repeated string excluded_ref_names = 8;
+  repeated RulesetRule rules = 9;
+  repeated RulesetBypassActor bypass_actors = 10;
+}
+
+message RulesetBypassActor {
+  string id = 1;
+  RulesetBypassMode bypass_mode = 2;
+  RulesetBypassActorKind actor_kind = 3;
+  google.protobuf.Struct actor_payload = 4;
+  optional string actor_app_id = 5;
+}
+
+message RulesetBypassActorInput {
+  RulesetBypassMode bypass_mode = 1;
+  RulesetBypassActorKind actor_kind = 2;
+  google.protobuf.Struct actor_payload = 3;
+  optional string actor_app_id = 4;
+}
+
+message RulesetRule {
+  string id = 1;
+  string rule_type = 2;
+  google.protobuf.Struct parameters = 3;
+}
+
+message RulesetRuleInput {
+  string rule_type = 1;
+  google.protobuf.Struct parameters = 2;
+}
+
+message SectionOfChanges {
+  string id = 1;
+  int32 number = 2;
+  string repo_id = 3;
+  string title = 4;
+  string description = 5;
+  string head_ref = 6;
+  string base_ref = 7;
+  string author_id = 8;
+  SectionOfChangesStatus status = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  optional google.protobuf.Timestamp merged_at = 12;
+  optional google.protobuf.Timestamp closed_at = 13;
+  string head_sha = 14;
+  string base_sha = 15;
+  int32 additions = 16;
+  int32 deletions = 17;
+  int32 changed_files = 18;
+  int32 version_count = 19;
+  optional string review_decision = 20;
+  repeated SectionOfChangesReviewer reviewers = 21;
+  int32 total_thread_count = 22;
+  int32 unresolved_thread_count = 23;
+  optional string parent_change_id = 24;
+  optional string stack_id = 25;
+  string repo_namespace = 26;
+  string repo_name = 27;
+  string author_kind = 28;
+  string author_display_name = 29;
+  string author_avatar_url = 30;
+  ActorWithDisplay author = 31;
+  optional google.protobuf.Timestamp viewer_last_viewed_at = 32;
+}
+
+message SectionOfChangesFilter {
+  oneof kind {
+    SectionOfChangesFilterAnd and = 1;
+    SectionOfChangesFilterOr or = 2;
+    SectionOfChangesFilterNot not = 3;
+    SectionOfChangesFilterConsolidatedStatus consolidated_status = 4;
+    SectionOfChangesFilterTitleContains title_contains = 5;
+    SectionOfChangesFilterDescriptionContains description_contains = 6;
+    SectionOfChangesFilterMergeBase merge_base = 7;
+    SectionOfChangesFilterTrunk trunk = 8;
+    SectionOfChangesFilterLastUpdated last_updated = 9;
+    SectionOfChangesFilterOpenReviewRequestFor open_review_request_for = 10;
+    SectionOfChangesFilterReopenedReviewRequestFor reopened_review_request_for = 11;
+    SectionOfChangesFilterClosedReviewRequestFrom closed_review_request_from = 12;
+    SectionOfChangesFilterIncludesDirectReviewer includes_direct_reviewer = 13;
+    SectionOfChangesFilterAuthorIs author_is = 14;
+    SectionOfChangesFilterReviewStatus review_status = 15;
+    SectionOfChangesFilterApprovedBy approved_by = 16;
+    SectionOfChangesFilterIncludesPastReviewer includes_past_reviewer = 17;
+    SectionOfChangesFilterHasLabel has_label = 18;
+    SectionOfChangesFilterNumFilesChanged num_files_changed = 19;
+    SectionOfChangesFilterNumLinesChanged num_lines_changed = 20;
+    SectionOfChangesFilterIncludesReviewer includes_reviewer = 21;
+    SectionOfChangesFilterIncludesAssignee includes_assignee = 22;
+    SectionOfChangesFilterIncludesDirectTeamReviewer includes_direct_team_reviewer = 23;
+    SectionOfChangesFilterMentions mentions = 24;
+    SectionOfChangesFilterUnsupported unsupported = 100;
+  }
+}
+
+message SectionOfChangesFilterAnd {
+  repeated SectionOfChangesFilter exprs = 1;
+}
+
+message SectionOfChangesFilterApprovedBy {
+  string auth_id = 1;
+}
+
+message SectionOfChangesFilterAuthorIs {
+  string auth_id = 1;
+}
+
+message SectionOfChangesFilterClosedReviewRequestFrom {
+  string auth_id = 1;
+}
+
+message SectionOfChangesFilterConsolidatedStatus {
+  SectionOfChangesStatus status = 1;
+}
+
+message SectionOfChangesFilterDescriptionContains {
+  string text = 1;
+}
+
+message SectionOfChangesFilterHasLabel {
+  string name = 1;
+}
+
+message SectionOfChangesFilterIncludesAssignee {
+  string auth_id = 1;
+}
+
+message SectionOfChangesFilterIncludesDirectReviewer {
+  string auth_id = 1;
+}
+
+message SectionOfChangesFilterIncludesDirectTeamReviewer {
+  string slug = 1;
+}
+
+message SectionOfChangesFilterIncludesPastReviewer {
+  string auth_id = 1;
+}
+
+message SectionOfChangesFilterIncludesReviewer {
+  string auth_id = 1;
+  repeated string group_public_ids = 2;
+}
+
+message SectionOfChangesFilterLastUpdated {
+  int32 hours = 1;
+}
+
+message SectionOfChangesFilterMentions {
+  string username = 1;
+}
+
+message SectionOfChangesFilterMergeBase {
+  string merge_base = 1;
+}
+
+message SectionOfChangesFilterNot {
+  SectionOfChangesFilter expr = 1;
+}
+
+message SectionOfChangesFilterNumFilesChanged {
+  int32 num_files = 1;
+}
+
+message SectionOfChangesFilterNumLinesChanged {
+  int32 num_lines = 1;
+}
+
+message SectionOfChangesFilterOpenReviewRequestFor {
+  string auth_id = 1;
+}
+
+message SectionOfChangesFilterOr {
+  repeated SectionOfChangesFilter exprs = 1;
+}
+
+message SectionOfChangesFilterReopenedReviewRequestFor {
+  string auth_id = 1;
+}
+
+message SectionOfChangesFilterReviewStatus {
+  SectionOfChangesReviewStatusState state = 1;
+}
+
+message SectionOfChangesFilterTitleContains {
+  string text = 1;
+}
+
+message SectionOfChangesFilterTrunk {
+  string trunk = 1;
+}
+
+message SectionOfChangesFilterUnsupported {
+  string kind = 1;
+}
+
+message SectionOfChangesReviewer {
+  string author_id = 1;
+  SectionOfChangesVerdict verdict = 2;
+  google.protobuf.Timestamp reviewed_at = 3;
+  string author_kind = 4;
+  string author_display_name = 5;
+  string author_avatar_url = 6;
+  ActorWithDisplay author = 7;
+}
+
+message SetAppIconRequest {
+  string app_id = 1;
+  bytes icon = 2;
+}
+
+message SetAppIconResponse {
+  App app = 1;
+}
+
+message SetBuildkiteTriggerEnabledRequest {
+  ClientRepoIdentifier repo = 1;
+  string trigger_id = 2;
+  bool enabled = 3;
+}
+
+message SetBuildkiteTriggerEnabledResponse {
+  BuildkiteTrigger trigger = 1;
+}
+
+message SetCommentReactionRequest {
+  string comment_id = 1;
+  string emoji = 2;
+  bool active = 3;
+}
+
+message SetCommentReactionResponse {
+}
+
+message SetRepoTeamAccessRequest {
+  oneof policy_update {
+    string policy_name = 3;
+    bool clear_override = 4;
+  }
+  ClientRepoIdentifier identifier = 1;
+  TeamGroupKind group = 2;
+}
+
+message SetRepoTeamAccessResponse {
+  OriginNamespace namespace = 1;
+  TeamGroupAccess team_admins = 2;
+  TeamGroupAccess team_members = 3;
+}
+
+message SetupTeamNamespaceRequest {
+  OriginNamespaceOwnerType owner_type = 1;
+  int64 owner_entity_id = 2;
+  string namespace = 3;
+}
+
+message SetupTeamNamespaceResponse {
+  OriginNamespace origin_namespace = 1;
+  bool namespace_created = 2;
+  bool grants_changed = 3;
+}
+
+message SetVercelTriggerEnabledRequest {
+  ClientRepoIdentifier repo = 1;
+  string trigger_id = 2;
+  bool enabled = 3;
+}
+
+message SetVercelTriggerEnabledResponse {
+  VercelTrigger trigger = 1;
+}
+
+message SshPublicKey {
+  string id = 1;
+  string name = 2;
+  string algo = 3;
+  string fingerprint = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp last_used_at = 6;
+}
+
+message StackMemberEvaluation {
+  uint64 change_number = 1;
+  string role = 2;
+  ChangesetMergeability mergeability = 3;
+}
+
+message StackMergeability {
+  uint64 target_change_number = 1;
+  repeated uint64 prefix_change_numbers = 2;
+  string root_base_ref = 3;
+  string verdict = 4;
+  repeated ChangesetMergeBlocker blockers = 5;
+  repeated StackMemberEvaluation member_evaluations = 6;
+  optional string convergence_state = 7;
+  optional uint64 convergence_conflicted_change_number = 8;
+  repeated string convergence_conflicted_paths = 9;
+  optional string convergence_updated_at = 10;
+}
+
+message StartReviewRequest {
+  ChangeIdentifier change = 1;
+  ReviewVerdict verdict = 2;
+  string body = 3;
+  uint64 version_number = 4;
+}
+
+message StartReviewResponse {
+  Review review = 1;
+}
+
+message SubmitReviewRequest {
+  ChangeIdentifier change = 1;
+  string review_id = 2;
+}
+
+message SubmitReviewResponse {
+  Review review = 1;
+}
+
+message SuspendInstallationRequest {
+  string id = 1;
+}
+
+message SuspendInstallationResponse {
+}
+
+message SyncEventHeartbeat {
+}
+
+message TaggedSyncEvent {
+  ChangeSyncTarget target = 1;
+  string event_json = 2;
+}
+
+message TaggedSyncSnapshot {
+  ChangeSyncTarget target = 1;
+  string snapshot_json = 2;
+}
+
+message TeamGroupAccess {
+  GrantPolicyRef namespace_policy = 1;
+  GrantPolicyRef repo_policy = 2;
+  GrantPolicyRef effective_policy = 3;
+}
+
+message TransitionRepoMirrorStatusRequest {
+  ClientRepoIdentifier identifier = 1;
+  RepoMirrorTransition transition = 2;
+}
+
+message TransitionRepoMirrorStatusResponse {
+  Repo repository = 1;
+  RepoMirrorTransitionJob active_job_info = 2;
+}
+
+message UnmarkAllFilesAsViewedRequest {
+  ChangeIdentifier change = 1;
+}
+
+message UnmarkAllFilesAsViewedResponse {
+}
+
+message UnmarkFileAsViewedRequest {
+  ChangeIdentifier change = 1;
+  string file_path = 2;
+}
+
+message UnmarkFileAsViewedResponse {
+}
+
+message UnsuspendInstallationRequest {
+  string id = 1;
+}
+
+message UnsuspendInstallationResponse {
+}
+
+message UpdateAppRequest {
+  string id = 1;
+  optional string display_name = 2;
+  optional string webhook_url = 3;
+  optional AppEventsReplace events = 5;
+  optional bool is_public = 6;
+  optional AppAuthPolicyStatementsReplace auth_policy_statements = 7;
+  optional AppInstallationRedirectUrisReplace installation_redirect_uris = 8;
+  optional string description = 9;
+  optional string website_url = 10;
+}
+
+message UpdateAppResponse {
+  App app = 1;
+}
+
+message UpdateChangeBranchRequest {
+  ChangeIdentifier change = 1;
+  UpdateChangeBranchMethod method = 2;
+}
+
+message UpdateChangeBranchResponse {
+  Change change = 1;
+  Version latest_version = 2;
+  bool unchanged = 3;
+}
+
+message UpdateChangeMetadataRequest {
+  ChangeIdentifier change = 1;
+  optional string title = 2;
+  optional string description = 3;
+}
+
+message UpdateChangeMetadataResponse {
+  Change change = 1;
+}
+
+message UpdateChangeRequest {
+  oneof parent_update {
+    ChangeIdentifier parent_change = 4;
+    bool clear_parent = 5;
+  }
+  ChangeIdentifier change = 1;
+  optional string head_ref = 2;
+  optional string base_ref = 3;
+}
+
+message UpdateChangeResponse {
+  Change change = 1;
+  Version latest_version = 2;
+  bool unchanged = 3;
+}
+
+message UpdateChangeStatusRequest {
+  ChangeIdentifier change = 1;
+  ChangeStatus status = 2;
+}
+
+message UpdateChangeStatusResponse {
+  Change change = 1;
+}
+
+message UpdateCommentRequest {
+  string comment_id = 1;
+  string body = 2;
+}
+
+message UpdateCommentResponse {
+  Comment comment = 1;
+}
+
+message UpdateLabelRequest {
+  ClientRepoIdentifier repo = 1;
+  string label_id = 2;
+  optional string name = 3;
+  optional string color = 4;
+  optional string description = 5;
+}
+
+message UpdateLabelResponse {
+  Label label = 1;
+}
+
+message UpdateRepoBranchDeletionSettingRequest {
+  ClientRepoIdentifier identifier = 1;
+  optional bool delete_branch_on_merge = 2;
+}
+
+message UpdateRepoBranchDeletionSettingResponse {
+  Repo repository = 1;
+}
+
+message UpdateRepoMergeSettingsRequest {
+  ClientRepoIdentifier identifier = 1;
+  bool allow_merge_commit = 2;
+  bool allow_squash_merge = 3;
+}
+
+message UpdateRepoMergeSettingsResponse {
+  Repo repository = 1;
+}
+
+message UpdateReviewRequest {
+  ChangeIdentifier change = 1;
+  string review_id = 2;
+  string body = 3;
+}
+
+message UpdateReviewResponse {
+  Review review = 1;
+}
+
+message UpdateWatchChangeSyncSubscriptionsRequest {
+  string connection_id = 1;
+  repeated ChangeSyncTarget add = 2;
+  repeated ChangeSyncTarget remove = 3;
+}
+
+message UpdateWatchChangeSyncSubscriptionsResponse {
+}
+
+message UpsertBuildkiteTriggerRequest {
+  ClientRepoIdentifier repo = 1;
+  string buildkite_org_slug = 2;
+  string pipeline_slug = 3;
+  string plaintext_api_token = 4;
+  optional bool enabled = 5;
+  optional bool trigger_on_prs = 6;
+  optional BuildkiteBranchFilters branch_filters = 7;
+}
+
+message UpsertBuildkiteTriggerResponse {
+  BuildkiteTrigger trigger = 1;
+}
+
+message UpsertGeneratedCodeTourRequest {
+  ChangeIdentifier change = 1;
+  string storage_key = 2;
+  string head_sha = 3;
+  string result = 4;
+  optional string agentic_markdown = 5;
+  optional string agentic_error_message = 6;
+  string feature_configuration_json = 7;
+}
+
+message UpsertGeneratedCodeTourResponse {
+  GeneratedCodeTour tour = 1;
+}
+
+message UpsertRulesetRequest {
+  ClientRepoIdentifier repo = 1;
+  optional string ruleset_id = 2;
+  string name = 3;
+  string description = 4;
+  RulesetEnforcement enforcement = 5;
+  RulesetKind kind = 6;
+  repeated string included_ref_names = 7;
+  repeated string excluded_ref_names = 8;
+  repeated RulesetRuleInput rules = 9;
+  repeated RulesetBypassActorInput bypass_actors = 10;
+}
+
+message UpsertRulesetResponse {
+  Ruleset ruleset = 1;
+}
+
+message UpsertVercelTriggerRequest {
+  ClientRepoIdentifier repo = 1;
+  string vercel_project_id = 2;
+  string vercel_team_id = 3;
+  string target = 4;
+  string plaintext_api_token = 5;
+  optional string branch_filter = 6;
+  optional bool enabled = 7;
+}
+
+message UpsertVercelTriggerResponse {
+  VercelTrigger trigger = 1;
+}
+
+message VercelTrigger {
+  string id = 1;
+  ClientRepoIdentifier repo = 2;
+  string vercel_project_id = 3;
+  string vercel_team_id = 4;
+  string target = 5;
+  optional string branch_filter = 6;
+  bool enabled = 7;
+}
+
+message Version {
+  string id = 1;
+  string change_id = 2;
+  uint64 number = 3;
+  string head_sha = 4;
+  string base_sha = 5;
+  google.protobuf.Timestamp created_at = 6;
+  int32 additions = 7;
+  int32 deletions = 8;
+  int32 changed_files = 9;
+}
+
+message WatchChangeSyncEventsRequest {
+  ClientRepoIdentifier identifier = 1;
+  uint64 change_number = 2;
+}
+
+message WatchChangeSyncEventsResponse {
+  oneof frame {
+    string snapshot_json = 1;
+    string event_json = 2;
+    SyncEventHeartbeat heartbeat = 3;
+  }
+}
+
+message WatchChangeSyncEventsV2Request {
+  repeated ChangeSyncTarget subscriptions = 1;
+}
+
+message WatchChangeSyncEventsV2Response {
+  oneof frame {
+    WatchSyncSessionStarted session = 1;
+    TaggedSyncSnapshot snapshot = 2;
+    TaggedSyncEvent event = 3;
+    SyncEventHeartbeat heartbeat = 4;
+    WatchSyncSubscriptionNack nack = 5;
+    WatchSyncSubscriptionRemoved removed = 6;
+  }
+}
+
+message WatchSyncSessionStarted {
+  string connection_id = 1;
+}
+
+message WatchSyncSubscriptionNack {
+  ChangeSyncTarget target = 1;
+  string reason = 2;
+  string message = 3;
+}
+
+message WatchSyncSubscriptionRemoved {
+  ChangeSyncTarget target = 1;
+}
+
+// ============================
+// Placeholder types (0 direct + 0 recursive-shell + 9 opaque)
+// ============================
+
+message PH_git_forge_v1_ChangeKind {} // opaque placeholder for git_forge.v1.ChangeKind
+
+message PH_git_forge_v1_Commit {} // opaque placeholder for git_forge.v1.Commit
+
+message PH_git_forge_v1_CommitFileOperation {} // opaque placeholder for git_forge.v1.CommitFileOperation
+
+message PH_git_forge_v1_GrepSearchOptions {} // opaque placeholder for git_forge.v1.GrepSearchOptions
+
+message PH_git_forge_v1_ListRefsFilter {} // opaque placeholder for git_forge.v1.ListRefsFilter
+
+message PH_git_forge_v1_MergeMode {} // opaque placeholder for git_forge.v1.MergeMode
+
+message PH_git_forge_v1_PathIdentifier {} // opaque placeholder for git_forge.v1.PathIdentifier
+
+message PH_git_forge_v1_ShortCommit {} // opaque placeholder for git_forge.v1.ShortCommit
+
+message PH_git_forge_v1_Signature {} // opaque placeholder for git_forge.v1.Signature

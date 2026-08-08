@@ -6,6 +6,15 @@ import { isCodexApiVisibleInputItem } from "./codex-response-items"
 export interface CodexLastResponseSnapshot {
   responseId: string
   itemsAdded: CodexInputItem[]
+  /** Eligibility captured from the full request that produced this response. */
+  eligibility?: CodexContinuationEligibility
+  /** Exact ModelClientSession that produced this response chain. */
+  modelClientSessionId: string
+}
+
+export interface CodexContinuationEligibility {
+  toolCatalogHash: string
+  settingsHash: string
 }
 
 export type CodexIncrementalInputResult =
@@ -40,14 +49,16 @@ export interface CodexInputMismatchItemDetail {
 }
 
 export interface CodexContinuationState {
-  lastResponse?: CodexLastResponseSnapshot
-  lastRequest?: Record<string, unknown>
+  lastResponse: CodexLastResponseSnapshot | undefined
+  lastRequest: Record<string, unknown> | undefined
+  /** Exact logical ModelClientSession identity for this continuation state. */
+  modelClientSessionId: string
 }
 
 export type CodexContinuationDecision =
   | {
       mode: "full"
-      reason: "no_baseline"
+      reason: "no_baseline" | "explicit_full_input"
       request: Record<string, unknown>
       nextState: CodexContinuationState
     }
@@ -69,6 +80,15 @@ export type CodexContinuationDecision =
       mode: "full_reset"
       reason: "input_not_extension"
       inputMismatch: CodexInputMismatch
+      request: Record<string, unknown>
+      nextState: CodexContinuationState
+    }
+  | {
+      mode: "full_reset"
+      reason:
+        | "tool_catalog_changed"
+        | "settings_changed"
+        | "model_client_session_changed"
       request: Record<string, unknown>
       nextState: CodexContinuationState
     }
@@ -105,6 +125,29 @@ export function codexRequestIncrementalSignature(
   return stableCodexJsonStringify(
     stripCodexRequestForIncrementalCompare(request)
   )
+}
+
+/**
+ * A response id is usable only when the exact model settings and dynamic tool
+ * catalog that created it remain active. Hash these independently so callers
+ * can explain why a continuation was intentionally abandoned.
+ */
+export function getCodexContinuationEligibility(
+  request: Record<string, unknown>
+): CodexContinuationEligibility {
+  const toolCatalog = {
+    tools: request.tools ?? [],
+    tool_choice: request.tool_choice,
+    parallel_tool_calls: request.parallel_tool_calls,
+  }
+  const settings = stripCodexRequestForIncrementalCompare(request)
+  delete settings.tools
+  delete settings.tool_choice
+  delete settings.parallel_tool_calls
+  return {
+    toolCatalogHash: hashCodexContinuationPart(toolCatalog),
+    settingsHash: hashCodexContinuationPart(settings),
+  }
 }
 
 export function getCodexIncrementalInput(
@@ -198,16 +241,33 @@ export function prepareCodexContinuationRequest(
 ): CodexContinuationDecision {
   const lastResponse = state.lastResponse
   const lastRequest = state.lastRequest
-  if (!lastResponse?.responseId || !lastRequest) {
+  if (!lastResponse || !lastRequest) {
     return {
       mode: "full",
       reason: "no_baseline",
       request,
-      nextState: {
-        lastRequest: request,
-        lastResponse: undefined,
-      },
+      nextState: buildNextContinuationState(state, request),
     }
+  }
+
+  if (lastResponse.modelClientSessionId !== state.modelClientSessionId) {
+    return buildEligibilityResetDecision(
+      state,
+      request,
+      "model_client_session_changed"
+    )
+  }
+
+  const previousEligibility =
+    lastResponse.eligibility ?? getCodexContinuationEligibility(lastRequest)
+  const currentEligibility = getCodexContinuationEligibility(request)
+  if (
+    previousEligibility.toolCatalogHash !== currentEligibility.toolCatalogHash
+  ) {
+    return buildEligibilityResetDecision(state, request, "tool_catalog_changed")
+  }
+  if (previousEligibility.settingsHash !== currentEligibility.settingsHash) {
+    return buildEligibilityResetDecision(state, request, "settings_changed")
   }
 
   const result = getCodexIncrementalInput(
@@ -223,10 +283,7 @@ export function prepareCodexContinuationRequest(
         reason: "static_fields_changed",
         changedStaticKeys: result.changedStaticKeys,
         request,
-        nextState: {
-          lastRequest: request,
-          lastResponse: undefined,
-        },
+        nextState: buildNextContinuationState(state, request),
       }
     }
 
@@ -235,10 +292,7 @@ export function prepareCodexContinuationRequest(
       reason: "input_not_extension",
       inputMismatch: result.inputMismatch,
       request,
-      nextState: {
-        lastRequest: request,
-        lastResponse: undefined,
-      },
+      nextState: buildNextContinuationState(state, request),
     }
   }
 
@@ -252,9 +306,53 @@ export function prepareCodexContinuationRequest(
     previousResponseId: lastResponse.responseId,
     incrementalItemCount: result.input.length,
     nextState: {
-      lastRequest: request,
+      ...buildNextContinuationState(state, request),
       lastResponse,
     },
+  }
+}
+
+/**
+ * Build a full-input continuation candidate without consulting the previous
+ * response chain. The caller still publishes `nextState` only after the
+ * physical request has been accepted.
+ */
+export function prepareCodexFullContinuationRequest(
+  request: Record<string, unknown>,
+  state: CodexContinuationState
+): Extract<CodexContinuationDecision, { mode: "full" }> {
+  return {
+    mode: "full",
+    reason: "explicit_full_input",
+    request,
+    nextState: buildNextContinuationState(state, request),
+  }
+}
+
+function buildEligibilityResetDecision(
+  state: CodexContinuationState,
+  request: Record<string, unknown>,
+  reason:
+    | "tool_catalog_changed"
+    | "settings_changed"
+    | "model_client_session_changed"
+): Extract<CodexContinuationDecision, { reason: typeof reason }> {
+  return {
+    mode: "full_reset",
+    reason,
+    request,
+    nextState: buildNextContinuationState(state, request),
+  }
+}
+
+function buildNextContinuationState(
+  state: CodexContinuationState,
+  request: Record<string, unknown>
+): CodexContinuationState {
+  return {
+    lastRequest: request,
+    lastResponse: undefined,
+    modelClientSessionId: state.modelClientSessionId,
   }
 }
 
@@ -275,6 +373,13 @@ function diffCodexStaticRequestKeys(
     }
   }
   return changed
+}
+
+function hashCodexContinuationPart(value: unknown): string {
+  return createHash("sha256")
+    .update(stableCodexJsonStringify(value))
+    .digest("hex")
+    .slice(0, 24)
 }
 
 function codexInputItemsEquivalentForContinuation(

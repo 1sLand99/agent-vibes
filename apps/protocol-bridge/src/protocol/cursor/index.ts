@@ -12,3 +12,10 @@ export { CursorConnectStreamService } from "./cursor-connect-stream.service"
 export { CursorGrpcService } from "./cursor-grpc.service"
 export { CursorModule } from "./cursor.module"
 export { SemanticSearchProviderService } from "./semantic-search-provider.service"
+export {
+  ProjectionAttemptGate,
+  ProjectionAttemptHandoffInProgressError,
+  type ProjectionAttemptHandoffOutcome,
+  type ProjectionAttemptHandoffToken,
+  type ProjectionAttemptLease,
+} from "./session/projection-attempt-gate.service"

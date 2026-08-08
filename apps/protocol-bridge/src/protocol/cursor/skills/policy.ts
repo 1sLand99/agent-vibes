@@ -237,7 +237,7 @@ export function findCursorSkillByName(
  * 用于「未激活的 Skill 不允许被工具直接读取」的访问拦截。
  */
 export function findCursorSkillForInternalPath(
-  rules: CursorRule[] | undefined,
+  rules: readonly CursorRule[] | undefined,
   rawPath: string,
   skillOptions?: SkillOptions
 ): CursorSkillMetadata | null {

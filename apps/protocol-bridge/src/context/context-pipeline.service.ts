@@ -1,8 +1,24 @@
 import { Injectable, Logger } from "@nestjs/common"
+import { AsyncLocalStorage } from "node:async_hooks"
+import {
+  projectionOwnerStorageKey,
+  type ProjectionOwner,
+} from "../protocol/cursor/session/projection-owner"
+
+interface ContextMutationScope {
+  ownerKey: string
+  label: string
+  /**
+   * AsyncLocalStorage propagates into detached descendants.  The scope must
+   * therefore expire when its queue operation releases; otherwise a late
+   * callback could appear to own a mutation after another operation starts.
+   */
+  active: boolean
+}
 
 /**
- * Per-conversation mutation queue for context-state mutations
- * (compaction, collapse, projection rewrites). Ensures only one
+ * Per-projection-owner mutation queue for context-state mutations
+ * (compaction and provider projection installs). Ensures only one
  * mutation operates on a given conversation's `ContextConversationState`
  * at a time without holding a global lock.
  *
@@ -14,8 +30,7 @@ import { Injectable, Logger } from "@nestjs/common"
  * the common race where a turn is superseded between the time it
  * enqueued the work and the time the queue gets around to it.
  *
- * Renamed from `ContextPipelineService` as part of Phase A of the
- * cursor-namespace rewrite. The required `signal` parameter is the
+ * The required `signal` parameter is the
  * load-bearing change — every caller now has to consciously pass a
  * lifecycle-bound signal, eliminating the silent "queue runs orphaned
  * work after the requester is gone" failure mode that produced the
@@ -25,15 +40,21 @@ import { Injectable, Logger } from "@nestjs/common"
 export class ContextPipeline {
   private readonly logger = new Logger(ContextPipeline.name)
   private readonly mutationQueues = new Map<string, Promise<void>>()
+  /**
+   * The queue is not merely advisory. Projection writers use this scope to
+   * reject a future direct write that would otherwise race a compact plan
+   * waiting on its no-tools summary request.
+   */
+  private readonly mutationScope = new AsyncLocalStorage<ContextMutationScope>()
 
   async runMutation<T>(args: {
-    conversationId: string
+    owner: ProjectionOwner
     label: string
     signal: AbortSignal
-    operation: (signal: AbortSignal) => Promise<T>
+    operation: (signal: AbortSignal) => T | Promise<T>
   }): Promise<T> {
-    const { conversationId, label, signal, operation } = args
-    const key = conversationId || "__stateless__"
+    const { owner, label, signal, operation } = args
+    const key = projectionOwnerStorageKey(owner)
     const previous = this.mutationQueues.get(key) || Promise.resolve()
     let release!: () => void
     const current = new Promise<void>((resolve) => {
@@ -64,7 +85,19 @@ export class ContextPipeline {
             : new Error(String(signal.reason ?? "ContextPipeline aborted"))
         throw reason
       }
-      return await operation(signal)
+      const scope: ContextMutationScope = {
+        ownerKey: key,
+        label,
+        active: true,
+      }
+      try {
+        return await this.mutationScope.run(scope, () => operation(signal))
+      } finally {
+        // AsyncLocalStorage propagates this object by reference. Marking it
+        // inactive rejects detached callbacks that outlive this serialized
+        // operation even though they retain its async context.
+        scope.active = false
+      }
     } finally {
       release()
       if (this.mutationQueues.get(key) === queued) {
@@ -72,10 +105,19 @@ export class ContextPipeline {
       }
     }
   }
-}
 
-/**
- * @deprecated Re-exported as ContextPipelineService for callers that
- * have not yet migrated. Will be deleted in Phase H.
- */
-export { ContextPipeline as ContextPipelineService }
+  /**
+   * Require that a projection write is executing under this exact owner's
+   * serialized mutation scope. Store-level transactions guard SQLite
+   * atomicity; this guard owns the corresponding hot-state ordering.
+   */
+  assertMutationOwner(owner: ProjectionOwner, operation: string): void {
+    const expectedKey = projectionOwnerStorageKey(owner)
+    const current = this.mutationScope.getStore()
+    if (!current || !current.active || current.ownerKey !== expectedKey) {
+      throw new Error(
+        `Context projection mutation ${operation} for ${owner.conversationId}/${owner.ownerKey} must run inside its ContextPipeline owner`
+      )
+    }
+  }
+}

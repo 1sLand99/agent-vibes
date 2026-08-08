@@ -2,10 +2,10 @@
  * Built-in sub-agent definitions for the Cursor protocol bridge.
  *
  * Inspired by claude-code/packages/builtin-tools/src/tools/AgentTool/built-in/
- * but adapted to the bridge's runtime constraints:
- *   - Sub-agents run inside the bridge. Read-only file/search tools are
- *     bridge-local; shell/edit/delete remain restricted to agents whose
- *     resolved tool surface explicitly lists them.
+ * but adapted to the bridge's execution model:
+ *   - Foreground and detached workers use the same agent definitions, while
+ *     `subagent-tool-resolver.ts` derives their concrete tool surface from
+ *     the execution mode and available bridge owners.
  *   - The proto `SubagentType` oneof has fixed built-in cases plus a
  *     `custom` case. General-purpose maps to `unspecified`; explore,
  *     browser, and bash map to their concrete cases; named agents such
@@ -16,6 +16,7 @@
  * blowing the prompt budget.
  */
 
+import { BUILTIN_SUBAGENT_IDENTITIES } from "./subagent-identity"
 import type { BuiltInSubagentDefinition } from "./types"
 
 const SHARED_PREFIX =
@@ -36,8 +37,9 @@ Guidelines:
 - Use file_search / glob_search for path-pattern lookups; semantic_search /
   deep_search for content-style questions.
 - For web tasks, prefer web_search to discover and web_fetch to read.
-- For MCP tasks, get_mcp_tools first lists what's actually mounted, then
-  mcp_tool dispatches a specific server tool.
+- Parent-mounted MCP capabilities appear as concrete direct functions in the
+  current tool surface. Call only those concrete functions; do not invent a
+  generic discovery or dispatch layer.
 - Use read_file / list_directory / grep_search when they are listed in your
   current tool surface. Do not claim to use shell/edit/delete unless those
   tools are explicitly listed for this agent.
@@ -48,7 +50,7 @@ Guidelines:
  * SubagentType.unspecified. Equivalent to claude-code's
  * GENERAL_PURPOSE_AGENT but trimmed to the bridge's tool surface. */
 export const GENERAL_PURPOSE_SUBAGENT: BuiltInSubagentDefinition = {
-  agentType: "general-purpose",
+  agentType: BUILTIN_SUBAGENT_IDENTITIES.GENERAL_PURPOSE.agentType,
   whenToUse:
     "General-purpose research agent for complex questions, code search, " +
     "and multi-step investigations. Use this when you need to explore the " +
@@ -57,11 +59,6 @@ export const GENERAL_PURPOSE_SUBAGENT: BuiltInSubagentDefinition = {
   // ["*"] = inherit the bridge's full sub-agent-safe surface. The actual
   // resolution happens in `subagent-tool-resolver.ts`.
   tools: ["*"],
-  // Research-style work routinely takes 20+ turns when chained with web
-  // fetches / semantic searches; bumping the default to 30 matches
-  // claude-code's general-purpose budget and avoids spurious "max turns"
-  // truncations observed during smoke regression.
-  maxTurns: 30,
   source: "built-in",
   getSystemPrompt: () =>
     `${SHARED_PREFIX}\n\n${SHARED_GUIDELINES}\n\n` +
@@ -73,7 +70,7 @@ export const GENERAL_PURPOSE_SUBAGENT: BuiltInSubagentDefinition = {
 /** Explore agent — read-only fast searcher. Maps to proto
  * SubagentType.explore. */
 export const EXPLORE_SUBAGENT: BuiltInSubagentDefinition = {
-  agentType: "explore",
+  agentType: BUILTIN_SUBAGENT_IDENTITIES.EXPLORE.agentType,
   whenToUse:
     "Fast read-only codebase explorer. Use when you need to find files by " +
     'pattern (e.g., "how is heartbeat handled?"), locate symbols, or trace ' +
@@ -100,11 +97,6 @@ export const EXPLORE_SUBAGENT: BuiltInSubagentDefinition = {
     "list_directory",
     "reflect",
   ],
-  // Explore is meant to be FAST — claude-code caps it at 25-ish turns
-  // because it's a read-only search agent that should converge quickly.
-  // 30 keeps the budget consistent with general-purpose without
-  // encouraging open-ended drilling.
-  maxTurns: 30,
   source: "built-in",
   getSystemPrompt: () =>
     `${SHARED_PREFIX}
@@ -131,37 +123,32 @@ ${SHARED_GUIDELINES}`,
 }
 
 /** Browser agent — drives the IDE's headless browser via the
- * `cursor-ide-browser` MCP server. Maps to proto SubagentType.browserUse.
+ * `cursor-ide-browser` MCP server when its current tool surface includes
+ * `mcp_tool`. Maps to proto SubagentType.browserUse.
  *
  * Cursor's third official built-in sub-agent (alongside explore + bash) is
- * `browser`. Unlike `bash`, browser automation does NOT need an
- * ExecServerMessage round-trip — it goes through the standard MCP channel
- * (`mcp_tool` calling `cursor-ide-browser-browser_*`), which the bridge's
- * sub-agent surface already exposes. So the only work is wiring up the
- * agent definition with a system prompt that teaches the model how to
- * drive the MCP-mounted browser tools.
+ * `browser`. Foreground execution invokes the standard MCP channel
+ * (`mcp_tool` calling `cursor-ide-browser-browser_*`). Detached workers do
+ * not own an IDE MCP-result channel, so their background tool surface omits
+ * mcp_tool rather than advertising a capability it cannot execute.
  *
  * The browser sub-agent is intentionally sandboxed to MCP + read-only
  * supporting tools — it should not be writing to disk or running shell
  * commands.
  */
 export const BROWSER_SUBAGENT: BuiltInSubagentDefinition = {
-  agentType: "browser",
+  agentType: BUILTIN_SUBAGENT_IDENTITIES.BROWSER.agentType,
   whenToUse:
     "Browser automation agent. Use when the parent task needs to drive a " +
-    "real browser — open URLs, fill forms, click elements, take screenshots, " +
-    "scrape rendered content, or watch network requests. Returns a concise " +
-    "report (and screenshot/snapshot summaries) once the browser interaction " +
-    "is complete. Backed by the Cursor IDE's headless browser through MCP.",
+    "real browser on an HTTP(S) website — open URLs, inspect rendered content, " +
+    "fill forms, click elements, or take screenshots. Do not use it to inspect " +
+    "local files, repository paths, or file:// URLs; use explore or bash for " +
+    "those tasks. Backed by the Cursor IDE's headless browser through MCP.",
   tools: [
-    // The browser is exposed entirely through the cursor-ide-browser MCP
-    // server, so we only need the MCP dispatch tools — the model uses
-    // `get_mcp_tools` to discover the browser_* surface, then `mcp_tool`
-    // to drive it.
-    "get_mcp_tools",
+    // `mcp_tool` is a spawn-time compiler policy. It expands to the exact
+    // direct browser functions frozen from the parent request; no generic
+    // discovery or dispatch function is exposed to the model.
     "mcp_tool",
-    "list_mcp_resources",
-    "read_mcp_resource",
     // Web tools for cross-checking what the browser sees against an HTTP
     // fetch (occasionally useful when the rendered DOM and the network
     // payload disagree).
@@ -172,36 +159,36 @@ export const BROWSER_SUBAGENT: BuiltInSubagentDefinition = {
     // hits an unexpected state.
     "reflect",
   ],
-  // Browser flows often need many small interactions (navigate → snapshot
-  // → click → wait_for → snapshot → ...); 30 keeps parity with explore /
-  // general-purpose so simple flows finish well under the cap and complex
-  // flows have headroom.
-  maxTurns: 30,
+  inheritedMcpServers: ["cursor-ide-browser"],
+  requiredMcpServers: ["cursor-ide-browser"],
   source: "built-in",
   getSystemPrompt: () =>
     `${SHARED_PREFIX}
 
-You are a browser automation specialist. You drive the Cursor IDE's
-headless browser through MCP — specifically the \`cursor-ide-browser\`
-server. Discover the available browser_* tools with get_mcp_tools, then
-invoke them via mcp_tool.
+You are a browser automation specialist. The concrete
+\`cursor-ide-browser-browser_*\` functions in your current tool surface are
+the complete browser contract for this run. Call those functions directly.
+Do not run MCP discovery and do not invent a generic MCP dispatch function.
+
+Browser navigation accepts only absolute \`http://\` or \`https://\` URLs.
+Never navigate to \`file://\`, a local repository path, or an editor file.
+If the parent assigned local-file or repository inspection, report that the
+task requires the explore or bash sub-agent instead of attempting navigation.
 
 Standard browser workflow:
-1. \`get_mcp_tools\` once at the start of a task to confirm the browser
-   server is mounted and to list the browser_* tools available in this
-   session.
-2. \`mcp_tool\` with server_name="cursor-ide-browser",
-   tool_name="browser_navigate", args={ url, ... } to open the target page.
-3. Use \`mcp_tool\` with \`browser_snapshot\` (preferred over screenshots
-   for action planning — it returns an accessibility tree with stable
-   element refs) to read the page state.
-4. Use \`browser_click\` / \`browser_fill\` / \`browser_select_option\` /
-   \`browser_press_key\` etc. with the refs you just obtained from the
-   snapshot. Do NOT pass arbitrary CSS selectors — always go through the
-   snapshot ref dance.
-5. \`browser_wait_for\` between steps when the page is async.
-6. \`browser_take_screenshot\` only when you need to surface visual
-   state to the parent agent; for action planning rely on snapshot.
+1. Call \`cursor-ide-browser-browser_navigate\` with the requested HTTP(S)
+   URL to open the target page.
+2. Use \`cursor-ide-browser-browser_snapshot\` (preferred over screenshots
+   for action planning) to read the accessibility tree and stable element
+   refs.
+3. Use the concrete \`browser_click\`, \`browser_fill\`,
+   \`browser_select_option\`, \`browser_press_key\`, \`browser_type\`, or
+   \`browser_scroll\` function present in the current tool surface. Do not
+   pass arbitrary CSS selectors; act through snapshot refs.
+4. Take another snapshot after asynchronous page changes instead of calling
+   a tool that is not present in the current surface.
+5. Use \`cursor-ide-browser-browser_take_screenshot\` only when the requested
+   evidence is visual; for action planning rely on snapshot.
 
 Cross-checks:
 - Use web_fetch / fetch to compare what an HTTP client sees against the
@@ -213,8 +200,8 @@ Limits and safety:
 - Do NOT navigate to internal-network URLs the user hasn't asked about.
 - Do NOT submit forms with credentials unless the parent agent explicitly
   provided them in the prompt.
-- If a navigation hangs, run \`browser_console_messages\` and
-  \`browser_network_requests\` to diagnose, then summarise findings.
+- Use only the concrete browser functions listed in this turn. If the
+  required capability is absent, report the missing capability precisely.
 
 Output format:
 - Lead with the answer / outcome of the browser interaction.
@@ -232,7 +219,7 @@ ${SHARED_GUIDELINES}`,
  * product endpoint.
  */
 export const BUGBOT_SUBAGENT: BuiltInSubagentDefinition = {
-  agentType: "bugbot",
+  agentType: BUILTIN_SUBAGENT_IDENTITIES.BUGBOT.agentType,
   whenToUse:
     "Code-review agent for Cursor /review-bugbot. Use only when the user " +
     "asks to run Bugbot or /review-bugbot. It computes the requested local " +
@@ -252,7 +239,6 @@ export const BUGBOT_SUBAGENT: BuiltInSubagentDefinition = {
     "fetch_pull_request",
     "reflect",
   ],
-  maxTurns: 40,
   source: "built-in",
   getSystemPrompt: () =>
     `${SHARED_PREFIX}
@@ -304,16 +290,13 @@ export function getBuiltInSubagents(): BuiltInSubagentDefinition[] {
 
 /** Bash agent — runs shell commands. Maps to proto SubagentType.bash.
  *
- * Implemented through the sub-agent ExecServerMessage bridge
- * (`SubagentExecBridgeService`): when this agent invokes
- * `run_terminal_command`, the bridge yields an ExecServerMessage to the
- * IDE on the same BiDi stream the parent agent uses, awaits the matching
- * ExecClientMessage, and feeds the shell result back into the
- * sub-agent's LLM loop. The ExecBridge owns the toolCallId → resolver
- * routing so parent and sub-agent shell calls do not collide.
+ * Foreground turns use the sub-agent Exec bridge
+ * (`SubagentExecBridgeService`). Detached turns use the bridge's local shell
+ * executor, which owns process lifecycle, workspace boundary enforcement,
+ * cancellation, and result delivery without an IDE round-trip.
  */
 export const BASH_SUBAGENT: BuiltInSubagentDefinition = {
-  agentType: "bash",
+  agentType: BUILTIN_SUBAGENT_IDENTITIES.BASH.agentType,
   whenToUse:
     "Shell command runner. Use when the task is best expressed as a small " +
     "script: running tests, computing checksums, inspecting git/diff output, " +
@@ -331,10 +314,6 @@ export const BASH_SUBAGENT: BuiltInSubagentDefinition = {
     "read_project",
     "reflect",
   ],
-  // Shell-driven sub-tasks routinely chain test → analyse → fix → re-test
-  // sequences; 30 turns matches the other built-ins and gives multi-step
-  // diagnoses room to converge before the cap trips.
-  maxTurns: 30,
   source: "built-in",
   getSystemPrompt: () =>
     `${SHARED_PREFIX}

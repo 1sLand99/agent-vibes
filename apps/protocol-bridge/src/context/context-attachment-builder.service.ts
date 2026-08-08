@@ -1,23 +1,21 @@
 import { Injectable } from "@nestjs/common"
+import { assertTerminalSessionMemoryProvenance } from "./session-memory.service"
 import { TokenCounterService } from "./token-counter.service"
 import type {
   ContextProjectionAttachment,
-  InvestigationMemorySummaryLike,
   SessionMemorySummaryLike,
 } from "./types"
+import type { SessionTodoStatus } from "../protocol/cursor/session/session-persistence.service"
 
 export interface SessionTodoAttachmentLike {
   id: string
   content: string
-  status: string
+  status: SessionTodoStatus
   dependencies: string[]
 }
 
 // Re-export for convenient import by downstream consumers.
-export type {
-  InvestigationMemorySummaryLike,
-  SessionMemorySummaryLike,
-} from "./types"
+export type { SessionMemorySummaryLike } from "./types"
 
 export interface ContextAttachmentSnapshot {
   readPaths: string[]
@@ -28,7 +26,6 @@ export interface ContextAttachmentSnapshot {
   }>
   todos: SessionTodoAttachmentLike[]
   sessionMemory?: SessionMemorySummaryLike[]
-  investigationSummaries?: InvestigationMemorySummaryLike[]
   /**
    * Snapshots of every foreground sub-agent currently running on the
    * conversation. Multiple entries appear when the parent dispatched
@@ -50,9 +47,6 @@ export interface ContextAttachmentSnapshot {
 export class ContextAttachmentBuilderService {
   private readonly TOTAL_ATTACHMENT_BUDGET = 2200
   private readonly MAX_ATTACHMENT_TOKENS = 700
-  private readonly INVESTIGATION_MEMORY_MAX_ATTACHMENT_TOKENS = 1500
-  private readonly INVESTIGATION_MEMORY_MAX_ITEMS = 6
-  private readonly INVESTIGATION_MEMORY_MAX_DETAIL_TOKENS = 420
   /** Per-snapshot caps for the file-content attachment. */
   private readonly FILE_SNAPSHOT_MAX_ATTACHMENT_TOKENS = 1600
   private readonly FILE_SNAPSHOT_MAX_FILES = 5
@@ -71,14 +65,8 @@ export class ContextAttachmentBuilderService {
     )
     if (budget <= 0) return []
 
-    // Attachment priority: session memory survives compaction boundaries and
-    // captures durable decisions/objectives. Investigation memory comes next
-    // because it captures distilled evidence from the current agent turn.
-    // When the total attachment budget is tight, earlier candidates consume
-    // budget first and later ones are dropped — so ordering encodes importance.
     const candidates: Array<ContextProjectionAttachment | null> = [
       this.buildSessionMemoryAttachment(snapshot),
-      this.buildInvestigationMemoryAttachment(snapshot),
       this.buildSubAgentAttachment(snapshot),
       this.buildTodosAttachment(snapshot),
       this.buildFileSnapshotsAttachment(snapshot),
@@ -92,9 +80,10 @@ export class ContextAttachmentBuilderService {
     for (const candidate of candidates) {
       if (!candidate) continue
       if (candidate.tokenCount <= 0) continue
-      if (consumed + candidate.tokenCount > budget) continue
-      attachments.push(candidate)
-      consumed += candidate.tokenCount
+      const fitted = this.fitAttachmentToBudget(candidate, budget - consumed)
+      if (!fitted) continue
+      attachments.push(fitted)
+      consumed += fitted.tokenCount
     }
 
     return attachments
@@ -105,6 +94,12 @@ export class ContextAttachmentBuilderService {
   ): ContextProjectionAttachment | null {
     const memories = snapshot.sessionMemory || []
     if (memories.length === 0) return null
+    for (const [index, memory] of memories.entries()) {
+      assertTerminalSessionMemoryProvenance(
+        memory,
+        `ContextAttachmentBuilderService: sessionMemory[${index}]`
+      )
+    }
 
     const selected = memories
       .slice()
@@ -157,70 +152,6 @@ export class ContextAttachmentBuilderService {
       "Session Memory",
       [...lines, "", footer].join("\n"),
       1400
-    )
-  }
-
-  // Investigation memory is rendered as a stable attachment instead of being
-  // appended to the live system prompt, so backends like Codex can treat it as
-  // part of the projected context/fingerprint path rather than a per-turn hack.
-  //
-  // Budget-aware construction: items are evaluated newest-first so that when
-  // the token budget is tight, older (less relevant) items are dropped while
-  // the most recent evidence and the footer instruction are always preserved.
-  private buildInvestigationMemoryAttachment(
-    snapshot: ContextAttachmentSnapshot
-  ): ContextProjectionAttachment | null {
-    const summaries = snapshot.investigationSummaries || []
-    if (summaries.length === 0) return null
-
-    const footer =
-      "Prefer synthesizing from this collected evidence instead of repeating equivalent investigative tool calls."
-
-    // Reserve tokens for the footer so it is never truncated.  The header
-    // line is added by buildAttachment and accounted for when that method
-    // trims body to maxTokens, so we do not reserve it here to avoid
-    // double-counting.
-    const reservedTokens = this.tokenCounter.countText(footer) + 2 // separators
-    const itemBudget = Math.max(
-      0,
-      this.INVESTIGATION_MEMORY_MAX_ATTACHMENT_TOKENS - reservedTokens
-    )
-
-    // Evaluate from newest to oldest so the most recent evidence survives
-    // budget constraints.  We collect in reverse, then flip for display.
-    const recent = summaries.slice(-this.INVESTIGATION_MEMORY_MAX_ITEMS)
-    const selected: string[] = []
-    let consumedTokens = 0
-
-    for (let i = recent.length - 1; i >= 0; i--) {
-      const summary = recent[i]!
-      const detailText = this.trimToBudget(
-        summary.details?.trim() || "",
-        this.INVESTIGATION_MEMORY_MAX_DETAIL_TOKENS
-      )
-      // Use a temporary marker; real numbering is assigned after reversal.
-      const itemText = detailText
-        ? `- ${summary.label}\n${detailText}`
-        : `- ${summary.label}`
-      const itemTokens = this.tokenCounter.countText(itemText)
-      if (consumedTokens + itemTokens > itemBudget) break
-      selected.push(itemText)
-      consumedTokens += itemTokens
-    }
-
-    if (selected.length === 0) return null
-
-    // Restore chronological order and assign stable numbering.
-    selected.reverse()
-    const numberedLines = selected
-      .map((line, index) => line.replace(/^- /, `${index + 1}. `))
-      .join("\n\n")
-
-    return this.buildAttachment(
-      "investigation_memory",
-      "Investigation Memory",
-      [numberedLines, footer].filter(Boolean).join("\n\n"),
-      this.INVESTIGATION_MEMORY_MAX_ATTACHMENT_TOKENS
     )
   }
 
@@ -418,7 +349,10 @@ export class ContextAttachmentBuilderService {
   ): ContextProjectionAttachment {
     const budget = maxTokens ?? this.MAX_ATTACHMENT_TOKENS
     const header = `[Context attachment: ${label}]`
-    const content = `${header}\n${this.trimToBudget(body, budget)}`
+    const headerTokens = this.tokenCounter.countText(header)
+    const bodyBudget = Math.max(0, budget - headerTokens)
+    const trimmedBody = this.trimToBudget(body, bodyBudget)
+    const content = trimmedBody ? `${header}\n${trimmedBody}` : header
     return {
       kind,
       label,
@@ -427,9 +361,44 @@ export class ContextAttachmentBuilderService {
     }
   }
 
+  /**
+   * Never discard an entire lower-priority attachment merely because the
+   * candidate was built for the nominal total budget.  Preserve its semantic
+   * header and fit its body into the actual remaining space instead.
+   */
+  private fitAttachmentToBudget(
+    attachment: ContextProjectionAttachment,
+    maxTokens: number
+  ): ContextProjectionAttachment | null {
+    if (maxTokens <= 0) return null
+    if (attachment.tokenCount <= maxTokens) return attachment
+
+    const header = `[Context attachment: ${attachment.label}]`
+    const headerTokens = this.tokenCounter.countText(header)
+    if (headerTokens > maxTokens) return null
+
+    const body = attachment.content.startsWith(`${header}\n`)
+      ? attachment.content.slice(header.length + 1)
+      : attachment.content
+    const trimmedBody = this.trimToBudget(body, maxTokens - headerTokens)
+    // A label without any retained fact is not context. Do not spend scarce
+    // prompt budget on a header-only fragment.
+    if (!trimmedBody) return null
+    const content = `${header}\n${trimmedBody}`
+    const tokenCount = this.tokenCounter.countText(content)
+    if (tokenCount > maxTokens) {
+      // `trimToBudget` is token-aware; reaching this guard means a provider
+      // tokenizer cannot represent even the fixed header within the remaining
+      // budget, so omitting is more honest than violating the budget.
+      return null
+    }
+    return { ...attachment, content, tokenCount }
+  }
+
   private trimToBudget(text: string, maxTokens: number): string {
     const value = text.trim()
     if (!value) return value
+    if (maxTokens <= 0) return ""
 
     if (this.tokenCounter.countText(value) <= maxTokens) {
       return value

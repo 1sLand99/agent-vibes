@@ -19,8 +19,10 @@ import { Injectable, Logger } from "@nestjs/common"
 import type { CursorRule, SkillOptions } from "../../../gen/agent/v1_pb"
 import type { SessionRecord } from "../session/session-lifecycle.service"
 import { SessionLifecycleService } from "../session/session-lifecycle.service"
+import { WorkspaceScope } from "../session/workspace-scope"
 import { renderCursorSkillsCatalog } from "./catalog"
 import { normalizePathForMatch, normalizeSkillName } from "./frontmatter"
+import type { CursorSkillActivationReceipt } from "./skill-activation-receipt"
 import {
   findCursorSkillByName,
   findCursorSkillForInternalPath,
@@ -37,12 +39,13 @@ import type {
 
 /** Service 接受的 Prompt 上下文子集；保持与 PromptContext 兼容。 */
 export interface CursorSkillsPromptContext {
+  /** Canonical live or restored workspace authority for this prompt build. */
+  workspaceScope: WorkspaceScope
   cursorRules?: CursorRule[]
   skillOptions?: SkillOptions
   selectedCursorRulePaths?: string[]
   selectedCursorRuleNames?: string[]
   activeCursorSkillNames?: string[]
-  projectContext?: { rootPath?: string }
   codeChunks?: Array<{ path: string }>
 }
 
@@ -113,16 +116,12 @@ export class CursorSkillsManager {
 
   /**
    * Derive the dedupe key for the suppressed-skills WARN. Falls back to
-   * `__no_session__` when the prompt context has no project root or
-   * tracked rule path; that bucket is intentionally global so non-
-   * session prompt rebuilds also dedupe instead of spamming.
+   * `__no_session__` only when no scope exists. Prompt contexts must carry a
+   * canonical WorkspaceScope, so the scope fingerprint keeps root grants and
+   * primary selection from being conflated in diagnostics.
    */
   private deriveDedupeSessionKey(context: CursorSkillsPromptContext): string {
-    const root = context.projectContext?.rootPath
-    if (typeof root === "string" && root.trim().length > 0) {
-      return `root:${root.trim()}`
-    }
-    return "__no_session__"
+    return `scope:${context.workspaceScope.scopeFingerprint}`
   }
 
   /**
@@ -178,23 +177,41 @@ export class CursorSkillsManager {
     )
   }
 
-  /** 在会话上激活某个 Skill（幂等）；返回本次是否新增激活态。 */
-  activate(session: SessionRecord, skillName: string, reason: string): boolean {
+  /**
+   * Produce an immutable activation receipt without changing session state.
+   * The receipt belongs to the matching tool-result graph commit.
+   */
+  planActivation(
+    session: SessionRecord,
+    skillName: string,
+    reason: string
+  ): CursorSkillActivationReceipt | undefined {
     const normalized = normalizeSkillName(skillName)
-    if (!normalized) return false
-    const activeNames = new Set(
-      (session.activeCursorSkillNames || []).map((name) =>
-        normalizeSkillName(name)
-      )
-    )
-    if (activeNames.has(normalized)) return false
+    if (!normalized || this.isActive(session, normalized)) return undefined
+    return Object.freeze({
+      skillName: normalized,
+      reason,
+    })
+  }
+
+  /**
+   * Publish a previously planned activation after its graph result commits.
+   * Concurrent commits are idempotent: a receipt that is already represented
+   * in the session becomes a no-op rather than a second state transition.
+   */
+  commitActivation(
+    session: SessionRecord,
+    receipt: CursorSkillActivationReceipt
+  ): boolean {
+    const normalized = normalizeSkillName(receipt.skillName)
+    if (!normalized || this.isActive(session, normalized)) return false
     session.activeCursorSkillNames = [
       ...(session.activeCursorSkillNames || []),
       normalized,
     ]
     this.sessionManager.markSessionDirty(session.conversationId)
     this.logger.log(
-      `Activated Cursor skill "${normalized}" for session ${session.conversationId}; reason=${reason}`
+      `Activated Cursor skill "${normalized}" for session ${session.conversationId}; reason=${receipt.reason}`
     )
     return true
   }
@@ -216,19 +233,25 @@ export class CursorSkillsManager {
     return true
   }
 
-  /** 根据当前工具访问的路径，自动激活满足 path_match 条件的 Skill。 */
-  activateForPath(
+  /**
+   * Plan all path-triggered activations for one tool call without mutating the
+   * session. The caller carries these receipts to that tool's graph commit.
+   */
+  planActivationsForPath(
     session: SessionRecord,
     rawPath: string,
     reason: string
-  ): void {
-    if (!rawPath) return
+  ): readonly CursorSkillActivationReceipt[] {
+    if (!rawPath) return []
     const policy = this.resolvePolicyForSession(session, [rawPath])
+    const receipts: CursorSkillActivationReceipt[] = []
     for (const skill of policy.activeSkills) {
       if (skill.activationReason === "path_match") {
-        this.activate(session, skill.name, reason)
+        const receipt = this.planActivation(session, skill.name, reason)
+        if (receipt) receipts.push(receipt)
       }
     }
+    return receipts
   }
 
   /* ---------------- 工具访问拦截 ---------------- */
@@ -241,7 +264,8 @@ export class CursorSkillsManager {
   guardToolAccess(
     session: SessionRecord,
     toolName: string,
-    input: Record<string, unknown>
+    input: Record<string, unknown>,
+    pendingActivations: readonly CursorSkillActivationReceipt[] = []
   ): string | null {
     const targetPath = this.pickToolTargetPath(toolName, input)
     if (!targetPath) return null
@@ -252,6 +276,15 @@ export class CursorSkillsManager {
     )
     if (!skill) return null
     if (this.isActive(session, skill.name)) return null
+    const normalizedSkillName = normalizeSkillName(skill.name)
+    if (
+      pendingActivations.some(
+        (receipt) =>
+          normalizeSkillName(receipt.skillName) === normalizedSkillName
+      )
+    ) {
+      return null
+    }
 
     const message =
       `Cursor skill access blocked: skill "${skill.name}" is available but not active. ` +
@@ -314,16 +347,23 @@ export class CursorSkillsManager {
   private toPolicyInput(
     context: CursorSkillsPromptContext
   ): CursorSkillPolicyInput {
+    const scope = this.requireWorkspaceScope(
+      context.workspaceScope,
+      "Cursor skill prompt policy"
+    )
     return {
       rules: context.cursorRules,
       skillOptions: context.skillOptions,
       selectedRulePaths: context.selectedCursorRulePaths,
       selectedRuleNames: context.selectedCursorRuleNames,
       activeSkillNames: context.activeCursorSkillNames,
-      projectRoot: context.projectContext?.rootPath,
+      projectRoot: scope.primaryRoot,
       contextPaths: (context.codeChunks || []).map((chunk) => chunk.path),
       environmentNames: DEFAULT_CURSOR_SKILL_ENVIRONMENTS,
-      scopePaths: this.buildScopePaths(context.projectContext?.rootPath),
+      // scoped_to represents IDE project identity, never broad additional
+      // execution grants. Additional roots may be executable but cannot make
+      // a skill appear to belong to a project it was not scoped for.
+      scopePaths: this.buildScopePaths(scope.ideRoots),
     }
   }
 
@@ -331,6 +371,10 @@ export class CursorSkillsManager {
     session: SessionRecord,
     extraContextPaths: string[]
   ): CursorSkillPolicyInput {
+    const scope = this.requireWorkspaceScope(
+      session.workspace?.scope,
+      "Cursor skill session policy"
+    )
     const baseContextPaths = (session.codeChunks || []).map(
       (chunk) => chunk.path
     )
@@ -343,20 +387,34 @@ export class CursorSkillsManager {
       selectedRulePaths: session.selectedCursorRulePaths,
       selectedRuleNames: session.selectedCursorRuleNames,
       activeSkillNames: session.activeCursorSkillNames,
-      projectRoot: session.projectContext?.rootPath,
+      projectRoot: scope.primaryRoot,
       contextPaths,
       environmentNames: DEFAULT_CURSOR_SKILL_ENVIRONMENTS,
-      scopePaths: this.buildScopePaths(session.projectContext?.rootPath),
+      scopePaths: this.buildScopePaths(scope.ideRoots),
     }
   }
 
-  private buildScopePaths(rootPath: string | undefined): string[] {
-    const normalizedRoot = rootPath?.trim()
-    if (!normalizedRoot) return []
-    const normalizedPath = normalizePathForMatch(normalizedRoot)
-    const segments = normalizedPath.split("/").filter(Boolean)
-    const leaf = segments[segments.length - 1]
-    return leaf ? [normalizedPath, leaf] : [normalizedPath]
+  private requireWorkspaceScope(
+    scope: WorkspaceScope | undefined,
+    operation: string
+  ): WorkspaceScope {
+    if (!(scope instanceof WorkspaceScope)) {
+      throw new Error(`${operation} requires a declared WorkspaceScope`)
+    }
+    return scope
+  }
+
+  private buildScopePaths(ideRoots: readonly string[]): string[] {
+    const scopePaths: string[] = []
+    for (const rootPath of ideRoots) {
+      const normalizedPath = normalizePathForMatch(rootPath)
+      if (!normalizedPath) continue
+      scopePaths.push(normalizedPath)
+      const segments = normalizedPath.split("/").filter(Boolean)
+      const leaf = segments[segments.length - 1]
+      if (leaf) scopePaths.push(leaf)
+    }
+    return [...new Set(scopePaths)]
   }
 }
 

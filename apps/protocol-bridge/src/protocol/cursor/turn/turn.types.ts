@@ -4,6 +4,7 @@
  * brand prevents accidental cross-wiring of TurnIds, ConversationIds,
  * and StreamIds at call sites.
  */
+import { requireExactDurableIdentifier } from "../../../context/durable-identifier"
 
 declare const __turnIdBrand: unique symbol
 declare const __conversationIdBrand: unique symbol
@@ -23,25 +24,32 @@ export type BidiId = string & { readonly [__bidiIdBrand]: "BidiId" }
  *
  * - `user`: top-level turn started from an inbound user message; owns
  *   its own outbound, has no parent.
+ * - `control`: model continuation started from a typed Cursor
+ *   ConversationAction. It retains the existing top-level user-request owner
+ *   and never creates a new user root.
  * - `foreground-subagent`: spawned by a `task` tool call without
  *   `run_in_background`; borrows the parent's outbound, lives in the
  *   parent's abort scope.
  * - `synthetic-compaction`: an LLM call the bridge originates to
  *   summarize old transcript. Has no outbound. Skips the normal
  *   prepare-then-compact pipeline so it does not recurse.
+ * - `background-subagent`: a detached child execution with no BiDi writer.
+ *   It remains conversation-owned and audited after the spawning BiDi closes.
  * - `recovery`: short-lived turn that emits a synthetic recovery
  *   frame after a crash or interruption. Owns its own outbound but
  *   never opens a backend HTTP call.
  */
 export type TurnKind =
   | "user"
+  | "control"
   | "foreground-subagent"
+  | "background-subagent"
   | "synthetic-compaction"
   | "recovery"
 
 export const TurnId = {
   of(raw: string): TurnId {
-    return raw as TurnId
+    return requireExactDurableIdentifier(raw, "TurnId") as TurnId
   },
   generate(prefix: TurnKind): TurnId {
     return `${prefix}:${crypto.randomUUID()}` as TurnId
@@ -49,7 +57,10 @@ export const TurnId = {
 }
 export const ConversationId = {
   of(raw: string): ConversationId {
-    return raw as ConversationId
+    return requireExactDurableIdentifier(
+      raw,
+      "ConversationId"
+    ) as ConversationId
   },
   /**
    * Build the provisional ConversationId used while a BiDi attachment
@@ -64,7 +75,10 @@ export const ConversationId = {
    * bidiId should keep their own reference.
    */
   provisional(bidiId: BidiId): ConversationId {
-    return `pending:${bidiId}` as ConversationId
+    return `pending:${requireExactDurableIdentifier(
+      bidiId,
+      "provisional ConversationId BiDi id"
+    )}` as ConversationId
   },
   /**
    * True when the ConversationId is the BiDi-attach sentinel produced
@@ -82,15 +96,18 @@ export const ConversationId = {
 }
 export const StreamId = {
   of(raw: string): StreamId {
-    return raw as StreamId
+    return requireExactDurableIdentifier(raw, "StreamId") as StreamId
   },
   provisional(bidiId: BidiId): StreamId {
-    return `pending:${bidiId}` as StreamId
+    return `pending:${requireExactDurableIdentifier(
+      bidiId,
+      "provisional StreamId BiDi id"
+    )}` as StreamId
   },
 }
 export const BidiId = {
   of(raw: string): BidiId {
-    return raw as BidiId
+    return requireExactDurableIdentifier(raw, "BidiId") as BidiId
   },
 }
 
@@ -117,16 +134,18 @@ export type TurnPhase =
 
 /**
  * The reason a Turn was cancelled. Drives downstream behaviour:
- * `user-cancel` synthesizes abort tool_results and persists
- * restartRecovery; `superseded` waits the foreground grace period
- * and only then aborts; `bidi-closed` retains pending tool calls
- * intact so a future resumeAction can pick them up.
+ * `user-cancel` synthesizes abort tool_results; `superseded` waits the foreground grace period
+ * and only then aborts; `bidi-closed` retains pending tool calls intact so a
+ * future resumeAction can pick them up. Client execution expiry is not a turn
+ * cancellation source because Cursor exposes no server abort control for it.
  */
 export type CancelReason =
   | { kind: "user-cancel"; reason: string }
   | { kind: "superseded"; by: TurnId }
   | { kind: "bidi-closed" }
   | { kind: "parent-cancelled"; ancestor: TurnId }
+  | { kind: "subagent-killed"; agentId: string }
+  | { kind: "subagent-backgrounded"; agentId: string; successor: TurnId }
   | { kind: "shutdown" }
 
 /**

@@ -93,51 +93,10 @@ jobs:
           npx -y postject "dist\$binaryName" NODE_SEA_BLOB dist\sea-prep.blob `
             --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
 
+          node sea\smoke.mjs "dist\$binaryName"
+
           $size = (Get-Item "dist\$binaryName").Length / 1MB
           Write-Host "✅ SEA binary ready: dist\$binaryName ($([math]::Round($size))MB)"
-
-      - name: Smoke test (Unix)
-        if: runner.os != 'Windows'
-        working-directory: apps/protocol-bridge
-        run: |
-          BINARY=$(ls dist/agent-vibes-bridge-* | head -1)
-          chmod +x "$BINARY"
-          # Start server, wait 5s, check health, then kill
-          PORT=19999 USE_HTTP2=false "$BINARY" &
-          PID=$!
-          sleep 5
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:19999/health || echo "000")
-          kill $PID 2>/dev/null || true
-          if [ "$STATUS" != "200" ]; then
-            echo "❌ Health check failed (HTTP $STATUS)"
-            exit 1
-          fi
-          echo "✅ Smoke test passed"
-
-      - name: Smoke test (Windows)
-        if: runner.os == 'Windows'
-        working-directory: apps/protocol-bridge
-        shell: pwsh
-        run: |
-          $binary = "dist\agent-vibes-bridge-win32-x64.exe"
-          $env:PORT = "19999"
-          $env:USE_HTTP2 = "false"
-          $proc = Start-Process -FilePath $binary -PassThru -NoNewWindow
-          Start-Sleep -Seconds 5
-          try {
-            $response = Invoke-WebRequest -Uri "http://127.0.0.1:19999/health" -UseBasicParsing -TimeoutSec 5
-            if ($response.StatusCode -eq 200) {
-              Write-Host "✅ Smoke test passed"
-            } else {
-              Write-Host "❌ Health check failed (HTTP $($response.StatusCode))"
-              exit 1
-            }
-          } catch {
-            Write-Host "❌ Health check failed: $_"
-            exit 1
-          } finally {
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-          }
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4

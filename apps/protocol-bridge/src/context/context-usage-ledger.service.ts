@@ -2,6 +2,7 @@ import { Injectable } from "@nestjs/common"
 import { fingerprintProjectedAttachments } from "./attachment-fingerprint"
 import { ContextAttachmentSnapshot } from "./context-attachment-builder.service"
 import { ContextProjectionService } from "./context-projection.service"
+import { createContextUsageSnapshot } from "./context-usage-contract"
 import {
   ContextModelProfile,
   isContextAccountingProfileCompatible,
@@ -33,17 +34,12 @@ export class ContextUsageLedgerService {
       attachmentFingerprint?: string
     }
   ): void {
+    const snapshot = createContextUsageSnapshot(usage, {
+      label: "context usage ledger",
+    })
     state.usageLedger = {
       anchorRecordId: recordId,
-      lastUsage: {
-        ...usage,
-        totalTokens:
-          usage.inputTokens +
-          usage.cachedInputTokens +
-          usage.cacheCreationInputTokens +
-          usage.outputTokens,
-        recordedAt: Date.now(),
-      },
+      lastUsage: snapshot,
       projectedTokenCount: options?.projectedTokenCount,
       accountingProfileKey: options?.accountingProfileKey,
       recordedCompactionId: options?.recordedCompactionId,
@@ -93,7 +89,7 @@ export class ContextUsageLedgerService {
       this.projection.project(state, {
         attachmentSnapshot: options?.attachmentSnapshot,
         attachmentTokenBudget: options?.attachmentTokenBudget,
-      })
+      }).messages
     const asUnified = projected.map((message) => ({
       role: message.role,
       content: message.content,

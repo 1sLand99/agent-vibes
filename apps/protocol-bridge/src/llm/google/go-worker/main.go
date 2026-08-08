@@ -119,10 +119,6 @@ type workerResponse struct {
 	UserAg string         `json:"userAgent,omitempty"`
 }
 
-type retryOptions struct {
-	PreferPoolRotation bool
-}
-
 type loadCodeAssistCacheEntry struct {
 	ExpiresAt time.Time
 	Result    any
@@ -525,7 +521,6 @@ func (w *workerState) handleGenerate(_ string, params map[string]any) (any, bool
 		return nil, false, errors.New("generate requires payload")
 	}
 	streamPayload := w.buildStreamPayload(payload)
-	retryPolicy := parseRetryOptions(params["retryPolicy"])
 	w.logf(
 		"[DEBUG] streamGenerateContent request: project=%v, model=%v",
 		streamPayload["project"],
@@ -539,7 +534,6 @@ func (w *workerState) handleGenerate(_ string, params map[string]any) (any, bool
 		context.Background(),
 		"streamGenerateContent",
 		streamPayload,
-		retryPolicy,
 		func(chunk any) error {
 			inner := unwrapResponseChunk(chunk)
 			candidate := firstCandidate(inner)
@@ -591,8 +585,6 @@ func (w *workerState) handleGenerateStream(id string, params map[string]any) err
 		return errors.New("generateStream requires payload")
 	}
 	streamPayload := w.buildStreamPayload(payload)
-	retryPolicy := parseRetryOptions(params["retryPolicy"])
-
 	streamCtx, cancel := context.WithCancelCause(context.Background())
 	w.mu.Lock()
 	w.activeStreamRequests[id] = cancel
@@ -613,7 +605,6 @@ func (w *workerState) handleGenerateStream(id string, params map[string]any) err
 		streamCtx,
 		"streamGenerateContent",
 		streamPayload,
-		retryPolicy,
 		func(chunk any) error {
 			w.sendMessage(workerResponse{
 				ID:     id,
@@ -669,7 +660,7 @@ func (w *workerState) handleFetchAvailableModels() (any, bool, error) {
 		return nil, false, errors.New("Worker not initialized")
 	}
 	payload := map[string]any{"project": w.currentProjectID()}
-	result, err := w.cloudCodeRequest(context.Background(), "fetchAvailableModels", payload, retryOptions{})
+	result, err := w.cloudCodeRequest(context.Background(), "fetchAvailableModels", payload)
 	return result, false, err
 }
 
@@ -685,7 +676,7 @@ func (w *workerState) handleFetchUserInfo(params map[string]any) (any, bool, err
 	if projectID != "" {
 		payload["project"] = projectID
 	}
-	result, err := w.cloudCodeRequest(context.Background(), "fetchUserInfo", payload, retryOptions{})
+	result, err := w.cloudCodeRequest(context.Background(), "fetchUserInfo", payload)
 	return result, false, err
 }
 
@@ -697,7 +688,7 @@ func (w *workerState) handleRecordCodeAssistMetrics(params map[string]any) (any,
 	if !ok {
 		return nil, false, errors.New("recordCodeAssistMetrics requires payload")
 	}
-	result, err := w.cloudCodeRequest(context.Background(), "recordCodeAssistMetrics", payload, retryOptions{})
+	result, err := w.cloudCodeRequest(context.Background(), "recordCodeAssistMetrics", payload)
 	return result, false, err
 }
 
@@ -709,7 +700,7 @@ func (w *workerState) handleRecordTrajectoryAnalytics(params map[string]any) (an
 	if !ok {
 		return nil, false, errors.New("recordTrajectoryAnalytics requires payload")
 	}
-	result, err := w.cloudCodeRequest(context.Background(), "recordTrajectoryAnalytics", payload, retryOptions{})
+	result, err := w.cloudCodeRequest(context.Background(), "recordTrajectoryAnalytics", payload)
 	return result, false, err
 }
 
@@ -755,7 +746,7 @@ func (w *workerState) handleWebSearch(params map[string]any) (any, bool, error) 
 			},
 		},
 	}
-	result, err := w.cloudCodeRequest(context.Background(), "generateContent", payload, retryOptions{})
+	result, err := w.cloudCodeRequestOnce(context.Background(), "generateContent", payload)
 	return result, false, err
 }
 
@@ -794,7 +785,7 @@ func (w *workerState) requestLoadCodeAssist(ctx context.Context, params map[stri
 		w.loadCodeAssistInflight[cacheKey] = inflight
 		w.mu.Unlock()
 
-		result, err := w.cloudCodeRequest(ctx, "loadCodeAssist", payload, retryOptions{})
+		result, err := w.cloudCodeRequest(ctx, "loadCodeAssist", payload)
 		if projectID := extractCloudCodeProjectID(result); projectID != "" {
 			w.mu.Lock()
 			w.cloudaicompanionProject = projectID
@@ -828,7 +819,7 @@ func (w *workerState) requestLoadCodeAssist(ctx context.Context, params map[stri
 		return result, err
 	}
 
-	result, err := w.cloudCodeRequest(ctx, "loadCodeAssist", payload, retryOptions{})
+	result, err := w.cloudCodeRequest(ctx, "loadCodeAssist", payload)
 	if projectID := extractCloudCodeProjectID(result); projectID != "" {
 		w.mu.Lock()
 		w.cloudaicompanionProject = projectID
@@ -1431,19 +1422,6 @@ func shouldGraceRetryQuotaExhausted(response *http.Response, errorText string) b
 	return ok && delay <= quotaResetGraceWindow
 }
 
-func shouldBypassLocalRetry(statusCode int, errorText string, options retryOptions) bool {
-	if !options.PreferPoolRotation {
-		return false
-	}
-	if statusCode == http.StatusTooManyRequests && isQuotaExhausted(errorText) {
-		return true
-	}
-	if statusCode == http.StatusServiceUnavailable && isModelCapacityExhausted(errorText) {
-		return true
-	}
-	return false
-}
-
 func shouldRetryCloudCodeStatus(statusCode int) bool {
 	return statusCode == http.StatusTooManyRequests || statusCode == http.StatusServiceUnavailable
 }
@@ -1476,11 +1454,47 @@ func normalizeAbortReason(apiMethod string, ctx context.Context, fallbackLabel s
 	return fmt.Errorf("Cloud Code %s %s", apiMethod, fallbackLabel)
 }
 
+// cloudCodeRequestOnce is the only path for a model-generation request that
+// returns a single JSON response. Account and attempt rotation belong to the
+// TypeScript owner, which creates a new immutable physical dispatch before it
+// asks this worker to send again.
+func (w *workerState) cloudCodeRequestOnce(
+	ctx context.Context,
+	apiMethod string,
+	payload any,
+) (any, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	url := fmt.Sprintf("%s/v1internal:%s", w.currentEndpoint(), apiMethod)
+	response, err := w.doAuthorizedRequest(
+		ctx,
+		url,
+		body,
+		"application/json",
+		true,
+		false,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if isSuccessfulStatus(response.StatusCode) {
+		return readJSONResponse(response)
+	}
+	errorText, readErr := readResponseText(response)
+	if readErr != nil {
+		return nil, readErr
+	}
+	return nil, buildCloudCodeError(apiMethod, response, errorText, "failed")
+}
+
+// cloudCodeRequest retries control-plane requests only. Model generation uses
+// cloudCodeRequestOnce or cloudCodeStreamRequest and is never resent here.
 func (w *workerState) cloudCodeRequest(
 	ctx context.Context,
 	apiMethod string,
 	payload any,
-	options retryOptions,
 ) (any, error) {
 	var lastErr error
 	var retryDelay time.Duration
@@ -1492,7 +1506,7 @@ func (w *workerState) cloudCodeRequest(
 				delay = time.Duration(1<<(attempt-1)) * baseDelay
 			}
 			retryDelay = 0
-			w.logf("[worker-local-retry] %s attempt %d/%d after %dms", apiMethod, attempt+1, maxRetries+1, delay.Milliseconds())
+			w.logf("[worker-control-retry] %s attempt %d/%d after %dms", apiMethod, attempt+1, maxRetries+1, delay.Milliseconds())
 			if err := sleepWithContext(ctx, delay); err != nil {
 				return nil, err
 			}
@@ -1534,13 +1548,10 @@ func (w *workerState) cloudCodeRequest(
 			continue
 		}
 		lastErr = buildCloudCodeError(apiMethod, response, errorText, "failed")
-		if shouldBypassLocalRetry(response.StatusCode, errorText, options) {
-			return nil, lastErr
-		}
 		if response.StatusCode == http.StatusTooManyRequests && isQuotaExhausted(errorText) {
 			if attempt < maxRetries && shouldGraceRetryQuotaExhausted(response, errorText) {
 				retryDelay = quotaResetRetryDelay
-				w.logf("[worker-local-retry] %s quota reset is imminent; retrying in %dms", apiMethod, retryDelay.Milliseconds())
+				w.logf("[worker-control-retry] %s quota reset is imminent; retrying in %dms", apiMethod, retryDelay.Milliseconds())
 				continue
 			}
 			return nil, lastErr
@@ -1563,173 +1574,114 @@ func (w *workerState) cloudCodeStreamRequest(
 	ctx context.Context,
 	apiMethod string,
 	payload any,
-	options retryOptions,
 	onChunk func(chunk any) error,
 ) error {
-	var lastErr error
-	var retryDelay time.Duration
+	if ctx.Err() != nil {
+		return normalizeAbortReason(apiMethod, ctx, "stream aborted")
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	w.logf("[DEBUG] %s payload: %s", apiMethod, summarizeStreamPayload(payload, len(body)))
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if ctx.Err() != nil {
-			return normalizeAbortReason(apiMethod, ctx, "stream aborted")
-		}
-		if attempt > 0 {
-			delay := retryDelay
-			if delay <= 0 {
-				delay = time.Duration(1<<(attempt-1)) * baseDelay
-			}
-			retryDelay = 0
-			w.logf("[worker-local-retry] %s stream attempt %d/%d after %dms", apiMethod, attempt+1, maxRetries+1, delay.Milliseconds())
-			if err := sleepWithContext(ctx, delay); err != nil {
-				return err
-			}
-		}
+	requestCtx, cancel := context.WithCancelCause(ctx)
+	timeout := newStreamInactivityTimeout(cancel, apiMethod)
+	timeout.Reset(streamFirstChunkTimeout, "first chunk")
 
-		body, err := json.Marshal(payload)
-		if err != nil {
-			return err
-		}
-		w.logf("[DEBUG] %s payload: %s", apiMethod, summarizeStreamPayload(payload, len(body)))
-
-		requestCtx, cancel := context.WithCancelCause(ctx)
-		timeout := newStreamInactivityTimeout(cancel, apiMethod)
-		timeout.Reset(streamFirstChunkTimeout, "first chunk")
-
-		url := fmt.Sprintf("%s/v1internal:%s?alt=sse", w.currentEndpoint(), apiMethod)
-		response, err := w.doAuthorizedRequest(
-			requestCtx,
-			url,
-			body,
-			"application/json",
-			true,
-			true,
-		)
-		if err != nil {
-			timeout.Stop()
+	url := fmt.Sprintf("%s/v1internal:%s?alt=sse", w.currentEndpoint(), apiMethod)
+	response, err := w.doAuthorizedRequest(
+		requestCtx,
+		url,
+		body,
+		"application/json",
+		true,
+		true,
+	)
+	if err != nil {
+		timeout.Stop()
+		if ctx.Err() != nil || context.Cause(requestCtx) != nil {
+			normalized := normalizeAbortReason(apiMethod, requestCtx, "stream aborted")
 			cancel(nil)
-			if ctx.Err() != nil {
-				return normalizeAbortReason(apiMethod, ctx, "stream aborted")
-			}
-			if context.Cause(requestCtx) != nil {
-				lastErr = normalizeAbortReason(apiMethod, requestCtx, "stream aborted")
-			} else {
-				lastErr = err
-			}
-			if attempt == maxRetries {
-				break
-			}
-			continue
+			return normalized
 		}
+		cancel(nil)
+		return err
+	}
 
-		if isSuccessfulStatus(response.StatusCode) {
-			if meta := extractCloudCodeResponseMeta(response); len(meta) > 0 {
-				if traceID, ok := meta["traceId"].(string); ok && traceID != "" {
-					if err := onChunk(map[string]any{
-						"__cloudCodeMeta": map[string]any{
-							"traceId": traceID,
-						},
-					}); err != nil {
-						timeout.Stop()
-						_ = response.Body.Close()
-						cancel(nil)
-						return err
-					}
-				}
-			}
-
-			reader, err := wrapResponseBody(response)
-			if err != nil {
-				timeout.Stop()
-				_ = response.Body.Close()
-				cancel(nil)
-				lastErr = err
-				if attempt == maxRetries {
-					break
-				}
-				continue
-			}
-
-			scanner := bufio.NewScanner(reader)
-			scanner.Buffer(make([]byte, 0, 64*1024), stdoutScannerBufferMaxSize)
-			for scanner.Scan() {
-				timeout.Reset(streamIdleTimeout, "idle")
-				line := strings.TrimSpace(scanner.Text())
-				if line == "" || strings.HasPrefix(line, ":") {
-					continue
-				}
-				if !strings.HasPrefix(line, "data: ") {
-					continue
-				}
-				payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
-				if payload == "[DONE]" {
-					timeout.Stop()
-					_ = reader.Close()
-					cancel(nil)
-					return nil
-				}
-				var decoded any
-				if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
-					continue
-				}
-				if err := onChunk(snakeToCamelValue(decoded)); err != nil {
-					timeout.Stop()
-					_ = reader.Close()
-					cancel(nil)
-					return err
-				}
-			}
-			scanErr := scanner.Err()
-			timeout.Stop()
-			_ = reader.Close()
-			cancel(nil)
-			if scanErr == nil {
-				return nil
-			}
-			if ctx.Err() != nil || context.Cause(requestCtx) != nil {
-				lastErr = normalizeAbortReason(apiMethod, requestCtx, "stream aborted")
-			} else {
-				lastErr = scanErr
-			}
-			if attempt == maxRetries {
-				break
-			}
-			continue
-		}
-
+	if !isSuccessfulStatus(response.StatusCode) {
 		timeout.Stop()
 		errorText, readErr := readResponseText(response)
 		cancel(nil)
 		if readErr != nil {
-			lastErr = readErr
-			if attempt == maxRetries {
-				break
+			return readErr
+		}
+		return buildCloudCodeError(apiMethod, response, errorText, "stream failed")
+	}
+
+	if meta := extractCloudCodeResponseMeta(response); len(meta) > 0 {
+		if traceID, ok := meta["traceId"].(string); ok && traceID != "" {
+			if err := onChunk(map[string]any{
+				"__cloudCodeMeta": map[string]any{
+					"traceId": traceID,
+				},
+			}); err != nil {
+				timeout.Stop()
+				_ = response.Body.Close()
+				cancel(nil)
+				return err
 			}
-			continue
-		}
-		lastErr = buildCloudCodeError(apiMethod, response, errorText, "stream failed")
-		if shouldBypassLocalRetry(response.StatusCode, errorText, options) {
-			return lastErr
-		}
-		if response.StatusCode == http.StatusTooManyRequests && isQuotaExhausted(errorText) {
-			if attempt < maxRetries && shouldGraceRetryQuotaExhausted(response, errorText) {
-				retryDelay = quotaResetRetryDelay
-				w.logf("[worker-local-retry] %s stream quota reset is imminent; retrying in %dms", apiMethod, retryDelay.Milliseconds())
-				continue
-			}
-			return lastErr
-		}
-		if !shouldRetryCloudCodeStatus(response.StatusCode) {
-			return lastErr
-		}
-		if delay, ok := getCloudCodeRetryDelayMS(response, errorText); ok {
-			retryDelay = delay
 		}
 	}
 
-	if lastErr == nil {
-		lastErr = fmt.Errorf("Cloud Code %s stream failed", apiMethod)
+	reader, err := wrapResponseBody(response)
+	if err != nil {
+		timeout.Stop()
+		_ = response.Body.Close()
+		cancel(nil)
+		return err
 	}
-	return lastErr
+
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), stdoutScannerBufferMaxSize)
+	for scanner.Scan() {
+		timeout.Reset(streamIdleTimeout, "idle")
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		chunkPayload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if chunkPayload == "[DONE]" {
+			timeout.Stop()
+			_ = reader.Close()
+			cancel(nil)
+			return nil
+		}
+		var decoded any
+		if err := json.Unmarshal([]byte(chunkPayload), &decoded); err != nil {
+			continue
+		}
+		if err := onChunk(snakeToCamelValue(decoded)); err != nil {
+			timeout.Stop()
+			_ = reader.Close()
+			cancel(nil)
+			return err
+		}
+	}
+
+	scanErr := scanner.Err()
+	timeout.Stop()
+	_ = reader.Close()
+	if ctx.Err() != nil || context.Cause(requestCtx) != nil {
+		normalized := normalizeAbortReason(apiMethod, requestCtx, "stream aborted")
+		cancel(nil)
+		return normalized
+	}
+	cancel(nil)
+	return scanErr
 }
 
 type streamInactivityTimeout struct {
@@ -1773,18 +1725,6 @@ func (w *workerState) currentEndpoint() string {
 		return endpoints.Production
 	}
 	return w.endpoint
-}
-
-func parseRetryOptions(raw any) retryOptions {
-	result := retryOptions{}
-	retryPolicy, ok := raw.(map[string]any)
-	if !ok {
-		return result
-	}
-	if value, ok := retryPolicy["preferPoolRotation"].(bool); ok {
-		result.PreferPoolRotation = value
-	}
-	return result
 }
 
 func (w *workerState) buildStreamPayload(incomingPayload map[string]any) map[string]any {

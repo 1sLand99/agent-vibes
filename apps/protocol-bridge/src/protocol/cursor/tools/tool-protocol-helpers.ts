@@ -1,14 +1,3 @@
-export interface ToolProtocolMessageLike {
-  role: "user" | "assistant"
-  content: unknown
-}
-
-export interface ToolResultAppendPlan {
-  mode: "append_new_user_message" | "merge_into_existing_user_message"
-  assistantMessageIndex: number
-  userMessageIndex?: number
-}
-
 export interface EditFailureSelection {
   startLine?: number
   endLine?: number
@@ -25,36 +14,6 @@ export interface NumberedLineEntry {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value)
-}
-
-function extractToolUseIds(content: unknown): Set<string> {
-  const ids = new Set<string>()
-  if (!Array.isArray(content)) return ids
-  for (const block of content) {
-    if (!isRecord(block) || block.type !== "tool_use") continue
-    const id = typeof block.id === "string" ? block.id.trim() : ""
-    if (id) ids.add(id)
-  }
-  return ids
-}
-
-function extractToolResultIds(content: unknown): Set<string> {
-  const ids = new Set<string>()
-  if (!Array.isArray(content)) return ids
-  for (const block of content) {
-    if (!isRecord(block) || block.type !== "tool_result") continue
-    const id =
-      typeof block.tool_use_id === "string" ? block.tool_use_id.trim() : ""
-    if (id) ids.add(id)
-  }
-  return ids
-}
-
-function isToolResultOnlyUserMessage(content: unknown): boolean {
-  if (!Array.isArray(content) || content.length === 0) return false
-  return content.every(
-    (block) => isRecord(block) && block.type === "tool_result"
-  )
 }
 
 function pickFirstNumber(
@@ -104,81 +63,6 @@ function splitContentLines(content: string): string[] {
     lines.pop()
   }
   return lines
-}
-
-export function messageContainsToolResult(
-  content: unknown,
-  toolCallId: string
-): boolean {
-  return extractToolResultIds(content).has(toolCallId)
-}
-
-/**
- * Find where to insert a tool result for the given toolCallId in the message
- * history.  Scans backward up to 32 messages — if the matching assistant
- * tool_use falls outside that window, the result will be appended as a new
- * standalone user message rather than merged into an existing one.
- */
-export function findToolResultAppendPlan(
-  messages: ToolProtocolMessageLike[],
-  toolCallId: string
-): ToolResultAppendPlan | null {
-  if (!toolCallId) return null
-
-  let trailingUserResultMessageIndex: number | undefined
-  // Limit backward scan depth to avoid unbounded traversal into old history.
-  const scanLimit = Math.max(0, messages.length - 32)
-  for (let index = messages.length - 1; index >= scanLimit; index--) {
-    const message = messages[index]
-    if (!message) continue
-
-    if (
-      message.role === "user" &&
-      isToolResultOnlyUserMessage(message.content)
-    ) {
-      trailingUserResultMessageIndex = index
-      continue
-    }
-
-    if (
-      message.role === "assistant" &&
-      extractToolUseIds(message.content).has(toolCallId)
-    ) {
-      const immediateNext = messages[index + 1]
-      if (
-        immediateNext?.role === "user" &&
-        isToolResultOnlyUserMessage(immediateNext.content)
-      ) {
-        return {
-          mode: "merge_into_existing_user_message",
-          assistantMessageIndex: index,
-          userMessageIndex: index + 1,
-        }
-      }
-
-      return trailingUserResultMessageIndex == null
-        ? {
-            mode: "append_new_user_message",
-            assistantMessageIndex: index,
-          }
-        : {
-            mode: "merge_into_existing_user_message",
-            assistantMessageIndex: index,
-            userMessageIndex: trailingUserResultMessageIndex,
-          }
-    }
-
-    // Any non-matching envelope breaks the contiguous run of tool-result-only
-    // user messages.  Reset the trailing index so we don't merge a result
-    // across an intervening assistant turn, which would create:
-    // assistant(tool_use A), assistant(tool_use B), user(tool_result A).
-    trailingUserResultMessageIndex = undefined
-    // Continue scanning instead of breaking — the matching assistant
-    // message may be further back when non-tool user messages or
-    // non-matching assistant messages intervene.
-  }
-
-  return null
 }
 
 export function extractEditFailureSelection(
@@ -295,64 +179,4 @@ export function formatLineNumberedSnippet(
     endLine: visibleEnd,
     truncated: lineCount > visibleCount,
   }
-}
-
-/**
- * Order buffered tool_result ids for the per-turn join barrier flush.
- *
- * The join barrier holds every tool_result of a multi-member assistant
- * batch until the last one settles, then flushes them in the model's
- * DECLARATION order so the persisted message log is born well-ordered
- * (eliminating the "第 1 类" displaced-tool_result repair).
- *
- * Flush order rules:
- *   1. Every id present in `declarationOrder` is emitted first, in that
- *      exact order — but only if it was actually buffered.
- *   2. Any buffered id NOT named in `declarationOrder` (defensive: should
- *      not normally happen) is appended afterwards in ascending
- *      `arrivalSeq` order so this function never silently drops one.
- *      NOTE: the caller (`flushBufferedToolResults`) deliberately does NOT
- *      write these — a non-declared buffered id can only be a stale leftover
- *      from a prior/abandoned batch, and emitting it would inject a stale
- *      tool_result into the current turn. The ordering here is kept purely so
- *      the contract is total and testable; the service drops non-declared ids.
- *   3. Duplicates are emitted once.
- *
- * Pure function over ids + arrival sequence so the ordering contract can
- * be unit-tested without the stream service's ~100 dependencies.
- */
-export function orderBufferedToolResultIdsForFlush(
-  declarationOrder: string[],
-  buffered: Array<{ toolCallId: string; arrivalSeq: number }>
-): string[] {
-  const bufferedById = new Map<string, number>()
-  for (const entry of buffered) {
-    if (
-      typeof entry.toolCallId === "string" &&
-      entry.toolCallId.length > 0 &&
-      !bufferedById.has(entry.toolCallId)
-    ) {
-      bufferedById.set(entry.toolCallId, entry.arrivalSeq)
-    }
-  }
-
-  const ordered: string[] = []
-  const emitted = new Set<string>()
-
-  for (const toolCallId of declarationOrder) {
-    if (bufferedById.has(toolCallId) && !emitted.has(toolCallId)) {
-      ordered.push(toolCallId)
-      emitted.add(toolCallId)
-    }
-  }
-
-  const stragglers = [...bufferedById.entries()]
-    .filter(([toolCallId]) => !emitted.has(toolCallId))
-    .sort((a, b) => a[1] - b[1])
-  for (const [toolCallId] of stragglers) {
-    ordered.push(toolCallId)
-    emitted.add(toolCallId)
-  }
-
-  return ordered
 }

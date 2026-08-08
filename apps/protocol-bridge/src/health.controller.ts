@@ -5,6 +5,7 @@ import type { GoogleQuotaAccountSnapshot } from "./llm/google/process-pool.servi
 import { ProcessPoolService } from "./llm/google/process-pool.service"
 import { KiroService } from "./llm/aws/kiro.service"
 import { CodexService } from "./llm/openai/codex.service"
+import { getCodexWeeklyRateLimitWindow } from "./llm/openai/codex-rate-limit-policy"
 import { OpenaiCompatService } from "./llm/openai/openai-compat.service"
 import type {
   BackendPoolEntryState,
@@ -88,6 +89,13 @@ export class HealthController {
       status: "ok",
       timestamp: new Date().toISOString(),
     }
+  }
+
+  @Get("background-ok")
+  @ApiOperation({ summary: "Return background-ok after 1 second" })
+  async getBackgroundOk(): Promise<string> {
+    await new Promise((resolve) => setTimeout(resolve, 1_000))
+    return "background-ok"
   }
 
   @Get("pool/status")
@@ -322,8 +330,9 @@ export class HealthController {
                     model: effective.model,
                     displayModel: effective.displayModel,
                     source: effective.source,
-                    primary: serializeWindow(effective.primary),
-                    secondary: serializeWindow(effective.secondary),
+                    weekly: serializeWindow(
+                      getCodexWeeklyRateLimitWindow(effective)
+                    ),
                     updatedAt: new Date(effective.updatedAt).toISOString(),
                   }
                 : null,
@@ -334,9 +343,8 @@ export class HealthController {
                 effective: modelSummary.effective
                   ? {
                       source: modelSummary.effective.source,
-                      primary: serializeWindow(modelSummary.effective.primary),
-                      secondary: serializeWindow(
-                        modelSummary.effective.secondary
+                      weekly: serializeWindow(
+                        getCodexWeeklyRateLimitWindow(modelSummary.effective)
                       ),
                       updatedAt: new Date(
                         modelSummary.effective.updatedAt
@@ -345,9 +353,8 @@ export class HealthController {
                   : null,
                 request: modelSummary.request
                   ? {
-                      primary: serializeWindow(modelSummary.request.primary),
-                      secondary: serializeWindow(
-                        modelSummary.request.secondary
+                      weekly: serializeWindow(
+                        getCodexWeeklyRateLimitWindow(modelSummary.request)
                       ),
                       updatedAt: new Date(
                         modelSummary.request.updatedAt
@@ -356,8 +363,9 @@ export class HealthController {
                   : null,
                 probe: modelSummary.probe
                   ? {
-                      primary: serializeWindow(modelSummary.probe.primary),
-                      secondary: serializeWindow(modelSummary.probe.secondary),
+                      weekly: serializeWindow(
+                        getCodexWeeklyRateLimitWindow(modelSummary.probe)
+                      ),
                       updatedAt: new Date(
                         modelSummary.probe.updatedAt
                       ).toISOString(),
@@ -385,7 +393,7 @@ export class HealthController {
     const runtime = this.cursorStream.getRuntimeActivitySnapshot()
     if (!runtime.canRestartWithoutInterruptingRuns) {
       this.logger.warn(
-        `Refused session reset: busy=${runtime.busySessionCount}, recovery=${runtime.recoverySessionCount}`
+        `Refused session reset: busy=${runtime.busySessionCount}, pendingRecovery=${runtime.pendingRecoverySessionCount}`
       )
       return {
         timestamp: new Date().toISOString(),

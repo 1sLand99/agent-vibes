@@ -1,5 +1,9 @@
 import { Injectable, Logger } from "@nestjs/common"
 import { createSpanContext, generateBlobId } from "./tools/agent-helpers"
+import {
+  cursorBlobIdToKey,
+  cursorTextBlobIdToKey,
+} from "./codec/cursor-blob-id"
 
 export interface KvBlobData {
   blobId: string
@@ -53,7 +57,7 @@ export class KvStorageService {
     // Serialize content to JSON and encode to base64
     const jsonContent = JSON.stringify(content)
     const blobData = Buffer.from(jsonContent).toString("base64")
-    const blobId = generateBlobId(blobData)
+    const blobId = cursorTextBlobIdToKey(generateBlobId(blobData))
 
     // Store in local cache
     KvStorageService.blobStore.set(blobId, blobData)
@@ -87,12 +91,13 @@ export class KvStorageService {
    * those exact bytes to Cursor's blob store.
    */
   createSetBinaryBlobMessage(
-    blobId: string,
+    blobIdBytes: Uint8Array,
     blobBytes: Uint8Array,
     traceId?: string,
     includeId: boolean = true
   ): KvServerMessage {
-    this.storeBinaryBlob(blobId, blobBytes)
+    const blobId = cursorBlobIdToKey(blobIdBytes)
+    this.storeBinaryBlob(blobIdBytes, blobBytes)
 
     const message: KvServerMessage = {
       setBlobArgs: {
@@ -119,7 +124,8 @@ export class KvStorageService {
   /**
    * Store an already-encoded base64 blob under a known blob ID.
    */
-  storeBlob(blobId: string, blobData: string): void {
+  storeBlob(blobIdBytes: Uint8Array, blobData: string): void {
+    const blobId = cursorBlobIdToKey(blobIdBytes)
     KvStorageService.blobStore.set(blobId, blobData)
     this.logger.debug(
       `Stored blob ${blobId.substring(0, 20)}... (${blobData.length} base64 chars)`
@@ -129,8 +135,8 @@ export class KvStorageService {
   /**
    * Store raw bytes under a known blob ID.
    */
-  storeBinaryBlob(blobId: string, blobBytes: Uint8Array): void {
-    this.storeBlob(blobId, Buffer.from(blobBytes).toString("base64"))
+  storeBinaryBlob(blobIdBytes: Uint8Array, blobBytes: Uint8Array): void {
+    this.storeBlob(blobIdBytes, Buffer.from(blobBytes).toString("base64"))
   }
 
   /**
@@ -154,8 +160,8 @@ export class KvStorageService {
   /**
    * Get blob data by ID
    */
-  getBlob(blobId: string): string | undefined {
-    return KvStorageService.blobStore.get(blobId)
+  getBlob(blobIdBytes: Uint8Array): string | undefined {
+    return KvStorageService.blobStore.get(cursorBlobIdToKey(blobIdBytes))
   }
 
   /**

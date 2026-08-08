@@ -37,9 +37,21 @@ import {
   BackendApiError,
 } from "../shared/backend-errors"
 import {
+  classifyBackendError,
+  RETRY_POLICY,
+  type BackendErrorClass,
+} from "../shared/backend-error-class"
+import {
   BackendPoolEntryState,
   BackendPoolStatus,
 } from "../shared/backend-pool-status"
+import {
+  assertProviderPhysicalDispatch,
+  isProviderAttemptRetryableError,
+  ProviderAttemptRetryableError,
+  runProviderPhysicalDispatch,
+  type ProviderPhysicalDispatch,
+} from "../shared/provider-physical-dispatch"
 import { appendLanguageDirectiveToAnthropicSystem } from "../shared/language-directive"
 import {
   type CursorDisplayModel,
@@ -543,10 +555,7 @@ const MODEL_DISCOVERY_TIMEOUT_MS = 8_000
 const MODEL_DISCOVERY_MAX_PAGES = 5
 const MODEL_DISCOVERY_TTL_MS = 15 * 60_000
 
-import type {
-  ProviderAdapter,
-  ProviderWarmupHint,
-} from "../shared/provider-adapter.interface"
+import type { ProviderAdapter } from "../shared/provider-adapter.interface"
 import { PromptCacheBreakDetectionService } from "./prompt-cache-break-detection.service"
 
 @Injectable()
@@ -633,7 +642,6 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       }
     }
 
-    this.configureAccountStateStore(this.accountsConfigPath)
     const persistedStates = this.loadPersistedAccountStates()
     for (const account of this.accounts) {
       this.applyPersistedAccountState(
@@ -1059,15 +1067,17 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
   }
 
   async sendClaudeMessage(
-    dto: CreateMessageDto,
+    dispatch: ProviderPhysicalDispatch<CreateMessageDto>,
     options: ClaudeApiCallOptions
   ): Promise<AnthropicResponse> {
-    return this.executeWithCooldownRetry(
+    this.assertClaudePhysicalDispatch(dispatch, "Claude API message dispatch")
+    const dto = dispatch.request
+    const candidate = await this.selectPreparedCandidate(dispatch)
+    return this.executeMessageOnce(
       dto,
+      candidate,
       options.forwardHeaders ?? {},
       options.clientMode,
-      new Set(),
-      undefined,
       {
         sessionId: options.sessionId,
         agentId: options.agentId,
@@ -1077,28 +1087,48 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
   }
 
   async *sendClaudeMessageStream(
-    dto: CreateMessageDto,
+    dispatch: ProviderPhysicalDispatch<CreateMessageDto>,
     options: ClaudeApiCallOptions
   ): AsyncGenerator<string, void, unknown> {
-    yield* this.executeStreamWithCooldownRetry(
-      dto,
-      options.forwardHeaders ?? {},
-      options.clientMode,
-      new Set(),
-      options.abortSignal,
-      undefined,
-      {
-        sessionId: options.sessionId,
-        agentId: options.agentId,
-        lastAssistantTimestampMs: options.lastAssistantTimestampMs,
+    this.assertClaudePhysicalDispatch(dispatch, "Claude API stream dispatch")
+    const dto = dispatch.request
+    const candidate = await this.selectPreparedCandidate(dispatch)
+    try {
+      yield* this.executeStreamOnce(
+        dto,
+        candidate,
+        options.forwardHeaders ?? {},
+        options.clientMode,
+        options.abortSignal,
+        {
+          sessionId: options.sessionId,
+          agentId: options.agentId,
+          lastAssistantTimestampMs: options.lastAssistantTimestampMs,
+        }
+      )
+      if (!dispatch.lifecycle.acceptanceStarted) {
+        throw new BackendApiError(
+          "Claude API stream completed before its semantic response boundary",
+          { backend: "claude-api", statusCode: 502 }
+        )
       }
-    )
+    } catch (error) {
+      const abortedError = toUpstreamRequestAbortedError(
+        error,
+        options.abortSignal,
+        "Claude API stream aborted"
+      )
+      if (abortedError) {
+        throw abortedError
+      }
+      throw this.toRetryableClaudePhysicalFailure(error, candidate)
+    }
   }
 
   /**
    * Execute a one-shot web search via the Anthropic API server-side
    * `web_search_20250305` tool. We synthesize a small CreateMessageDto, run it
-   * through the standard candidate / cooldown machinery, and then collect any
+   * through the shared physical-dispatch runner, and then collect any
    * `server_tool_use` / `web_search_tool_result` blocks plus the final
    * assistant text into the same shape the Google backend returns —
    * `{ text, references: [{ title, url, chunk }] }` — so callers can stay
@@ -1161,7 +1191,16 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       stream: false,
     }
 
-    const result = await this.sendClaudeMessage(dto, { clientMode: "generic" })
+    const result = await runProviderPhysicalDispatch({
+      plan: {
+        scope: `anthropic:web-search:${crypto.randomUUID()}`,
+        backend: "claude-api",
+        model,
+        request: dto,
+      },
+      execute: (dispatch) =>
+        this.sendClaudeMessage(dispatch, { clientMode: "generic" }),
+    })
     return this.extractWebSearchResultFromResponse(result)
   }
 
@@ -1258,12 +1297,131 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     }
   }
 
-  private async executeWithCooldownRetry(
+  /**
+   * Enforce that the DTO reaching the provider is the immutable request owned
+   * by this exact physical attempt. Account/token preparation deliberately
+   * happens after this boundary and before the one allowed POST.
+   */
+  private assertClaudePhysicalDispatch(
+    dispatch: ProviderPhysicalDispatch<CreateMessageDto>,
+    label: string
+  ): void {
+    assertProviderPhysicalDispatch({
+      dispatch,
+      backend: "claude-api",
+      label,
+    })
+    if (dispatch.request.model !== dispatch.attempt.model) {
+      throw new Error(
+        `${label} request model does not match its physical attempt model`
+      )
+    }
+  }
+
+  private async selectPreparedCandidate(
+    dispatch: ProviderPhysicalDispatch<CreateMessageDto>
+  ): Promise<ClaudeApiCandidate> {
+    const candidate = this.nextCandidate(dispatch.attempt.model)
+    if (await this.prepareAccountToken(candidate.account)) {
+      return candidate
+    }
+
+    const retryAfterMs = this.getCandidateRetryAfterMs(candidate)
+    throw new ProviderAttemptRetryableError(
+      "Claude API account token preparation failed; retry on a new physical attempt",
+      {
+        backend: "claude-api",
+        errorClass: "auth_failed",
+        statusCode: 401,
+        retryAfterMs,
+        maxRetries: RETRY_POLICY.auth_failed.maxRetries,
+      }
+    )
+  }
+
+  /**
+   * A provider transport never rotates candidates itself. Once the selected
+   * account has been marked healthy/unhealthy, the outer attempt runner gets
+   * one typed decision and must prepare a fresh immutable dispatch to retry.
+   */
+  private toRetryableClaudePhysicalFailure(
+    error: unknown,
+    candidate: ClaudeApiCandidate
+  ): ProviderAttemptRetryableError {
+    if (isProviderAttemptRetryableError(error)) {
+      return error
+    }
+
+    const errorClass = this.classifyClaudePhysicalFailure(error)
+    const policy = RETRY_POLICY[errorClass]
+    if (!policy.retryableSameRequest && !policy.retryableDifferentAccount) {
+      throw error
+    }
+
+    this.markClaudePhysicalFailureIfNeeded(error, candidate, errorClass)
+
+    const statusCode =
+      error instanceof BackendApiError ? error.statusCode : undefined
+    const retryAfterMs = this.getCandidateRetryAfterMs(candidate, error)
+    return new ProviderAttemptRetryableError(
+      `Claude API physical dispatch failed before acceptance: ${formatUnknownError(error)}`,
+      {
+        backend: "claude-api",
+        errorClass,
+        statusCode,
+        retryAfterMs,
+        maxRetries: policy.maxRetries,
+      }
+    )
+  }
+
+  private classifyClaudePhysicalFailure(error: unknown): BackendErrorClass {
+    if (error instanceof BackendApiError && error.errorClass) {
+      return error.errorClass
+    }
+    return classifyBackendError(error)
+  }
+
+  private markClaudePhysicalFailureIfNeeded(
+    error: unknown,
+    candidate: ClaudeApiCandidate,
+    errorClass: BackendErrorClass = this.classifyClaudePhysicalFailure(error)
+  ): void {
+    if (error instanceof BackendApiError || errorClass === "client_aborted") {
+      return
+    }
+    if (errorClass === "transient_network" || errorClass === "transient_5xx") {
+      this.markAccountTemporaryFailure(
+        candidate.account,
+        errorClass === "transient_network" ? 504 : 502,
+        candidate.upstreamModel
+      )
+    }
+  }
+
+  private getCandidateRetryAfterMs(
+    candidate: ClaudeApiCandidate,
+    error?: unknown
+  ): number | undefined {
+    const fromError =
+      error instanceof BackendApiError &&
+      typeof error.retryAfterSeconds === "number"
+        ? Math.max(0, Math.ceil(error.retryAfterSeconds * 1_000))
+        : undefined
+    const fromCooldown = Math.max(
+      0,
+      candidate.account.cooldownUntil - Date.now()
+    )
+    const retryAfterMs = Math.max(fromError ?? 0, fromCooldown)
+    return retryAfterMs > 0 ? retryAfterMs : undefined
+  }
+
+  /** Execute one selected Claude account over one messages POST. */
+  private async executeMessageOnce(
     dto: CreateMessageDto,
+    candidate: ClaudeApiCandidate,
     forwardHeaders: AnthropicForwardHeaders,
     clientMode: ClaudeApiClientMode,
-    attemptedCandidates: Set<string>,
-    candidate: ClaudeApiCandidate = this.nextCandidate(dto.model),
     cacheBreakTracking?: {
       sessionId?: string
       agentId?: string
@@ -1271,27 +1429,6 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     }
   ): Promise<AnthropicResponse> {
     const requestStartedAt = Date.now()
-    attemptedCandidates.add(this.buildCandidateKey(candidate))
-    if (!(await this.prepareAccountToken(candidate.account))) {
-      const nextCandidate = this.nextRetryCandidate(
-        dto.model,
-        attemptedCandidates
-      )
-      if (nextCandidate) {
-        return this.executeWithCooldownRetry(
-          dto,
-          forwardHeaders,
-          clientMode,
-          attemptedCandidates,
-          nextCandidate,
-          cacheBreakTracking
-        )
-      }
-      throw new BackendApiError(
-        "All Claude API accounts failed token refresh",
-        { backend: "claude-api", statusCode: 401 }
-      )
-    }
     const request: {
       body: Record<string, unknown>
       betas: string[]
@@ -1416,37 +1553,17 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       })
       return result
     } catch (error) {
-      const nextCandidate = this.shouldRetryWithNextCandidate(
-        error,
-        candidate,
-        candidate.upstreamModel
-      )
-        ? this.nextRetryCandidate(dto.model, attemptedCandidates)
-        : null
-      if (nextCandidate) {
-        this.logger.warn(
-          `[Claude API] Request failed on ${candidate.account.label || "account"} (${candidate.upstreamModel}), retrying with ${nextCandidate.account.label || "account"} (${nextCandidate.upstreamModel})`
-        )
-        return this.executeWithCooldownRetry(
-          dto,
-          forwardHeaders,
-          clientMode,
-          attemptedCandidates,
-          nextCandidate,
-          cacheBreakTracking
-        )
-      }
-      throw error
+      throw this.toRetryableClaudePhysicalFailure(error, candidate)
     }
   }
 
-  private async *executeStreamWithCooldownRetry(
+  /** Execute one selected Claude account over one streaming messages POST. */
+  private async *executeStreamOnce(
     dto: CreateMessageDto,
+    candidate: ClaudeApiCandidate,
     forwardHeaders: AnthropicForwardHeaders,
     clientMode: ClaudeApiClientMode,
-    attemptedCandidates: Set<string>,
     abortSignal?: AbortSignal,
-    candidate: ClaudeApiCandidate = this.nextCandidate(dto.model),
     cacheBreakTracking?: {
       sessionId?: string
       agentId?: string
@@ -1454,29 +1571,6 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     }
   ): AsyncGenerator<string, void, unknown> {
     const requestStartedAt = Date.now()
-    attemptedCandidates.add(this.buildCandidateKey(candidate))
-    if (!(await this.prepareAccountToken(candidate.account))) {
-      const nextCandidate = this.nextRetryCandidate(
-        dto.model,
-        attemptedCandidates
-      )
-      if (nextCandidate) {
-        yield* this.executeStreamWithCooldownRetry(
-          dto,
-          forwardHeaders,
-          clientMode,
-          attemptedCandidates,
-          abortSignal,
-          nextCandidate,
-          cacheBreakTracking
-        )
-        return
-      }
-      throw new BackendApiError(
-        "All Claude API accounts failed token refresh",
-        { backend: "claude-api", statusCode: 401 }
-      )
-    }
     const request: {
       body: Record<string, unknown>
       betas: string[]
@@ -1526,7 +1620,7 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
       upstreamModel: candidate.upstreamModel,
     })
 
-    let emittedEvents = false
+    let sawProviderFrame = false
     try {
       let response: Response
       try {
@@ -1610,11 +1704,10 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         outputTokens: 0,
         webSearchRequests: 0,
       }
-      // Track wire-shape invariants Anthropic CC CLI relies on. We use the
-      // tracker to bail out (with a fall-back-eligible 502) BEFORE any
-      // bytes are emitted to the client when the upstream returns an
-      // explicit `event: error` or an obviously empty body. Once the
-      // client has seen bytes we only log violations.
+      // Track wire-shape invariants Anthropic CC CLI relies on. A malformed
+      // upstream error is surfaced as a transport failure; the shared stream
+      // owner, not this provider, decides whether its semantic response
+      // boundary has been crossed and whether a new physical attempt is legal.
       const streamShape: ClaudeStreamShape = {
         sawMessageStart: false,
         sawMessageDelta: false,
@@ -1653,12 +1746,11 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
               streamUsage,
               oauthToolReverseMap
             )
-            // If a malformed `event: error` arrived before any client-visible
-            // bytes were emitted, surface it as a BackendApiError so the
-            // fallback chain can take over instead of leaking a partial SSE
-            // stream that the client has no way to interpret.
+            // Do not relay an upstream `event: error` as a successful Claude
+            // frame. The public dispatch boundary converts this into a typed
+            // failure; the shared runner then decides whether the response has
+            // already crossed its acceptance barrier.
             if (
-              !emittedEvents &&
               streamShape.upstreamErrorMessage &&
               !streamShape.upstreamErrorRaised
             ) {
@@ -1671,7 +1763,7 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
                 }
               )
             }
-            emittedEvents = true
+            sawProviderFrame = true
             await appendClaudeResponseChunk(requestLog, restored)
             yield restored.endsWith("\n\n") ? restored : `${restored}\n\n`
             boundary = buffer.indexOf("\n\n")
@@ -1687,7 +1779,6 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
             oauthToolReverseMap
           )
           if (
-            !emittedEvents &&
             streamShape.upstreamErrorMessage &&
             !streamShape.upstreamErrorRaised
           ) {
@@ -1700,12 +1791,12 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
               }
             )
           }
-          emittedEvents = true
+          sawProviderFrame = true
           await appendClaudeResponseChunk(requestLog, restored)
           yield restored.endsWith("\n\n") ? restored : `${restored}\n\n`
         }
 
-        if (!emittedEvents) {
+        if (!sawProviderFrame) {
           throw new BackendApiError(
             "Claude API stream returned an empty body",
             {
@@ -1715,9 +1806,9 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
           )
         }
 
-        // Once the client has seen bytes we cannot take them back, but we
-        // still flag protocol violations to the request log so the next
-        // bug report has a hint that the upstream short-circuited.
+        // Record wire-shape violations for diagnosis. The shared dispatcher
+        // owns the semantic acceptance barrier and will reject an
+        // envelope-only completion before it reaches a caller.
         if (!streamShape.sawMessageStart) {
           this.logger.warn(
             "[Claude API] stream completed without message_start — upstream may be malformed"
@@ -1766,38 +1857,6 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         if (abortedError) {
           throw abortedError
         }
-        await appendClaudeResponseError(requestLog, error)
-        this.markAccountTemporaryFailure(
-          candidate.account,
-          504,
-          candidate.upstreamModel
-        )
-
-        const nextCandidate =
-          !emittedEvents &&
-          this.shouldRetryWithNextCandidate(
-            error,
-            candidate,
-            candidate.upstreamModel
-          )
-            ? this.nextRetryCandidate(dto.model, attemptedCandidates)
-            : null
-        if (nextCandidate) {
-          this.logger.warn(
-            `[Claude API] Stream failed on ${candidate.account.label || "account"} (${candidate.upstreamModel}), retrying with ${nextCandidate.account.label || "account"} (${nextCandidate.upstreamModel})`
-          )
-          yield* this.executeStreamWithCooldownRetry(
-            dto,
-            forwardHeaders,
-            clientMode,
-            attemptedCandidates,
-            abortSignal,
-            nextCandidate,
-            cacheBreakTracking
-          )
-          return
-        }
-
         throw error
       } finally {
         try {
@@ -1816,71 +1875,8 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         throw abortedError
       }
       await appendClaudeResponseError(requestLog, error)
-
-      const nextCandidate =
-        !emittedEvents &&
-        this.shouldRetryWithNextCandidate(
-          error,
-          candidate,
-          candidate.upstreamModel
-        )
-          ? this.nextRetryCandidate(dto.model, attemptedCandidates)
-          : null
-      if (nextCandidate) {
-        this.logger.warn(
-          `[Claude API] Stream request failed on ${candidate.account.label || "account"} (${candidate.upstreamModel}), retrying with ${nextCandidate.account.label || "account"} (${nextCandidate.upstreamModel})`
-        )
-        yield* this.executeStreamWithCooldownRetry(
-          dto,
-          forwardHeaders,
-          clientMode,
-          attemptedCandidates,
-          abortSignal,
-          nextCandidate,
-          cacheBreakTracking
-        )
-        return
-      }
       throw error
     }
-  }
-
-  private buildCandidateKey(candidate: ClaudeApiCandidate): string {
-    return [
-      candidate.account.stateKey,
-      candidate.upstreamModel.trim().toLowerCase(),
-      candidate.publicModelId.trim().toLowerCase(),
-    ].join("\0")
-  }
-
-  private shouldRetryWithNextCandidate(
-    error: unknown,
-    candidate: ClaudeApiCandidate,
-    model: string
-  ): boolean {
-    if (!isAccountAvailableForModel(candidate.account, model)) {
-      return true
-    }
-
-    if (!(error instanceof BackendApiError)) {
-      return false
-    }
-
-    const statusCode = error.statusCode
-    if (typeof statusCode !== "number") {
-      return false
-    }
-
-    return (
-      statusCode === 401 ||
-      statusCode === 402 ||
-      statusCode === 403 ||
-      statusCode === 404 ||
-      statusCode === 408 ||
-      statusCode === 409 ||
-      statusCode === 429 ||
-      statusCode >= 500
-    )
   }
 
   /**
@@ -2157,20 +2153,6 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     return chunk
   }
 
-  private nextRetryCandidate(
-    model: string,
-    attemptedCandidates: Set<string>
-  ): ClaudeApiCandidate | null {
-    const remainingCandidates = this.resolveCandidates(model).filter(
-      (candidate) => !attemptedCandidates.has(this.buildCandidateKey(candidate))
-    )
-    if (remainingCandidates.length === 0) {
-      return null
-    }
-
-    return this.selectCandidate(model, remainingCandidates)
-  }
-
   private getActiveModelCooldowns(
     account: ClaudeApiAccount,
     now: number
@@ -2235,11 +2217,6 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
   private normalizeBaseUrl(baseUrl?: string): string {
     const normalized = (baseUrl || "").trim()
     return normalized || DEFAULT_ANTHROPIC_BASE_URL
-  }
-
-  private configureAccountStateStore(_configPath?: string | null): void {
-    // No-op: PersistenceService handles the unified DB path.
-    // Kept for interface compatibility.
   }
 
   private normalizeModels(
@@ -2667,7 +2644,6 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         }
 
         this.accountsConfigPath = configPath
-        this.configureAccountStateStore(configPath)
         this.logger.log(
           `Loaded ${data.accounts.length} Claude API account(s) from ${configPath}`
         )
@@ -4013,6 +3989,7 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     retryAfterHeader?: string
   ): BackendApiError {
     const permanent = this.shouldDisableAccountPermanently(statusCode, detail)
+    const errorClass = this.classifyClaudeHttpFailure(statusCode, detail)
     if (permanent) {
       this.disableAccountPermanently(account, statusCode, detail)
     } else {
@@ -4030,6 +4007,7 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         backend: "claude-api",
         statusCode,
         permanent,
+        errorClass,
       }
     )
   }
@@ -4044,7 +4022,20 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
     return new BackendApiError(message, {
       backend: "claude-api",
       statusCode,
+      errorClass: statusCode >= 500 ? "transient_5xx" : "transient_network",
     })
+  }
+
+  private classifyClaudeHttpFailure(
+    statusCode: number,
+    detail: string
+  ): BackendErrorClass {
+    return classifyBackendError(
+      new BackendApiError(detail, {
+        backend: "claude-api",
+        statusCode,
+      })
+    )
   }
 
   private async fetchWithResponseHeadersTimeout(
@@ -4112,13 +4103,6 @@ export class AnthropicApiService implements OnModuleInit, ProviderAdapter {
         clearTimeout(timer)
       }
     }
-  }
-
-  // ── ProviderAdapter Interface ────────────────────────────────────────
-
-  /** No-op — HTTP-based Claude API doesn't need connection prewarming. */
-  warmup(_hint: ProviderWarmupHint): void {
-    // Intentionally empty — HTTP connections are established per-request.
   }
 
   /** No-op — Claude API is stateless per-request, no session resources to release. */

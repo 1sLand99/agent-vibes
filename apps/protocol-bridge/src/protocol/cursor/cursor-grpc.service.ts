@@ -1,7 +1,21 @@
-import { create, type JsonObject, toBinary } from "@bufbuild/protobuf"
+import {
+  create,
+  fromJson,
+  type JsonObject,
+  toBinary,
+  toJson,
+} from "@bufbuild/protobuf"
 import { Injectable, Logger } from "@nestjs/common"
 import * as crypto from "crypto"
+import { requireExactDurableIdentifier } from "../../context/durable-identifier"
 import type { KvServerMessage as KvStorageMessage } from "./kv-storage.service"
+import { cursorBlobIdFromKey } from "./codec/cursor-blob-id"
+import { normalizeCursorAskQuestionArgs } from "./tools/ask-question-protocol"
+import {
+  parseGoalStatus,
+  toProtoGoalState,
+  type BridgeGoalState,
+} from "./tools/goal-state"
 
 import {
   // InteractionUpdate 补齐
@@ -40,6 +54,7 @@ import {
   AwaitResultSchema,
   AwaitSuccessSchema,
   AwaitTaskCompleteSchema,
+  AwaitTaskStillRunningSchema,
   AwaitToolCallSchema,
   BackgroundShellSpawnArgsSchema,
   BlameByFilePathArgsSchema,
@@ -62,6 +77,23 @@ import {
   ComputerUseResultSchema,
   ComputerUseSuccessSchema,
   ComputerUseToolCallSchema,
+  ConnectScmArgsSchema,
+  ConnectScmErrorSchema,
+  ConnectScmGithubRepositorySchema,
+  ConnectScmGithubSchema,
+  ConnectScmRejectedSchema,
+  ConnectScmRequestQuerySchema,
+  type ConnectScmResult,
+  ConnectScmResultSchema,
+  ConnectScmSuccessSchema,
+  ConnectScmToolCallSchema,
+  ConversationSearchArgsSchema,
+  ConversationSearchErrorSchema,
+  ConversationSearchHitSchema,
+  ConversationSearchResultSchema,
+  ConversationSearchSource,
+  ConversationSearchSuccessSchema,
+  SearchConversationsToolCallSchema,
   // ConversationStateStructure
   ConversationStateStructureSchema,
   type ConversationStep,
@@ -72,6 +104,17 @@ import {
   PromptContextUsageTreeSchema,
   PromptTokenBreakdownCategorySchema,
   PromptTokenBreakdownSnapshotSchema,
+  ContextInjectionCancelledSchema,
+  ContextInjectionDeliveredSchema,
+  ContextInjectionQueuedForNextTurnSchema,
+  ContextInjectionQueuedSchema,
+  ContextInjectionRejectedSchema,
+  ContextInjectionStateSchema,
+  ContextInjectionStateUpdateSchema,
+  CreateGoalArgsSchema,
+  CreateGoalResultSchema,
+  CreateGoalSuccessSchema,
+  CreateGoalToolCallSchema,
   CreatePlanArgsSchema,
   CreatePlanErrorSchema,
   CreatePlanRequestQuerySchema,
@@ -106,9 +149,13 @@ import {
   EditToolCallSchema,
   EditWritePermissionDeniedSchema,
   // Fetch/Search schemas (Cursor v2.6.13: ExaFetch→Fetch, ExaSearch→WebSearch)
+  ExecServerAbortSchema,
+  ExecServerControlMessageSchema,
   type ExecServerMessage,
   ExecServerMessageSchema,
+  type ExecuteHookRequest,
   ExecuteHookArgsSchema,
+  ExecuteHookRequestSchema,
   FeedbackRequestCategorySchema,
   FeedbackRequestUpdateSchema,
   FetchArgsSchema,
@@ -126,6 +173,7 @@ import {
   GenerateImageSuccessSchema,
   GenerateImageToolCallSchema,
   GetBlobArgsSchema,
+  GetCiStatusActionSchema,
   GetMcpToolsAgentResultSchema,
   GetMcpToolsArgsSchema,
   GetMcpToolsErrorSchema,
@@ -136,6 +184,8 @@ import {
   GlobToolErrorSchema,
   GlobToolResultSchema,
   GlobToolSuccessSchema,
+  GoalErrorSchema,
+  GoalStatus,
   GrepArgsSchema,
   GrepContentMatchSchema,
   GrepContentResultSchema,
@@ -195,13 +245,66 @@ import {
   McpToolResultSchema,
   OutputLocationSchema,
   PartialToolCallUpdateSchema,
+  PH_aiserver_v1_CodeBlockSchema,
+  PH_aiserver_v1_CodeResultSchema,
   PhaseSchema,
+  // PI tools
+  PiBashExecArgsSchema,
+  PiBashToolArgsSchema,
+  PiBashToolCallSchema,
+  PiBashToolErrorSchema,
+  PiBashToolResultSchema,
+  PiBashToolSuccessSchema,
+  PiEditExecArgsSchema,
+  PiEditReplacementSchema,
+  PiEditToolArgsSchema,
+  PiEditToolCallSchema,
+  PiEditToolErrorSchema,
+  PiEditToolRejectedSchema,
+  PiEditToolResultSchema,
+  PiEditToolSuccessSchema,
+  PiFindExecArgsSchema,
+  PiFindToolArgsSchema,
+  PiFindToolCallSchema,
+  PiFindToolErrorSchema,
+  PiFindToolResultSchema,
+  PiFindToolSuccessSchema,
+  PiGrepExecArgsSchema,
+  PiGrepToolArgsSchema,
+  PiGrepToolCallSchema,
+  PiGrepToolErrorSchema,
+  PiGrepToolResultSchema,
+  PiGrepToolSuccessSchema,
+  PiLsExecArgsSchema,
+  PiLsToolArgsSchema,
+  PiLsToolCallSchema,
+  PiLsToolErrorSchema,
+  PiLsToolResultSchema,
+  PiLsToolSuccessSchema,
+  PiReadExecArgsSchema,
+  PiReadToolArgsSchema,
+  PiReadToolCallSchema,
+  PiReadToolErrorSchema,
+  PiReadToolResultSchema,
+  PiReadToolSuccessSchema,
+  PiWriteExecArgsSchema,
+  PiWriteToolArgsSchema,
+  PiWriteToolCallSchema,
+  PiWriteToolErrorSchema,
+  PiWriteToolRejectedSchema,
+  PiWriteToolResultSchema,
+  PiWriteToolSuccessSchema,
   PositionSchema,
+  PostCommentActionSchema,
   PostRequestPromptUpdateSchema,
+  ResolveCommentActionSchema,
   type PrManagementArgs,
   PrManagementArgsSchema,
   PrManagementErrorSchema,
+  PrManagementNeedsConfirmationSchema,
+  PrManagementRegisteredSchema,
   PrManagementRejectedSchema,
+  PrManagementRequestQuerySchema,
   type PrManagementResult,
   PrManagementResultSchema,
   PrManagementSuccessSchema,
@@ -245,6 +348,15 @@ import {
   ReflectResultSchema,
   ReflectSuccessSchema,
   ReflectToolCallSchema,
+  ReplaceEnvArgsSchema,
+  ReplaceEnvConfigSchema,
+  ReplaceEnvFailureSchema,
+  ReplaceEnvMode,
+  type ReplaceEnvResult,
+  ReplaceEnvResultSchema,
+  ReplaceEnvSuccessSchema,
+  ReplaceEnvToolCallSchema,
+  RepoCheckoutRefOverrideSchema,
   ReportBugArgsSchema,
   ReportBugErrorSchema,
   ReportBugfixResultsArgsSchema,
@@ -255,8 +367,20 @@ import {
   ReportBugResultSchema,
   ReportBugSuccessSchema,
   ReportBugToolCallSchema,
+  ResponseComparisonCompletedSchema,
+  ResponseComparisonDisplayOrder,
+  ResponseComparisonSkippedSchema,
+  ResponseComparisonSkipReason,
+  ResponseComparisonStartedSchema,
+  ResponseComparisonTextDeltaSchema,
+  ResponseComparisonUpdateSchema,
   // ExecServerMessage 补齐
   RequestContextArgsSchema,
+  NetworkPolicy_DefaultAction,
+  NetworkPolicyLoggingConfigSchema,
+  NetworkPolicySchema,
+  type SandboxPolicy,
+  SandboxPolicy_ReadBoundaryMode,
   SandboxPolicy_Type,
   SandboxPolicySchema,
   SemSearchToolArgsSchema,
@@ -283,6 +407,7 @@ import {
   SetActiveBranchSuccessSchema,
   SetActiveBranchToolCallSchema,
   SetBlobArgsSchema,
+  SetPrStatusActionSchema,
   SetupVmEnvironmentArgsSchema,
   SetupVmEnvironmentResultSchema,
   SetupVmEnvironmentSuccessSchema,
@@ -329,18 +454,8 @@ import {
   StepTimingSchema,
   SubagentArgsSchema,
   SubagentAwaitArgsSchema,
-  SubagentTypeBashSchema,
-  SubagentTypeBrowserUseSchema,
-  SubagentTypeComputerUseSchema,
-  SubagentTypeCursorGuideSchema,
   SubagentTypeCustomSchema,
-  SubagentTypeDebugSchema,
-  SubagentTypeExploreSchema,
-  SubagentTypeMediaReviewSchema,
   SubagentTypeSchema,
-  SubagentTypeShellSchema,
-  SubagentTypeUnspecifiedSchema,
-  SubagentTypeVmSetupHelperSchema,
   SummaryCompletedUpdateSchema,
   SummaryStartedUpdateSchema,
   SummaryUpdateSchema,
@@ -382,12 +497,18 @@ import {
   TruncatedToolCallSchema,
   TruncatedToolCallSuccessSchema,
   TurnEndedUpdateSchema,
+  PullRequestStatus,
   UpdatePrActionSchema,
+  UpdateGoalArgsSchema,
+  UpdateGoalResultSchema,
+  UpdateGoalSuccessSchema,
+  UpdateGoalToolCallSchema,
   UpdateTodosArgsSchema,
   UpdateTodosErrorSchema,
   UpdateTodosResultSchema,
   UpdateTodosSuccessSchema,
   UpdateTodosToolCallSchema,
+  type UserMessage,
   UserMessage_SimulatedMessageMetadataSchema,
   UserMessageAppendedUpdateSchema,
   UserMessageSchema,
@@ -421,7 +542,6 @@ import {
   type Value,
   ValueSchema,
 } from "../../gen/google/protobuf/value_pb"
-import { CursorProtocolTraceService } from "./cursor-protocol-trace.service"
 import { safeJsonByteLength, safeJsonStringify } from "./safe-json"
 import {
   describeSessionFileStateLimit,
@@ -429,8 +549,38 @@ import {
   isSessionFileStateWithinLimit,
 } from "./session/file-state-limits"
 import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./tools/bugfix-result-normalizer"
-import { resolveCursorToolDefinitionKey } from "./tools/cursor-tool-mapper"
-import { resolveMcpCallFields as resolveMcpCallFieldsFromContract } from "./tools/mcp-call-contract"
+import {
+  getCursorProtocolProjectionDecision,
+  getFrozenCursorToolDefinition,
+  hasValidCursorApplyAgentDiffArgs,
+  resolveCursorToolDefinitionKey,
+} from "./tools/cursor-tool-mapper"
+import {
+  type CursorProjectionToolFamily,
+  getCursorProjectionFamilyForDefinitionKey,
+  getCursorProjectionFamilyForRuntimeName,
+} from "./tools/cursor-tool-runtime-contract"
+import {
+  extractMcpRawArguments,
+  resolveMcpCallFields as resolveMcpCallFieldsFromContract,
+} from "./tools/mcp-call-contract"
+import {
+  type CanonicalTaskToolInput,
+  parseCanonicalTaskToolInput,
+} from "./tools/task-tool-input"
+import {
+  assertFrozenSubagentExecProtocolOwnerBinding,
+  type SubagentToolContractEntry,
+  type SubagentToolExecutionOwner,
+} from "./session/subagent-spawn-request"
+import {
+  BUILTIN_SUBAGENT_IDENTITIES,
+  projectBuiltInSubagentIdentityToProto,
+} from "./subagents/subagent-identity"
+import {
+  assertFrozenSubagentToolEntryOwnerBinding,
+  resolveFrozenSubagentToolCallProjection,
+} from "./subagents/subagent-tool-call-projection"
 
 /**
  * Safely convert unknown value to string
@@ -451,10 +601,35 @@ function safeString(value: unknown, defaultValue: string = ""): string {
   return defaultValue
 }
 
+/**
+ * Paths and URIs are protocol locations, not display text. Their leading and
+ * trailing spaces are significant bytes, so encoders must never trim or
+ * stringify them. Invalid location values are omitted rather than repaired.
+ */
+function preserveProtocolLocation(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.includes("\u0000")
+  ) {
+    return undefined
+  }
+  return value
+}
+
+function preserveProtocolLocationArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((entry) => {
+    const location = preserveProtocolLocation(entry)
+    return location === undefined ? [] : [location]
+  })
+}
+
 // ─── Protobuf OneOf type aliases ───────────────────────────────
 type ToolCallOneOf = ToolCall["tool"]
 type InteractionUpdateOneOf = InteractionUpdate["message"]
 type InteractionQueryOneOf = InteractionQuery["query"]
+type InteractionQueryCase = Exclude<InteractionQueryOneOf["case"], undefined>
 
 interface ConversationCheckpointTokenCategory {
   id: string
@@ -742,34 +917,28 @@ interface ListDirArgs {
 }
 
 interface GrepArgs {
-  query?: string
   pattern?: string
-  Query?: string
   path?: string
-  SearchPath?: string
-  searchPath?: string
-  search_path?: string
   glob?: string
-  includes?: string[]
-  Includes?: string[]
   output_mode?: string
   outputMode?: string
-  matchPerLine?: boolean
-  match_per_line?: boolean
-  MatchPerLine?: boolean
-  caseInsensitive?: boolean
   case_insensitive?: boolean
-  CaseInsensitive?: boolean
-  isRegex?: boolean
-  is_regex?: boolean
-  IsRegex?: boolean
+  caseInsensitive?: boolean
+  context_before?: number
+  contextBefore?: number
+  context_after?: number
+  contextAfter?: number
+  context?: number
+  multiline?: boolean
+  sort?: string
+  sort_ascending?: boolean
+  sortAscending?: boolean
   head_limit?: number
   headLimit?: number
-  HeadLimit?: number
   offset?: number
-  Offset?: number
   type?: string
-  case_sensitive?: boolean
+  sandbox_policy?: Record<string, unknown>
+  sandboxPolicy?: Record<string, unknown>
 }
 
 interface GlobArgs {
@@ -902,83 +1071,12 @@ type ToolArgs =
   | WriteShellStdinArgs
   | ExecuteHookArgs
 
-type ToolFamily =
-  | "get_mcp_tools"
-  | "read_mcp_resource"
-  | "list_mcp_resources"
-  | "read_lints"
-  | "fix_lints"
-  | "read_todos"
-  | "update_todos"
-  | "apply_agent_diff"
-  | "write_shell_stdin"
-  | "background_shell_spawn"
-  | "setup_vm_environment"
-  | "start_grind_execution"
-  | "start_grind_planning"
-  | "report_bugfix_results"
-  | "generate_image"
-  | "record_screen"
-  | "computer_use"
-  | "web_search"
-  | "web_fetch"
-  | "exa_search"
-  | "exa_fetch"
-  | "ask_question"
-  | "switch_mode"
-  | "create_plan"
-  | "sem_search"
-  | "truncated"
-  | "reflect"
-  | "read"
-  | "edit"
-  | "ls"
-  | "delete"
-  | "grep"
-  | "glob"
-  | "fetch"
-  | "mcp"
-  | "mcp_auth"
-  | "task"
-  | "shell"
-  | "execute_hook"
-  | "await"
-  | "ai_attribution"
-  | "pr_management"
-  | "blame_by_file_path"
-  | "report_bug"
-  | "set_active_branch"
-  // 新增 proto 更新后的 Exec 工具
-  | "force_background_shell"
-  | "force_background_subagent"
-  | "canvas_get_url"
-  | "canvas_destroy"
-  | "canvas_register"
-  | "mcp_state_exec"
-  | "subagent_await"
-  // 新增 ToolCall 级工具（有正式 ToolCall oneof case）
-  | "communicate_update"
-  | "send_final_summary"
-  | "send_to_user"
-  // ExecServerMessage 补齐
-  | "request_context"
-  | "redacted_read"
-  | "unknown"
+type ToolFamily = CursorProjectionToolFamily
 
-type ToolResultProjectionStatus =
-  | "success"
-  | "failure"
-  | "error"
-  | "rejected"
-  | "timeout"
-  | "file_busy"
-  | "permission_denied"
-  | "spawn_error"
-  | "file_not_found"
-  | "invalid_file"
-  | "aborted"
+export type ToolResultProjectionStatus =
+  import("./tools/tool-result-status").CursorToolResultStatus
 
-interface ToolCompletionExtraData {
+export interface ToolCompletionExtraData {
   beforeContent?: string
   afterContent?: string
   editSuccess?: {
@@ -999,12 +1097,18 @@ interface ToolCompletionExtraData {
     relatedCursorRules?: Array<Record<string, unknown>>
   }
   shellResult?: {
+    command?: string
+    workingDirectory?: string
     stdout?: string
     stderr?: string
     exitCode?: number
+    signal?: string
     shellId?: number
     pid?: number
     interleavedOutput?: string
+    outputHead?: string
+    outputTail?: string
+    elidedChars?: number
     msToWait?: number
     localExecutionTimeMs?: number
     executionTime?: number
@@ -1013,19 +1117,23 @@ interface ToolCompletionExtraData {
     backgroundReason?: number
     outputLocation?: {
       filePath?: string
-      lineStart?: number
-      lineEnd?: number
+      sizeBytes?: bigint | number
+      lineCount?: bigint | number
     }
     terminalsFolder?: string
     timeoutBehavior?: number
     hardTimeout?: number
-    requestedSandboxPolicy?: { type?: unknown } | null
+    requestedSandboxPolicy?: Record<string, unknown> | SandboxPolicy | null
     isBackground?: boolean
     description?: string
     classifierResult?: Record<string, unknown> | CommandClassifierResult
     closeStdin?: boolean
     fileOutputThresholdBytes?: bigint | number
+    timeoutMs?: number
+    isReadonly?: boolean
+    terminalMessage?: string
   }
+  taskError?: string
   lsDirectoryTreeRoot?: Record<string, unknown>
   grepSuccess?: {
     pattern?: string
@@ -1041,17 +1149,25 @@ interface ToolCompletionExtraData {
     prevContent?: string
   }
   taskSuccess?: {
-    conversationSteps?: Array<Record<string, unknown>>
+    conversationSteps?: ReadonlyArray<
+      ConversationStep | Record<string, unknown>
+    >
     agentId?: string
     isBackground?: boolean
     durationMs?: bigint | number
     resultSuffix?: string
+    backgroundReason?: number
     transcriptPath?: string
   }
   diagnosticsSuccess?: {
     path?: string
     diagnostics?: Array<Record<string, unknown>>
     totalDiagnostics?: number
+    files?: Array<{
+      path: string
+      diagnostics: Array<Record<string, unknown>>
+      totalDiagnostics: number
+    }>
   }
   listMcpResourcesSuccess?: {
     resources?: Array<Record<string, unknown>>
@@ -1074,6 +1190,45 @@ interface ToolCompletionExtraData {
     filePath?: string
     imageData?: string
   }
+  replaceEnvResult?:
+    | { case: "success"; setupLogs?: string }
+    | { case: "failure"; errorMessage?: string; setupLogs?: string }
+  prManagementResult?:
+    | {
+        case: "success"
+        prUrl?: string
+        prNumber?: number
+        message?: string
+      }
+    | { case: "error"; error?: string }
+    | { case: "rejected"; reason?: string }
+    | {
+        case: "registered"
+        message?: string
+        title?: string
+        body?: string
+        baseBranch?: string
+        draft?: boolean
+        branchName?: string
+      }
+    | {
+        case: "needsConfirmation"
+        message?: string
+        discoveredPrUrl?: string
+        discoveredPrNumber?: number
+        discoveredPrTitle?: string
+        branchName?: string
+      }
+  conversationSearchSuccess?: {
+    hits: Array<{
+      conversationId: string
+      title: string
+      updatedAtMs: number
+      snippet: string
+    }>
+    truncated: boolean
+    partial: boolean
+  }
   toolResultState?: {
     status: ToolResultProjectionStatus
     message?: string
@@ -1090,14 +1245,13 @@ interface ToolCompletionExtraData {
   }
   // New v2.6.13
   awaitResult?: {
+    complete?: boolean
     runtimeMs?: number
     outputFilePath?: string
     outputLength?: number
     exitCode?: number
-  }
-  prResult?: {
-    prUrl?: string
-    prNumber?: number
+    regexRequested?: boolean
+    regexMatch?: string
   }
   aiAttributionResult?: {
     filePaths?: string[]
@@ -1108,6 +1262,23 @@ interface ToolCompletionExtraData {
     maxCommits?: number
     includeLineRanges?: boolean
   }
+}
+
+/**
+ * The only presentation authority for a child capability.  This deliberately
+ * accepts the resolver's durable entry/owner pair rather than a model tool
+ * name: Cursor UI case selection must be replayable after recovery without
+ * classifying a name against the current bridge or MCP catalog.
+ */
+export interface FrozenSubagentToolCallInvocation {
+  readonly entry: Pick<SubagentToolContractEntry, "name">
+  readonly phaseOwner: SubagentToolExecutionOwner
+}
+
+/** Explicit terminal fact for a frozen child ToolCall presentation. */
+export interface FrozenSubagentToolCallOutcome {
+  readonly status: ToolResultProjectionStatus
+  readonly extraData?: ToolCompletionExtraData
 }
 
 /**
@@ -1278,6 +1449,13 @@ export class CursorGrpcService {
     // ExecServerMessage 补齐
     "request_context",
     "redacted_read",
+    "pi_read",
+    "pi_bash",
+    "pi_edit",
+    "pi_write",
+    "pi_grep",
+    "pi_find",
+    "pi_ls",
   ])
   private readonly protocolInlineOnlyFamilies: ReadonlySet<ToolFamily> =
     new Set([
@@ -1287,6 +1465,8 @@ export class CursorGrpcService {
       "apply_agent_diff",
       "sem_search",
       "setup_vm_environment",
+      "replace_env",
+      "connect_scm",
       "web_fetch",
       "web_search",
       "exa_search",
@@ -1308,6 +1488,9 @@ export class CursorGrpcService {
       "communicate_update",
       "send_final_summary",
       "send_to_user",
+      "search_conversations",
+      "create_goal",
+      "update_goal",
     ])
 
   // Active blob ID list (for KV storage)
@@ -1328,14 +1511,32 @@ export class CursorGrpcService {
 
   private serializeAgentServerMessage(
     msg: AgentServerMessage,
-    context: string
+    _context: string
   ): Buffer {
     const payload = toBinary(AgentServerMessageSchema, msg)
-    CursorProtocolTraceService.recordServerMessage(msg, {
-      bytes: payload.length,
-      context,
-    })
     return this.addConnectEnvelope(payload)
+  }
+
+  createExecServerAbortResponse(execId: number): Buffer {
+    if (!Number.isSafeInteger(execId) || execId <= 0) {
+      throw new Error(
+        `Exec server abort requires a positive integer id: ${execId}`
+      )
+    }
+    return this.serializeAgentServerMessage(
+      create(AgentServerMessageSchema, {
+        message: {
+          case: "execServerControlMessage",
+          value: create(ExecServerControlMessageSchema, {
+            message: {
+              case: "abort",
+              value: create(ExecServerAbortSchema, { id: execId }),
+            },
+          }),
+        },
+      }),
+      "execServerControlMessage.abort"
+    )
   }
 
   /**
@@ -1494,7 +1695,7 @@ export class CursorGrpcService {
    */
   createInteractionQueryResponse(
     queryId: number,
-    queryCase: string,
+    queryCase: InteractionQueryCase,
     queryValue: unknown
   ): Buffer {
     let normalizedValue = queryValue
@@ -1505,6 +1706,45 @@ export class CursorGrpcService {
       normalizedValue = create(CreatePlanRequestQuerySchema, {
         args: planArgs,
         toolCallId: safeString(record.toolCallId ?? record.tool_call_id),
+      })
+    } else if (queryCase === "setupVmEnvironmentArgs") {
+      const record = queryValue as Record<string, unknown>
+      normalizedValue = create(SetupVmEnvironmentArgsSchema, {
+        installCommand: safeString(
+          record.installCommand ?? record.install_command
+        ),
+        startCommand: safeString(record.startCommand ?? record.start_command),
+        dockerfileContents: safeString(
+          record.dockerfileContents ?? record.dockerfile_contents
+        ),
+      })
+    } else if (queryCase === "replaceEnvArgs") {
+      normalizedValue = this.buildReplaceEnvArgs(
+        queryValue as Record<string, unknown>
+      )
+    } else if (queryCase === "connectScmRequestQuery") {
+      const record = queryValue as Record<string, unknown>
+      const rawArgs =
+        record.args && typeof record.args === "object"
+          ? (record.args as Record<string, unknown>)
+          : record
+      normalizedValue = create(ConnectScmRequestQuerySchema, {
+        args: this.buildConnectScmArgs(
+          rawArgs,
+          safeString(rawArgs.toolCallId ?? rawArgs.tool_call_id)
+        ),
+      })
+    } else if (queryCase === "prManagementRequestQuery") {
+      const record = queryValue as Record<string, unknown>
+      const rawArgs =
+        record.args && typeof record.args === "object"
+          ? (record.args as Record<string, unknown>)
+          : record
+      normalizedValue = create(PrManagementRequestQuerySchema, {
+        args: this.buildPrManagementArgs(
+          rawArgs,
+          safeString(rawArgs.toolCallId ?? rawArgs.tool_call_id)
+        ),
       })
     }
 
@@ -1561,6 +1801,99 @@ export class CursorGrpcService {
     )
   }
 
+  createResponseComparisonStartedResponse(input: {
+    comparisonId: string
+    displayOrder: ResponseComparisonDisplayOrder
+    parentInvocationId: string
+    alternateInvocationId: string
+    parentResponse: string
+  }): Buffer {
+    if (input.displayOrder === ResponseComparisonDisplayOrder.UNSPECIFIED) {
+      throw new Error("Response comparison requires an explicit display order")
+    }
+    for (const [field, value] of [
+      ["comparisonId", input.comparisonId],
+      ["parentInvocationId", input.parentInvocationId],
+      ["alternateInvocationId", input.alternateInvocationId],
+    ] as const) {
+      if (!value.trim()) {
+        throw new Error(`Response comparison ${field} must be non-empty`)
+      }
+    }
+    return this.wrapInteractionUpdate(
+      "responseComparison",
+      create(ResponseComparisonUpdateSchema, {
+        comparisonId: input.comparisonId,
+        event: {
+          case: "started",
+          value: create(ResponseComparisonStartedSchema, {
+            displayOrder: input.displayOrder,
+            parentInvocationId: input.parentInvocationId,
+            alternateInvocationId: input.alternateInvocationId,
+            parentResponse: input.parentResponse,
+          }),
+        },
+      })
+    )
+  }
+
+  createResponseComparisonTextDeltaResponse(
+    comparisonId: string,
+    text: string
+  ): Buffer {
+    if (!comparisonId.trim()) {
+      throw new Error("Response comparison comparisonId must be non-empty")
+    }
+    return this.wrapInteractionUpdate(
+      "responseComparison",
+      create(ResponseComparisonUpdateSchema, {
+        comparisonId,
+        event: {
+          case: "textDelta",
+          value: create(ResponseComparisonTextDeltaSchema, { text }),
+        },
+      })
+    )
+  }
+
+  createResponseComparisonCompletedResponse(comparisonId: string): Buffer {
+    if (!comparisonId.trim()) {
+      throw new Error("Response comparison comparisonId must be non-empty")
+    }
+    return this.wrapInteractionUpdate(
+      "responseComparison",
+      create(ResponseComparisonUpdateSchema, {
+        comparisonId,
+        event: {
+          case: "completed",
+          value: create(ResponseComparisonCompletedSchema, {}),
+        },
+      })
+    )
+  }
+
+  createResponseComparisonSkippedResponse(
+    comparisonId: string,
+    reason: ResponseComparisonSkipReason
+  ): Buffer {
+    if (!comparisonId.trim()) {
+      throw new Error("Response comparison comparisonId must be non-empty")
+    }
+    if (reason === ResponseComparisonSkipReason.UNSPECIFIED) {
+      throw new Error("Response comparison skip reason must be explicit")
+    }
+    return this.wrapInteractionUpdate(
+      "responseComparison",
+      create(ResponseComparisonUpdateSchema, {
+        comparisonId,
+        event: {
+          case: "skipped",
+          value: create(ResponseComparisonSkippedSchema, { reason }),
+        },
+      })
+    )
+  }
+
   /**
    * Create SummaryStarted response
    */
@@ -1612,6 +1945,15 @@ export class CursorGrpcService {
    * (history rendering, "queued"/"continuation" badges, retry
    * filtering) cannot recognise the event.
    */
+  createUserMessageAppendedFromMessage(userMessage: UserMessage): Buffer {
+    return this.wrapInteractionUpdate(
+      "userMessageAppended",
+      create(UserMessageAppendedUpdateSchema, {
+        userMessage: create(UserMessageSchema, userMessage),
+      })
+    )
+  }
+
   createUserMessageAppendedResponse(
     text: string,
     messageId: string,
@@ -1673,6 +2015,90 @@ export class CursorGrpcService {
     return this.wrapInteractionUpdate(
       "heartbeat",
       create(HeartbeatUpdateSchema, {})
+    )
+  }
+
+  /**
+   * Emit official InteractionUpdate.context_injection_state for inject_context_action.
+   */
+  createContextInjectionStateUpdateResponse(input: {
+    injectionId: string
+    state:
+      | "queued"
+      | "delivered"
+      | "queuedForNextTurn"
+      | "cancelled"
+      | "rejected"
+    step?: number
+    deliveryBatchId?: string
+    deliveredAtMs?: number
+    reason?: string
+  }): Buffer {
+    const injectionId = input.injectionId.trim()
+    if (!injectionId) {
+      throw new Error("contextInjectionState requires injectionId")
+    }
+
+    const state = (() => {
+      switch (input.state) {
+        case "queued":
+          return create(ContextInjectionStateSchema, {
+            state: {
+              case: "queued",
+              value: create(ContextInjectionQueuedSchema, {}),
+            },
+          })
+        case "queuedForNextTurn":
+          return create(ContextInjectionStateSchema, {
+            state: {
+              case: "queuedForNextTurn",
+              value: create(ContextInjectionQueuedForNextTurnSchema, {}),
+            },
+          })
+        case "cancelled":
+          return create(ContextInjectionStateSchema, {
+            state: {
+              case: "cancelled",
+              value: create(ContextInjectionCancelledSchema, {}),
+            },
+          })
+        case "rejected":
+          return create(ContextInjectionStateSchema, {
+            state: {
+              case: "rejected",
+              value: create(ContextInjectionRejectedSchema, {
+                reason: input.reason || "context injection rejected",
+              }),
+            },
+          })
+        case "delivered":
+          return create(ContextInjectionStateSchema, {
+            state: {
+              case: "delivered",
+              value: create(ContextInjectionDeliveredSchema, {
+                step: input.step ?? 0,
+                deliveryBatchId: input.deliveryBatchId || "",
+                deliveredAtMs: BigInt(
+                  Math.max(0, input.deliveredAtMs ?? Date.now())
+                ),
+              }),
+            },
+          })
+        default: {
+          const _exhaustive: never = input.state
+          throw new Error(
+            `Unsupported context injection state: ${String(_exhaustive)}`
+          )
+        }
+      }
+    })()
+
+    return this.wrapInteractionUpdate(
+      "contextInjectionState",
+      create(ContextInjectionStateUpdateSchema, {
+        injectionId,
+        state,
+      })
     )
   }
 
@@ -1861,18 +2287,13 @@ export class CursorGrpcService {
    * Create ShellOutput start response
    */
   createShellOutputStartResponse(
-    sandboxPolicy?: { type?: unknown } | null
+    sandboxPolicy?: SandboxPolicy | Record<string, unknown> | null
   ): Buffer {
-    const rawType = sandboxPolicy?.type
-    const parsedType = Number(rawType)
     const resolvedSandboxPolicy =
-      Number.isFinite(parsedType) && parsedType >= 0
-        ? create(SandboxPolicySchema, {
-            type: Math.floor(parsedType) as SandboxPolicy_Type,
-          })
-        : create(SandboxPolicySchema, {
-            type: SandboxPolicy_Type.WORKSPACE_READWRITE,
-          })
+      this.normalizeSandboxPolicy(sandboxPolicy) ??
+      create(SandboxPolicySchema, {
+        type: SandboxPolicy_Type.WORKSPACE_READWRITE,
+      })
 
     return this.wrapInteractionUpdate(
       "shellOutputDelta",
@@ -1887,19 +2308,6 @@ export class CursorGrpcService {
     )
   }
 
-  /**
-   * @deprecated Use createShellOutputStdoutResponse / createShellOutputStderrResponse
-   */
-  createShellOutputDeltaResponse(
-    stdout: string = "",
-    stderr: string = ""
-  ): Buffer {
-    if (stderr) {
-      return this.createShellOutputStderrResponse(stderr)
-    }
-    return this.createShellOutputStdoutResponse(stdout)
-  }
-
   // ─── ToolCall Started / Completed / Partial ────────────────
 
   /**
@@ -1912,6 +2320,7 @@ export class CursorGrpcService {
     toolFamilyHint?: ToolFamily,
     modelCallId: string = ""
   ): Buffer {
+    this.assertCursorToolProjectionAllowed(toolName)
     return this.wrapInteractionUpdate(
       "toolCallStarted",
       create(ToolCallStartedUpdateSchema, {
@@ -1934,6 +2343,7 @@ export class CursorGrpcService {
     modelCallId: string = "",
     extraData?: ToolCompletionExtraData
   ): Buffer {
+    this.assertCursorToolProjectionAllowed(toolName)
     return this.wrapInteractionUpdate(
       "toolCallCompleted",
       create(ToolCallCompletedUpdateSchema, {
@@ -1953,17 +2363,23 @@ export class CursorGrpcService {
 
   /**
    * Create empty PartialToolCall response (initial notification)
+   *
+   * `toolFamilyHint` is required for session-registered MCP tools whose
+   * model-facing names (e.g. `user-context7-resolve-library-id`) are not in
+   * the static Cursor definition registry.
    */
   createEmptyPartialToolCallResponse(
     callId: string,
     toolName: string,
-    modelCallId: string = ""
+    modelCallId: string = "",
+    toolFamilyHint?: ToolFamily
   ): Buffer {
+    this.assertCursorToolProjectionAllowed(toolName)
     return this.wrapInteractionUpdate(
       "partialToolCall",
       create(PartialToolCallUpdateSchema, {
         callId,
-        toolCall: this.buildEmptyToolCallV2(toolName),
+        toolCall: this.buildEmptyToolCallV2(toolName, callId, toolFamilyHint),
         argsTextDelta: "",
         modelCallId,
       })
@@ -1980,6 +2396,7 @@ export class CursorGrpcService {
     argsTextDelta: string = "",
     modelCallId: string = ""
   ): Buffer {
+    this.assertCursorToolProjectionAllowed(toolName)
     return this.wrapInteractionUpdate(
       "partialToolCall",
       create(PartialToolCallUpdateSchema, {
@@ -2005,7 +2422,7 @@ export class CursorGrpcService {
       "partialToolCall",
       create(PartialToolCallUpdateSchema, {
         callId,
-        toolCall: this.buildEmptyToolCallV2(toolName),
+        toolCall: this.buildEmptyToolCallV2(toolName, callId),
         argsTextDelta,
         modelCallId,
       })
@@ -2018,11 +2435,12 @@ export class CursorGrpcService {
    */
   createToolCallDeltaResponse(
     callId: string,
-    _toolName: string,
+    toolName: string,
     deltaType: "stdout" | "stderr" | "progress" | "stream_content",
     deltaContent: string,
     modelCallId?: string
   ): Buffer {
+    this.assertCursorToolProjectionAllowed(toolName)
     // Build the appropriate ToolCallDelta based on deltaType
     let toolCallDelta: ToolCallDelta | undefined
     if (deltaType === "stdout") {
@@ -2317,11 +2735,340 @@ export class CursorGrpcService {
     })
   }
 
+  /**
+   * Emit a started update for a child capability whose presentation authority
+   * was already resolved from its immutable spawn contract.  In particular,
+   * this method never re-classifies `entry.name` and never looks at a live
+   * MCP registry.
+   */
+  buildFrozenSubagentToolCallStartedInteractionUpdate(
+    invocation: FrozenSubagentToolCallInvocation,
+    callId: string,
+    validatedInput: Record<string, unknown>,
+    modelCallId: string = ""
+  ) {
+    return create(InteractionUpdateSchema, {
+      message: {
+        case: "toolCallStarted" as const,
+        value: create(ToolCallStartedUpdateSchema, {
+          callId,
+          toolCall: this.buildFrozenSubagentToolCall(
+            invocation,
+            callId,
+            validatedInput
+          ),
+          modelCallId,
+        }),
+      },
+    })
+  }
+
+  /**
+   * Emit a completed update using the same frozen ToolCall builder as the
+   * durable ConversationStep.  The terminal status is an explicit execution
+   * fact; do not infer it from display text on the child path.
+   */
+  buildFrozenSubagentToolCallCompletedInteractionUpdate(
+    invocation: FrozenSubagentToolCallInvocation,
+    callId: string,
+    validatedInput: Record<string, unknown>,
+    resultContent: string,
+    outcome: FrozenSubagentToolCallOutcome,
+    modelCallId: string = ""
+  ) {
+    return create(InteractionUpdateSchema, {
+      message: {
+        case: "toolCallCompleted" as const,
+        value: create(ToolCallCompletedUpdateSchema, {
+          callId,
+          toolCall: this.buildFrozenSubagentToolCall(
+            invocation,
+            callId,
+            validatedInput,
+            resultContent,
+            outcome
+          ),
+          modelCallId,
+        }),
+      },
+    })
+  }
+
+  /**
+   * Build the durable task-bubble fact for a child capability.  Foreground
+   * updates and detached-worker conversation steps both delegate to the same
+   * exact encoder, so an old graph cannot render a different ToolCall family
+   * after the live tool catalog changes.
+   */
+  buildFrozenSubagentToolCallConversationStep(
+    invocation: FrozenSubagentToolCallInvocation,
+    callId: string,
+    validatedInput: Record<string, unknown>,
+    resultContent: string,
+    outcome: FrozenSubagentToolCallOutcome
+  ) {
+    return create(ConversationStepSchema, {
+      message: {
+        case: "toolCall" as const,
+        value: this.buildFrozenSubagentToolCall(
+          invocation,
+          callId,
+          validatedInput,
+          resultContent,
+          outcome
+        ),
+      },
+    })
+  }
+
+  /**
+   * This is intentionally separate from the generic ToolCall builders.  The
+   * generic path is allowed to classify current tool names for top-level
+   * compatibility; a child run must instead select its proto family solely
+   * from the persisted execution owner.
+   */
+  private buildFrozenSubagentToolCall(
+    invocation: FrozenSubagentToolCallInvocation,
+    callId: string,
+    validatedInput: Record<string, unknown>,
+    resultContent?: string,
+    outcome?: FrozenSubagentToolCallOutcome
+  ): ToolCall {
+    if (typeof callId !== "string" || !callId || callId !== callId.trim()) {
+      throw new Error("Frozen subagent ToolCall requires an exact call id")
+    }
+    if (
+      !validatedInput ||
+      typeof validatedInput !== "object" ||
+      Array.isArray(validatedInput)
+    ) {
+      throw new Error(
+        "Frozen subagent ToolCall requires object capability input"
+      )
+    }
+    if (resultContent === undefined && outcome !== undefined) {
+      throw new Error(
+        "Frozen subagent ToolCall outcome cannot exist without result content"
+      )
+    }
+    if (resultContent !== undefined && outcome === undefined) {
+      throw new Error(
+        "Frozen subagent ToolCall result content requires an explicit outcome"
+      )
+    }
+
+    const projection = this.resolveFrozenSubagentToolCallProjection(invocation)
+
+    if (projection.owner.kind === "mcp-client") {
+      return this.buildFrozenSubagentMcpToolCall(
+        projection.owner,
+        callId,
+        validatedInput,
+        resultContent,
+        outcome
+      )
+    }
+
+    if (resultContent === undefined) {
+      return this.buildIdentifiedToolCall(
+        callId,
+        this.buildToolCallOneOf(
+          projection.displayName,
+          validatedInput,
+          callId,
+          projection.family
+        )
+      )
+    }
+
+    const explicitOutcome = outcome as FrozenSubagentToolCallOutcome
+    const extraData: ToolCompletionExtraData = {
+      ...(explicitOutcome.extraData || {}),
+      toolResultState: {
+        ...(explicitOutcome.extraData?.toolResultState || {}),
+        status: explicitOutcome.status,
+      },
+    }
+    return this.buildIdentifiedToolCall(
+      callId,
+      this.buildToolCallWithResult(
+        projection.displayName,
+        callId,
+        validatedInput,
+        resultContent,
+        extraData,
+        projection.family
+      )
+    )
+  }
+
+  /**
+   * Maps the finite, persisted child owner enum to the finite Cursor ToolCall
+   * enum.  It does not accept a model name as authority.  Static capabilities
+   * are additionally checked against their frozen Cursor definition so a
+   * coherent-but-wrong contract cannot silently render a different action.
+   */
+  private resolveFrozenSubagentToolCallProjection(
+    invocation: FrozenSubagentToolCallInvocation
+  ): {
+    family: ToolFamily
+    displayName: string
+    owner: SubagentToolExecutionOwner
+  } {
+    assertFrozenSubagentToolEntryOwnerBinding(
+      invocation.entry,
+      invocation.phaseOwner
+    )
+    const projection = resolveFrozenSubagentToolCallProjection(
+      invocation.phaseOwner
+    )
+    return {
+      family: projection.family,
+      displayName: invocation.entry.name,
+      owner: invocation.phaseOwner,
+    }
+  }
+
+  /**
+   * MCP has its own exact presentation branch because the generic ToolCall
+   * encoder accepts aliases and derives identity fields.  A child MCP call is
+   * already bound to one frozen provider/server/tool triple, so copy only
+   * that triple and the schema-validated argument object into the proto.
+   */
+  private buildFrozenSubagentMcpToolCall(
+    owner: Extract<SubagentToolExecutionOwner, { kind: "mcp-client" }>,
+    callId: string,
+    validatedInput: Record<string, unknown>,
+    resultContent?: string,
+    outcome?: FrozenSubagentToolCallOutcome
+  ): ToolCall {
+    const rawArgs = extractMcpRawArguments(validatedInput)
+    if (resultContent === undefined) {
+      return this.buildIdentifiedToolCall(callId, {
+        case: "mcpToolCall" as const,
+        value: create(McpToolCallSchema, {
+          args: create(McpArgsSchema, {
+            name: owner.definitionName,
+            toolName: owner.toolName,
+            providerIdentifier: owner.providerIdentifier,
+            serverIdentifier: owner.ideRegistryKey,
+            args: this.toProtoValueMap(rawArgs),
+            toolCallId: callId,
+          }),
+        }),
+      })
+    }
+
+    const status = (outcome as FrozenSubagentToolCallOutcome).status
+    let result: McpToolResult["result"]
+    if (status === "success") {
+      result = {
+        case: "success" as const,
+        value: create(McpSuccessSchema, {
+          content: this.buildMcpResultContentItems(resultContent, {
+            server: owner.definitionName,
+            toolName: owner.toolName,
+            providerIdentifier: owner.providerIdentifier,
+          }),
+          isError: false,
+        }),
+      }
+    } else if (status === "rejected") {
+      result = {
+        case: "rejected" as const,
+        value: create(McpRejectedSchema, {
+          reason:
+            outcome?.extraData?.toolResultState?.message ||
+            "mcp capability rejected",
+          isReadonly: false,
+        }),
+      }
+    } else if (status === "permission_denied") {
+      result = {
+        case: "permissionDenied" as const,
+        value: create(McpPermissionDeniedSchema, {
+          error:
+            outcome?.extraData?.toolResultState?.message ||
+            "mcp capability permission denied",
+          isReadonly: false,
+        }),
+      }
+    } else {
+      result = {
+        case: "error" as const,
+        value: create(McpToolErrorSchema, {
+          error:
+            outcome?.extraData?.toolResultState?.message ||
+            resultContent ||
+            "mcp capability failed",
+          readToolDefReminder: "",
+        }),
+      }
+    }
+
+    return this.buildIdentifiedToolCall(callId, {
+      case: "mcpToolCall" as const,
+      value: create(McpToolCallSchema, {
+        args: create(McpArgsSchema, {
+          name: owner.definitionName,
+          toolName: owner.toolName,
+          providerIdentifier: owner.providerIdentifier,
+          serverIdentifier: owner.ideRegistryKey,
+          args: this.toProtoValueMap(rawArgs),
+          toolCallId: callId,
+        }),
+        result: create(McpToolResultSchema, { result }),
+      }),
+    })
+  }
+
   normalizeConversationStepForEncoding(value: unknown): ConversationStep {
+    if (
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      !(value instanceof Uint8Array)
+    ) {
+      const record = value as Record<string, unknown>
+      if (
+        record.assistantMessage !== undefined ||
+        record.toolCall !== undefined ||
+        record.thinkingMessage !== undefined
+      ) {
+        return fromJson(ConversationStepSchema, record as JsonObject)
+      }
+    }
+
     return create(
       ConversationStepSchema,
       this.normalizeConversationStepShape(value) as never
     )
+  }
+
+  /**
+   * Persist TaskSuccess as canonical protobuf JSON. Conversation steps are
+   * protocol state used to rebuild Cursor checkpoint blobs, so they must never
+   * pass through diagnostic JSON truncation or preview summarization.
+   */
+  encodeTaskSuccessForDurableJson(
+    value: NonNullable<ToolCompletionExtraData["taskSuccess"]>
+  ): JsonObject {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new TypeError("Cursor durable TaskSuccess must be an object")
+    }
+    if (
+      value.conversationSteps !== undefined &&
+      !Array.isArray(value.conversationSteps)
+    ) {
+      throw new TypeError(
+        "Cursor durable TaskSuccess conversationSteps must be an array"
+      )
+    }
+
+    return toJson(
+      TaskSuccessSchema,
+      this.normalizeTaskSuccessForEncoding(value)
+    ) as JsonObject
   }
 
   private normalizeConversationStepShape(value: unknown): unknown {
@@ -2421,6 +3168,16 @@ export class CursorGrpcService {
       })
     }
 
+    if (oneOf.case === "semSearchToolCall") {
+      return create(ToolCallSchema, {
+        ...this.normalizeToolCallMetadata(record),
+        tool: {
+          case: "semSearchToolCall" as const,
+          value: this.normalizeSemSearchToolCallForEncoding(oneOf.value),
+        },
+      })
+    }
+
     if (oneOf.case === "webSearchToolCall") {
       return create(ToolCallSchema, {
         ...this.normalizeToolCallMetadata(record),
@@ -2472,6 +3229,186 @@ export class CursorGrpcService {
     }
 
     return create(ToolCallSchema, value as never)
+  }
+
+  private normalizeSemSearchToolCallForEncoding(value: unknown) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new TypeError(
+        "Cursor semantic-search ToolCall must be an object before encoding"
+      )
+    }
+
+    const record = value as Record<string, unknown>
+    const args = this.normalizeSemSearchArgsForEncoding(record.args)
+    const result = this.normalizeSemSearchResultForEncoding(record.result)
+
+    return create(SemSearchToolCallSchema, {
+      ...(args ? { args } : {}),
+      ...(result ? { result } : {}),
+    })
+  }
+
+  private normalizeSemSearchArgsForEncoding(value: unknown) {
+    if (value === undefined || value === null) return undefined
+    if (typeof value !== "object" || Array.isArray(value)) {
+      throw new TypeError(
+        "Cursor semantic-search ToolCall args must be an object"
+      )
+    }
+
+    const record = value as Record<string, unknown>
+    const targetDirectories = record.targetDirectories
+    if (targetDirectories !== undefined && !Array.isArray(targetDirectories)) {
+      throw new TypeError(
+        "Cursor semantic-search targetDirectories must be an array"
+      )
+    }
+    if (
+      Array.isArray(targetDirectories) &&
+      targetDirectories.some((entry) => typeof entry !== "string")
+    ) {
+      throw new TypeError(
+        "Cursor semantic-search targetDirectories entries must be strings"
+      )
+    }
+
+    return create(SemSearchToolArgsSchema, {
+      query: this.normalizeSemSearchString(record.query, "args.query"),
+      targetDirectories: (targetDirectories || []) as string[],
+      explanation: this.normalizeSemSearchString(
+        record.explanation,
+        "args.explanation"
+      ),
+    })
+  }
+
+  private normalizeSemSearchResultForEncoding(value: unknown) {
+    if (value === undefined || value === null) return undefined
+    if (typeof value !== "object" || Array.isArray(value)) {
+      throw new TypeError(
+        "Cursor semantic-search ToolCall result must be an object"
+      )
+    }
+
+    const record = value as Record<string, unknown>
+    const result = record.result
+    if (result === undefined || result === null) {
+      return create(SemSearchToolResultSchema, {})
+    }
+    if (typeof result !== "object" || Array.isArray(result)) {
+      throw new TypeError(
+        "Cursor semantic-search ToolCall result branch must be an object"
+      )
+    }
+
+    const oneOf = result as { case?: unknown; value?: unknown }
+    if (oneOf.case === undefined) {
+      return create(SemSearchToolResultSchema, {})
+    }
+    if (oneOf.case === "success") {
+      if (
+        !oneOf.value ||
+        typeof oneOf.value !== "object" ||
+        Array.isArray(oneOf.value)
+      ) {
+        throw new TypeError(
+          "Cursor semantic-search success result must be an object"
+        )
+      }
+      const success = oneOf.value as Record<string, unknown>
+      return create(SemSearchToolResultSchema, {
+        result: {
+          case: "success" as const,
+          value: create(SemSearchToolSuccessSchema, {
+            results: this.normalizeSemSearchString(
+              success.results,
+              "success.results"
+            ),
+            codeResults: this.normalizeSemSearchCodeResultsForEncoding(
+              success.codeResults
+            ),
+          }),
+        },
+      })
+    }
+    if (oneOf.case === "error") {
+      if (
+        !oneOf.value ||
+        typeof oneOf.value !== "object" ||
+        Array.isArray(oneOf.value)
+      ) {
+        throw new TypeError(
+          "Cursor semantic-search error result must be an object"
+        )
+      }
+      const error = oneOf.value as Record<string, unknown>
+      return create(SemSearchToolResultSchema, {
+        result: {
+          case: "error" as const,
+          value: create(SemSearchToolErrorSchema, {
+            errorMessage: this.normalizeSemSearchString(
+              error.errorMessage,
+              "error.errorMessage"
+            ),
+          }),
+        },
+      })
+    }
+
+    throw new TypeError(
+      `Cursor semantic-search ToolCall has unsupported result branch ${String(oneOf.case)}`
+    )
+  }
+
+  private normalizeSemSearchCodeResultsForEncoding(value: unknown) {
+    if (value === undefined || value === null) return []
+    if (!Array.isArray(value)) {
+      throw new TypeError(
+        "Cursor semantic-search success codeResults must be an array"
+      )
+    }
+
+    return value.map((entry, index) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new TypeError(
+          `Cursor semantic-search codeResults[${index}] must be an object`
+        )
+      }
+      const record = entry as Record<string, unknown>
+      if (record.score !== undefined && typeof record.score !== "number") {
+        throw new TypeError(
+          `Cursor semantic-search codeResults[${index}].score must be a number`
+        )
+      }
+
+      let codeBlock:
+        | ReturnType<typeof create<typeof PH_aiserver_v1_CodeBlockSchema>>
+        | undefined
+      if (record.codeBlock !== undefined && record.codeBlock !== null) {
+        if (
+          typeof record.codeBlock !== "object" ||
+          Array.isArray(record.codeBlock)
+        ) {
+          throw new TypeError(
+            `Cursor semantic-search codeResults[${index}].codeBlock must be an object`
+          )
+        }
+        codeBlock = create(PH_aiserver_v1_CodeBlockSchema, {})
+      }
+
+      return create(PH_aiserver_v1_CodeResultSchema, {
+        ...(codeBlock ? { codeBlock } : {}),
+        score: record.score ?? 0,
+      })
+    })
+  }
+
+  private normalizeSemSearchString(value: unknown, field: string): string {
+    if (value === undefined || value === null) return ""
+    if (typeof value !== "string") {
+      throw new TypeError(`Cursor semantic-search ${field} must be a string`)
+    }
+    return value
   }
 
   private normalizeWebSearchToolCallForEncoding(value: unknown) {
@@ -2778,7 +3715,8 @@ export class CursorGrpcService {
           }),
         }
       }
-      planUri = safeString(result.planUri ?? result.plan_uri)
+      planUri =
+        preserveProtocolLocation(result.planUri ?? result.plan_uri) ?? ""
     }
 
     return create(CreatePlanToolCallSchema, {
@@ -2795,13 +3733,18 @@ export class CursorGrpcService {
   }
 
   private normalizeToolCallMetadata(record: Record<string, unknown>) {
+    const rawToolCallId = safeString(record.toolCallId ?? record.tool_call_id)
     return {
       hookAdditionalContexts: this.normalizeHookAdditionalContexts(
         record.hookAdditionalContexts ?? record.hook_additional_contexts
       ),
       toolCallId:
-        safeString(record.toolCallId ?? record.tool_call_id).trim() ||
-        undefined,
+        rawToolCallId === ""
+          ? undefined
+          : requireExactDurableIdentifier(
+              rawToolCallId,
+              "Cursor tool-call metadata identity"
+            ),
       startedAtMs: this.normalizeOptionalBigInt(
         record.startedAtMs ?? record.started_at_ms
       ),
@@ -2853,9 +3796,8 @@ export class CursorGrpcService {
             : []
         const relatedCursorRules = relatedRulesRaw.map((rule: any) =>
           create(CursorRuleSchema, {
-            fullPath: safeString(
-              rule?.fullPath ?? rule?.full_path ?? rule?.name
-            ),
+            fullPath:
+              preserveProtocolLocation(rule?.fullPath ?? rule?.full_path) ?? "",
             content: safeString(rule?.content),
           })
         )
@@ -2907,7 +3849,7 @@ export class CursorGrpcService {
               ),
               totalLines: Number(val?.totalLines ?? val?.total_lines) || 0,
               fileSize: Number(val?.fileSize ?? val?.file_size) || 0,
-              path: safeString(val?.path),
+              path: preserveProtocolLocation(val?.path) ?? "",
               readRange:
                 readRangeVal && typeof readRangeVal === "object"
                   ? create(ReadRangeSchema, {
@@ -2926,8 +3868,8 @@ export class CursorGrpcService {
                   : val?.include_line_numbers !== undefined
                     ? this.parseBooleanFlag(val.include_line_numbers)
                     : undefined,
-              relatedCursorRulePaths: relatedCursorRulePaths.map((p) =>
-                safeString(p)
+              relatedCursorRulePaths: preserveProtocolLocationArray(
+                relatedCursorRulePaths
               ),
               relatedCursorRules,
             }),
@@ -2998,7 +3940,7 @@ export class CursorGrpcService {
           result: {
             case: "rejected" as const,
             value: create(LsRejectedSchema, {
-              path: safeString(val?.path),
+              path: preserveProtocolLocation(val?.path) ?? "",
               reason: safeString(val?.reason),
             }),
           },
@@ -3009,7 +3951,7 @@ export class CursorGrpcService {
           result: {
             case: "error" as const,
             value: create(LsErrorSchema, {
-              path: safeString(val?.path),
+              path: preserveProtocolLocation(val?.path) ?? "",
               error: safeString(val?.error),
             }),
           },
@@ -3075,7 +4017,7 @@ export class CursorGrpcService {
 
     return create(GrepSuccessSchema, {
       pattern: safeString(record.pattern),
-      path: safeString(record.path),
+      path: preserveProtocolLocation(record.path) ?? "",
       outputMode: safeString(record.outputMode ?? record.output_mode),
       workspaceResults,
       activeEditorResult,
@@ -3124,12 +4066,18 @@ export class CursorGrpcService {
         ? (value as Record<string, unknown>)
         : {}
 
+    const rawAgentId = safeString(record.agentId ?? record.agent_id)
     return create(TaskSuccessSchema, {
       conversationSteps: this.normalizeTaskConversationSteps(
         record.conversationSteps ?? record.conversation_steps
       ),
       agentId:
-        safeString(record.agentId ?? record.agent_id).trim() || undefined,
+        rawAgentId === ""
+          ? undefined
+          : requireExactDurableIdentifier(
+              rawAgentId,
+              "Cursor task success agent identity"
+            ),
       isBackground: this.parseBooleanFlag(
         record.isBackground ?? record.is_background
       ),
@@ -3142,9 +4090,9 @@ export class CursorGrpcService {
       backgroundReason: this.parseOptionalNonNegativeInt(
         record.backgroundReason ?? record.background_reason
       ),
-      transcriptPath:
-        safeString(record.transcriptPath ?? record.transcript_path).trim() ||
-        undefined,
+      transcriptPath: preserveProtocolLocation(
+        record.transcriptPath ?? record.transcript_path
+      ),
     })
   }
 
@@ -3338,15 +4286,13 @@ export class CursorGrpcService {
             typeof record.requested_sandbox_policy === "object"
           ? (record.requested_sandbox_policy as Record<string, unknown>)
           : undefined
-    const requestedSandboxType = this.parseOptionalNonNegativeInt(
-      requestedSandboxPolicy?.type
-    )
 
     return create(ShellArgsSchema, {
       command: safeString(record.command),
-      workingDirectory: safeString(
-        record.workingDirectory ?? record.working_directory
-      ),
+      workingDirectory:
+        preserveProtocolLocation(
+          record.workingDirectory ?? record.working_directory
+        ) ?? "",
       timeout: normalizeShellTimeoutMs(record.timeout),
       toolCallId: safeString(record.toolCallId ?? record.tool_call_id),
       simpleCommands: this.toStringArray(
@@ -3361,12 +4307,9 @@ export class CursorGrpcService {
       parsingResult: this.normalizeShellParsingResultForEncoding(
         record.parsingResult ?? record.parsing_result
       ),
-      requestedSandboxPolicy:
-        requestedSandboxType !== undefined
-          ? create(SandboxPolicySchema, {
-              type: requestedSandboxType as SandboxPolicy_Type,
-            })
-          : undefined,
+      requestedSandboxPolicy: this.normalizeSandboxPolicy(
+        requestedSandboxPolicy
+      ),
       fileOutputThresholdBytes: this.normalizeOptionalBigInt(
         record.fileOutputThresholdBytes ?? record.file_output_threshold_bytes
       ),
@@ -3584,6 +4527,259 @@ export class CursorGrpcService {
   }
 
   /**
+   * Encode a persisted child cursor-client capability without consulting the
+   * dynamic tool-name classifier.  The durable owner supplies the exact
+   * definition identity; only definitions with a first-class frozen encoder
+   * are allowed to cross this boundary.
+   */
+  createFrozenSubagentCursorToolCallResponse(
+    owner: Extract<SubagentToolExecutionOwner, { kind: "cursor-client" }>,
+    toolCallId: string,
+    args: Record<string, unknown>,
+    execIdNumber: number
+  ): Buffer {
+    this.assertFrozenCursorClientOwner(owner)
+    if (!Number.isSafeInteger(execIdNumber) || execIdNumber <= 0) {
+      throw new Error(
+        `Frozen cursor client dispatch requires a positive exec id, received ${execIdNumber}`
+      )
+    }
+    if (
+      typeof toolCallId !== "string" ||
+      !toolCallId ||
+      toolCallId !== toolCallId.trim()
+    ) {
+      throw new Error(
+        "Frozen cursor client dispatch requires an exact tool call id"
+      )
+    }
+
+    const message = this.buildFrozenSubagentCursorExecMessageOneOf(
+      owner,
+      args,
+      toolCallId
+    )
+    if (message.case !== owner.execProtocol.requestCase) {
+      throw new Error(
+        `Frozen cursor client encoder emitted ${message.case || "empty"} for ` +
+          `the persisted ${owner.execProtocol.requestCase} exec protocol request.`
+      )
+    }
+    return this.serializeAgentServerMessage(
+      create(AgentServerMessageSchema, {
+        message: {
+          case: "execServerMessage" as const,
+          value: create(ExecServerMessageSchema, {
+            id: execIdNumber,
+            execId: toolCallId,
+            spanContext: this.buildSpanContext(),
+            acceptHookAdditionalContexts: true,
+            message,
+          }),
+        },
+      }),
+      `execServerMessage.frozen.${owner.cursorDefinitionKey}`
+    )
+  }
+
+  /**
+   * Encode one concrete frozen MCP capability.  The provider/server/tool
+   * fields are asserted against the persisted owner and never recovered from
+   * the model payload or a live MCP registry.
+   */
+  createFrozenSubagentMcpToolCallResponse(
+    owner: Extract<SubagentToolExecutionOwner, { kind: "mcp-client" }>,
+    toolCallId: string,
+    dispatchInput: Record<string, unknown>,
+    execIdNumber: number
+  ): Buffer {
+    assertFrozenSubagentExecProtocolOwnerBinding(owner)
+    if (!Number.isSafeInteger(execIdNumber) || execIdNumber <= 0) {
+      throw new Error(
+        `Frozen MCP client dispatch requires a positive exec id, received ${execIdNumber}`
+      )
+    }
+    if (
+      typeof toolCallId !== "string" ||
+      !toolCallId ||
+      toolCallId !== toolCallId.trim()
+    ) {
+      throw new Error(
+        "Frozen MCP client dispatch requires an exact tool call id"
+      )
+    }
+    if (
+      dispatchInput.name !== owner.definitionName ||
+      dispatchInput.toolName !== owner.toolName ||
+      dispatchInput.providerIdentifier !== owner.providerIdentifier ||
+      dispatchInput.serverIdentifier !== owner.ideRegistryKey
+    ) {
+      throw new Error(
+        "Frozen MCP dispatch identity does not match its durable owner"
+      )
+    }
+    const rawArgs = dispatchInput.arguments
+    if (!rawArgs || typeof rawArgs !== "object" || Array.isArray(rawArgs)) {
+      throw new Error("Frozen MCP dispatch requires object arguments")
+    }
+    const message: ExecServerMessage["message"] = {
+      case: "mcpArgs" as const,
+      value: create(McpArgsSchema, {
+        name: owner.definitionName,
+        toolName: owner.toolName,
+        providerIdentifier: owner.providerIdentifier,
+        serverIdentifier: owner.ideRegistryKey,
+        args: this.toProtoValueMap(rawArgs),
+        toolCallId,
+      }),
+    }
+    if (message.case !== owner.execProtocol.requestCase) {
+      throw new Error(
+        `Frozen MCP encoder emitted ${message.case || "empty"} for ` +
+          `the persisted ${owner.execProtocol.requestCase} exec protocol request.`
+      )
+    }
+    return this.serializeAgentServerMessage(
+      create(AgentServerMessageSchema, {
+        message: {
+          case: "execServerMessage" as const,
+          value: create(ExecServerMessageSchema, {
+            id: execIdNumber,
+            execId: toolCallId,
+            spanContext: this.buildSpanContext(),
+            acceptHookAdditionalContexts: true,
+            message,
+          }),
+        },
+      }),
+      `execServerMessage.frozenMcp.${owner.definitionName}`
+    )
+  }
+
+  /**
+   * Emit the exact official create-plan interaction query owned by a frozen
+   * child capability.  It intentionally bypasses the generic deferred-tool
+   * query router: the persisted owner fixes both protocol oneof cases.
+   */
+  createFrozenSubagentCreatePlanInteractionQuery(
+    owner: Extract<
+      SubagentToolExecutionOwner,
+      { kind: "cursor-interaction-query" }
+    >,
+    queryId: number,
+    toolCallId: string,
+    args: Record<string, unknown>
+  ): Buffer {
+    if (!Number.isSafeInteger(queryId) || queryId <= 0) {
+      throw new Error(
+        `Frozen create-plan interaction requires a positive query id, received ${queryId}`
+      )
+    }
+    if (
+      typeof toolCallId !== "string" ||
+      !toolCallId ||
+      toolCallId !== toolCallId.trim()
+    ) {
+      throw new Error(
+        "Frozen create-plan interaction requires an exact tool call id"
+      )
+    }
+    const definition = getFrozenCursorToolDefinition(owner.cursorDefinitionKey)
+    if (
+      owner.cursorDefinitionKey !== "CLIENT_SIDE_TOOL_V2_CREATE_PLAN" ||
+      owner.protocolToolName !== "create_plan" ||
+      definition.name !== owner.protocolToolName ||
+      owner.queryCase !== "createPlanRequestQuery" ||
+      owner.responseCase !== "createPlanRequestResponse"
+    ) {
+      throw new Error(
+        "Frozen interaction owner is not the create_plan protocol pair"
+      )
+    }
+    return this.serializeAgentServerMessage(
+      create(AgentServerMessageSchema, {
+        message: {
+          case: "interactionQuery" as const,
+          value: create(InteractionQuerySchema, {
+            id: queryId,
+            query: {
+              case: "createPlanRequestQuery" as const,
+              value: create(CreatePlanRequestQuerySchema, {
+                args: this.buildCreatePlanArgs(args),
+                toolCallId,
+              }),
+            },
+          }),
+        },
+      }),
+      "interactionQuery.createPlanRequestQuery.frozen"
+    )
+  }
+
+  private assertFrozenCursorClientOwner(
+    owner: Extract<SubagentToolExecutionOwner, { kind: "cursor-client" }>
+  ): void {
+    assertFrozenSubagentExecProtocolOwnerBinding(owner)
+    const definition = getFrozenCursorToolDefinition(owner.cursorDefinitionKey)
+    if (definition.name !== owner.protocolToolName) {
+      throw new Error(
+        `Frozen cursor client definition ${owner.cursorDefinitionKey} does not match protocol tool ${owner.protocolToolName}`
+      )
+    }
+    switch (owner.cursorDefinitionKey) {
+      case "CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2":
+      case "CLIENT_SIDE_TOOL_V2_DELETE_FILE":
+        return
+      default:
+        throw new Error(
+          `Frozen cursor client definition ${owner.cursorDefinitionKey} has no exact sub-agent exec encoder`
+        )
+    }
+  }
+
+  private buildFrozenSubagentCursorExecMessageOneOf(
+    owner: Extract<SubagentToolExecutionOwner, { kind: "cursor-client" }>,
+    args: Record<string, unknown>,
+    toolCallId: string
+  ): ExecServerMessage["message"] {
+    switch (owner.cursorDefinitionKey) {
+      case "CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2": {
+        const path = args.path
+        const replacement = args.replace
+        if (typeof path !== "string" || typeof replacement !== "string") {
+          throw new Error(
+            "Frozen edit_file_v2 dispatch requires exact string path and replace arguments"
+          )
+        }
+        return {
+          case: "writeArgs" as const,
+          value: create(WriteArgsSchema, {
+            path,
+            fileText: replacement,
+            toolCallId,
+          }),
+        }
+      }
+      case "CLIENT_SIDE_TOOL_V2_DELETE_FILE": {
+        const path = args.path
+        if (typeof path !== "string") {
+          throw new Error(
+            "Frozen delete_file dispatch requires an exact string path argument"
+          )
+        }
+        return {
+          case: "deleteArgs" as const,
+          value: create(DeleteArgsSchema, { path, toolCallId }),
+        }
+      }
+      default:
+        throw new Error(
+          `Frozen cursor client definition ${owner.cursorDefinitionKey} has no exact sub-agent exec encoder`
+        )
+    }
+  }
+
+  /**
    * 创建 Edit tool 的 ReadArgs ExecServerMessage
    * 串行协议第一步：发送 readArgs 让 Cursor 读取文件当前内容
    */
@@ -3600,6 +4796,7 @@ export class CursorGrpcService {
           id: execIdNumber,
           execId,
           spanContext: this.buildSpanContext(),
+          acceptHookAdditionalContexts: true,
           message: {
             case: "readArgs" as const,
             value: create(ReadArgsSchema, {
@@ -3634,6 +4831,7 @@ export class CursorGrpcService {
           id: execIdNumber,
           execId,
           spanContext: this.buildSpanContext(),
+          acceptHookAdditionalContexts: true,
           message: {
             case: "writeArgs" as const,
             value: create(WriteArgsSchema, {
@@ -3653,407 +4851,37 @@ export class CursorGrpcService {
   }
 
   /**
-   * 创建 Edit tool 两步消息（先 read 再 write）
-   * @deprecated 使用 createReadExecMessage + createWriteExecMessage 串行发送
+   * Some runtime-native tools have no Cursor protocol representation. They
+   * must stay out of Cursor interaction updates entirely rather than being
+   * mislabeled as a generic/truncated Cursor tool call.
    */
-  createEditToolExecMessages(
-    toolCallId: string,
-    path: string,
-    newContent: string
-  ): Buffer[] {
-    return [
-      this.createReadExecMessage(toolCallId, path),
-      this.createWriteExecMessage(toolCallId, path, newContent),
-    ]
-  }
-
-  private normalizeToolName(toolName: string): string {
-    return toolName.toLowerCase().replace(/[^a-z0-9]+/g, "")
+  private assertCursorToolProjectionAllowed(toolName: string): void {
+    const decision = getCursorProtocolProjectionDecision(toolName)
+    if (decision.reason === "not_in_cursor_protocol") {
+      throw new Error(
+        `Tool "${toolName}" is runtime-native and has no Cursor ToolCall projection`
+      )
+    }
   }
 
   private detectToolFamily(toolName: string): ToolFamily {
+    // Codex apply_patch has no Cursor ToolCall or ExecServerMessage payload.
+    // Do not turn a freeform multi-file patch into ApplyAgentDiff or PiEdit.
+    if (
+      toolName.trim() === "apply_patch" &&
+      !getCursorProtocolProjectionDecision(toolName).allowed
+    ) {
+      return "unknown"
+    }
+
     const definitionKey = resolveCursorToolDefinitionKey(toolName)
     if (definitionKey) {
-      switch (definitionKey) {
-        case "CLIENT_SIDE_TOOL_V2_READ_FILE":
-        case "CLIENT_SIDE_TOOL_V2_READ_FILE_V2":
-        case "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES":
-        case "CLIENT_SIDE_TOOL_V2_FETCH_RULES":
-          return "read"
-        case "CLIENT_SIDE_TOOL_V2_EDIT_FILE":
-        case "CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2":
-          return "edit"
-        case "CLIENT_SIDE_TOOL_V2_LIST_DIR":
-        case "CLIENT_SIDE_TOOL_V2_LIST_DIR_V2":
-        case "CLIENT_SIDE_TOOL_V2_READ_PROJECT":
-          return "ls"
-        case "CLIENT_SIDE_TOOL_V2_DELETE_FILE":
-          return "delete"
-        case "CLIENT_SIDE_TOOL_V2_RIPGREP_SEARCH":
-        case "CLIENT_SIDE_TOOL_V2_RIPGREP_RAW_SEARCH":
-          return "grep"
-        case "CLIENT_SIDE_TOOL_V2_FILE_SEARCH":
-        case "CLIENT_SIDE_TOOL_V2_GLOB_FILE_SEARCH":
-          return "glob"
-        case "CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2":
-          return "shell"
-        case "CLIENT_SIDE_TOOL_V2_BACKGROUND_SHELL_SPAWN":
-          return "background_shell_spawn"
-        case "CLIENT_SIDE_TOOL_V2_MCP":
-        case "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL":
-          return "mcp"
-        case "CLIENT_SIDE_TOOL_V2_LIST_MCP_RESOURCES":
-          return "list_mcp_resources"
-        case "CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE":
-          return "read_mcp_resource"
-        case "CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS":
-          return "get_mcp_tools"
-        case "CLIENT_SIDE_TOOL_V2_DIAGNOSTICS":
-        case "CLIENT_SIDE_TOOL_V2_READ_LINTS":
-          return "read_lints"
-        case "CLIENT_SIDE_TOOL_V2_FIX_LINTS":
-          return "fix_lints"
-        case "CLIENT_SIDE_TOOL_V2_WEB_SEARCH":
-        case "CLIENT_SIDE_TOOL_V2_KNOWLEDGE_BASE":
-          return "web_search"
-        case "CLIENT_SIDE_TOOL_V2_WEB_FETCH":
-        case "CLIENT_SIDE_TOOL_V2_FETCH_PULL_REQUEST":
-          return "web_fetch"
-        case "CLIENT_SIDE_TOOL_V2_EXA_SEARCH":
-          return "exa_search"
-        case "CLIENT_SIDE_TOOL_V2_EXA_FETCH":
-          return "exa_fetch"
-        case "CLIENT_SIDE_TOOL_V2_ASK_QUESTION":
-        case "CLIENT_SIDE_TOOL_V2_ASK_FOLLOWUP_QUESTION":
-          return "ask_question"
-        case "CLIENT_SIDE_TOOL_V2_CREATE_PLAN":
-          return "create_plan"
-        case "CLIENT_SIDE_TOOL_V2_SWITCH_MODE":
-          return "switch_mode"
-        case "CLIENT_SIDE_TOOL_V2_SEMANTIC_SEARCH_FULL":
-        case "CLIENT_SIDE_TOOL_V2_DEEP_SEARCH":
-        case "CLIENT_SIDE_TOOL_V2_SEARCH_SYMBOLS":
-        case "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION":
-          return "sem_search"
-        case "CLIENT_SIDE_TOOL_V2_FETCH":
-          return "fetch"
-        case "CLIENT_SIDE_TOOL_V2_RECORD_SCREEN":
-          return "record_screen"
-        case "CLIENT_SIDE_TOOL_V2_COMPUTER_USE":
-          return "computer_use"
-        case "CLIENT_SIDE_TOOL_V2_WRITE_SHELL_STDIN":
-          return "write_shell_stdin"
-        case "CLIENT_SIDE_TOOL_V2_TASK":
-        case "CLIENT_SIDE_TOOL_V2_TASK_V2":
-          return "task"
-        case "CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP":
-        case "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT":
-          return "truncated"
-        case "CLIENT_SIDE_TOOL_V2_AWAIT_TASK":
-          return "await"
-        case "CLIENT_SIDE_TOOL_V2_TODO_READ":
-          return "read_todos"
-        case "CLIENT_SIDE_TOOL_V2_TODO_WRITE":
-          return "update_todos"
-        case "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF":
-        case "CLIENT_SIDE_TOOL_V2_REAPPLY":
-          return "apply_agent_diff"
-        case "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE":
-        case "CLIENT_SIDE_TOOL_V2_CREATE_DIAGRAM":
-          return "generate_image"
-        case "CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT":
-          return "setup_vm_environment"
-        case "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS":
-          return "report_bugfix_results"
-        case "CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION":
-          return "start_grind_execution"
-        case "CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING":
-          return "start_grind_planning"
-        case "CLIENT_SIDE_TOOL_V2_REFLECT":
-          return "reflect"
-        case "CLIENT_SIDE_TOOL_V2_SEND_TO_USER":
-          return "send_to_user"
-      }
-      // 注意：force_background_shell/subagent、canvas_*、mcp_state_exec、subagent_await
-      // 没有对应的 ClientSideToolV2 枚举——它们是纯 ExecServerMessage 工具，
-      // 由 Cursor IDE 端内部触发而非通过 ClientSideToolV2 映射。
-      // communicate_update 和 send_final_summary 也没有 ClientSideToolV2 枚举，
-      // 但有专用 ToolCall oneof case（48/49），需通过模糊匹配识别。
+      return (
+        getCursorProjectionFamilyForDefinitionKey(definitionKey) || "unknown"
+      )
     }
-
-    const normalized = this.normalizeToolName(toolName)
-
-    if (normalized.includes("readsemsearchfiles")) return "read"
-    if (normalized.includes("reapply")) return "apply_agent_diff"
-    if (normalized.includes("fetchrules")) return "read"
-    if (normalized.includes("searchsymbols")) return "sem_search"
-    if (normalized.includes("execcommand")) return "shell"
-    if (normalized.includes("backgroundcomposerfollowup")) return "truncated"
-    if (normalized.includes("knowledgebase")) return "web_search"
-    if (normalized.includes("fetchpullrequest")) return "web_fetch"
-    if (normalized.includes("creatediagram")) return "generate_image"
-    if (normalized.includes("gotodefinition")) return "sem_search"
-    if (normalized.includes("awaittask")) return "await"
-    if (normalized.includes("readproject")) return "ls"
-    if (normalized.includes("updateproject")) return "truncated"
-    if (normalized.includes("requestuserinput")) return "ask_question"
-    // Codex's native update_plan tool mutates the shared todo/plan state, so
-    // project it onto Cursor's updateTodos UI instead of the generic
-    // truncatedToolCall placeholder.
-    if (normalized.includes("updateplan")) return "update_todos"
-    if (normalized.includes("listmcpresourcetemplates"))
-      return "list_mcp_resources"
-    if (normalized.includes("viewimage")) return "read"
-    // Bridge-internal tools with no proto representation
-    if (normalized === "discovertool" || normalized === "discover_tool")
-      return "truncated"
-    if (normalized === "snipmessages" || normalized === "snip_messages")
-      return "truncated"
-    // Cursor's current protobuf does not expose exact Codex-native oneofs for
-    // sub-agent lifecycle or apply_patch. Project them onto the closest native
-    // Cursor families so the UI/tool stream stays structured instead of
-    // collapsing into truncatedToolCall placeholders.
-    if (normalized.includes("spawnagent")) return "task"
-    if (normalized.includes("sendinput")) return "task"
-    if (normalized.includes("resumeagent")) return "task"
-    if (normalized.includes("waitagent")) return "await"
-    if (normalized.includes("closeagent")) return "task"
-    // Bridge-defined sub-agent control surface — the IDE proto has no
-    // dedicated ToolCall oneof for `kill_agent`, so we project it onto
-    // the inline-only `truncated` family. Without this the family
-    // resolver lands on `unknown` and the gRPC layer logs
-    // `[ToolProjection] toolName="kill_agent" family="unknown"` while
-    // emitting a `truncatedToolCall` placeholder. Mapping straight to
-    // `truncated` keeps the result envelope identical (the IDE renders
-    // both as `[Tool: truncatedToolCall]`) and silences the
-    // misleading "unknown ToolCall result type" warning.
-    if (normalized.includes("killagent") || normalized.includes("kill_agent"))
-      return "truncated"
-    if (normalized.includes("applypatch")) return "apply_agent_diff"
-
-    if (
-      normalized.includes("readmcpresource") ||
-      normalized.includes("readmcp")
-    ) {
-      return "read_mcp_resource"
-    }
-    if (
-      normalized.includes("listmcpresources") ||
-      normalized.includes("listmcp")
-    ) {
-      return "list_mcp_resources"
-    }
-    if (normalized.includes("getmcptools")) {
-      return "get_mcp_tools"
-    }
-    if (
-      normalized.includes("readlints") ||
-      normalized.includes("diagnostics")
-    ) {
-      return "read_lints"
-    }
-    if (normalized.includes("fixlints")) return "fix_lints"
-    if (normalized.includes("readtodos")) return "read_todos"
-    if (normalized.includes("updatetodos")) return "update_todos"
-    if (normalized.includes("applyagentdiff")) return "apply_agent_diff"
-    if (normalized.includes("writeshellstdin")) return "write_shell_stdin"
-    if (normalized.includes("backgroundshellspawn"))
-      return "background_shell_spawn"
-    if (
-      normalized.includes("setupvmenvironment") ||
-      normalized.includes("setupvm")
-    ) {
-      return "setup_vm_environment"
-    }
-    if (normalized.includes("startgrindexecution"))
-      return "start_grind_execution"
-    if (normalized.includes("startgrindplanning")) return "start_grind_planning"
-    if (
-      normalized.includes("reportbugfixresults") ||
-      normalized.includes("reportbugfix")
-    ) {
-      return "report_bugfix_results"
-    }
-    if (normalized.includes("generateimage")) return "generate_image"
-    if (normalized.includes("recordscreen")) return "record_screen"
-    if (normalized.includes("computeruse")) return "computer_use"
-    if (normalized.includes("websearch")) return "web_search"
-    if (normalized === "searchweb") return "web_search"
-    if (normalized.includes("webfetch")) return "web_fetch"
-    if (normalized === "readurlcontent" || normalized === "viewcontentchunk") {
-      return "web_fetch"
-    }
-    if (normalized.includes("deepsearch")) return "sem_search"
-    if (normalized.includes("exasearch")) return "exa_search"
-    if (normalized.includes("exafetch")) return "exa_fetch"
-    // New v2.6.13 tools
-    if (normalized.includes("await")) return "await"
-    if (
-      normalized.includes("aiattribution") ||
-      normalized.includes("ai_attribution")
-    )
-      return "ai_attribution"
-    if (normalized.includes("mcpauth") || normalized.includes("mcp_auth"))
-      return "mcp_auth"
-    if (
-      normalized.includes("prmanagement") ||
-      normalized.includes("pr_management") ||
-      normalized.includes("createpr") ||
-      normalized.includes("create_pr")
-    )
-      return "pr_management"
-    if (
-      normalized.includes("blamebyfilepath") ||
-      normalized.includes("blame_by_file_path")
-    )
-      return "blame_by_file_path"
-    if (normalized.includes("reportbug") || normalized.includes("report_bug")) {
-      // Distinguish report_bug from report_bugfix_results
-      if (
-        normalized.includes("bugfix") ||
-        normalized.includes("bugfixresults")
-      ) {
-        return "report_bugfix_results"
-      }
-      return "report_bug"
-    }
-    if (
-      normalized.includes("setactivebranch") ||
-      normalized.includes("set_active_branch")
-    )
-      return "set_active_branch"
-    // 新增 proto 更新后的 Exec 工具模糊匹配
-    if (
-      normalized.includes("forcebackgroundshell") ||
-      normalized.includes("force_background_shell")
-    )
-      return "force_background_shell"
-    if (
-      normalized.includes("forcebackgroundsubagent") ||
-      normalized.includes("force_background_subagent")
-    )
-      return "force_background_subagent"
-    if (
-      normalized.includes("canvasgeturl") ||
-      normalized.includes("canvas_get_url")
-    )
-      return "canvas_get_url"
-    if (
-      normalized.includes("canvasdestroy") ||
-      normalized.includes("canvas_destroy")
-    )
-      return "canvas_destroy"
-    if (
-      normalized.includes("canvasregister") ||
-      normalized.includes("canvas_register")
-    )
-      return "canvas_register"
-    if (
-      normalized.includes("mcpstateexec") ||
-      normalized.includes("mcp_state_exec") ||
-      normalized.includes("mcpstate")
-    )
-      return "mcp_state_exec"
-    if (
-      normalized.includes("subagentawait") ||
-      normalized.includes("subagent_await")
-    )
-      return "subagent_await"
-    if (
-      normalized.includes("communicateupdate") ||
-      normalized.includes("communicate_update")
-    )
-      return "communicate_update"
-    if (
-      normalized.includes("sendfinalsummary") ||
-      normalized.includes("send_final_summary")
-    )
-      return "send_final_summary"
-    if (
-      normalized.includes("sendtouser") ||
-      normalized.includes("send_to_user")
-    )
-      return "send_to_user"
-    // ExecServerMessage 补齐模糊匹配
-    if (
-      normalized.includes("requestcontext") ||
-      normalized.includes("request_context")
-    )
-      return "request_context"
-    if (
-      normalized.includes("redactedread") ||
-      normalized.includes("redacted_read")
-    )
-      return "redacted_read"
-    if (normalized.includes("askquestion")) return "ask_question"
-    if (normalized.includes("switchmode")) return "switch_mode"
-    if (normalized.includes("createplan")) return "create_plan"
-    if (
-      normalized.includes("semsearch") ||
-      normalized.includes("semanticsearch")
-    ) {
-      return "sem_search"
-    }
-    if (normalized.includes("truncated")) return "truncated"
-    if (normalized.includes("reflect")) return "reflect"
-    if (normalized.includes("executehook") || normalized === "hook") {
-      return "execute_hook"
-    }
-    if (normalized.includes("task")) return "task"
-    if (
-      normalized.includes("grep") ||
-      normalized.includes("ripgrep") ||
-      normalized.includes("ripgraw")
-    ) {
-      return "grep"
-    }
-    if (normalized.includes("glob") || normalized.includes("filesearch")) {
-      return "glob"
-    }
-    if (
-      normalized === "read" ||
-      normalized === "readfilev2" ||
-      normalized.includes("readfile")
-    ) {
-      return "read"
-    }
-    if (
-      normalized === "edit" ||
-      normalized.includes("editfile") ||
-      normalized.includes("writefile")
-    ) {
-      return "edit"
-    }
-    if (
-      normalized === "ls" ||
-      normalized === "lsv2" ||
-      normalized.includes("listdir") ||
-      normalized.includes("listdirectory")
-    ) {
-      return "ls"
-    }
-    if (normalized === "delete" || normalized.includes("deletefile")) {
-      return "delete"
-    }
-    if (
-      normalized.includes("shell") ||
-      normalized.includes("terminal") ||
-      normalized.includes("command")
-    ) {
-      return "shell"
-    }
-    if (normalized.includes("fetch")) return "fetch"
-    if (
-      normalized === "mcp" ||
-      normalized === "mcptool" ||
-      normalized === "clientsidetoolv2mcp" ||
-      normalized === "clientsidetoolv2callmcptool"
-    ) {
-      return "mcp"
-    }
-    return "unknown"
+    return getCursorProjectionFamilyForRuntimeName(toolName) || "unknown"
   }
-
   isExecDispatchableTool(toolName: string): boolean {
     return this.execDispatchableFamilies.has(this.detectToolFamily(toolName))
   }
@@ -4065,6 +4893,8 @@ export class CursorGrpcService {
     }
     if (family === "setup_vm_environment")
       return "setup_vm_environment_tool_call"
+    if (family === "replace_env") return "replace_env_tool_call"
+    if (family === "connect_scm") return "connect_scm_tool_call"
     if (family === "get_mcp_tools") return "get_mcp_tools_tool_call"
     if (family === "read_todos") return "read_todos_tool_call"
     if (family === "apply_agent_diff") return "apply_agent_diff_tool_call"
@@ -4092,6 +4922,10 @@ export class CursorGrpcService {
     if (family === "mcp_auth") return "mcp_auth_tool_call"
     if (family === "pr_management") return "pr_management_tool_call"
     if (family === "send_to_user") return "send_to_user_tool_call"
+    if (family === "search_conversations")
+      return "search_conversations_tool_call"
+    if (family === "create_goal") return "create_goal_tool_call"
+    if (family === "update_goal") return "update_goal_tool_call"
     return undefined
   }
 
@@ -4107,14 +4941,14 @@ export class CursorGrpcService {
   }
 
   private extractCreatePlanUri(value: unknown): string {
-    const text = safeString(value).trim()
-    if (!text) return ""
+    const text = safeString(value)
+    if (!text.trim()) return ""
 
     const uriMatch =
       text.match(/(?:^|\n)\s*plan_uri\s*:\s*(.+)\s*$/im) ||
       text.match(/(?:^|\n)\s*planUri\s*:\s*(.+)\s*$/im)
 
-    return uriMatch?.[1]?.trim() || ""
+    return preserveProtocolLocation(uriMatch?.[1]) ?? ""
   }
 
   /**
@@ -4197,6 +5031,7 @@ export class CursorGrpcService {
   ): ToolResultProjectionStatus {
     const explicit = extraData?.toolResultState?.status
     if (explicit) return explicit
+    if (extraData?.taskError !== undefined) return "error"
 
     const normalized = result.trim().toLowerCase()
     if (normalized.startsWith("tool execution aborted by client"))
@@ -4219,6 +5054,7 @@ export class CursorGrpcService {
       normalized.includes("[delete error]") ||
       normalized.includes("[ls error]") ||
       normalized.includes("[grep error]") ||
+      normalized.startsWith("[task error]") ||
       normalized.includes("error:")
     ) {
       return "error"
@@ -4355,23 +5191,25 @@ export class CursorGrpcService {
     return references
   }
 
-  private buildWebSearchFallbackReferences(
-    searchTerm: string,
-    result: string
+  private normalizeStructuredWebSearchReferences(
+    args: Record<string, unknown>
   ): WebSearchReference[] {
-    const normalizedTerm = searchTerm.trim()
-    if (!normalizedTerm) return []
-
-    const snippet = result.replace(/\s+/g, " ").trim().slice(0, 320)
-    const fallbackUrl = `https://www.google.com/search?q=${encodeURIComponent(normalizedTerm)}`
-
-    return [
-      this.createWebSearchReference({
-        title: normalizedTerm,
-        url: fallbackUrl,
-        chunk: snippet || `Search query: ${normalizedTerm}`,
-      }),
-    ]
+    const seenUrls = new Set<string>()
+    const references: WebSearchReference[] = []
+    for (const entry of this.toRecordArray(args.references)) {
+      const url = safeString(entry.url).trim()
+      if (!url || seenUrls.has(url)) continue
+      seenUrls.add(url)
+      references.push(
+        this.createWebSearchReference({
+          title: safeString(entry.title).trim() || url,
+          url,
+          chunk: safeString(entry.chunk || entry.text),
+        })
+      )
+      if (references.length >= 20) break
+    }
+    return references
   }
 
   private toRecordArray(value: unknown): Array<Record<string, unknown>> {
@@ -4403,7 +5241,7 @@ export class CursorGrpcService {
     }> = []
 
     for (const entry of this.toRecordArray(value)) {
-      const uri = safeString(entry.uri).trim()
+      const uri = preserveProtocolLocation(entry.uri)
       if (!uri) continue
 
       const server =
@@ -4464,9 +5302,7 @@ export class CursorGrpcService {
       : Array.isArray(args.matches)
         ? args.matches
         : []
-    const files = filesCandidate
-      .map((entry) => safeString(entry).trim())
-      .filter((entry) => entry.length > 0)
+    const files = preserveProtocolLocationArray(filesCandidate)
     const totalRaw = Number(
       args.totalFiles ??
         args.total_files ??
@@ -4497,41 +5333,169 @@ export class CursorGrpcService {
       pattern: safeString(
         args.pattern || args.query || args.globPattern || args.glob_pattern
       ),
-      targetDirectory: safeString(
-        args.path || args.targetDirectory || args.target_directory
+      targetDirectory:
+        preserveProtocolLocation(
+          args.path ?? args.targetDirectory ?? args.target_directory
+        ) ?? "",
+    }
+  }
+
+  private normalizeSandboxPolicyType(value: unknown): SandboxPolicy_Type {
+    const numeric = this.parseOptionalNonNegativeInt(value)
+    const min = Number(SandboxPolicy_Type.UNSPECIFIED)
+    const max = Number(SandboxPolicy_Type.WORKSPACE_READONLY)
+    if (numeric !== undefined && numeric >= min && numeric <= max) {
+      return numeric as SandboxPolicy_Type
+    }
+
+    switch (safeString(value).trim().toLowerCase()) {
+      case "insecure_none":
+      case "insecure-none":
+      case "none":
+        return SandboxPolicy_Type.INSECURE_NONE
+      case "workspace_readwrite":
+      case "workspace-readwrite":
+      case "workspace_read_write":
+        return SandboxPolicy_Type.WORKSPACE_READWRITE
+      case "workspace_readonly":
+      case "workspace-readonly":
+      case "workspace_read_only":
+        return SandboxPolicy_Type.WORKSPACE_READONLY
+      default:
+        return SandboxPolicy_Type.UNSPECIFIED
+    }
+  }
+
+  private normalizeNetworkPolicyDefaultAction(
+    value: unknown
+  ): NetworkPolicy_DefaultAction | undefined {
+    const numeric = this.parseOptionalNonNegativeInt(value)
+    const min = Number(NetworkPolicy_DefaultAction.UNSPECIFIED)
+    const max = Number(NetworkPolicy_DefaultAction.DENY)
+    if (numeric !== undefined && numeric >= min && numeric <= max) {
+      return numeric as NetworkPolicy_DefaultAction
+    }
+
+    switch (safeString(value).trim().toLowerCase()) {
+      case "allow":
+      case "default_action_allow":
+        return NetworkPolicy_DefaultAction.ALLOW
+      case "deny":
+      case "default_action_deny":
+        return NetworkPolicy_DefaultAction.DENY
+      case "unspecified":
+      case "default_action_unspecified":
+        return NetworkPolicy_DefaultAction.UNSPECIFIED
+      default:
+        return undefined
+    }
+  }
+
+  private normalizeSandboxReadBoundary(
+    value: unknown
+  ): SandboxPolicy_ReadBoundaryMode {
+    const numeric = this.parseOptionalNonNegativeInt(value)
+    const min = Number(SandboxPolicy_ReadBoundaryMode.UNSPECIFIED)
+    const max = Number(SandboxPolicy_ReadBoundaryMode.CUSTOM)
+    if (numeric !== undefined && numeric >= min && numeric <= max) {
+      return numeric as SandboxPolicy_ReadBoundaryMode
+    }
+
+    switch (safeString(value).trim().toLowerCase()) {
+      case "system":
+      case "read_boundary_mode_system":
+        return SandboxPolicy_ReadBoundaryMode.SYSTEM
+      case "workspace":
+      case "read_boundary_mode_workspace":
+        return SandboxPolicy_ReadBoundaryMode.WORKSPACE
+      case "custom":
+      case "read_boundary_mode_custom":
+        return SandboxPolicy_ReadBoundaryMode.CUSTOM
+      default:
+        return SandboxPolicy_ReadBoundaryMode.UNSPECIFIED
+    }
+  }
+
+  /** Preserve the complete official SandboxPolicy field surface. */
+  private normalizeSandboxPolicy(value: unknown) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return undefined
+    }
+
+    const policy = value as Record<string, unknown>
+    const optionalBoolean = (candidate: unknown): boolean | undefined =>
+      candidate === undefined ? undefined : this.parseBooleanFlag(candidate)
+    const rawNetworkPolicy =
+      policy.networkPolicy && typeof policy.networkPolicy === "object"
+        ? (policy.networkPolicy as Record<string, unknown>)
+        : policy.network_policy && typeof policy.network_policy === "object"
+          ? (policy.network_policy as Record<string, unknown>)
+          : undefined
+    const rawLogging =
+      rawNetworkPolicy?.logging && typeof rawNetworkPolicy.logging === "object"
+        ? (rawNetworkPolicy.logging as Record<string, unknown>)
+        : undefined
+
+    return create(SandboxPolicySchema, {
+      type: this.normalizeSandboxPolicyType(policy.type),
+      networkAccess: optionalBoolean(
+        policy.networkAccess ?? policy.network_access
       ),
-    }
-  }
-
-  private escapeGrepLiteralPattern(value: string): string {
-    return value.replace(/[|\\{}()[\]^$+*?.]/g, "\\$&")
-  }
-
-  private collapseGrepGlobPatterns(patterns: string[]): string | undefined {
-    const normalized = patterns
-      .map((entry) => safeString(entry).trim())
-      .filter((entry) => entry.length > 0)
-    if (normalized.length === 0) return undefined
-    if (normalized.length === 1) return normalized[0]
-
-    const positive = normalized.filter((entry) => !entry.startsWith("!"))
-    const negative = normalized
-      .filter((entry) => entry.startsWith("!"))
-      .map((entry) => entry.slice(1))
-      .filter((entry) => entry.length > 0)
-
-    if (positive.length > 1) {
-      // agent.v1 GrepArgs currently supports a single glob field, so collapse
-      // multi-include official payloads into a best-effort brace glob.
-      return `{${positive.join(",")}}`
-    }
-    if (positive.length === 1) {
-      return positive[0]
-    }
-    if (negative.length === 1) {
-      return `!${negative[0]}`
-    }
-    return `!{${negative.join(",")}}`
+      additionalReadwritePaths: preserveProtocolLocationArray(
+        policy.additionalReadwritePaths ?? policy.additional_readwrite_paths
+      ),
+      additionalReadonlyPaths: preserveProtocolLocationArray(
+        policy.additionalReadonlyPaths ?? policy.additional_readonly_paths
+      ),
+      debugOutputDir: preserveProtocolLocation(
+        policy.debugOutputDir ?? policy.debug_output_dir
+      ),
+      disableTmpWrite: optionalBoolean(
+        policy.disableTmpWrite ?? policy.disable_tmp_write
+      ),
+      allowlistEscalated: optionalBoolean(
+        policy.allowlistEscalated ?? policy.allowlist_escalated
+      ),
+      enableSharedBuildCache: optionalBoolean(
+        policy.enableSharedBuildCache ?? policy.enable_shared_build_cache
+      ),
+      networkPolicy: rawNetworkPolicy
+        ? create(NetworkPolicySchema, {
+            version: this.parseOptionalNonNegativeInt(rawNetworkPolicy.version),
+            defaultAction: this.normalizeNetworkPolicyDefaultAction(
+              rawNetworkPolicy.defaultAction ?? rawNetworkPolicy.default_action
+            ),
+            deny: this.toStringArray(rawNetworkPolicy.deny),
+            allow: this.toStringArray(rawNetworkPolicy.allow),
+            logging: rawLogging
+              ? create(NetworkPolicyLoggingConfigSchema, {
+                  decisionLogPath: preserveProtocolLocation(
+                    rawLogging.decisionLogPath ?? rawLogging.decision_log_path
+                  ),
+                  logFormat:
+                    safeString(
+                      rawLogging.logFormat ?? rawLogging.log_format
+                    ).trim() || undefined,
+                })
+              : undefined,
+          })
+        : undefined,
+      networkPolicyStrict: optionalBoolean(
+        policy.networkPolicyStrict ?? policy.network_policy_strict
+      ),
+      captureDenies: optionalBoolean(
+        policy.captureDenies ?? policy.capture_denies
+      ),
+      skipStatsigDefaults: optionalBoolean(
+        policy.skipStatsigDefaults ?? policy.skip_statsig_defaults
+      ),
+      readBoundary: this.normalizeSandboxReadBoundary(
+        policy.readBoundary ?? policy.read_boundary
+      ),
+      additionalReadPaths: preserveProtocolLocationArray(
+        policy.additionalReadPaths ?? policy.additional_read_paths
+      ),
+    })
   }
 
   private normalizeGrepCallArgs(args: Record<string, unknown>): {
@@ -4539,108 +5503,114 @@ export class CursorGrpcService {
     path: string
     glob?: string
     outputMode?: string
+    contextBefore?: number
+    contextAfter?: number
+    context?: number
     caseInsensitive?: boolean
     type?: string
     headLimit?: number
+    multiline?: boolean
+    sort?: string
+    sortAscending?: boolean
     offset?: number
+    sandboxPolicy?: SandboxPolicy
   } {
-    const hasOfficialShape =
-      "SearchPath" in args ||
-      "Query" in args ||
-      "Includes" in args ||
-      "MatchPerLine" in args ||
-      "CaseInsensitive" in args ||
-      "IsRegex" in args
-
-    const explicitPattern = safeString(args.pattern).trim()
-    const query = safeString(
-      explicitPattern ||
-        args.query ||
-        args.Query ||
-        args.regex ||
-        args.searchTerm ||
-        args.search_term
-    ).trim()
-    const isRegexRaw = args.isRegex ?? args.is_regex ?? args.IsRegex
-    const isRegex =
-      isRegexRaw === undefined ? undefined : this.parseBooleanFlag(isRegexRaw)
-    const pattern =
-      !explicitPattern &&
-      query &&
-      (isRegex === false || (hasOfficialShape && isRegex !== true))
-        ? this.escapeGrepLiteralPattern(query)
-        : query
-    const path = safeString(
-      args.path || args.SearchPath || args.searchPath || args.search_path
-    ).trim()
-    const directGlob = safeString(args.glob).trim()
-    const includes = this.toStringArray(
-      args.includes ?? args.Includes ?? args.include
-    )
-    const glob = directGlob || this.collapseGrepGlobPatterns(includes)
-    const explicitOutputMode = safeString(
-      args.output_mode || args.outputMode
-    ).trim()
-    const matchPerLineRaw =
-      args.matchPerLine ?? args.match_per_line ?? args.MatchPerLine
-    const matchPerLine =
-      matchPerLineRaw === undefined
-        ? undefined
-        : this.parseBooleanFlag(matchPerLineRaw)
-    const outputMode =
-      explicitOutputMode ||
-      (matchPerLine === false
-        ? "files_with_matches"
-        : matchPerLine === true || hasOfficialShape
-          ? "content"
-          : "")
-    const caseInsensitiveRaw =
-      args.caseInsensitive ??
-      args.case_insensitive ??
-      args.CaseInsensitive ??
-      args["-i"]
-    const caseSensitiveRaw =
-      args.case_sensitive ?? args.caseSensitive ?? args.CaseSensitive
-    const caseInsensitive =
-      caseInsensitiveRaw === undefined
-        ? caseSensitiveRaw === undefined
-          ? undefined
-          : !this.parseBooleanFlag(caseSensitiveRaw, true)
-        : this.parseBooleanFlag(caseInsensitiveRaw)
-    const type = safeString(args.type).trim()
-    // head_limit=0 is the explicit "remove the bridge default" escape hatch:
-    // omit the field so no client-side cap is sent (the protocol treats an
-    // absent head_limit as "no client limit"; any residual ripgrep cap is
-    // surfaced to the model via ripgrep_truncated). An unspecified head_limit
-    // falls back to the official default of 50 for official-shape requests.
-    const rawHeadLimit = this.parseOptionalNonNegativeInt(
-      args.head_limit ?? args.headLimit ?? args.HeadLimit
-    )
-    const headLimit =
-      rawHeadLimit === 0
-        ? undefined
-        : (rawHeadLimit ?? (hasOfficialShape ? 50 : undefined))
-    const offset = this.parseOptionalNonNegativeInt(args.offset ?? args.Offset)
+    const optionalText = (value: unknown): string | undefined => {
+      const normalized = safeString(value).trim()
+      return normalized || undefined
+    }
+    const optionalBoolean = (value: unknown): boolean | undefined =>
+      value === undefined ? undefined : this.parseBooleanFlag(value)
 
     return {
-      pattern,
-      path,
-      ...(glob ? { glob } : {}),
-      ...(outputMode ? { outputMode } : {}),
-      ...(caseInsensitive !== undefined ? { caseInsensitive } : {}),
-      ...(type ? { type } : {}),
-      ...(headLimit !== undefined ? { headLimit } : {}),
-      ...(offset !== undefined ? { offset } : {}),
+      pattern: safeString(args.pattern),
+      path: preserveProtocolLocation(args.path) ?? "",
+      glob: optionalText(args.glob),
+      outputMode: optionalText(args.output_mode ?? args.outputMode),
+      contextBefore: this.parseOptionalNonNegativeInt(
+        args.context_before ?? args.contextBefore
+      ),
+      contextAfter: this.parseOptionalNonNegativeInt(
+        args.context_after ?? args.contextAfter
+      ),
+      context: this.parseOptionalNonNegativeInt(args.context),
+      caseInsensitive: optionalBoolean(
+        args.case_insensitive ?? args.caseInsensitive
+      ),
+      type: optionalText(args.type),
+      headLimit: this.parseOptionalNonNegativeInt(
+        args.head_limit ?? args.headLimit
+      ),
+      multiline: optionalBoolean(args.multiline),
+      sort: optionalText(args.sort),
+      sortAscending: optionalBoolean(args.sort_ascending ?? args.sortAscending),
+      offset: this.parseOptionalNonNegativeInt(args.offset),
+      sandboxPolicy: this.normalizeSandboxPolicy(
+        args.sandbox_policy ?? args.sandboxPolicy
+      ),
+    }
+  }
+
+  private createGrepArgsMessage(
+    args: Record<string, unknown>,
+    toolCallId?: string
+  ) {
+    const normalized = this.normalizeGrepCallArgs(args)
+    return create(GrepArgsSchema, {
+      pattern: normalized.pattern,
+      path: normalized.path || undefined,
+      glob: normalized.glob,
+      outputMode: normalized.outputMode,
+      contextBefore: normalized.contextBefore,
+      contextAfter: normalized.contextAfter,
+      context: normalized.context,
+      caseInsensitive: normalized.caseInsensitive,
+      type: normalized.type,
+      headLimit: normalized.headLimit,
+      multiline: normalized.multiline,
+      sort: normalized.sort,
+      sortAscending: normalized.sortAscending,
+      toolCallId,
+      sandboxPolicy: normalized.sandboxPolicy,
+      offset: normalized.offset,
+    })
+  }
+
+  private normalizePiGrepCallArgs(args: Record<string, unknown>): {
+    pattern: string
+    path?: string
+    glob?: string
+    ignoreCase?: boolean
+    literal?: boolean
+    context?: number
+    limit?: number
+  } {
+    const optionalText = (value: unknown): string | undefined => {
+      const normalized = safeString(value).trim()
+      return normalized || undefined
+    }
+    const optionalBoolean = (value: unknown): boolean | undefined =>
+      value === undefined ? undefined : this.parseBooleanFlag(value)
+    return {
+      pattern: safeString(args.pattern),
+      path: preserveProtocolLocation(args.path),
+      glob: optionalText(args.glob),
+      ignoreCase: optionalBoolean(args.ignore_case ?? args.ignoreCase),
+      literal: optionalBoolean(args.literal),
+      context: this.parseOptionalNonNegativeInt(args.context),
+      limit: this.parseOptionalNonNegativeInt(args.limit),
     }
   }
 
   private resolveLsPath(args: Record<string, unknown>): string {
-    return safeString(
-      args.path ||
-        args.root_path ||
-        args.rootPath ||
-        args.project_path ||
-        args.projectPath
+    return (
+      preserveProtocolLocation(
+        args.path ??
+          args.root_path ??
+          args.rootPath ??
+          args.project_path ??
+          args.projectPath
+      ) ?? ""
     )
   }
 
@@ -4720,7 +5690,7 @@ export class CursorGrpcService {
     return create(GrepCountResultSchema, {
       counts: this.toRecordArray(record.counts).map((entry) =>
         create(GrepFileCountSchema, {
-          file: safeString(entry.file),
+          file: preserveProtocolLocation(entry.file) ?? "",
           count: this.parseOptionalNonNegativeInt(entry.count) ?? 0,
         })
       ),
@@ -4752,9 +5722,7 @@ export class CursorGrpcService {
       value && typeof value === "object"
         ? (value as Record<string, unknown>)
         : {}
-    const files = Array.isArray(record.files)
-      ? record.files.map((entry) => safeString(entry)).filter(Boolean)
-      : []
+    const files = preserveProtocolLocationArray(record.files)
     return create(GrepFilesResultSchema, {
       files,
       totalFiles:
@@ -4783,7 +5751,7 @@ export class CursorGrpcService {
         : {}
     const matches = this.toRecordArray(record.matches).map((fileMatch) =>
       create(GrepFileMatchSchema, {
-        file: safeString(fileMatch.file),
+        file: preserveProtocolLocation(fileMatch.file) ?? "",
         matches: this.toRecordArray(fileMatch.matches).map((match) =>
           create(GrepContentMatchSchema, {
             lineNumber:
@@ -4979,146 +5947,6 @@ export class CursorGrpcService {
     return defaultValue
   }
 
-  private normalizeAskQuestionOptionId(
-    value: unknown,
-    fallback: string
-  ): string {
-    const normalized = safeString(value)
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "_")
-      .replace(/^_+|_+$/g, "")
-    return normalized || fallback
-  }
-
-  private normalizeAskQuestionOptions(
-    value: unknown,
-    questionIndex: number
-  ): Array<{ id: string; label: string }> {
-    if (!Array.isArray(value)) return []
-
-    const normalized: Array<{ id: string; label: string }> = []
-    const seenIds = new Set<string>()
-
-    for (const [optionIndex, entry] of value.entries()) {
-      let id = ""
-      let label = ""
-
-      if (typeof entry === "string") {
-        label = entry.trim()
-      } else if (entry && typeof entry === "object") {
-        const option = entry as Record<string, unknown>
-        id = safeString(option.id || option.optionId || option.option_id).trim()
-        label = safeString(
-          option.label ||
-            option.text ||
-            option.title ||
-            option.name ||
-            option.value
-        ).trim()
-      }
-
-      if (!id && !label) continue
-      if (!id) {
-        id = this.normalizeAskQuestionOptionId(
-          label,
-          `opt_${questionIndex}_${optionIndex + 1}`
-        )
-      }
-      if (!label) {
-        label = id
-      }
-      if (seenIds.has(id)) continue
-
-      seenIds.add(id)
-      normalized.push({ id, label })
-    }
-
-    return normalized
-  }
-
-  private normalizeAskQuestionArgs(
-    args: Record<string, unknown>,
-    callId: string
-  ): {
-    title: string
-    questions: Array<{
-      id: string
-      prompt: string
-      options: Array<{ id: string; label: string }>
-      allowMultiple: boolean
-    }>
-    runAsync: boolean
-    asyncOriginalToolCallId: string
-  } {
-    const explicitTitle = safeString(args.question || args.title).trim()
-    const runAsync = this.parseBooleanFlag(args.runAsync ?? args.run_async)
-    const explicitAsyncOriginalToolCallId = safeString(
-      args.asyncOriginalToolCallId || args.async_original_tool_call_id
-    ).trim()
-
-    const questions = this.toRecordArray(args.questions)
-      .map((question, index) => {
-        const prompt =
-          safeString(
-            question.prompt ||
-              question.question ||
-              question.title ||
-              question.label ||
-              explicitTitle
-          ).trim() || `Question ${index + 1}`
-        const id =
-          safeString(
-            question.id || question.questionId || question.question_id
-          ).trim() || `q${index + 1}`
-        const options = this.normalizeAskQuestionOptions(
-          Array.isArray(question.options)
-            ? question.options
-            : Array.isArray(question.choices)
-              ? question.choices
-              : [],
-          index + 1
-        )
-        const allowMultiple = this.parseBooleanFlag(
-          question.allowMultiple ?? question.allow_multiple
-        )
-        return {
-          id,
-          prompt,
-          options,
-          allowMultiple,
-        }
-      })
-      .filter((question) => question.prompt.trim().length > 0)
-
-    if (questions.length === 0) {
-      questions.push({
-        id: "q1",
-        prompt: explicitTitle || "Follow-up",
-        options: this.normalizeAskQuestionOptions(
-          Array.isArray(args.options)
-            ? args.options
-            : Array.isArray(args.choices)
-              ? args.choices
-              : [],
-          1
-        ),
-        allowMultiple: this.parseBooleanFlag(
-          args.allowMultiple ?? args.allow_multiple
-        ),
-      })
-    }
-
-    return {
-      title: explicitTitle || questions[0]?.prompt || "Follow-up",
-      questions,
-      runAsync,
-      asyncOriginalToolCallId: runAsync
-        ? explicitAsyncOriginalToolCallId || callId
-        : explicitAsyncOriginalToolCallId,
-    }
-  }
-
   private parseOptionalNonNegativeInt(value: unknown): number | undefined {
     if (value === null || value === undefined) return undefined
     if (typeof value === "string" && value.trim() === "") return undefined
@@ -5127,6 +5955,69 @@ export class CursorGrpcService {
     const normalized = Math.floor(numeric)
     if (normalized < 0) return undefined
     return normalized
+  }
+
+  private parseOptionalNonNegativeNumber(value: unknown): number | undefined {
+    if (value === null || value === undefined) return undefined
+    if (typeof value === "string" && value.trim() === "") return undefined
+    const numeric = Number(value)
+    return Number.isFinite(numeric) && numeric >= 0 ? numeric : undefined
+  }
+
+  private buildPiEditReplacements(args: Record<string, unknown>) {
+    const rawEdits = Array.isArray(args.edits)
+      ? args.edits
+      : [
+          {
+            oldText:
+              args.oldText ??
+              args.old_text ??
+              args.oldString ??
+              args.old_string,
+            newText:
+              args.newText ??
+              args.new_text ??
+              args.newString ??
+              args.new_string,
+          },
+        ]
+
+    return rawEdits
+      .filter(
+        (entry): entry is Record<string, unknown> =>
+          !!entry && typeof entry === "object" && !Array.isArray(entry)
+      )
+      .filter(
+        (entry) =>
+          safeString(
+            entry.oldText ??
+              entry.old_text ??
+              entry.oldString ??
+              entry.old_string
+          ).length > 0 ||
+          safeString(
+            entry.newText ??
+              entry.new_text ??
+              entry.newString ??
+              entry.new_string
+          ).length > 0
+      )
+      .map((entry) =>
+        create(PiEditReplacementSchema, {
+          oldText: safeString(
+            entry.oldText ??
+              entry.old_text ??
+              entry.oldString ??
+              entry.old_string
+          ),
+          newText: safeString(
+            entry.newText ??
+              entry.new_text ??
+              entry.newString ??
+              entry.new_string
+          ),
+        })
+      )
   }
 
   private normalizeOptionalBigInt(value: unknown): bigint | undefined {
@@ -5152,7 +6043,8 @@ export class CursorGrpcService {
   private normalizeOutputLocation(value: unknown) {
     if (!value || typeof value !== "object") return undefined
     const record = value as Record<string, unknown>
-    const filePath = safeString(record.filePath || record.file_path).trim()
+    const filePath =
+      preserveProtocolLocation(record.filePath ?? record.file_path) ?? ""
     const sizeBytes = this.normalizeOptionalBigInt(
       record.sizeBytes ?? record.size_bytes
     )
@@ -5243,9 +6135,8 @@ export class CursorGrpcService {
             typeof args.requested_sandbox_policy === "object"
           ? (args.requested_sandbox_policy as Record<string, unknown>)
           : undefined
-    const requestedSandboxType = this.parseOptionalNonNegativeInt(
-      shellResult?.requestedSandboxPolicy?.type ??
-        requestedSandboxPolicyArg?.type
+    const requestedSandboxPolicy = this.normalizeSandboxPolicy(
+      shellResult?.requestedSandboxPolicy ?? requestedSandboxPolicyArg
     )
     const timeoutBehavior = this.normalizeTimeoutBehavior(
       shellResult?.timeoutBehavior ??
@@ -5269,12 +6160,7 @@ export class CursorGrpcService {
       hasInputRedirect: parsed.hasInputRedirect,
       hasOutputRedirect: parsed.hasOutputRedirect,
       parsingResult: parsed.parsingResult,
-      requestedSandboxPolicy:
-        requestedSandboxType !== undefined
-          ? create(SandboxPolicySchema, {
-              type: requestedSandboxType as SandboxPolicy_Type,
-            })
-          : undefined,
+      requestedSandboxPolicy,
       fileOutputThresholdBytes,
       isBackground: this.parseBooleanFlag(
         shellResult?.isBackground ?? args.isBackground ?? args.is_background
@@ -5311,31 +6197,14 @@ export class CursorGrpcService {
   }
 
   private resolveShellWorkingDirectory(args: Record<string, unknown>): string {
-    return safeString(
-      args.cwd ||
-        args.workdir ||
-        args.working_directory ||
-        args.workingDirectory
+    return (
+      preserveProtocolLocation(
+        args.cwd ??
+          args.workdir ??
+          args.working_directory ??
+          args.workingDirectory
+      ) ?? ""
     )
-  }
-
-  private extractTaskAttachments(args: Record<string, unknown>): string[] {
-    const explicitAttachments = this.toStringArray(args.attachments)
-    if (explicitAttachments.length > 0) {
-      return explicitAttachments
-    }
-
-    const items = Array.isArray(args.items) ? args.items : []
-    const attachments: string[] = []
-    for (const rawItem of items) {
-      if (!rawItem || typeof rawItem !== "object") continue
-      const item = rawItem as Record<string, unknown>
-      const candidate = safeString(item.path || item.image_url).trim()
-      if (candidate) {
-        attachments.push(candidate)
-      }
-    }
-    return attachments
   }
 
   private normalizeReadLintsDiagnosticPosition(
@@ -5409,21 +6278,22 @@ export class CursorGrpcService {
   }
 
   private resolveReadPath(args: Record<string, unknown>): string {
-    const arrayCandidate = (
-      Array.isArray(args.file_paths)
-        ? args.file_paths
-        : Array.isArray(args.paths)
-          ? args.paths
-          : Array.isArray(args.files)
-            ? args.files
-            : []
+    const directPath = preserveProtocolLocation(
+      args.path ?? args.file_path ?? args.filePath
     )
-      .map((entry) => safeString(entry).trim())
-      .find((entry) => entry.length > 0)
+    if (directPath !== undefined) return directPath
 
-    return safeString(
-      args.path || args.file_path || args.filePath || arrayCandidate
-    ).trim()
+    return (
+      preserveProtocolLocationArray(
+        Array.isArray(args.file_paths)
+          ? args.file_paths
+          : Array.isArray(args.paths)
+            ? args.paths
+            : Array.isArray(args.files)
+              ? args.files
+              : []
+      )[0] ?? ""
+    )
   }
 
   private normalizeReadToolArgs(args: Record<string, unknown>): {
@@ -5509,8 +6379,246 @@ export class CursorGrpcService {
     return 1
   }
 
+  private buildConnectScmArgs(
+    args: Record<string, unknown>,
+    toolCallId: string
+  ) {
+    const github =
+      args.github && typeof args.github === "object"
+        ? (args.github as Record<string, unknown>)
+        : args
+    const repository =
+      github.repository && typeof github.repository === "object"
+        ? (github.repository as Record<string, unknown>)
+        : github
+    const owner = safeString(repository.owner).trim()
+    const repo = safeString(repository.repo).trim()
+    if (!owner || !repo) {
+      throw new Error(
+        "Invalid connect_scm args: GitHub repository owner and repo are required"
+      )
+    }
+    return create(ConnectScmArgsSchema, {
+      toolCallId,
+      target: {
+        case: "github" as const,
+        value: create(ConnectScmGithubSchema, {
+          repository: create(ConnectScmGithubRepositorySchema, { owner, repo }),
+          gheApplication:
+            safeString(
+              github.gheApplication ?? github.ghe_application
+            ).trim() || undefined,
+        }),
+      },
+    })
+  }
+
+  private parseReplaceEnvMode(value: unknown): ReplaceEnvMode {
+    if (value === ReplaceEnvMode.CUSTOM || value === "custom") {
+      return ReplaceEnvMode.CUSTOM
+    }
+    if (
+      value === ReplaceEnvMode.CLEAN_SLATE ||
+      value === "clean_slate" ||
+      value === "cleanSlate"
+    ) {
+      return ReplaceEnvMode.CLEAN_SLATE
+    }
+    if (value === ReplaceEnvMode.DEFAULT || value === "default") {
+      return ReplaceEnvMode.DEFAULT
+    }
+    throw new Error(
+      "Invalid replace_env args: mode must be custom, clean_slate, or default"
+    )
+  }
+
+  private buildReplaceEnvArgs(args: Record<string, unknown>) {
+    const config =
+      args.config && typeof args.config === "object"
+        ? (args.config as Record<string, unknown>)
+        : args
+    const checkoutRefOverrides = this.toRecordArray(
+      args.checkoutRefOverrides ?? args.checkout_ref_overrides
+    ).map((entry) =>
+      create(RepoCheckoutRefOverrideSchema, {
+        repoUrl: safeString(entry.repoUrl ?? entry.repo_url),
+        ref: safeString(entry.ref),
+      })
+    )
+    return create(ReplaceEnvArgsSchema, {
+      config: create(ReplaceEnvConfigSchema, {
+        installScript: safeString(
+          config.installScript ?? config.install_script
+        ),
+        dockerfileContents: safeString(
+          config.dockerfileContents ?? config.dockerfile_contents
+        ),
+      }),
+      mode: this.parseReplaceEnvMode(args.mode),
+      checkoutRefOverrides,
+    })
+  }
+
+  private buildPrManagementArgs(
+    args: Record<string, unknown>,
+    toolCallId: string
+  ) {
+    const actionInputs = [
+      args.create_pr ?? args.createPr,
+      args.update_pr ?? args.updatePr,
+      args.post_comment ?? args.postComment,
+      args.resolve_comment ?? args.resolveComment,
+      args.get_ci_status ?? args.getCiStatus,
+      args.set_pr_status ?? args.setPrStatus,
+    ].filter((value) => value !== undefined)
+    if (actionInputs.length !== 1) {
+      throw new Error(
+        "Invalid pr_management args: exactly one action is required"
+      )
+    }
+
+    let action: PrManagementArgs["action"]
+    if (args.create_pr || args.createPr) {
+      const value = (args.create_pr || args.createPr) as Record<string, unknown>
+      action = {
+        case: "createPr" as const,
+        value: create(CreatePrActionSchema, {
+          title: safeString(value.title),
+          body: safeString(value.body),
+          baseBranch:
+            safeString(value.base_branch ?? value.baseBranch) || undefined,
+          draft: typeof value.draft === "boolean" ? value.draft : undefined,
+          branchName: safeString(value.branch_name ?? value.branchName),
+          addLabels: this.toStringArray(value.add_labels ?? value.addLabels),
+          repoUrl: safeString(value.repo_url ?? value.repoUrl) || undefined,
+          skipBranchPrefixCheck:
+            typeof (
+              value.skip_branch_prefix_check ?? value.skipBranchPrefixCheck
+            ) === "boolean"
+              ? ((value.skip_branch_prefix_check ??
+                  value.skipBranchPrefixCheck) as boolean)
+              : undefined,
+        }),
+      }
+    } else if (args.update_pr || args.updatePr) {
+      const value = (args.update_pr || args.updatePr) as Record<string, unknown>
+      action = {
+        case: "updatePr" as const,
+        value: create(UpdatePrActionSchema, {
+          prUrl: safeString(value.pr_url ?? value.prUrl) || undefined,
+          title: safeString(value.title) || undefined,
+          body: safeString(value.body) || undefined,
+          baseBranch:
+            safeString(value.base_branch ?? value.baseBranch) || undefined,
+          branchName:
+            safeString(value.branch_name ?? value.branchName) || undefined,
+          addLabels: this.toStringArray(value.add_labels ?? value.addLabels),
+          removeLabels: this.toStringArray(
+            value.remove_labels ?? value.removeLabels
+          ),
+          repoUrl: safeString(value.repo_url ?? value.repoUrl) || undefined,
+        }),
+      }
+    } else if (args.post_comment || args.postComment) {
+      const value = (args.post_comment || args.postComment) as Record<
+        string,
+        unknown
+      >
+      const body = safeString(value.body)
+      if (!body.trim()) {
+        throw new Error("Invalid PR post_comment action: missing body")
+      }
+      action = {
+        case: "postComment" as const,
+        value: create(PostCommentActionSchema, {
+          prUrl: safeString(value.pr_url ?? value.prUrl) || undefined,
+          branchName:
+            safeString(value.branch_name ?? value.branchName) || undefined,
+          body,
+          repoUrl: safeString(value.repo_url ?? value.repoUrl) || undefined,
+          inReplyTo: this.normalizeOptionalBigInt(
+            value.in_reply_to ?? value.inReplyTo
+          ),
+          path: preserveProtocolLocation(value.path),
+          line: this.parseOptionalNonNegativeInt(value.line),
+          startLine: this.parseOptionalNonNegativeInt(
+            value.start_line ?? value.startLine
+          ),
+          side: safeString(value.side) || undefined,
+        }),
+      }
+    } else if (args.resolve_comment || args.resolveComment) {
+      const value = (args.resolve_comment || args.resolveComment) as Record<
+        string,
+        unknown
+      >
+      const commentId = this.normalizeOptionalBigInt(
+        value.comment_id ?? value.commentId
+      )
+      if (commentId === undefined) {
+        throw new Error("Invalid PR resolve_comment action: missing comment_id")
+      }
+      action = {
+        case: "resolveComment" as const,
+        value: create(ResolveCommentActionSchema, {
+          prUrl: safeString(value.pr_url ?? value.prUrl) || undefined,
+          branchName:
+            safeString(value.branch_name ?? value.branchName) || undefined,
+          commentId,
+          repoUrl: safeString(value.repo_url ?? value.repoUrl) || undefined,
+        }),
+      }
+    } else if (args.get_ci_status || args.getCiStatus) {
+      const value = (args.get_ci_status || args.getCiStatus) as Record<
+        string,
+        unknown
+      >
+      action = {
+        case: "getCiStatus" as const,
+        value: create(GetCiStatusActionSchema, {
+          prUrl: safeString(value.pr_url ?? value.prUrl) || undefined,
+          branchName:
+            safeString(value.branch_name ?? value.branchName) || undefined,
+          repoUrl: safeString(value.repo_url ?? value.repoUrl) || undefined,
+        }),
+      }
+    } else {
+      const value = (args.set_pr_status || args.setPrStatus) as Record<
+        string,
+        unknown
+      >
+      const rawStatus = value.status
+      const numericStatus = this.parseOptionalNonNegativeInt(rawStatus)
+      const normalizedStatus =
+        numericStatus === PullRequestStatus.OPEN ||
+        safeString(rawStatus).trim().toLowerCase() === "open"
+          ? PullRequestStatus.OPEN
+          : numericStatus === PullRequestStatus.CLOSED ||
+              safeString(rawStatus).trim().toLowerCase() === "closed"
+            ? PullRequestStatus.CLOSED
+            : undefined
+      if (normalizedStatus === undefined) {
+        throw new Error(
+          "Invalid PR set_pr_status action: status must be open or closed"
+        )
+      }
+      action = {
+        case: "setPrStatus" as const,
+        value: create(SetPrStatusActionSchema, {
+          prUrl: safeString(value.pr_url ?? value.prUrl) || undefined,
+          branchName:
+            safeString(value.branch_name ?? value.branchName) || undefined,
+          repoUrl: safeString(value.repo_url ?? value.repoUrl) || undefined,
+          status: normalizedStatus,
+        }),
+      }
+    }
+
+    return create(PrManagementArgsSchema, { toolCallId, action })
+  }
+
   private buildCreatePlanArgs(args: Record<string, unknown>) {
-    const title = safeString(args.title || args.name).trim()
+    const title = safeString(args.name || args.title).trim()
     const overview = safeString(args.overview || args.description).trim()
 
     // LLM tool definition sends `steps: string[]`, map them to both plan text and todos
@@ -5618,182 +6726,82 @@ export class CursorGrpcService {
    *
    * 协议要求 TaskArgs.subagent_type / SubagentArgs.subagent_type 必须是合法
    * 的 SubagentType message。模型/IDE 里通常用字符串描述子代理类型
-   * (e.g. "explore", "bash", "shell", "browser_use", 自定义名字)。
-   * 这里负责把字符串归一化到 proto oneof。
+   * (e.g. "explore", "bash", "browser", 自定义名字)。这里只投影具有
+   * 可执行运行时定义的精确内建身份；相似拼写和仅存在于 proto 的 oneof
+   * 字段都属于不同的 custom agent，不做别名兼容。
    *
    * 未识别的非空字符串走 `custom`，空 / 缺省走 `unspecified`，避免出现
    * `subagent_type: undefined` 让 IDE 端校验拒绝整条 ToolCall。
    */
   private buildSubagentTypeMessage(rawSubagentType: string) {
-    const normalized = rawSubagentType.trim().toLowerCase()
-    switch (normalized) {
-      case "":
-      case "unspecified":
-      // The bridge's built-in `general-purpose` agent maps to the proto's
-      // unspecified case. claude-code uses the same convention — passing
-      // an explicit "general-purpose" name produces the same IDE bubble
-      // the unset case would, so the IDE renders the default label.
-      // falls through
-      case "general":
-      case "general-purpose":
-      case "general_purpose":
-      case "generalpurpose":
-        return create(SubagentTypeSchema, {
-          type: {
-            case: "unspecified" as const,
-            value: create(SubagentTypeUnspecifiedSchema, {}),
-          },
-        })
-      case "computer_use":
-      case "computeruse":
-        return create(SubagentTypeSchema, {
-          type: {
-            case: "computerUse" as const,
-            value: create(SubagentTypeComputerUseSchema, {}),
-          },
-        })
-      case "explore":
-        return create(SubagentTypeSchema, {
-          type: {
-            case: "explore" as const,
-            value: create(SubagentTypeExploreSchema, {}),
-          },
-        })
-      case "media_review":
-      case "mediareview":
-        return create(SubagentTypeSchema, {
-          type: {
-            case: "mediaReview" as const,
-            value: create(SubagentTypeMediaReviewSchema, {}),
-          },
-        })
-      case "bash":
-        return create(SubagentTypeSchema, {
-          type: {
-            case: "bash" as const,
-            value: create(SubagentTypeBashSchema, {}),
-          },
-        })
-      case "browser_use":
-      case "browseruse":
-      // Cursor's official 3rd built-in sub-agent is named `browser` in
-      // user-facing docs but the proto oneof case is `browserUse`. Treat
-      // both names as the same proto type so a `subagent_type: "browser"`
-      // call from the model maps cleanly to SubagentType.browserUse.
-      // falls through
-      case "browser":
-        return create(SubagentTypeSchema, {
-          type: {
-            case: "browserUse" as const,
-            value: create(SubagentTypeBrowserUseSchema, {}),
-          },
-        })
-      case "shell":
-        return create(SubagentTypeSchema, {
-          type: {
-            case: "shell" as const,
-            value: create(SubagentTypeShellSchema, {}),
-          },
-        })
-      case "vm_setup_helper":
-      case "vmsetuphelper":
-        return create(SubagentTypeSchema, {
-          type: {
-            case: "vmSetupHelper" as const,
-            value: create(SubagentTypeVmSetupHelperSchema, {}),
-          },
-        })
-      case "debug":
-        return create(SubagentTypeSchema, {
-          type: {
-            case: "debug" as const,
-            value: create(SubagentTypeDebugSchema, {}),
-          },
-        })
-      case "cursor_guide":
-      case "cursorguide":
-        return create(SubagentTypeSchema, {
-          type: {
-            case: "cursorGuide" as const,
-            value: create(SubagentTypeCursorGuideSchema, {}),
-          },
-        })
-      default:
-        return create(SubagentTypeSchema, {
-          type: {
-            case: "custom" as const,
-            value: create(SubagentTypeCustomSchema, {
-              name: rawSubagentType.trim(),
-            }),
-          },
-        })
+    if (rawSubagentType === "") {
+      return projectBuiltInSubagentIdentityToProto(
+        BUILTIN_SUBAGENT_IDENTITIES.GENERAL_PURPOSE.agentType
+      )!
     }
-  }
-
-  /**
-   * 从 task / subagent / spawn_agent 工具调用 args 中提取 subagent_type 字段。
-   * 兼容 camelCase / snake_case / 别名 (subagent_type / subagentType /
-   * agent_type / type)。
-   */
-  private extractSubagentTypeName(args: Record<string, unknown>): string {
-    return safeString(
-      args.subagent_type ??
-        args.subagentType ??
-        args.agent_type ??
-        args.agentType ??
-        args.type
-    )
+    const builtIn = projectBuiltInSubagentIdentityToProto(rawSubagentType)
+    if (builtIn) return builtIn
+    return create(SubagentTypeSchema, {
+      type: {
+        case: "custom" as const,
+        value: create(SubagentTypeCustomSchema, { name: rawSubagentType }),
+      },
+    })
   }
 
   private buildTaskArgs(args: Record<string, unknown>) {
-    const items = Array.isArray(args.items) ? args.items : []
-    const itemPrompt = items
-      .map((rawItem) => {
-        if (!rawItem || typeof rawItem !== "object") return ""
-        const item = rawItem as Record<string, unknown>
-        return safeString(item.text || item.path || item.image_url).trim()
-      })
-      .filter((value) => value.length > 0)
-      .join("\n")
-      .trim()
-    const resume = safeString(args.resume || args.id).trim()
-    const agentId = safeString(
-      args.agentId || args.agent_id || args.target || args.id
-    ).trim()
-    const fallbackAgentTaskLabel =
-      agentId || resume ? `Agent task ${agentId || resume}` : ""
-    const prompt = safeString(
-      args.prompt ||
-        args.description ||
-        args.task ||
-        args.message ||
-        itemPrompt ||
-        fallbackAgentTaskLabel ||
-        args.key ||
-        args.value
-    )
-    const description = safeString(
-      args.description ||
-        args.prompt ||
-        args.task ||
-        args.message ||
-        itemPrompt ||
-        fallbackAgentTaskLabel ||
-        args.value ||
-        args.key
-    )
-    const model = safeString(args.model).trim()
-    const attachments = this.extractTaskAttachments(args)
-    const subagentTypeName = this.extractSubagentTypeName(args)
+    const parsed = parseCanonicalTaskToolInput(args)
+    if (parsed.kind === "invalid") {
+      throw new Error(`Cannot project invalid task args: ${parsed.message}`)
+    }
+    return this.projectCanonicalTaskArgs(parsed.value)
+  }
+
+  private projectCanonicalTaskArgs(input: CanonicalTaskToolInput) {
+    return create(TaskArgsSchema, {
+      description: input.description,
+      prompt: input.prompt,
+      model: input.model,
+      attachments: [],
+      mode: TaskMode.AGENT,
+      subagentType: this.buildSubagentTypeMessage(input.subagent_type ?? ""),
+    })
+  }
+
+  /**
+   * Rejected model input still belongs in Cursor's durable checkpoint even
+   * though it was never executable. Admission remains strict, while the error
+   * projection preserves only exact, correctly typed protocol fields. Missing
+   * required strings remain protobuf defaults rather than being synthesized
+   * from aliases or from each other.
+   */
+  private buildCompletedTaskArgs(
+    args: Record<string, unknown>,
+    status: ToolResultProjectionStatus
+  ) {
+    const parsed = parseCanonicalTaskToolInput(args)
+    if (parsed.kind === "valid") {
+      return this.projectCanonicalTaskArgs(parsed.value)
+    }
+    if (status === "success" || status === "approved") {
+      throw new Error(
+        `Cannot project successful task with invalid args: ${parsed.message}`
+      )
+    }
+
+    const description =
+      typeof args.description === "string" ? args.description : ""
+    const prompt = typeof args.prompt === "string" ? args.prompt : ""
+    const model = typeof args.model === "string" ? args.model : undefined
+    const subagentType =
+      typeof args.subagent_type === "string" ? args.subagent_type : ""
     return create(TaskArgsSchema, {
       description,
       prompt,
-      model: model || undefined,
-      resume: resume || undefined,
-      agentId: agentId || undefined,
-      attachments,
+      model,
+      attachments: [],
       mode: TaskMode.AGENT,
-      subagentType: this.buildSubagentTypeMessage(subagentTypeName),
+      subagentType: this.buildSubagentTypeMessage(subagentType),
     })
   }
 
@@ -5846,7 +6854,7 @@ export class CursorGrpcService {
       : childrenFiles.length
 
     return create(LsDirectoryTreeNodeSchema, {
-      absPath: safeString(node.absPath, fallbackAbsPath),
+      absPath: preserveProtocolLocation(node.absPath) ?? fallbackAbsPath,
       childrenDirs,
       childrenFiles,
       childrenWereProcessed: this.parseBooleanFlag(
@@ -5867,6 +6875,7 @@ export class CursorGrpcService {
     name: string
     toolName: string
     providerIdentifier: string
+    serverIdentifier: string
     rawArgs: Record<string, unknown>
   } {
     try {
@@ -5880,6 +6889,41 @@ export class CursorGrpcService {
   /**
    * 构建 ExecServerMessage
    */
+  createExecuteHookResponse(
+    request: ExecuteHookRequest["request"],
+    execIdNumber: number,
+    protocolExecId: string
+  ): Buffer {
+    if (!request.case) {
+      throw new Error("ExecuteHook request case must be set")
+    }
+    const exactProtocolExecId = requireExactDurableIdentifier(
+      protocolExecId,
+      "ExecuteHook protocol exec id"
+    )
+    const msg = create(AgentServerMessageSchema, {
+      message: {
+        case: "execServerMessage",
+        value: create(ExecServerMessageSchema, {
+          id: execIdNumber,
+          execId: exactProtocolExecId,
+          spanContext: this.buildSpanContext(),
+          acceptHookAdditionalContexts: true,
+          message: {
+            case: "executeHookArgs",
+            value: create(ExecuteHookArgsSchema, {
+              request: create(ExecuteHookRequestSchema, { request }),
+            }),
+          },
+        }),
+      },
+    })
+    return this.serializeAgentServerMessage(
+      msg,
+      `execServerMessage.executeHookArgs.${request.case}`
+    )
+  }
+
   private buildExecServerMessage(
     toolName: string,
     args: ToolArgs,
@@ -5897,6 +6941,7 @@ export class CursorGrpcService {
           id: execIdNumber,
           execId,
           spanContext: this.buildSpanContext(),
+          acceptHookAdditionalContexts: true,
           message: messageOneOf,
         }),
       },
@@ -5916,15 +6961,15 @@ export class CursorGrpcService {
     switch (family) {
       case "read_mcp_resource": {
         const a = args as ReadMcpResourceArgs
-        const downloadPath = safeString(
-          a.downloadPath || a.download_path
-        ).trim()
+        const downloadPath = preserveProtocolLocation(
+          a.downloadPath ?? a.download_path
+        )
         return {
           case: "readMcpResourceExecArgs",
           value: create(ReadMcpResourceExecArgsSchema, {
             server: safeString(a.serverName || a.server || a.server_name),
-            uri: safeString(a.uri),
-            downloadPath: downloadPath || undefined,
+            uri: preserveProtocolLocation(a.uri) ?? "",
+            downloadPath,
           }),
         }
       }
@@ -5956,7 +7001,7 @@ export class CursorGrpcService {
         return {
           case: "writeArgs" as const,
           value: create(WriteArgsSchema, {
-            path: safeString(a.path),
+            path: preserveProtocolLocation(a.path) ?? "",
             fileText: safeString(a.new_text || a.replace),
             toolCallId,
           }),
@@ -5967,7 +7012,7 @@ export class CursorGrpcService {
         return {
           case: "deleteArgs" as const,
           value: create(DeleteArgsSchema, {
-            path: safeString(a.path),
+            path: preserveProtocolLocation(a.path) ?? "",
             toolCallId,
           }),
         }
@@ -6025,28 +7070,20 @@ export class CursorGrpcService {
         }
       }
       case "grep": {
-        const a = this.normalizeGrepCallArgs(args as Record<string, unknown>)
         return {
           case: "grepArgs" as const,
-          value: create(GrepArgsSchema, {
-            pattern: a.pattern,
-            path: a.path || undefined,
-            glob: a.glob,
-            outputMode: a.outputMode,
-            caseInsensitive: a.caseInsensitive,
-            type: a.type,
-            headLimit: a.headLimit,
-            offset: a.offset,
-            toolCallId,
-          }),
+          value: this.createGrepArgsMessage(
+            args as Record<string, unknown>,
+            toolCallId
+          ),
         }
       }
       case "read_lints": {
         const a = args as DiagnosticsArgs
         const path =
-          this.toStringArray(a.paths).find(
-            (candidate) => candidate.length > 0
-          ) || safeString(a.path)
+          preserveProtocolLocationArray(a.paths)[0] ??
+          preserveProtocolLocation(a.path) ??
+          ""
         return {
           case: "diagnosticsArgs" as const,
           value: create(DiagnosticsArgsSchema, {
@@ -6056,43 +7093,111 @@ export class CursorGrpcService {
         }
       }
       case "mcp": {
-        const a = args as McpArgs
-        let mcpExecName: string
-        let mcpExecToolName: string
-        let mcpExecProviderIdentifier: string
-        let mcpExecRawArgs: Record<string, unknown>
-        try {
-          const resolved = this.resolveMcpCallFields(
-            a as unknown as Record<string, unknown>
-          )
-          mcpExecName = resolved.name
-          mcpExecToolName = resolved.toolName
-          mcpExecProviderIdentifier = resolved.providerIdentifier
-          mcpExecRawArgs = resolved.rawArgs
-        } catch {
-          // Fallback: use whatever identity fields are available
-          mcpExecName = safeString((a as Record<string, unknown>).name)
-          mcpExecToolName = safeString(
-            (a as Record<string, unknown>).toolName ||
-              (a as Record<string, unknown>).tool_name
-          )
-          mcpExecProviderIdentifier = safeString(
-            (a as Record<string, unknown>).providerIdentifier ||
-              (a as Record<string, unknown>).provider_identifier ||
-              (a as Record<string, unknown>).serverName ||
-              (a as Record<string, unknown>).server ||
-              (a as Record<string, unknown>).server_name
-          )
-          mcpExecRawArgs = { ...(a as unknown as Record<string, unknown>) }
-        }
+        const resolved = this.resolveMcpCallFields(
+          args as unknown as Record<string, unknown>
+        )
         return {
           case: "mcpArgs" as const,
           value: create(McpArgsSchema, {
-            name: mcpExecName,
-            toolName: mcpExecToolName,
-            providerIdentifier: mcpExecProviderIdentifier,
-            args: this.toProtoValueMap(mcpExecRawArgs),
+            name: resolved.name,
+            toolName: resolved.toolName,
+            providerIdentifier: resolved.providerIdentifier,
+            serverIdentifier: resolved.serverIdentifier,
+            args: this.toProtoValueMap(resolved.rawArgs),
             toolCallId,
+          }),
+        }
+      }
+      case "pi_read": {
+        const piArgs = args as unknown as Record<string, unknown>
+        const normalized = this.normalizeReadToolArgs(piArgs)
+        return {
+          case: "piReadArgs" as const,
+          value: create(PiReadExecArgsSchema, {
+            path: normalized.path,
+            offset: normalized.offset,
+            limit: normalized.limit,
+          }),
+        }
+      }
+      case "pi_bash": {
+        const piArgs = args as unknown as Record<string, unknown>
+        return {
+          case: "piBashArgs" as const,
+          value: create(PiBashExecArgsSchema, {
+            command: safeString(piArgs.command || piArgs.cmd),
+            timeout: this.parseOptionalNonNegativeNumber(piArgs.timeout),
+          }),
+        }
+      }
+      case "pi_edit": {
+        const piArgs = args as unknown as Record<string, unknown>
+        const edits = this.buildPiEditReplacements(piArgs)
+        if (edits.length === 0) {
+          throw new Error("Invalid PI edit args: missing edits")
+        }
+        return {
+          case: "piEditArgs" as const,
+          value: create(PiEditExecArgsSchema, {
+            path:
+              preserveProtocolLocation(
+                piArgs.path ?? piArgs.filePath ?? piArgs.file_path
+              ) ?? "",
+            edits,
+          }),
+        }
+      }
+      case "pi_write": {
+        const piArgs = args as unknown as Record<string, unknown>
+        return {
+          case: "piWriteArgs" as const,
+          value: create(PiWriteExecArgsSchema, {
+            path:
+              preserveProtocolLocation(
+                piArgs.path ?? piArgs.filePath ?? piArgs.file_path
+              ) ?? "",
+            content: safeString(piArgs.content),
+          }),
+        }
+      }
+      case "pi_grep": {
+        const piArgs = args as unknown as Record<string, unknown>
+        const normalized = this.normalizePiGrepCallArgs(piArgs)
+        return {
+          case: "piGrepArgs" as const,
+          value: create(PiGrepExecArgsSchema, {
+            pattern: normalized.pattern,
+            path: normalized.path,
+            glob: normalized.glob,
+            ignoreCase: normalized.ignoreCase,
+            literal: normalized.literal,
+            context: normalized.context,
+            limit: normalized.limit,
+          }),
+        }
+      }
+      case "pi_find": {
+        const piArgs = args as unknown as Record<string, unknown>
+        return {
+          case: "piFindArgs" as const,
+          value: create(PiFindExecArgsSchema, {
+            pattern: safeString(piArgs.pattern || piArgs.query),
+            path: preserveProtocolLocation(piArgs.path),
+            limit: this.parseOptionalNonNegativeInt(
+              piArgs.limit ?? piArgs.headLimit ?? piArgs.head_limit
+            ),
+          }),
+        }
+      }
+      case "pi_ls": {
+        const piArgs = args as unknown as Record<string, unknown>
+        return {
+          case: "piLsArgs" as const,
+          value: create(PiLsExecArgsSchema, {
+            path: preserveProtocolLocation(piArgs.path),
+            limit: this.parseOptionalNonNegativeInt(
+              piArgs.limit ?? piArgs.headLimit ?? piArgs.head_limit
+            ),
           }),
         }
       }
@@ -6104,9 +7209,10 @@ export class CursorGrpcService {
           case: "backgroundShellSpawnArgs" as const,
           value: create(BackgroundShellSpawnArgsSchema, {
             command,
-            workingDirectory: safeString(
-              a.cwd || a.working_directory || a.workingDirectory
-            ),
+            workingDirectory:
+              preserveProtocolLocation(
+                a.cwd ?? a.working_directory ?? a.workingDirectory
+              ) ?? "",
             toolCallId,
             parsingResult: parsed.parsingResult,
             enableWriteShellStdinTool: this.parseBooleanFlag(
@@ -6129,15 +7235,15 @@ export class CursorGrpcService {
       case "record_screen": {
         const a = args as RecordScreenArgs
         const mode = this.parseRecordScreenMode(a.mode)
-        const saveAsFilename = safeString(
-          a.saveAsFilename || a.save_as_filename
-        ).trim()
+        const saveAsFilename = preserveProtocolLocation(
+          a.saveAsFilename ?? a.save_as_filename
+        )
         return {
           case: "recordScreenArgs" as const,
           value: create(RecordScreenArgsSchema, {
             mode,
             toolCallId,
-            saveAsFilename: saveAsFilename || undefined,
+            saveAsFilename,
           }),
         }
       }
@@ -6165,10 +7271,9 @@ export class CursorGrpcService {
         }
       }
       case "execute_hook":
-        return {
-          case: "executeHookArgs" as const,
-          value: create(ExecuteHookArgsSchema, {}),
-        }
+        throw new Error(
+          "execute_hook is a lifecycle transport and cannot be projected from model tool args"
+        )
       // 新增 proto 更新后的 Exec 工具 args 构建
       case "force_background_shell": {
         const a = args as Record<string, unknown>
@@ -6282,6 +7387,7 @@ export class CursorGrpcService {
    * fallback when the args payload is too large to stream safely.
    */
   private buildSizeGuardTruncatedToolCall(
+    callId: string,
     toolName: string,
     bytesEstimate: number,
     reason: string
@@ -6292,25 +7398,42 @@ export class CursorGrpcService {
       "truncated",
       `${reason} (bytes≈${bytesEstimate})`
     )
-    return create(ToolCallSchema, {
-      tool: {
-        case: "truncatedToolCall" as const,
-        value: create(TruncatedToolCallSchema, {
-          args: create(TruncatedToolCallArgsSchema, {}),
-          result: create(TruncatedToolCallResultSchema, {
-            result: {
-              case: "error" as const,
-              value: create(TruncatedToolCallErrorSchema, {
-                error:
-                  `Tool "${toolName}" args exceeded ` +
-                  `${CursorGrpcService.TOOL_CALL_ARGS_SIZE_GUARD_BYTES} bytes ` +
-                  `(${bytesEstimate} bytes); payload was dropped to ` +
-                  `protect the protocol stream.`,
-              }),
-            },
-          }),
+    return this.buildIdentifiedToolCall(callId, {
+      case: "truncatedToolCall" as const,
+      value: create(TruncatedToolCallSchema, {
+        args: create(TruncatedToolCallArgsSchema, {}),
+        result: create(TruncatedToolCallResultSchema, {
+          result: {
+            case: "error" as const,
+            value: create(TruncatedToolCallErrorSchema, {
+              error:
+                `Tool "${toolName}" args exceeded ` +
+                `${CursorGrpcService.TOOL_CALL_ARGS_SIZE_GUARD_BYTES} bytes ` +
+                `(${bytesEstimate} bytes); payload was dropped to ` +
+                `protect the protocol stream.`,
+            }),
+          },
         }),
-      } as ToolCallOneOf,
+      }),
+    } as ToolCallOneOf)
+  }
+
+  /**
+   * Construct the official ToolCall envelope at one identity boundary.
+   * Cursor repeats the id inside several tool-specific Args messages, but
+   * `ToolCall.tool_call_id` is the canonical identity for generic consumers
+   * such as TaskSuccess.conversation_steps and recovered projections.
+   */
+  private buildIdentifiedToolCall(
+    callId: string,
+    tool: ToolCallOneOf
+  ): ToolCall {
+    return create(ToolCallSchema, {
+      toolCallId: requireExactDurableIdentifier(
+        callId,
+        "Cursor ToolCall identity"
+      ),
+      tool,
     })
   }
 
@@ -6323,9 +7446,11 @@ export class CursorGrpcService {
     args: Record<string, unknown>,
     toolFamilyHint?: ToolFamily
   ) {
+    this.assertCursorToolProjectionAllowed(toolName)
     const bytes = this.estimateToolCallArgsBytes(args)
     if (bytes > CursorGrpcService.TOOL_CALL_ARGS_SIZE_GUARD_BYTES) {
       return this.buildSizeGuardTruncatedToolCall(
+        callId,
         toolName,
         bytes,
         "tool_use args payload exceeds size guard"
@@ -6337,16 +7462,20 @@ export class CursorGrpcService {
       callId,
       toolFamilyHint
     )
-    return create(ToolCallSchema, {
-      tool: toolOneOf,
-    })
+    return this.buildIdentifiedToolCall(callId, toolOneOf)
   }
 
   private resolveToolFamily(
     toolName: string,
     toolFamilyHint?: ToolFamily
   ): ToolFamily {
-    return toolFamilyHint || this.detectToolFamily(toolName)
+    const family = toolFamilyHint || this.detectToolFamily(toolName)
+    if (family === "unknown") {
+      throw new Error(
+        `Tool "${toolName}" has no registered Cursor ToolCall projection`
+      )
+    }
+    return family
   }
 
   /**
@@ -6371,11 +7500,9 @@ export class CursorGrpcService {
    *                         recognised. This is a real signal that the
    *                         family resolver needs a new entry; keep `warn`.
    *
-   * The set below mirrors the `truncatedToolCall` entries in
-   * `buildEmptyToolCallV2.familyToCase` plus the explicit fall-throughs
-   * inside `detectToolFamily` (discover_tool, killagent, kill_agent,
-   * backgroundcomposerfollowup, updateproject) that intentionally return
-   * the `truncated` family.
+   * The set below mirrors the exact registered `truncatedToolCall` entries in
+   * `buildEmptyToolCallV2.familyToCase`. Unknown names fail at the projection
+   * boundary and can never enter this set.
    */
   private static readonly EXPECTED_TRUNCATED_TOOL_FAMILIES: ReadonlySet<ToolFamily> =
     new Set<ToolFamily>([
@@ -6394,25 +7521,9 @@ export class CursorGrpcService {
 
   private isExpectedTruncatedProjection(
     family: ToolFamily,
-    toolName: string
+    _toolName: string
   ): boolean {
-    if (CursorGrpcService.EXPECTED_TRUNCATED_TOOL_FAMILIES.has(family)) {
-      return true
-    }
-    // detectToolFamily routes a few bridge-internal tool names directly to
-    // the `truncated` family. Treat them as expected even though the
-    // family name itself is generic.
-    const normalized = this.normalizeToolName(toolName)
-    return (
-      normalized === "discovertool" ||
-      normalized === "discover_tool" ||
-      normalized === "snipmessages" ||
-      normalized === "snip_messages" ||
-      normalized.includes("killagent") ||
-      normalized === "kill_agent" ||
-      normalized.includes("backgroundcomposerfollowup") ||
-      normalized.includes("updateproject")
-    )
+    return CursorGrpcService.EXPECTED_TRUNCATED_TOOL_FAMILIES.has(family)
   }
 
   private warnTruncatedToolProjection(
@@ -6438,7 +7549,12 @@ export class CursorGrpcService {
   /**
    * 构建空的 ToolCall V2（用于初始 partialToolCall 通知）
    */
-  private buildEmptyToolCallV2(toolName: string, toolFamilyHint?: ToolFamily) {
+  private buildEmptyToolCallV2(
+    toolName: string,
+    callId: string,
+    toolFamilyHint?: ToolFamily
+  ) {
+    this.assertCursorToolProjectionAllowed(toolName)
     const family = this.resolveToolFamily(toolName, toolFamilyHint)
     const familyToCase: Record<ToolFamily, string> = {
       get_mcp_tools: "getMcpToolsToolCall",
@@ -6452,6 +7568,8 @@ export class CursorGrpcService {
       write_shell_stdin: "writeShellStdinToolCall",
       background_shell_spawn: "shellToolCall",
       setup_vm_environment: "setupVmEnvironmentToolCall",
+      replace_env: "replaceEnvToolCall",
+      connect_scm: "connectScmToolCall",
       start_grind_execution: "startGrindExecutionToolCall",
       start_grind_planning: "startGrindPlanningToolCall",
       report_bugfix_results: "reportBugfixResultsToolCall",
@@ -6504,13 +7622,23 @@ export class CursorGrpcService {
       // ExecServerMessage 补齐（proto 没有专用 ToolCall case）
       request_context: "truncatedToolCall",
       redacted_read: "readToolCall",
+      pi_read: "piReadToolCall",
+      pi_bash: "piBashToolCall",
+      pi_edit: "piEditToolCall",
+      pi_write: "piWriteToolCall",
+      pi_grep: "piGrepToolCall",
+      pi_find: "piFindToolCall",
+      pi_ls: "piLsToolCall",
+      search_conversations: "searchConversationsToolCall",
+      create_goal: "createGoalToolCall",
+      update_goal: "updateGoalToolCall",
       // 有专用 ToolCall oneof case 的新工具
       communicate_update: "communicateUpdateToolCall",
       send_final_summary: "sendFinalSummaryToolCall",
       send_to_user: "sendToUserToolCall",
       unknown: "truncatedToolCall",
     }
-    const matchedCase = familyToCase[family] || "truncatedToolCall"
+    const matchedCase = familyToCase[family]
     if (matchedCase === "truncatedToolCall") {
       this.warnTruncatedToolProjection(
         "empty_tool_call",
@@ -6520,9 +7648,10 @@ export class CursorGrpcService {
       )
     }
 
-    return create(ToolCallSchema, {
-      tool: this.buildEmptyToolCallOneOfFromCase(matchedCase),
-    })
+    return this.buildIdentifiedToolCall(
+      callId,
+      this.buildEmptyToolCallOneOfFromCase(matchedCase)
+    )
   }
 
   /**
@@ -6535,9 +7664,8 @@ export class CursorGrpcService {
    * as a bare `[Tool: <caseName>]` label instead of the structured
    * tool-row UI.
    *
-   * Cases not yet wired here fall back to `truncatedToolCall`, mirroring
-   * the existing fallback in `familyToCase` for pure ExecServerMessage
-   * tools that have no dedicated ToolCall oneof case in the proto.
+   * Registered ExecServerMessage-only families explicitly select
+   * `truncatedToolCall`; an unregistered case is a protocol defect and fails.
    */
   private buildEmptyToolCallOneOfFromCase(caseName: string): ToolCallOneOf {
     switch (caseName) {
@@ -6676,6 +7804,16 @@ export class CursorGrpcService {
           case: "setupVmEnvironmentToolCall",
           value: create(SetupVmEnvironmentToolCallSchema, {}),
         }
+      case "replaceEnvToolCall":
+        return {
+          case: "replaceEnvToolCall",
+          value: create(ReplaceEnvToolCallSchema, {}),
+        }
+      case "connectScmToolCall":
+        return {
+          case: "connectScmToolCall",
+          value: create(ConnectScmToolCallSchema, {}),
+        }
       case "startGrindExecutionToolCall":
         return {
           case: "startGrindExecutionToolCall",
@@ -6751,14 +7889,65 @@ export class CursorGrpcService {
           case: "sendToUserToolCall",
           value: create(SendToUserToolCallSchema, {}),
         }
+      case "piReadToolCall":
+        return {
+          case: "piReadToolCall",
+          value: create(PiReadToolCallSchema, {}),
+        }
+      case "piBashToolCall":
+        return {
+          case: "piBashToolCall",
+          value: create(PiBashToolCallSchema, {}),
+        }
+      case "piEditToolCall":
+        return {
+          case: "piEditToolCall",
+          value: create(PiEditToolCallSchema, {}),
+        }
+      case "piWriteToolCall":
+        return {
+          case: "piWriteToolCall",
+          value: create(PiWriteToolCallSchema, {}),
+        }
+      case "piGrepToolCall":
+        return {
+          case: "piGrepToolCall",
+          value: create(PiGrepToolCallSchema, {}),
+        }
+      case "piFindToolCall":
+        return {
+          case: "piFindToolCall",
+          value: create(PiFindToolCallSchema, {}),
+        }
+      case "piLsToolCall":
+        return {
+          case: "piLsToolCall",
+          value: create(PiLsToolCallSchema, {}),
+        }
+      case "searchConversationsToolCall":
+        return {
+          case: "searchConversationsToolCall",
+          value: create(SearchConversationsToolCallSchema, {}),
+        }
+      case "createGoalToolCall":
+        return {
+          case: "createGoalToolCall",
+          value: create(CreateGoalToolCallSchema, {}),
+        }
+      case "updateGoalToolCall":
+        return {
+          case: "updateGoalToolCall",
+          value: create(UpdateGoalToolCallSchema, {}),
+        }
       case "truncatedToolCall":
-      default:
         return {
           case: "truncatedToolCall",
           value: create(TruncatedToolCallSchema, {
             args: create(TruncatedToolCallArgsSchema, {}),
           }),
         }
+      default:
+        throw new Error(`Unregistered Cursor ToolCall oneof case "${caseName}"`)
     }
   }
 
@@ -6809,7 +7998,7 @@ export class CursorGrpcService {
           case: "deleteToolCall" as const,
           value: create(DeleteToolCallSchema, {
             args: create(DeleteArgsSchema, {
-              path: safeString(args.path),
+              path: preserveProtocolLocation(args.path) ?? "",
             }),
           }),
         }
@@ -6826,20 +8015,143 @@ export class CursorGrpcService {
         }
       }
       case "grep": {
-        const normalizedGrepArgs = this.normalizeGrepCallArgs(args)
         return {
           case: "grepToolCall" as const,
           value: create(GrepToolCallSchema, {
-            args: create(GrepArgsSchema, {
-              pattern: normalizedGrepArgs.pattern,
-              path: normalizedGrepArgs.path || undefined,
-              glob: normalizedGrepArgs.glob,
-              outputMode: normalizedGrepArgs.outputMode,
-              caseInsensitive: normalizedGrepArgs.caseInsensitive,
-              type: normalizedGrepArgs.type,
-              headLimit: normalizedGrepArgs.headLimit,
-              offset: normalizedGrepArgs.offset,
+            args: this.createGrepArgsMessage(args, callId),
+          }),
+        }
+      }
+      case "pi_read": {
+        const normalized = this.normalizeReadToolArgs(args)
+        return {
+          case: "piReadToolCall" as const,
+          value: create(PiReadToolCallSchema, {
+            args: create(PiReadToolArgsSchema, {
+              path: normalized.path,
+              offset: normalized.offset,
+              limit: normalized.limit,
             }),
+          }),
+        }
+      }
+      case "pi_bash":
+        return {
+          case: "piBashToolCall" as const,
+          value: create(PiBashToolCallSchema, {
+            args: create(PiBashToolArgsSchema, {
+              command: safeString(args.command || args.cmd),
+              timeout: this.parseOptionalNonNegativeNumber(args.timeout),
+            }),
+          }),
+        }
+      case "pi_edit": {
+        const edits = this.buildPiEditReplacements(args)
+        if (edits.length === 0) {
+          throw new Error("Invalid PI edit args: missing edits")
+        }
+        return {
+          case: "piEditToolCall" as const,
+          value: create(PiEditToolCallSchema, {
+            args: create(PiEditToolArgsSchema, {
+              path:
+                preserveProtocolLocation(
+                  args.path ?? args.filePath ?? args.file_path
+                ) ?? "",
+              edits,
+            }),
+          }),
+        }
+      }
+      case "pi_write":
+        return {
+          case: "piWriteToolCall" as const,
+          value: create(PiWriteToolCallSchema, {
+            args: create(PiWriteToolArgsSchema, {
+              path:
+                preserveProtocolLocation(
+                  args.path ?? args.filePath ?? args.file_path
+                ) ?? "",
+              content: safeString(args.content),
+            }),
+          }),
+        }
+      case "pi_grep": {
+        const normalized = this.normalizePiGrepCallArgs(args)
+        return {
+          case: "piGrepToolCall" as const,
+          value: create(PiGrepToolCallSchema, {
+            args: create(PiGrepToolArgsSchema, {
+              pattern: normalized.pattern,
+              path: normalized.path,
+              glob: normalized.glob,
+              ignoreCase: normalized.ignoreCase,
+              literal: normalized.literal,
+              context: normalized.context,
+              limit: normalized.limit,
+            }),
+          }),
+        }
+      }
+      case "pi_find":
+        return {
+          case: "piFindToolCall" as const,
+          value: create(PiFindToolCallSchema, {
+            args: create(PiFindToolArgsSchema, {
+              pattern: safeString(args.pattern || args.query),
+              path: preserveProtocolLocation(args.path),
+              limit: this.parseOptionalNonNegativeInt(
+                args.limit ?? args.headLimit ?? args.head_limit
+              ),
+            }),
+          }),
+        }
+      case "pi_ls":
+        return {
+          case: "piLsToolCall" as const,
+          value: create(PiLsToolCallSchema, {
+            args: create(PiLsToolArgsSchema, {
+              path: preserveProtocolLocation(args.path),
+              limit: this.parseOptionalNonNegativeInt(
+                args.limit ?? args.headLimit ?? args.head_limit
+              ),
+            }),
+          }),
+        }
+      case "search_conversations":
+        return {
+          case: "searchConversationsToolCall" as const,
+          value: create(SearchConversationsToolCallSchema, {
+            args: create(ConversationSearchArgsSchema, {
+              query: safeString(args.query),
+              toolCallId: callId,
+              limit: this.parseOptionalNonNegativeInt(args.limit),
+            }),
+          }),
+        }
+      case "create_goal":
+        return {
+          case: "createGoalToolCall" as const,
+          value: create(CreateGoalToolCallSchema, {
+            args: create(CreateGoalArgsSchema, {
+              objective: safeString(args.objective),
+            }),
+          }),
+        }
+      case "update_goal": {
+        let status = GoalStatus.UNSPECIFIED
+        try {
+          status =
+            typeof args.status === "number"
+              ? (args.status as GoalStatus)
+              : parseGoalStatus(args.status)
+        } catch {
+          status = GoalStatus.UNSPECIFIED
+        }
+        return {
+          case: "updateGoalToolCall" as const,
+          value: create(UpdateGoalToolCallSchema, {
+            args: create(UpdateGoalArgsSchema, { status }),
           }),
         }
       }
@@ -6926,7 +8238,7 @@ export class CursorGrpcService {
           case: "editToolCall" as const,
           value: create(EditToolCallSchema, {
             args: create(EditArgsSchema, {
-              path: safeString(args.path),
+              path: preserveProtocolLocation(args.path) ?? "",
             }),
           }),
         }
@@ -6940,11 +8252,13 @@ export class CursorGrpcService {
         }
       }
       case "read_lints": {
+        const pathsFromArray = preserveProtocolLocationArray(args.paths)
+        const directPath = preserveProtocolLocation(args.path)
         const paths =
-          this.toStringArray(args.paths).length > 0
-            ? this.toStringArray(args.paths)
-            : safeString(args.path).trim()
-              ? [safeString(args.path).trim()]
+          pathsFromArray.length > 0
+            ? pathsFromArray
+            : directPath
+              ? [directPath]
               : []
         return {
           case: "readLintsToolCall" as const,
@@ -6967,31 +8281,16 @@ export class CursorGrpcService {
           }),
         }
       case "mcp": {
-        let mcpName: string
-        let mcpToolNameStarted: string
-        let mcpProviderIdentifier: string
-        let mcpRawArgs: Record<string, unknown>
-        try {
-          const resolved = this.resolveMcpCallFields(args)
-          mcpName = resolved.name
-          mcpToolNameStarted = resolved.toolName
-          mcpProviderIdentifier = resolved.providerIdentifier
-          mcpRawArgs = resolved.rawArgs
-        } catch {
-          // Fallback: derive identity from the outer toolName parameter
-          mcpToolNameStarted = toolName
-          mcpName = toolName
-          mcpProviderIdentifier = ""
-          mcpRawArgs = { ...args }
-        }
+        const resolved = this.resolveMcpCallFields(args)
         return {
           case: "mcpToolCall" as const,
           value: create(McpToolCallSchema, {
             args: create(McpArgsSchema, {
-              name: mcpName,
-              toolName: mcpToolNameStarted,
-              providerIdentifier: mcpProviderIdentifier,
-              args: this.toProtoValueMap(mcpRawArgs),
+              name: resolved.name,
+              toolName: resolved.toolName,
+              providerIdentifier: resolved.providerIdentifier,
+              serverIdentifier: resolved.serverIdentifier,
+              args: this.toProtoValueMap(resolved.rawArgs),
               toolCallId: callId,
             }),
           }),
@@ -7011,10 +8310,13 @@ export class CursorGrpcService {
           }),
         }
       case "sem_search": {
+        const primaryTargetDirectories = preserveProtocolLocationArray(
+          args.targetDirectories
+        )
         const targetDirectories =
-          this.toStringArray(args.targetDirectories).length > 0
-            ? this.toStringArray(args.targetDirectories)
-            : this.toStringArray(args.target_directories)
+          primaryTargetDirectories.length > 0
+            ? primaryTargetDirectories
+            : preserveProtocolLocationArray(args.target_directories)
         return {
           case: "semSearchToolCall" as const,
           value: create(SemSearchToolCallSchema, {
@@ -7073,10 +8375,10 @@ export class CursorGrpcService {
               server: safeString(
                 args.serverName || args.server || args.server_name
               ),
-              uri: safeString(args.uri),
-              downloadPath:
-                safeString(args.downloadPath || args.download_path).trim() ||
-                undefined,
+              uri: preserveProtocolLocation(args.uri) ?? "",
+              downloadPath: preserveProtocolLocation(
+                args.downloadPath ?? args.download_path
+              ),
             }),
           }),
         }
@@ -7102,7 +8404,10 @@ export class CursorGrpcService {
             }),
           }),
         }
-      case "apply_agent_diff":
+      case "apply_agent_diff": {
+        if (!hasValidCursorApplyAgentDiffArgs(args)) {
+          throw new Error("ApplyAgentDiff requires a non-empty agent_id")
+        }
         return {
           case: "applyAgentDiffToolCall" as const,
           value: create(ApplyAgentDiffToolCallSchema, {
@@ -7111,11 +8416,9 @@ export class CursorGrpcService {
             }),
           }),
         }
+      }
       case "ask_question": {
-        const normalizedAskQuestionArgs = this.normalizeAskQuestionArgs(
-          args,
-          callId
-        )
+        const normalizedAskQuestionArgs = normalizeCursorAskQuestionArgs(args)
         return {
           case: "askQuestionToolCall" as const,
           value: create(AskQuestionToolCallSchema, {
@@ -7205,7 +8508,9 @@ export class CursorGrpcService {
           case: "aiAttributionToolCall" as const,
           value: create(AiAttributionToolCallSchema, {
             args: create(AiAttributionArgsSchema, {
-              filePaths: this.toStringArray(args.file_paths || args.filePaths),
+              filePaths: preserveProtocolLocationArray(
+                args.file_paths ?? args.filePaths
+              ),
               commitHashes: this.toStringArray(
                 args.commit_hashes || args.commitHashes
               ),
@@ -7233,53 +8538,34 @@ export class CursorGrpcService {
             }),
           }),
         }
-      case "pr_management": {
-        const prAction: { action?: PrManagementArgs["action"] } = {}
-        if (args.create_pr || args.createPr) {
-          const cp = (args.create_pr || args.createPr) as Record<
-            string,
-            unknown
-          >
-          prAction.action = {
-            case: "createPr" as const,
-            value: create(CreatePrActionSchema, {
-              title: safeString(cp.title),
-              body: safeString(cp.body),
-              baseBranch:
-                safeString(cp.base_branch || cp.baseBranch) || undefined,
-              draft: (cp.draft as boolean) ?? undefined,
-            }),
-          }
-        } else if (args.update_pr || args.updatePr) {
-          const up = (args.update_pr || args.updatePr) as Record<
-            string,
-            unknown
-          >
-          prAction.action = {
-            case: "updatePr" as const,
-            value: create(UpdatePrActionSchema, {
-              prUrl: safeString(up.pr_url || up.prUrl) || undefined,
-              title: safeString(up.title) || undefined,
-              body: safeString(up.body) || undefined,
-            }),
-          }
-        }
+      case "pr_management":
         return {
           case: "prManagementToolCall" as const,
           value: create(PrManagementToolCallSchema, {
-            args: create(PrManagementArgsSchema, {
-              toolCallId: callId,
-              ...prAction,
-            }),
+            args: this.buildPrManagementArgs(args, callId),
           }),
         }
-      }
+      case "replace_env":
+        return {
+          case: "replaceEnvToolCall" as const,
+          value: create(ReplaceEnvToolCallSchema, {
+            args: this.buildReplaceEnvArgs(args),
+          }),
+        }
+      case "connect_scm":
+        return {
+          case: "connectScmToolCall" as const,
+          value: create(ConnectScmToolCallSchema, {
+            args: this.buildConnectScmArgs(args, callId),
+          }),
+        }
       case "blame_by_file_path":
         return {
           case: "blameByFilePathToolCall" as const,
           value: create(BlameByFilePathToolCallSchema, {
             args: create(BlameByFilePathArgsSchema, {
-              filePath: safeString(args.filePath || args.file_path),
+              filePath:
+                preserveProtocolLocation(args.filePath ?? args.file_path) ?? "",
               startLine: this.parseOptionalNonNegativeInt(
                 args.startLine ?? args.start_line
               ),
@@ -7295,9 +8581,10 @@ export class CursorGrpcService {
           value: create(ReportBugToolCallSchema, {
             args: create(ReportBugArgsSchema, {
               title: safeString(args.title),
-              file: safeString(
-                args.file || args.path || args.filePath || args.file_path
-              ),
+              file:
+                preserveProtocolLocation(
+                  args.file ?? args.path ?? args.filePath ?? args.file_path
+                ) ?? "",
               startLine:
                 this.parseOptionalNonNegativeInt(
                   args.startLine ?? args.start_line
@@ -7318,40 +8605,46 @@ export class CursorGrpcService {
           case: "setActiveBranchToolCall" as const,
           value: create(SetActiveBranchToolCallSchema, {
             args: create(SetActiveBranchArgsSchema, {
-              path: safeString(args.path),
+              path: preserveProtocolLocation(args.path) ?? "",
               branchName: safeString(args.branchName || args.branch_name),
             }),
           }),
         }
       case "generate_image": {
+        const primaryReferenceImagePaths = preserveProtocolLocationArray(
+          args.referenceImagePaths
+        )
         const referenceImagePaths =
-          this.toStringArray(args.referenceImagePaths).length > 0
-            ? this.toStringArray(args.referenceImagePaths)
-            : this.toStringArray(args.reference_image_paths)
+          primaryReferenceImagePaths.length > 0
+            ? primaryReferenceImagePaths
+            : preserveProtocolLocationArray(args.reference_image_paths)
         return {
           case: "generateImageToolCall" as const,
           value: create(GenerateImageToolCallSchema, {
             args: create(GenerateImageArgsSchema, {
               description: safeString(args.prompt || args.description),
-              filePath:
-                safeString(args.filePath || args.file_path) || undefined,
+              filePath: preserveProtocolLocation(
+                args.filePath ?? args.file_path
+              ),
               referenceImagePaths,
+              aspectRatio:
+                safeString(args.aspectRatio || args.aspect_ratio) || undefined,
             }),
           }),
         }
       }
       case "record_screen": {
         const mode = this.parseRecordScreenMode(args.mode)
-        const saveAsFilename = safeString(
-          args.saveAsFilename || args.save_as_filename
-        ).trim()
+        const saveAsFilename = preserveProtocolLocation(
+          args.saveAsFilename ?? args.save_as_filename
+        )
         return {
           case: "recordScreenToolCall" as const,
           value: create(RecordScreenToolCallSchema, {
             args: create(RecordScreenArgsSchema, {
               mode,
               toolCallId: callId,
-              saveAsFilename: saveAsFilename || undefined,
+              saveAsFilename,
             }),
           }),
         }
@@ -7394,6 +8687,9 @@ export class CursorGrpcService {
                 args.installCommand || args.install_command
               ),
               startCommand: safeString(args.startCommand || args.start_command),
+              dockerfileContents: safeString(
+                args.dockerfileContents || args.dockerfile_contents
+              ),
             }),
           }),
         }
@@ -7546,9 +8842,11 @@ export class CursorGrpcService {
     extraData?: ToolCompletionExtraData,
     toolFamilyHint?: ToolFamily
   ) {
+    this.assertCursorToolProjectionAllowed(toolName)
     const bytes = this.estimateToolCallArgsBytes(args)
     if (bytes > CursorGrpcService.TOOL_CALL_ARGS_SIZE_GUARD_BYTES) {
       return this.buildSizeGuardTruncatedToolCall(
+        callId,
         toolName,
         bytes,
         "tool_use args payload exceeds size guard (with result)"
@@ -7562,9 +8860,7 @@ export class CursorGrpcService {
       extraData,
       toolFamilyHint
     )
-    return create(ToolCallSchema, {
-      tool: toolOneOf,
-    })
+    return this.buildIdentifiedToolCall(callId, toolOneOf)
   }
 
   /**
@@ -7681,8 +8977,13 @@ export class CursorGrpcService {
 
     if (family === "shell" || family === "background_shell_spawn") {
       const shellResult = extraData?.shellResult
-      const command = this.resolveShellCommand(args)
-      const workingDirectory = this.resolveShellWorkingDirectory(args)
+      const command =
+        typeof shellResult?.command === "string"
+          ? shellResult.command
+          : this.resolveShellCommand(args)
+      const workingDirectory =
+        preserveProtocolLocation(shellResult?.workingDirectory) ??
+        this.resolveShellWorkingDirectory(args)
 
       let resultOneOf: ShellResult["result"]
       if (status === "timeout") {
@@ -7691,10 +8992,9 @@ export class CursorGrpcService {
           value: create(ShellTimeoutSchema, {
             command,
             workingDirectory,
-            timeoutMs: normalizeShellTimeoutMs(
-              args.timeout,
-              DEFAULT_SHELL_TIMEOUT_MS
-            ),
+            timeoutMs:
+              this.parseOptionalNonNegativeInt(shellResult?.timeoutMs) ??
+              normalizeShellTimeoutMs(args.timeout, DEFAULT_SHELL_TIMEOUT_MS),
           }),
         }
       } else if (status === "rejected") {
@@ -7703,8 +9003,11 @@ export class CursorGrpcService {
           value: create(ShellRejectedSchema, {
             command,
             workingDirectory,
-            reason: statusMessage || "Shell command rejected",
-            isReadonly: false,
+            reason:
+              shellResult?.terminalMessage ??
+              statusMessage ??
+              "Shell command rejected",
+            isReadonly: shellResult?.isReadonly ?? false,
           }),
         }
       } else if (status === "permission_denied") {
@@ -7713,8 +9016,11 @@ export class CursorGrpcService {
           value: create(ShellPermissionDeniedSchema, {
             command,
             workingDirectory,
-            error: statusMessage || "Permission denied",
-            isReadonly: false,
+            error:
+              shellResult?.terminalMessage ??
+              statusMessage ??
+              "Permission denied",
+            isReadonly: shellResult?.isReadonly ?? false,
           }),
         }
       } else if (status === "spawn_error") {
@@ -7723,7 +9029,23 @@ export class CursorGrpcService {
           value: create(ShellSpawnErrorSchema, {
             command,
             workingDirectory,
-            error: statusMessage || "Failed to spawn process",
+            error:
+              shellResult?.terminalMessage ??
+              statusMessage ??
+              "Failed to spawn process",
+          }),
+        }
+      } else if (status === "sandbox_unsupported") {
+        resultOneOf = {
+          case: "permissionDenied" as const,
+          value: create(ShellPermissionDeniedSchema, {
+            command,
+            workingDirectory,
+            error:
+              shellResult?.terminalMessage ??
+              statusMessage ??
+              "Requested shell sandbox is unsupported",
+            isReadonly: shellResult?.isReadonly ?? false,
           }),
         }
       } else if (
@@ -7740,7 +9062,14 @@ export class CursorGrpcService {
             workingDirectory,
             exitCode: shellResult?.exitCode ?? 1,
             stdout: shellResult?.stdout || "",
-            stderr: shellResult?.stderr || statusMessage || result,
+            stderr:
+              shellResult?.stderr ??
+              shellResult?.terminalMessage ??
+              statusMessage ??
+              result,
+            signal: safeString(shellResult?.signal),
+            executionTime:
+              this.parseOptionalNonNegativeInt(shellResult?.executionTime) ?? 0,
             outputLocation: this.normalizeOutputLocation(
               shellResult?.outputLocation
             ),
@@ -7752,6 +9081,11 @@ export class CursorGrpcService {
             localExecutionTimeMs: this.parseOptionalNonNegativeInt(
               shellResult?.localExecutionTimeMs
             ),
+            outputHead: shellResult?.outputHead,
+            outputTail: shellResult?.outputTail,
+            elidedChars: this.parseOptionalNonNegativeInt(
+              shellResult?.elidedChars
+            ),
           }),
         }
       } else {
@@ -7761,8 +9095,11 @@ export class CursorGrpcService {
             command,
             workingDirectory,
             exitCode: shellResult?.exitCode ?? 0,
-            stdout: shellResult?.stdout || result,
-            stderr: shellResult?.stderr || "",
+            signal: safeString(shellResult?.signal),
+            stdout: shellResult?.stdout ?? result,
+            stderr: shellResult?.stderr ?? "",
+            executionTime:
+              this.parseOptionalNonNegativeInt(shellResult?.executionTime) ?? 0,
             outputLocation: this.normalizeOutputLocation(
               shellResult?.outputLocation
             ),
@@ -7776,6 +9113,11 @@ export class CursorGrpcService {
             backgroundReason: this.normalizeShellBackgroundReason(
               shellResult?.backgroundReason
             ),
+            outputHead: shellResult?.outputHead,
+            outputTail: shellResult?.outputTail,
+            elidedChars: this.parseOptionalNonNegativeInt(
+              shellResult?.elidedChars
+            ),
           }),
         }
       }
@@ -7787,20 +9129,13 @@ export class CursorGrpcService {
           description: this.resolveShellToolDescription(args, shellResult),
           result: create(ShellResultSchema, {
             result: resultOneOf,
-            sandboxPolicy:
-              shellResult?.requestedSandboxPolicy &&
-              this.parseOptionalNonNegativeInt(
-                shellResult.requestedSandboxPolicy.type
-              ) !== undefined
-                ? create(SandboxPolicySchema, {
-                    type: this.parseOptionalNonNegativeInt(
-                      shellResult.requestedSandboxPolicy.type
-                    ) as SandboxPolicy_Type,
-                  })
-                : undefined,
+            sandboxPolicy: this.normalizeSandboxPolicy(
+              shellResult?.requestedSandboxPolicy
+            ),
             isBackground: this.parseBooleanFlag(shellResult?.isBackground),
-            terminalsFolder:
-              safeString(shellResult?.terminalsFolder).trim() || undefined,
+            terminalsFolder: preserveProtocolLocation(
+              shellResult?.terminalsFolder
+            ),
             pid: this.parseOptionalNonNegativeInt(shellResult?.pid),
           }),
         }),
@@ -7808,7 +9143,7 @@ export class CursorGrpcService {
     }
 
     if (family === "edit") {
-      const path = safeString(args.path)
+      const path = preserveProtocolLocation(args.path) ?? ""
       let editResultOneOf: EditResult["result"]
       if (status === "success") {
         editResultOneOf = {
@@ -7867,6 +9202,338 @@ export class CursorGrpcService {
       }
     }
 
+    if (family === "search_conversations") {
+      const searchSuccess = extraData?.conversationSearchSuccess
+      if (status === "success" && !searchSuccess) {
+        throw new Error(
+          "Conversation search completed without structured search results"
+        )
+      }
+      const searchResult =
+        status === "success" && searchSuccess
+          ? {
+              case: "success" as const,
+              value: create(ConversationSearchSuccessSchema, {
+                hits: searchSuccess.hits.map((hit) =>
+                  create(ConversationSearchHitSchema, {
+                    conversationId: hit.conversationId,
+                    title: hit.title,
+                    source: ConversationSearchSource.LOCAL,
+                    updatedAtMs: BigInt(Math.max(0, hit.updatedAtMs)),
+                    snippet: hit.snippet || undefined,
+                  })
+                ),
+                truncated: searchSuccess.truncated,
+                partial: searchSuccess.partial,
+                rebuilding: false,
+              }),
+            }
+          : {
+              case: "error" as const,
+              value: create(ConversationSearchErrorSchema, {
+                error: statusMessage || result || "Conversation search failed",
+              }),
+            }
+      return {
+        case: "searchConversationsToolCall" as const,
+        value: create(SearchConversationsToolCallSchema, {
+          args: create(ConversationSearchArgsSchema, {
+            query: safeString(args.query),
+            toolCallId: callId,
+            limit: this.parseOptionalNonNegativeInt(args.limit),
+          }),
+          result: create(ConversationSearchResultSchema, {
+            result: searchResult,
+          }),
+        }),
+      }
+    }
+
+    if (family === "create_goal") {
+      const createGoalResult =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(CreateGoalSuccessSchema, {}),
+            }
+          : {
+              case: "error" as const,
+              value: create(GoalErrorSchema, {
+                error: statusMessage || result || "create_goal failed",
+              }),
+            }
+      return {
+        case: "createGoalToolCall" as const,
+        value: create(CreateGoalToolCallSchema, {
+          args: create(CreateGoalArgsSchema, {
+            objective: safeString(args.objective),
+          }),
+          result: create(CreateGoalResultSchema, {
+            result: createGoalResult,
+          }),
+        }),
+      }
+    }
+
+    if (family === "update_goal") {
+      let requestedStatus = GoalStatus.UNSPECIFIED
+      try {
+        requestedStatus =
+          typeof args.status === "number"
+            ? (args.status as GoalStatus)
+            : parseGoalStatus(args.status)
+      } catch {
+        requestedStatus = GoalStatus.UNSPECIFIED
+      }
+      const updateGoalResult =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(UpdateGoalSuccessSchema, {
+                status: requestedStatus,
+              }),
+            }
+          : {
+              case: "error" as const,
+              value: create(GoalErrorSchema, {
+                error: statusMessage || result || "update_goal failed",
+              }),
+            }
+      return {
+        case: "updateGoalToolCall" as const,
+        value: create(UpdateGoalToolCallSchema, {
+          args: create(UpdateGoalArgsSchema, { status: requestedStatus }),
+          result: create(UpdateGoalResultSchema, {
+            result: updateGoalResult,
+          }),
+        }),
+      }
+    }
+
+    if (family === "pi_read") {
+      const normalized = this.normalizeReadToolArgs(args)
+      const piResult =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(PiReadToolSuccessSchema, { output: result }),
+            }
+          : {
+              case: "error" as const,
+              value: create(PiReadToolErrorSchema, {
+                error: statusMessage || result || "PI read failed",
+              }),
+            }
+      return {
+        case: "piReadToolCall" as const,
+        value: create(PiReadToolCallSchema, {
+          args: create(PiReadToolArgsSchema, {
+            path: normalized.path,
+            offset: normalized.offset,
+            limit: normalized.limit,
+          }),
+          result: create(PiReadToolResultSchema, { result: piResult }),
+        }),
+      }
+    }
+
+    if (family === "pi_bash") {
+      const fullOutputPath = preserveProtocolLocation(
+        extraData?.shellResult?.outputLocation?.filePath
+      )
+      const piResult =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(PiBashToolSuccessSchema, {
+                output: result,
+                fullOutputPath,
+              }),
+            }
+          : {
+              case: "error" as const,
+              value: create(PiBashToolErrorSchema, {
+                error: statusMessage || result || "PI bash failed",
+                fullOutputPath,
+              }),
+            }
+      return {
+        case: "piBashToolCall" as const,
+        value: create(PiBashToolCallSchema, {
+          args: create(PiBashToolArgsSchema, {
+            command: safeString(args.command || args.cmd),
+            timeout: this.parseOptionalNonNegativeNumber(args.timeout),
+          }),
+          result: create(PiBashToolResultSchema, { result: piResult }),
+        }),
+      }
+    }
+
+    if (family === "pi_edit") {
+      const edits = this.buildPiEditReplacements(args)
+      if (edits.length === 0) {
+        throw new Error("Invalid PI edit args: missing edits")
+      }
+      const editDiff = extraData?.editSuccess?.diffString || ""
+      const piResult =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(PiEditToolSuccessSchema, {
+                output: result,
+                diff: editDiff,
+                patch: editDiff,
+              }),
+            }
+          : status === "rejected"
+            ? {
+                case: "rejected" as const,
+                value: create(PiEditToolRejectedSchema, {
+                  reason: statusMessage || result || "PI edit rejected",
+                }),
+              }
+            : {
+                case: "error" as const,
+                value: create(PiEditToolErrorSchema, {
+                  error: statusMessage || result || "PI edit failed",
+                }),
+              }
+      return {
+        case: "piEditToolCall" as const,
+        value: create(PiEditToolCallSchema, {
+          args: create(PiEditToolArgsSchema, {
+            path:
+              preserveProtocolLocation(
+                args.path ?? args.filePath ?? args.file_path
+              ) ?? "",
+            edits,
+          }),
+          result: create(PiEditToolResultSchema, { result: piResult }),
+        }),
+      }
+    }
+
+    if (family === "pi_write") {
+      const piResult =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(PiWriteToolSuccessSchema, { output: result }),
+            }
+          : status === "rejected"
+            ? {
+                case: "rejected" as const,
+                value: create(PiWriteToolRejectedSchema, {
+                  reason: statusMessage || result || "PI write rejected",
+                }),
+              }
+            : {
+                case: "error" as const,
+                value: create(PiWriteToolErrorSchema, {
+                  error: statusMessage || result || "PI write failed",
+                }),
+              }
+      return {
+        case: "piWriteToolCall" as const,
+        value: create(PiWriteToolCallSchema, {
+          args: create(PiWriteToolArgsSchema, {
+            path:
+              preserveProtocolLocation(
+                args.path ?? args.filePath ?? args.file_path
+              ) ?? "",
+            content: safeString(args.content),
+          }),
+          result: create(PiWriteToolResultSchema, { result: piResult }),
+        }),
+      }
+    }
+
+    if (family === "pi_grep") {
+      const normalized = this.normalizePiGrepCallArgs(args)
+      const piResult =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(PiGrepToolSuccessSchema, { output: result }),
+            }
+          : {
+              case: "error" as const,
+              value: create(PiGrepToolErrorSchema, {
+                error: statusMessage || result || "PI grep failed",
+              }),
+            }
+      return {
+        case: "piGrepToolCall" as const,
+        value: create(PiGrepToolCallSchema, {
+          args: create(PiGrepToolArgsSchema, {
+            pattern: normalized.pattern,
+            path: normalized.path,
+            glob: normalized.glob,
+            ignoreCase: normalized.ignoreCase,
+            literal: normalized.literal,
+            context: normalized.context,
+            limit: normalized.limit,
+          }),
+          result: create(PiGrepToolResultSchema, { result: piResult }),
+        }),
+      }
+    }
+
+    if (family === "pi_find") {
+      const piResult =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(PiFindToolSuccessSchema, { output: result }),
+            }
+          : {
+              case: "error" as const,
+              value: create(PiFindToolErrorSchema, {
+                error: statusMessage || result || "PI find failed",
+              }),
+            }
+      return {
+        case: "piFindToolCall" as const,
+        value: create(PiFindToolCallSchema, {
+          args: create(PiFindToolArgsSchema, {
+            pattern: safeString(args.pattern || args.query),
+            path: preserveProtocolLocation(args.path),
+            limit: this.parseOptionalNonNegativeInt(
+              args.limit ?? args.headLimit ?? args.head_limit
+            ),
+          }),
+          result: create(PiFindToolResultSchema, { result: piResult }),
+        }),
+      }
+    }
+
+    if (family === "pi_ls") {
+      const piResult =
+        status === "success"
+          ? {
+              case: "success" as const,
+              value: create(PiLsToolSuccessSchema, { output: result }),
+            }
+          : {
+              case: "error" as const,
+              value: create(PiLsToolErrorSchema, {
+                error: statusMessage || result || "PI ls failed",
+              }),
+            }
+      return {
+        case: "piLsToolCall" as const,
+        value: create(PiLsToolCallSchema, {
+          args: create(PiLsToolArgsSchema, {
+            path: preserveProtocolLocation(args.path),
+            limit: this.parseOptionalNonNegativeInt(
+              args.limit ?? args.headLimit ?? args.head_limit
+            ),
+          }),
+          result: create(PiLsToolResultSchema, { result: piResult }),
+        }),
+      }
+    }
+
     if (family === "read" || family === "redacted_read") {
       const normalizedReadArgs = this.normalizeReadToolArgs(args)
       const readSuccess = extraData?.readSuccess
@@ -7874,9 +9541,10 @@ export class CursorGrpcService {
       const successContent =
         typeof readSuccess?.content === "string" ? readSuccess.content : result
       const successData = hasBinaryOutput ? readSuccess.data : undefined
-      const resolvedPath = safeString(
-        readSuccess?.path || normalizedReadArgs.path
-      ).trim()
+      const resolvedPath =
+        preserveProtocolLocation(
+          readSuccess?.path ?? normalizedReadArgs.path
+        ) ?? ""
       const explicitTotalLines = this.parseOptionalNonNegativeInt(
         readSuccess?.totalLines
       )
@@ -7916,14 +9584,19 @@ export class CursorGrpcService {
       const relatedCursorRulePaths = Array.isArray(
         readSuccess?.relatedCursorRulePaths
       )
-        ? readSuccess.relatedCursorRulePaths
-            .map((entry) => safeString(entry).trim())
-            .filter((entry) => entry.length > 0)
+        ? preserveProtocolLocationArray(readSuccess.relatedCursorRulePaths)
         : []
       const relatedCursorRules = Array.isArray(readSuccess?.relatedCursorRules)
         ? readSuccess.relatedCursorRules
             .filter((entry) => !!entry && typeof entry === "object")
-            .map((entry) => create(CursorRuleSchema, entry))
+            .map((entry) => {
+              return create(CursorRuleSchema, {
+                fullPath:
+                  preserveProtocolLocation(entry.fullPath ?? entry.full_path) ??
+                  "",
+                content: safeString(entry.content),
+              })
+            })
         : []
       const readResultOneOf =
         status === "success"
@@ -8049,7 +9722,10 @@ export class CursorGrpcService {
       const pattern = safeString(
         normalizedGrepArgs.pattern || grepSuccess?.pattern
       )
-      const path = safeString(normalizedGrepArgs.path || grepSuccess?.path)
+      const path =
+        preserveProtocolLocation(normalizedGrepArgs.path) ??
+        preserveProtocolLocation(grepSuccess?.path) ??
+        ""
       const outputMode = safeString(
         normalizedGrepArgs.outputMode ??
           grepSuccessRecord?.outputMode ??
@@ -8077,16 +9753,15 @@ export class CursorGrpcService {
       return {
         case: "grepToolCall" as const,
         value: create(GrepToolCallSchema, {
-          args: create(GrepArgsSchema, {
-            pattern,
-            path: path || undefined,
-            glob: normalizedGrepArgs.glob,
-            outputMode: outputMode || undefined,
-            caseInsensitive: normalizedGrepArgs.caseInsensitive,
-            type: normalizedGrepArgs.type,
-            headLimit: normalizedGrepArgs.headLimit,
-            offset: normalizedGrepArgs.offset,
-          }),
+          args: this.createGrepArgsMessage(
+            {
+              ...args,
+              pattern,
+              path,
+              output_mode: outputMode || undefined,
+            },
+            safeString(args.toolCallId ?? args.tool_call_id) || undefined
+          ),
           result: create(GrepResultSchema, {
             result: grepResultOneOf,
           }),
@@ -8096,8 +9771,10 @@ export class CursorGrpcService {
 
     if (family === "delete") {
       const deleteSuccess = extraData?.deleteSuccess
-      const path = safeString(deleteSuccess?.path || args.path)
-      const deletedFile = safeString(deleteSuccess?.deletedFile || path)
+      const path =
+        preserveProtocolLocation(deleteSuccess?.path ?? args.path) ?? ""
+      const deletedFile =
+        preserveProtocolLocation(deleteSuccess?.deletedFile ?? path) ?? ""
       const rawFileSize = deleteSuccess?.fileSize
       let fileSize = 0n
       if (typeof rawFileSize === "bigint") {
@@ -8258,15 +9935,37 @@ export class CursorGrpcService {
 
     if (family === "read_lints") {
       const diagnosticsSuccess = extraData?.diagnosticsSuccess
-      const paths =
-        asStringArray(args.paths).length > 0
-          ? asStringArray(args.paths)
-          : safeString(args.path)
-            ? [safeString(args.path)]
+      const requestedPathArray = preserveProtocolLocationArray(args.paths)
+      const requestedDirectPath = preserveProtocolLocation(args.path)
+      const requestedPaths =
+        requestedPathArray.length > 0
+          ? requestedPathArray
+          : requestedDirectPath
+            ? [requestedDirectPath]
             : []
-      const diagnosticsPath = safeString(diagnosticsSuccess?.path).trim()
+      const diagnosticFiles = (diagnosticsSuccess?.files || [])
+        .map((file) => ({
+          path: preserveProtocolLocation(file.path) ?? "",
+          diagnostics: this.normalizeReadLintsDiagnosticItems(file.diagnostics),
+          totalDiagnostics:
+            this.parseOptionalNonNegativeInt(file.totalDiagnostics) ??
+            this.normalizeReadLintsDiagnosticItems(file.diagnostics).length,
+        }))
+        .filter((file) => file.path.length > 0)
+      const diagnosticsPath =
+        preserveProtocolLocation(diagnosticsSuccess?.path) ?? ""
+      const paths =
+        requestedPaths.length > 0
+          ? requestedPaths
+          : diagnosticFiles.length > 0
+            ? diagnosticFiles.map((file) => file.path)
+            : diagnosticsPath
+              ? [diagnosticsPath]
+              : []
       const resolvedPaths =
-        paths.length > 0 ? paths : diagnosticsPath ? [diagnosticsPath] : []
+        diagnosticFiles.length > 0
+          ? diagnosticFiles.map((file) => file.path)
+          : paths
       const normalizedDiagnosticItems = this.normalizeReadLintsDiagnosticItems(
         diagnosticsSuccess?.diagnostics
       )
@@ -8295,13 +9994,49 @@ export class CursorGrpcService {
         this.parseOptionalNonNegativeInt(
           diagnosticsSuccess?.totalDiagnostics
         ) ?? protoDiagnosticItems.length
-      const fileDiagnostics = resolvedPaths.map((path, index) =>
-        create(FileDiagnosticsSchema, {
-          path,
-          diagnostics: index === 0 ? protoDiagnosticItems : [],
-          diagnosticsCount: index === 0 ? primaryDiagnosticsCount : 0,
-        })
-      )
+      const fileDiagnostics =
+        diagnosticFiles.length > 0
+          ? diagnosticFiles.map((file) =>
+              create(FileDiagnosticsSchema, {
+                path: file.path,
+                diagnostics: file.diagnostics.map((item) =>
+                  create(DiagnosticItemSchema, {
+                    severity: item.severity,
+                    ...(item.range
+                      ? {
+                          range: create(DiagnosticRangeSchema, {
+                            ...(item.range.start
+                              ? {
+                                  start: create(
+                                    PositionSchema,
+                                    item.range.start
+                                  ),
+                                }
+                              : {}),
+                            ...(item.range.end
+                              ? {
+                                  end: create(PositionSchema, item.range.end),
+                                }
+                              : {}),
+                          }),
+                        }
+                      : {}),
+                    message: item.message,
+                    source: item.source,
+                    code: item.code,
+                    isStale: item.isStale,
+                  })
+                ),
+                diagnosticsCount: file.totalDiagnostics,
+              })
+            )
+          : resolvedPaths.map((path, index) =>
+              create(FileDiagnosticsSchema, {
+                path,
+                diagnostics: index === 0 ? protoDiagnosticItems : [],
+                diagnosticsCount: index === 0 ? primaryDiagnosticsCount : 0,
+              })
+            )
       const totalDiagnostics =
         fileDiagnostics.length > 0
           ? fileDiagnostics.reduce(
@@ -8459,6 +10194,9 @@ export class CursorGrpcService {
     }
 
     if (family === "apply_agent_diff") {
+      if (!hasValidCursorApplyAgentDiffArgs(args)) {
+        throw new Error("ApplyAgentDiff requires a non-empty agent_id")
+      }
       const applyDiffResultOneOf =
         status === "success"
           ? {
@@ -8555,10 +10293,7 @@ export class CursorGrpcService {
         }
       }
 
-      const normalizedAskQuestionArgs = this.normalizeAskQuestionArgs(
-        args,
-        callId
-      )
+      const normalizedAskQuestionArgs = normalizeCursorAskQuestionArgs(args)
 
       return {
         case: "askQuestionToolCall" as const,
@@ -8572,7 +10307,8 @@ export class CursorGrpcService {
     }
 
     if (family === "create_plan") {
-      const planUriFromArgs = safeString(args.planUri || args.plan_uri).trim()
+      const planUriFromArgs =
+        preserveProtocolLocation(args.planUri ?? args.plan_uri) ?? ""
       const planUriFromResult =
         this.extractCreatePlanUri(result) ||
         this.extractCreatePlanUri(statusMessage)
@@ -8603,6 +10339,13 @@ export class CursorGrpcService {
     }
 
     if (family === "sem_search") {
+      const primaryTargetDirectories = preserveProtocolLocationArray(
+        args.targetDirectories
+      )
+      const targetDirectories =
+        primaryTargetDirectories.length > 0
+          ? primaryTargetDirectories
+          : preserveProtocolLocationArray(args.target_directories)
       const semSearchResultOneOf =
         status === "success"
           ? {
@@ -8626,7 +10369,7 @@ export class CursorGrpcService {
             query: safeString(
               args.query || args.symbol || args.search_term || args.searchTerm
             ),
-            targetDirectories: asStringArray(args.targetDirectories),
+            targetDirectories,
             explanation: safeString(args.explanation),
           }),
           result: create(SemSearchToolResultSchema, {
@@ -8726,26 +10469,17 @@ export class CursorGrpcService {
     }
 
     if (family === "mcp") {
-      let name: string
-      let mcpToolName: string
-      let providerIdentifier: string
-      let mcpArgsInput: Record<string, unknown>
-      try {
-        const resolved = this.resolveMcpCallFields(args)
-        name = resolved.name
-        mcpToolName = resolved.toolName
-        providerIdentifier = resolved.providerIdentifier
-        mcpArgsInput = resolved.rawArgs
-      } catch {
-        // MCP tool args stored in transcript may not contain identity fields
-        // (e.g. user-context7-resolve-library-id stores { libraryName, query }
-        // without name/toolName/providerIdentifier). Fall back to deriving
-        // identity from the outer toolName parameter.
-        mcpToolName = toolName
-        name = toolName
-        providerIdentifier = ""
-        mcpArgsInput = { ...args }
-      }
+      const resolved = this.resolveMcpCallFields({
+        ...args,
+        name: safeString(args.name).trim() || toolName,
+        toolName:
+          safeString(args.toolName || args.tool_name).trim() || toolName,
+      })
+      const name = resolved.name
+      const mcpToolName = resolved.toolName
+      const providerIdentifier = resolved.providerIdentifier
+      const serverIdentifier = resolved.serverIdentifier
+      const mcpArgsInput = resolved.rawArgs
       let mcpResultOneOf: McpToolResult["result"]
       if (status === "success") {
         const contentItems = this.buildMcpResultContentItems(result, {
@@ -8793,6 +10527,7 @@ export class CursorGrpcService {
             args: this.toProtoValueMap(mcpArgsInput),
             toolName: mcpToolName,
             providerIdentifier,
+            serverIdentifier,
             toolCallId: callId,
           }),
           result: create(McpToolResultSchema, {
@@ -8847,13 +10582,14 @@ export class CursorGrpcService {
 
     if (family === "read_mcp_resource") {
       const readMcpSuccess = extraData?.readMcpResourceSuccess
-      const uri = safeString(readMcpSuccess?.uri || args.uri)
+      const uri =
+        preserveProtocolLocation(readMcpSuccess?.uri ?? args.uri) ?? ""
       const server = safeString(
         args.serverName || args.server || args.server_name
       )
-      const downloadPath = safeString(
-        readMcpSuccess?.downloadPath || args.downloadPath || args.download_path
-      ).trim()
+      const downloadPath = preserveProtocolLocation(
+        readMcpSuccess?.downloadPath ?? args.downloadPath ?? args.download_path
+      )
       let readMcpResultOneOf: ReadMcpResourceExecResult["result"]
       if (status === "success") {
         const successAnnotations = this.normalizeStringMap(
@@ -8883,7 +10619,7 @@ export class CursorGrpcService {
               safeString(readMcpSuccess?.description).trim() || undefined,
             mimeType: safeString(readMcpSuccess?.mimeType).trim() || undefined,
             annotations: successAnnotations,
-            downloadPath: downloadPath || undefined,
+            downloadPath,
           }),
         }
       } else if (status === "rejected") {
@@ -9070,24 +10806,21 @@ export class CursorGrpcService {
       )
       let webSearchResultOneOf: WebSearchResult["result"]
       if (status === "success") {
-        let references = this.parseWebSearchReferences(result)
+        const references = this.normalizeStructuredWebSearchReferences(args)
         if (references.length === 0) {
-          references = this.buildWebSearchFallbackReferences(searchTerm, result)
-          if (references.length > 0) {
-            this.logger.warn(
-              `web_search produced no parseable sources; using fallback query reference (query="${searchTerm.slice(0, 120)}")`
-            )
-          } else {
-            this.logger.warn(
-              `web_search produced empty sources and empty query; returning success with empty references`
-            )
+          webSearchResultOneOf = {
+            case: "error" as const,
+            value: create(WebSearchErrorSchema, {
+              error: "web_search succeeded without structured references",
+            }),
           }
-        }
-        webSearchResultOneOf = {
-          case: "success" as const,
-          value: create(WebSearchSuccessSchema, {
-            references,
-          }),
+        } else {
+          webSearchResultOneOf = {
+            case: "success" as const,
+            value: create(WebSearchSuccessSchema, {
+              references,
+            }),
+          }
         }
       } else if (status === "rejected") {
         webSearchResultOneOf = {
@@ -9171,21 +10904,30 @@ export class CursorGrpcService {
       )
       let awaitResultOneOf: AwaitResult["result"]
       if (status === "success") {
+        const awaitDetails = extraData?.awaitResult
+        const awaitTask = {
+          taskId: taskIdVal,
+          runtimeMs: BigInt(awaitDetails?.runtimeMs ?? 0),
+          outputFilePath:
+            preserveProtocolLocation(awaitDetails?.outputFilePath) ?? "",
+          outputLength: BigInt(awaitDetails?.outputLength ?? 0),
+          regexRequested: awaitDetails?.regexRequested ?? false,
+          regexMatch: awaitDetails?.regexMatch,
+          exitCode: awaitDetails?.exitCode,
+        }
         awaitResultOneOf = {
           case: "success" as const,
           value: create(AwaitSuccessSchema, {
-            awaitResult: {
-              case: "complete" as const,
-              value: create(AwaitTaskCompleteSchema, {
-                taskId: taskIdVal,
-                runtimeMs: BigInt(extraData?.awaitResult?.runtimeMs ?? 0),
-                outputFilePath: safeString(
-                  extraData?.awaitResult?.outputFilePath
-                ),
-                outputLength: BigInt(extraData?.awaitResult?.outputLength ?? 0),
-                exitCode: extraData?.awaitResult?.exitCode ?? undefined,
-              }),
-            },
+            awaitResult:
+              awaitDetails?.complete === false
+                ? {
+                    case: "stillRunning" as const,
+                    value: create(AwaitTaskStillRunningSchema, awaitTask),
+                  }
+                : {
+                    case: "complete" as const,
+                    value: create(AwaitTaskCompleteSchema, awaitTask),
+                  },
           }),
         }
       } else {
@@ -9209,6 +10951,7 @@ export class CursorGrpcService {
                 args.block_until_ms,
               30000
             ),
+            regex: safeString(args.regex) || undefined,
           }),
           result: create(AwaitResultSchema, {
             result: awaitResultOneOf,
@@ -9239,7 +10982,9 @@ export class CursorGrpcService {
         case: "aiAttributionToolCall" as const,
         value: create(AiAttributionToolCallSchema, {
           args: create(AiAttributionArgsSchema, {
-            filePaths: this.toStringArray(args.file_paths || args.filePaths),
+            filePaths: preserveProtocolLocationArray(
+              args.file_paths ?? args.filePaths
+            ),
             commitHashes: this.toStringArray(
               args.commit_hashes || args.commitHashes
             ),
@@ -9293,39 +11038,159 @@ export class CursorGrpcService {
       }
     }
 
-    if (family === "pr_management") {
-      let prResultOneOf: PrManagementResult["result"]
-      if (status === "success") {
-        prResultOneOf = {
+    if (family === "replace_env") {
+      const captured = extraData?.replaceEnvResult
+      let replaceResultOneOf: ReplaceEnvResult["result"]
+      if (captured?.case === "success" || status === "success") {
+        replaceResultOneOf = {
           case: "success" as const,
-          value: create(PrManagementSuccessSchema, {
-            prUrl: safeString(extraData?.prResult?.prUrl),
-            prNumber: extraData?.prResult?.prNumber ?? 0,
-            message: result || "PR created successfully",
-          }),
-        }
-      } else if (status === "rejected") {
-        prResultOneOf = {
-          case: "rejected" as const,
-          value: create(PrManagementRejectedSchema, {
-            reason: statusMessage || "pr_management rejected",
+          value: create(ReplaceEnvSuccessSchema, {
+            setupLogs:
+              captured?.case === "success" ? captured.setupLogs || "" : "",
           }),
         }
       } else {
-        prResultOneOf = {
-          case: "error" as const,
-          value: create(PrManagementErrorSchema, {
-            error: statusMessage || "pr_management failed",
+        replaceResultOneOf = {
+          case: "failure" as const,
+          value: create(ReplaceEnvFailureSchema, {
+            errorMessage:
+              captured?.case === "failure"
+                ? captured.errorMessage || statusMessage
+                : statusMessage || "replace_env failed",
+            setupLogs:
+              captured?.case === "failure" ? captured.setupLogs || "" : "",
           }),
         }
+      }
+      return {
+        case: "replaceEnvToolCall" as const,
+        value: create(ReplaceEnvToolCallSchema, {
+          args: this.buildReplaceEnvArgs(args),
+          result: create(ReplaceEnvResultSchema, {
+            result: replaceResultOneOf,
+          }),
+        }),
+      }
+    }
+
+    if (family === "connect_scm") {
+      let connectResultOneOf: ConnectScmResult["result"]
+      if (status === "success") {
+        connectResultOneOf = {
+          case: "success" as const,
+          value: create(ConnectScmSuccessSchema, {}),
+        }
+      } else if (status === "rejected") {
+        connectResultOneOf = {
+          case: "rejected" as const,
+          value: create(ConnectScmRejectedSchema, {
+            reason: statusMessage || "connect_scm rejected",
+          }),
+        }
+      } else {
+        connectResultOneOf = {
+          case: "error" as const,
+          value: create(ConnectScmErrorSchema, {
+            error: statusMessage || "connect_scm failed",
+          }),
+        }
+      }
+      return {
+        case: "connectScmToolCall" as const,
+        value: create(ConnectScmToolCallSchema, {
+          args: this.buildConnectScmArgs(args, callId),
+          result: create(ConnectScmResultSchema, {
+            result: connectResultOneOf,
+          }),
+        }),
+      }
+    }
+
+    if (family === "pr_management") {
+      const captured = extraData?.prManagementResult
+      let prResultOneOf: PrManagementResult["result"]
+      switch (captured?.case) {
+        case "success":
+          prResultOneOf = {
+            case: "success" as const,
+            value: create(PrManagementSuccessSchema, {
+              prUrl: captured.prUrl || "",
+              prNumber: captured.prNumber || 0,
+              message: captured.message || result,
+            }),
+          }
+          break
+        case "registered":
+          prResultOneOf = {
+            case: "registered" as const,
+            value: create(PrManagementRegisteredSchema, {
+              message: captured.message || "",
+              title: captured.title || "",
+              body: captured.body || "",
+              baseBranch: captured.baseBranch,
+              draft: captured.draft,
+              branchName: captured.branchName || "",
+            }),
+          }
+          break
+        case "needsConfirmation":
+          prResultOneOf = {
+            case: "needsConfirmation" as const,
+            value: create(PrManagementNeedsConfirmationSchema, {
+              message: captured.message || "",
+              discoveredPrUrl: captured.discoveredPrUrl || "",
+              discoveredPrNumber: captured.discoveredPrNumber || 0,
+              discoveredPrTitle: captured.discoveredPrTitle || "",
+              branchName: captured.branchName || "",
+            }),
+          }
+          break
+        case "rejected":
+          prResultOneOf = {
+            case: "rejected" as const,
+            value: create(PrManagementRejectedSchema, {
+              reason: captured.reason || statusMessage,
+            }),
+          }
+          break
+        case "error":
+          prResultOneOf = {
+            case: "error" as const,
+            value: create(PrManagementErrorSchema, {
+              error: captured.error || statusMessage,
+            }),
+          }
+          break
+        default:
+          prResultOneOf =
+            status === "rejected"
+              ? {
+                  case: "rejected" as const,
+                  value: create(PrManagementRejectedSchema, {
+                    reason: statusMessage || "pr_management rejected",
+                  }),
+                }
+              : status === "success"
+                ? {
+                    case: "success" as const,
+                    value: create(PrManagementSuccessSchema, {
+                      prUrl: "",
+                      prNumber: 0,
+                      message: result,
+                    }),
+                  }
+                : {
+                    case: "error" as const,
+                    value: create(PrManagementErrorSchema, {
+                      error: statusMessage || "pr_management failed",
+                    }),
+                  }
       }
 
       return {
         case: "prManagementToolCall" as const,
         value: create(PrManagementToolCallSchema, {
-          args: create(PrManagementArgsSchema, {
-            toolCallId: callId,
-          }),
+          args: this.buildPrManagementArgs(args, callId),
           result: create(PrManagementResultSchema, {
             result: prResultOneOf,
           }),
@@ -9375,21 +11240,25 @@ export class CursorGrpcService {
     }
 
     if (family === "generate_image") {
+      const primaryReferenceImagePaths = preserveProtocolLocationArray(
+        args.referenceImagePaths
+      )
       const referenceImagePaths =
-        asStringArray(args.referenceImagePaths).length > 0
-          ? asStringArray(args.referenceImagePaths)
-          : asStringArray(args.reference_image_paths)
+        primaryReferenceImagePaths.length > 0
+          ? primaryReferenceImagePaths
+          : preserveProtocolLocationArray(args.reference_image_paths)
       const generateImageSuccess = extraData?.generateImageSuccess
       const generateImageResultOneOf =
         status === "success"
           ? {
               case: "success" as const,
               value: create(GenerateImageSuccessSchema, {
-                filePath: safeString(
-                  generateImageSuccess?.filePath ||
-                    args.filePath ||
-                    args.file_path
-                ),
+                filePath:
+                  preserveProtocolLocation(
+                    generateImageSuccess?.filePath ??
+                      args.filePath ??
+                      args.file_path
+                  ) ?? "",
                 imageData:
                   safeString(generateImageSuccess?.imageData) || result,
               }),
@@ -9406,7 +11275,7 @@ export class CursorGrpcService {
         value: create(GenerateImageToolCallSchema, {
           args: create(GenerateImageArgsSchema, {
             description: safeString(args.prompt || args.description),
-            filePath: safeString(args.filePath || args.file_path) || undefined,
+            filePath: preserveProtocolLocation(args.filePath ?? args.file_path),
             referenceImagePaths,
           }),
           result: create(GenerateImageResultSchema, {
@@ -9418,9 +11287,9 @@ export class CursorGrpcService {
 
     if (family === "record_screen") {
       const mode = this.parseRecordScreenMode(args.mode)
-      const saveAsFilename = safeString(
-        args.saveAsFilename || args.save_as_filename
-      ).trim()
+      const saveAsFilename = preserveProtocolLocation(
+        args.saveAsFilename ?? args.save_as_filename
+      )
       const recordScreenResultOneOf =
         status === "success"
           ? mode === RecordingMode.SAVE_RECORDING
@@ -9428,12 +11297,12 @@ export class CursorGrpcService {
                 case: "saveSuccess" as const,
                 value: create(RecordScreenSaveSuccessSchema, {
                   path:
-                    safeString(
-                      args.path ||
-                        args.filePath ||
-                        args.file_path ||
+                    preserveProtocolLocation(
+                      args.path ??
+                        args.filePath ??
+                        args.file_path ??
                         saveAsFilename
-                    ) || "",
+                    ) ?? "",
                   recordingDurationMs: BigInt(
                     asInt(
                       args.recordingDurationMs ||
@@ -9468,7 +11337,7 @@ export class CursorGrpcService {
           args: create(RecordScreenArgsSchema, {
             mode,
             toolCallId: callId,
-            saveAsFilename: saveAsFilename || undefined,
+            saveAsFilename,
           }),
           result: create(RecordScreenResultSchema, {
             result: recordScreenResultOneOf,
@@ -9497,7 +11366,8 @@ export class CursorGrpcService {
         case: "blameByFilePathToolCall" as const,
         value: create(BlameByFilePathToolCallSchema, {
           args: create(BlameByFilePathArgsSchema, {
-            filePath: safeString(args.filePath || args.file_path),
+            filePath:
+              preserveProtocolLocation(args.filePath ?? args.file_path) ?? "",
             startLine: this.parseOptionalNonNegativeInt(
               args.startLine ?? args.start_line
             ),
@@ -9533,9 +11403,10 @@ export class CursorGrpcService {
         value: create(ReportBugToolCallSchema, {
           args: create(ReportBugArgsSchema, {
             title: safeString(args.title),
-            file: safeString(
-              args.file || args.path || args.filePath || args.file_path
-            ),
+            file:
+              preserveProtocolLocation(
+                args.file ?? args.path ?? args.filePath ?? args.file_path
+              ) ?? "",
             startLine:
               this.parseOptionalNonNegativeInt(
                 args.startLine ?? args.start_line
@@ -9573,7 +11444,7 @@ export class CursorGrpcService {
         case: "setActiveBranchToolCall" as const,
         value: create(SetActiveBranchToolCallSchema, {
           args: create(SetActiveBranchArgsSchema, {
-            path: safeString(args.path),
+            path: preserveProtocolLocation(args.path) ?? "",
             branchName: safeString(args.branchName || args.branch_name),
           }),
           result: create(SetActiveBranchResultSchema, {
@@ -9633,6 +11504,9 @@ export class CursorGrpcService {
               args.installCommand || args.install_command
             ),
             startCommand: safeString(args.startCommand || args.start_command),
+            dockerfileContents: safeString(
+              args.dockerfileContents || args.dockerfile_contents
+            ),
           }),
           // Proto currently defines success-only oneof for this result.
           // Keep oneof unset on failure instead of projecting a false success.
@@ -9767,7 +11641,12 @@ export class CursorGrpcService {
             ? BigInt(Math.max(0, Math.floor(durationMsRaw)))
             : undefined
       const resultSuffix = safeString(taskSuccessExtra?.resultSuffix).trim()
-      const transcriptPath = safeString(taskSuccessExtra?.transcriptPath).trim()
+      const backgroundReason = this.parseOptionalNonNegativeInt(
+        taskSuccessExtra?.backgroundReason
+      )
+      const transcriptPath = preserveProtocolLocation(
+        taskSuccessExtra?.transcriptPath
+      )
       const taskResultOneOf =
         status === "success"
           ? {
@@ -9778,20 +11657,21 @@ export class CursorGrpcService {
                 agentId: taskAgentId || undefined,
                 durationMs,
                 resultSuffix: resultSuffix || undefined,
-                transcriptPath: transcriptPath || undefined,
+                backgroundReason,
+                transcriptPath,
               }),
             }
           : {
               case: "error" as const,
               value: create(TaskErrorSchema, {
-                error: statusMessage || "task failed",
+                error: extraData?.taskError ?? statusMessage ?? "task failed",
               }),
             }
 
       return {
         case: "taskToolCall" as const,
         value: create(TaskToolCallSchema, {
-          args: this.buildTaskArgs(args),
+          args: this.buildCompletedTaskArgs(args, status),
           result: create(TaskResultSchema, {
             result: taskResultOneOf,
           }),
@@ -9979,70 +11859,14 @@ export class CursorGrpcService {
     }
 
     if (family === "unknown") {
-      this.warnTruncatedToolProjection(
-        "tool_call_completed",
-        toolName,
-        family,
-        "unknown ToolCall result type"
+      throw new Error(
+        `Tool "${toolName}" has no registered Cursor ToolCall result projection`
       )
-      const fallbackResultOneOf =
-        status === "success"
-          ? {
-              case: "success" as const,
-              value: create(TruncatedToolCallSuccessSchema, {}),
-            }
-          : {
-              case: "error" as const,
-              value: create(TruncatedToolCallErrorSchema, {
-                error:
-                  statusMessage ||
-                  `${family} completed without dedicated ToolCall result schema`,
-              }),
-            }
-
-      return {
-        case: "truncatedToolCall" as const,
-        value: create(TruncatedToolCallSchema, {
-          args: create(TruncatedToolCallArgsSchema, {}),
-          result: create(TruncatedToolCallResultSchema, {
-            result: fallbackResultOneOf,
-          }),
-        }),
-      }
     }
 
-    // Last-resort safety net: always emit protocol-valid result oneof.
-    const unhandledFamily = String(family || "unknown")
-    this.warnTruncatedToolProjection(
-      "tool_call_completed",
-      toolName,
-      family,
-      `unhandled tool family "${unhandledFamily}"`
+    throw new Error(
+      `Registered Cursor tool family "${String(family)}" has no ToolCall result projection`
     )
-    const safetyResultOneOf =
-      status === "success"
-        ? {
-            case: "success" as const,
-            value: create(TruncatedToolCallSuccessSchema, {}),
-          }
-        : {
-            case: "error" as const,
-            value: create(TruncatedToolCallErrorSchema, {
-              error:
-                statusMessage ||
-                `Unhandled tool family "${unhandledFamily}" while building ToolCall result`,
-            }),
-          }
-
-    return {
-      case: "truncatedToolCall" as const,
-      value: create(TruncatedToolCallSchema, {
-        args: create(TruncatedToolCallArgsSchema, {}),
-        result: create(TruncatedToolCallResultSchema, {
-          result: safetyResultOneOf,
-        }),
-      }),
-    }
   }
 
   // ─── Conversation Checkpoint ───────────────────────────────
@@ -10083,6 +11907,10 @@ export class CursorGrpcService {
       }>
       /** Blob ids for serialized `ConversationSummaryArchive` records. */
       summaryArchiveBlobIds?: string[]
+      /** Durable ConversationStateStructure.goal_state. */
+      goalState?: BridgeGoalState
+      /** Durable ConversationStateStructure.is_root_project_conversation. */
+      isRootProjectConversation?: boolean
     }
   ): Buffer {
     // 构建 file_states_v2 (map<string, FileStateStructure>)
@@ -10114,16 +11942,14 @@ export class CursorGrpcService {
       })
     )
 
-    // 构建 turns (repeated bytes) — 将 turn ID 编码为 bytes
-    const turnsBytes = (checkpoint.turns || []).map((t) =>
-      new TextEncoder().encode(t)
-    )
+    // Blob identifiers are opaque bytes; checkpoint state stores only their
+    // canonical base64url keys.
+    const turnsBytes = (checkpoint.turns || []).map(cursorBlobIdFromKey)
 
     const compactionHistory = checkpoint.compactionHistory || []
-    const summaryArchivesBytes = (checkpoint.summaryArchiveBlobIds || [])
-      .map((blobId) => blobId.trim())
-      .filter((blobId) => blobId.length > 0)
-      .map((blobId) => new TextEncoder().encode(blobId))
+    const summaryArchivesBytes = (checkpoint.summaryArchiveBlobIds || []).map(
+      cursorBlobIdFromKey
+    )
 
     // 构建 summary (optional bytes) — 当前 active summary。Cursor 把它
     // 渲染在 chat 顶部"已压缩 X 条消息"的 banner 上。bridge 没有显式的
@@ -10182,6 +12008,12 @@ export class CursorGrpcService {
         })
         return toBinary(TodoItemSchema, item)
       }),
+      ...(checkpoint.goalState
+        ? { goalState: toProtoGoalState(checkpoint.goalState) }
+        : {}),
+      ...(checkpoint.isRootProjectConversation !== undefined
+        ? { isRootProjectConversation: checkpoint.isRootProjectConversation }
+        : {}),
     })
 
     const msg = create(AgentServerMessageSchema, {
@@ -10206,9 +12038,7 @@ export class CursorGrpcService {
           message: {
             case: "getBlobArgs" as const,
             value: create(GetBlobArgsSchema, {
-              blobId: new TextEncoder().encode(
-                kvMessage.getBlobArgs.blobId || ""
-              ),
+              blobId: cursorBlobIdFromKey(kvMessage.getBlobArgs.blobId),
             }),
           },
         })
@@ -10219,9 +12049,7 @@ export class CursorGrpcService {
           message: {
             case: "setBlobArgs" as const,
             value: create(SetBlobArgsSchema, {
-              blobId: new TextEncoder().encode(
-                kvMessage.setBlobArgs.blobId || ""
-              ),
+              blobId: cursorBlobIdFromKey(kvMessage.setBlobArgs.blobId),
               blobData:
                 kvMessage.setBlobArgs.blobData instanceof Uint8Array
                   ? kvMessage.setBlobArgs.blobData

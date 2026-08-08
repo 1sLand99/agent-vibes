@@ -33,12 +33,14 @@ import { GoogleModelCacheService } from "../../../llm/google/google-model-cache.
 import { KiroService } from "../../../llm/aws/kiro.service"
 import { CodexService } from "../../../llm/openai/codex.service"
 import { OpenaiCompatService } from "../../../llm/openai/openai-compat.service"
+import { cursorBlobIdToKey } from "../codec/cursor-blob-id"
+import { CursorWireStore } from "../session/cursor-wire-store.service"
+import { ConversationId } from "../turn/turn.types"
 import {
   canPublicClaudeModelUseGoogle,
   getCursorDisplayModels,
   resolveCloudCodeModel,
 } from "../../../llm/shared/model-registry"
-import { parseModelRequest } from "../../../llm/shared/model-request"
 import { ModelRouterService } from "../../../llm/shared/model-router.service"
 import type { AnthropicResponse } from "../../../shared/anthropic"
 import type { CreateMessageDto } from "../../anthropic/dto/create-message.dto"
@@ -49,7 +51,6 @@ import {
   appendRequestedCursorModels,
   buildCursorUsableModel,
 } from "../cursor-model-protocol"
-import { KvStorageService } from "../kv-storage.service"
 
 /**
  * Cursor ConnectRPC Adapter Controller
@@ -74,7 +75,7 @@ export class CursorAdapterController {
     private readonly modelRouter: ModelRouterService,
     private readonly openaiCompatService: OpenaiCompatService,
     private readonly messagesService: MessagesService,
-    private readonly kvStorageService: KvStorageService
+    private readonly cursorWireStore: CursorWireStore
   ) {}
 
   private isGptBackendAvailable(): boolean {
@@ -171,54 +172,6 @@ export class CursorAdapterController {
   private logModelNames(label: string, modelNames: string[]): void {
     this.logger.debug(
       `${label}: ${modelNames.length} model(s) -> ${modelNames.join(", ")}`
-    )
-  }
-
-  private scheduleCodexWarmupForCursorModel(
-    cursorModel: string | undefined,
-    reason: string
-  ): void {
-    const normalizedModel = cursorModel?.trim()
-    if (!normalizedModel) {
-      return
-    }
-
-    try {
-      const routableModel =
-        parseModelRequest(normalizedModel).baseModel || normalizedModel
-      const route = this.modelRouter.resolveModel(routableModel)
-      if (route.backend !== "codex") {
-        return
-      }
-
-      void this.codexService
-        .prewarmSessionConnection(
-          {
-            model: route.model,
-          },
-          { reason }
-        )
-        .catch((error) => {
-          this.logger.debug(
-            `Codex warmup failed for model=${normalizedModel} routed=${route.model}: ${error instanceof Error ? error.message : String(error)}`
-          )
-        })
-    } catch (error) {
-      this.logger.debug(
-        `Skipped Codex warmup for model=${normalizedModel}: ${error instanceof Error ? error.message : String(error)}`
-      )
-    }
-  }
-
-  private schedulePreferredCodexWarmup(models: Array<{ name: string }>): void {
-    const preferredModel =
-      models.find((model) => model.name === "gpt-5.5")?.name ||
-      models.find((model) => model.name === "gpt-5.4")?.name ||
-      models.find((model) => model.name === "gpt-5")?.name ||
-      models[0]?.name
-    this.scheduleCodexWarmupForCursorModel(
-      preferredModel,
-      "agent-usable-models"
     )
   }
 
@@ -397,7 +350,6 @@ export class CursorAdapterController {
       "AgentService.GetUsableModels response",
       cursorModels.map((model) => model.name)
     )
-    this.schedulePreferredCodexWarmup(cursorModels)
     const response = create(GetUsableModelsResponseSchema, { models })
     res
       .status(200)
@@ -437,15 +389,19 @@ export class CursorAdapterController {
       UploadConversationBlobsRequestSchema,
       payload
     )
-    const textDecoder = new TextDecoder()
-
+    const conversationId = ConversationId.of(uploadRequest.conversationId)
     for (const blob of uploadRequest.blobs) {
-      const blobId = textDecoder.decode(blob.id)
-      this.kvStorageService.storeBinaryBlob(blobId, blob.value)
+      this.cursorWireStore.putBlob({
+        conversationId,
+        blobId: cursorBlobIdToKey(blob.id),
+        blobKind: "conversation_upload",
+        payload: Buffer.from(blob.value),
+        capturedAt: Date.now(),
+      })
     }
 
     this.logger.log(
-      `Stored ${uploadRequest.blobs.length} conversation blob(s) for conversation=${uploadRequest.conversationId || "(none)"} chunk=${uploadRequest.chunkIndex + 1}/${uploadRequest.totalChunks || 1}`
+      `Stored ${uploadRequest.blobs.length} conversation blob(s) for conversation=${conversationId} chunk=${uploadRequest.chunkIndex + 1}/${uploadRequest.totalChunks || 1}`
     )
 
     res.header("Content-Type", "application/proto")

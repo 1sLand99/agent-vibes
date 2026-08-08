@@ -13,6 +13,7 @@ import type {
   ContextMessageSource,
   ContextNativeManagementConfig,
   ContextProjectionAttachment,
+  LooseMessageContent,
 } from "../../../context"
 
 class MessageContentDto {
@@ -53,7 +54,7 @@ class MessageContentDto {
   // tool_result nested content (string or array of content blocks)
   @ApiPropertyOptional()
   @IsOptional()
-  content?: string | Array<Record<string, unknown>>
+  content?: LooseMessageContent
 }
 
 class MessageDto {
@@ -64,7 +65,7 @@ class MessageDto {
   // Content can be string or array of content blocks - use @IsOptional to allow any type
   @ApiProperty({ oneOf: [{ type: "string" }, { type: "array" }] })
   @IsOptional()
-  content: string | MessageContentDto[]
+  content: LooseMessageContent
 
   @IsOptional()
   @IsBoolean()
@@ -73,6 +74,11 @@ class MessageDto {
   @IsOptional()
   @IsString()
   source?: ContextMessageSource
+
+  /** Durable graph identity retained through request assembly. */
+  @IsOptional()
+  @IsString()
+  sourceUuid?: string
 
   @IsOptional()
   @IsString()
@@ -294,7 +300,7 @@ export class CreateMessageDto {
   /**
    * Internal carrier for a wire-ready cross-turn reasoning preamble.
    * Producer (cursor-connect-stream.service.ts:buildStreamingDtoForRoute)
-   * sources records from ReasoningMemoryService.buildPreamble, applies
+   * derives the payload from the exact graph-backed request candidate, applies
    * budget arithmetic, frames the text as
    * `<previous_thinking>...</previous_thinking>`, and hands the
    * ready-to-splice payload over via this field. Consumer (provider
@@ -302,9 +308,9 @@ export class CreateMessageDto {
    * additional framing — onto the next user content block.
    *
    * Only populated for backends whose
-   * BackendCapability.continuityStrategy === "text_preamble" (kiro,
-   * codex). Native-signature backends rely on the structured assistant
-   * history instead.
+   * BackendCapability.continuityStrategy === "text_preamble" (Kiro).
+   * Native-signature and native-rollout backends retain reasoning through
+   * their structured provider history instead.
    */
   @IsOptional()
   @IsString()

@@ -1,3 +1,5 @@
+import { requireExactDurableIdentifier } from "../../context/durable-identifier"
+
 export interface CodexConversationSession<TActive> {
   conversationId: string
   active: TActive | null
@@ -13,32 +15,26 @@ export class CodexConversationSessionStore<TActive> {
   >()
 
   get(conversationId: string): CodexConversationSession<TActive> | undefined {
-    const normalized = this.normalizeConversationId(conversationId)
-    return normalized ? this.sessions.get(normalized) : undefined
+    return this.sessions.get(this.requireConversationId(conversationId))
   }
 
   getOrCreate(conversationId: string): CodexConversationSession<TActive> {
-    const normalized = this.normalizeConversationId(conversationId)
-    if (!normalized) {
-      throw new Error(
-        "[CodexConversationSessionStore] empty conversationId passed to getOrCreate"
-      )
-    }
+    const exactConversationId = this.requireConversationId(conversationId)
 
-    const existing = this.sessions.get(normalized)
+    const existing = this.sessions.get(exactConversationId)
     if (existing) {
       existing.updatedAt = Date.now()
       return existing
     }
 
     const created: CodexConversationSession<TActive> = {
-      conversationId: normalized,
+      conversationId: exactConversationId,
       active: null,
       streamTail: null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     }
-    this.sessions.set(normalized, created)
+    this.sessions.set(exactConversationId, created)
     return created
   }
 
@@ -68,19 +64,13 @@ export class CodexConversationSessionStore<TActive> {
   }
 
   delete(conversationId: string): void {
-    const normalized = this.normalizeConversationId(conversationId)
-    if (normalized) {
-      this.sessions.delete(normalized)
-    }
+    this.sessions.delete(this.requireConversationId(conversationId))
   }
 
   async acquireStreamLock(conversationId: string): Promise<() => void> {
-    const normalized = this.normalizeConversationId(conversationId)
-    if (!normalized) {
-      return () => {}
-    }
+    const exactConversationId = this.requireConversationId(conversationId)
 
-    const session = this.getOrCreate(normalized)
+    const session = this.getOrCreate(exactConversationId)
     const previousTail = session.streamTail
     let release!: () => void
     const currentTail = new Promise<void>((resolve) => {
@@ -90,39 +80,36 @@ export class CodexConversationSessionStore<TActive> {
     session.updatedAt = Date.now()
 
     if (previousTail) {
-      try {
-        await previousTail
-      } catch {
-        // Stream lock tails resolve during normal flow; ignore defensive rejects
-        // so a broken prior turn cannot block the conversation forever.
-      }
+      await previousTail
     }
 
     let released = false
     return () => {
       if (released) return
       released = true
-      const current = this.get(normalized)
+      const current = this.get(exactConversationId)
       if (current && current.streamTail === currentTail) {
         current.streamTail = null
         current.updatedAt = Date.now()
-        this.purgeIfIdle(normalized)
+        this.purgeIfIdle(exactConversationId)
       }
       release()
     }
   }
 
   private purgeIfIdle(conversationId: string): void {
-    const normalized = this.normalizeConversationId(conversationId)
-    if (!normalized) return
-    const session = this.sessions.get(normalized)
+    const exactConversationId = this.requireConversationId(conversationId)
+    const session = this.sessions.get(exactConversationId)
     if (!session) return
     if (session.active === null && session.streamTail === null) {
-      this.sessions.delete(normalized)
+      this.sessions.delete(exactConversationId)
     }
   }
 
-  private normalizeConversationId(conversationId: string): string {
-    return conversationId.trim()
+  private requireConversationId(conversationId: string): string {
+    return requireExactDurableIdentifier(
+      conversationId,
+      "Codex conversation id"
+    )
   }
 }

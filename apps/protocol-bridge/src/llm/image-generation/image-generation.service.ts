@@ -18,7 +18,7 @@ export interface ImageGenerationInput {
   conversationId?: string
   outputFormat?: string
   referenceImagePaths?: string[]
-  projectRoot?: string
+  referenceImages?: ImageGenerationReference[]
 }
 
 export interface ImageGenerationResult {
@@ -47,7 +47,7 @@ export class ImageGenerationService {
     }
 
     const errors: string[] = []
-    for (const provider of this.resolveProviderOrder(input.model)) {
+    for (const provider of this.resolveProviderOrder(input)) {
       try {
         return provider === "gemini"
           ? await this.generateWithGemini({ ...input, prompt })
@@ -66,8 +66,17 @@ export class ImageGenerationService {
     throw new Error(`Image generation failed: ${errors.join("; ")}`)
   }
 
-  private resolveProviderOrder(model?: string): ImageGenerationProvider[] {
-    const normalized = model?.trim().toLowerCase() || ""
+  private resolveProviderOrder(
+    input: ImageGenerationInput
+  ): ImageGenerationProvider[] {
+    const hasReferenceImages =
+      (input.referenceImages?.length || 0) > 0 ||
+      (input.referenceImagePaths?.length || 0) > 0
+    if (hasReferenceImages) {
+      return ["gemini"]
+    }
+
+    const normalized = input.model?.trim().toLowerCase() || ""
     if (normalized.includes("gemini")) {
       return ["gemini", "codex"]
     }
@@ -93,10 +102,13 @@ export class ImageGenerationService {
   private async generateWithGemini(
     input: ImageGenerationInput
   ): Promise<ImageGenerationResult> {
-    const references = await this.loadReferenceImages(
-      input.referenceImagePaths || [],
-      input.projectRoot
+    const pathReferences = await this.loadReferenceImages(
+      input.referenceImagePaths || []
     )
+    const references = [
+      ...(input.referenceImages || []),
+      ...pathReferences,
+    ].slice(0, 3)
     const result = await this.googleService.generateImage({
       prompt: input.prompt,
       model: input.model,
@@ -111,8 +123,7 @@ export class ImageGenerationService {
   }
 
   private async loadReferenceImages(
-    referenceImagePaths: string[],
-    projectRoot?: string
+    referenceImagePaths: string[]
   ): Promise<ImageGenerationReference[]> {
     const normalized = referenceImagePaths
       .map((value) => value.trim())
@@ -121,9 +132,12 @@ export class ImageGenerationService {
 
     const references: ImageGenerationReference[] = []
     for (const referencePath of normalized) {
-      const absolutePath = path.isAbsolute(referencePath)
-        ? referencePath
-        : path.resolve(projectRoot || process.cwd(), referencePath)
+      if (!path.isAbsolute(referencePath)) {
+        throw new Error(
+          "Image reference paths must be admitted absolute filesystem paths"
+        )
+      }
+      const absolutePath = path.resolve(referencePath)
       const data = await fs.readFile(absolutePath)
       references.push({
         path: absolutePath,

@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto"
+import { requireExactDurableIdentifier } from "./durable-identifier"
 import {
-  ContextCollapseCommit,
   ContextCompactionCommit,
   ContextProjectionAttachment,
   ContextTranscriptRecord,
@@ -21,12 +21,6 @@ export function isCompactSummaryRecord(
   record: ContextTranscriptRecord
 ): boolean {
   return record.kind === "compact_summary"
-}
-
-export function isContextCollapseSummaryRecord(
-  record: ContextTranscriptRecord
-): boolean {
-  return record.kind === "context_collapse_summary"
 }
 
 export function isSnipBoundaryRecord(record: ContextTranscriptRecord): boolean {
@@ -100,38 +94,40 @@ export function resolveCompactSummaryReplacementAnchor(
   return resolveContextReplacementAnchor(records, `compact_summary_${commitId}`)
 }
 
-export function createContextCollapseSummaryRecord(
-  commit: ContextCollapseCommit,
-  createdAt: number = Date.now()
-): ContextTranscriptRecord {
-  return {
-    id: commit.summaryRecordId,
-    role: "user",
-    kind: "context_collapse_summary",
-    content: renderContextCollapseSummary(commit),
-    createdAt,
-    contextCollapseMetadata: { commit, summary: commit.summary },
+export function createSnipBoundaryRecord(input: {
+  id: string
+  afterGraphUuid: string
+  removedRecordIds: readonly string[]
+  createdAt: number
+}): ContextTranscriptRecord {
+  const id = requireExactDurableIdentifier(input.id, "Snip boundary id")
+  const afterGraphUuid = requireExactDurableIdentifier(
+    input.afterGraphUuid,
+    "Snip boundary graph anchor"
+  )
+  const removedRecordIds = input.removedRecordIds.map((recordId, index) =>
+    requireExactDurableIdentifier(
+      recordId,
+      `Snip boundary removed record id ${index}`
+    )
+  )
+  if (
+    removedRecordIds.length === 0 ||
+    new Set(removedRecordIds).size !== removedRecordIds.length
+  ) {
+    throw new Error("Snip boundary requires unique removed record ids")
   }
-}
-
-export function createSnipBoundaryRecord(
-  removedRecordIds: readonly string[],
-  createdAt: number = Date.now(),
-  summary?: string
-): ContextTranscriptRecord {
-  const trimmedSummary = summary?.trim()
-  const content = trimmedSummary
-    ? `[Context snipped — earlier exploration summary]\n${trimmedSummary}`
-    : "Context snipped"
   return {
-    id: `snip_boundary_${randomUUID()}`,
+    id,
     role: "user",
     kind: "snip_boundary",
-    content,
-    createdAt,
+    // Deliberately static: a Snip is an explicit removal boundary, never an
+    // inferred summary of deleted content.
+    content: "Context snipped",
+    createdAt: input.createdAt,
     snipMetadata: {
-      removedRecordIds: [...removedRecordIds],
-      ...(trimmedSummary ? { summary: trimmedSummary } : {}),
+      afterGraphUuid,
+      removedRecordIds,
     },
   }
 }
@@ -205,21 +201,18 @@ export function renderCompactBoundary(commit: ContextCompactionCommit): string {
 }
 
 export function renderCompactSummary(commit: ContextCompactionCommit): string {
-  return (
-    `[Context summary ${commit.id}]\n` +
-    `${commit.summary}\n\n` +
-    `Use this only as compressed working context.`
-  )
-}
+  let continuation =
+    "This session is being continued from a previous conversation that ran out of context. " +
+    "The summary below covers the earlier portion of the conversation.\n\n" +
+    `Summary:\n${commit.summary.trim()}`
 
-export function renderContextCollapseSummary(
-  commit: ContextCollapseCommit
-): string {
-  return (
-    `[Context collapse ${commit.id}]\n` +
-    `${commit.summary}\n\n` +
-    `Use this as compressed working context for the collapsed span.`
-  )
+  if (commit.strategy !== "manual") {
+    continuation +=
+      "\nContinue the conversation from where it left off without asking the user any further questions. " +
+      "Resume directly — do not acknowledge the summary, do not recap what was happening, " +
+      'do not preface with "I\'ll continue" or similar. Pick up the last task as if the break never happened.'
+  }
+  return continuation
 }
 
 export function findLastCompactBoundaryIndex(

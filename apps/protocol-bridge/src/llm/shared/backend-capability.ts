@@ -19,7 +19,9 @@ import type { BackendType } from "./model-router.service"
  *                       state losslessly. No bridge-side preamble needed.
  *   - text_preamble:    wire drops thinking; bridge injects a textual
  *                       `<previous_thinking>` preamble built from
- *                       ReasoningMemoryService.
+ *                       the exact durable graph candidate.
+ *   - native_rollout:   provider-native input items retain reasoning in the
+ *                       durable rollout; no text replay is permitted.
  *   - none:             model has no reasoning channel; never store, never inject.
  */
 export interface BackendCapability {
@@ -41,7 +43,11 @@ export interface BackendCapability {
    */
   disabledIntentRespected: boolean
   /** Cross-turn reasoning continuity strategy. */
-  continuityStrategy: "native_signature" | "text_preamble" | "none"
+  continuityStrategy:
+    | "native_signature"
+    | "native_rollout"
+    | "text_preamble"
+    | "none"
   /**
    * Effective input-token capacity of this backend.
    *
@@ -114,6 +120,15 @@ const TEXT_PREAMBLE: Omit<
   continuityStrategy: "text_preamble",
 }
 
+const NATIVE_ROLLOUT: Omit<
+  BackendCapability,
+  "disabledIntentRespected" | "contextWindow"
+> = {
+  wireSupportsThinkingBlock: false,
+  wireSupportsSignature: false,
+  continuityStrategy: "native_rollout",
+}
+
 export const BACKEND_CAPABILITY: Record<BackendType, BackendCapability> = {
   "claude-api": {
     ...NATIVE,
@@ -155,7 +170,7 @@ export const BACKEND_CAPABILITY: Record<BackendType, BackendCapability> = {
     },
   },
   codex: {
-    ...TEXT_PREAMBLE,
+    ...NATIVE_ROLLOUT,
     disabledIntentRespected: true,
     contextWindow: {
       maxInputTokens: ANTHROPIC_DEFAULT_WINDOW,

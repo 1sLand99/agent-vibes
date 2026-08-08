@@ -8,6 +8,8 @@ import {
   type CodexResponsesRequestKind,
   type CodexTurnCompactionMetadata,
 } from "../../llm/openai/codex-turn-metadata"
+import type { CodexProviderIdentity } from "../../llm/openai/codex-provider-identity"
+import { requireOptionalExactDurableIdentifier } from "../../context/durable-identifier"
 
 export interface CursorCodexThinkingSummaryInput {
   backend: string
@@ -22,8 +24,10 @@ export interface CursorCodexRequestAssemblyInput {
   systemPrompt: string
   contextMessages?: CodexExecutionRequest["contextMessages"]
   messages: CodexExecutionRequest["messages"]
-  conversationId?: string
-  pendingToolUseIds?: string[]
+  /** Native Responses identity; not the local projection key below. */
+  upstreamIdentity: CodexProviderIdentity
+  /** Local continuation/projection scope; never serialized as native identity. */
+  localProjectionKey: string
   tools?: CodexConversationTool[]
   includeThinkingSummary: boolean
   serviceTier?: string
@@ -33,10 +37,9 @@ export interface CursorCodexRequestAssemblyInput {
 }
 
 export interface CursorCodexClientMetadataInput {
-  conversationId?: string
-  requestOrdinal?: number
-  turnId?: string
-  windowId?: string
+  identity: CodexProviderIdentity
+  turnId: string
+  windowId: string
   requestKind?: CodexResponsesRequestKind
   installationId: string
   workspaceRootPath?: string
@@ -45,8 +48,6 @@ export interface CursorCodexClientMetadataInput {
 }
 
 export interface CursorCodexTurnIdInput {
-  conversationId?: string
-  requestOrdinal?: number
   cursorTurnId?: string
   parentTurnId?: string
   openTurnId?: string
@@ -54,29 +55,32 @@ export interface CursorCodexTurnIdInput {
 
 export function resolveCursorCodexTurnId(
   input: CursorCodexTurnIdInput
-): string | undefined {
-  const cursorTurnId = input.cursorTurnId?.trim()
-  if (cursorTurnId) {
+): string {
+  const cursorTurnId = requireOptionalExactDurableIdentifier(
+    input.cursorTurnId,
+    "Cursor Codex cursor turnId"
+  )
+  if (cursorTurnId !== undefined) {
     return cursorTurnId
   }
 
-  const parentTurnId = input.parentTurnId?.trim()
-  if (parentTurnId) {
+  const parentTurnId = requireOptionalExactDurableIdentifier(
+    input.parentTurnId,
+    "Cursor Codex parent turnId"
+  )
+  if (parentTurnId !== undefined) {
     return parentTurnId
   }
 
-  const openTurnId = input.openTurnId?.trim()
-  if (openTurnId) {
+  const openTurnId = requireOptionalExactDurableIdentifier(
+    input.openTurnId,
+    "Cursor Codex open turnId"
+  )
+  if (openTurnId !== undefined) {
     return openTurnId
   }
 
-  const conversationId = input.conversationId?.trim()
-  if (!conversationId) {
-    return undefined
-  }
-
-  const requestOrdinal = Math.max(1, Math.floor(input.requestOrdinal || 1))
-  return `${conversationId}:${requestOrdinal}`
+  throw new Error("Cursor Codex metadata requires an owned turnId")
 }
 
 export function resolveCursorCodexServiceTier(
@@ -191,11 +195,8 @@ export function assembleCursorCodexExecutionRequest(
         ? input.contextMessages
         : undefined,
     messages: input.messages,
-    conversationId: input.conversationId,
-    pendingToolUseIds:
-      input.pendingToolUseIds && input.pendingToolUseIds.length > 0
-        ? input.pendingToolUseIds
-        : undefined,
+    upstreamIdentity: input.upstreamIdentity,
+    localProjectionKey: input.localProjectionKey,
     includeThinkingSummary: input.includeThinkingSummary,
     serviceTier: input.serviceTier,
     clientMetadata: input.clientMetadata,
@@ -222,6 +223,6 @@ export function buildCursorCodexCompactionMetadata(input: {
 
 export function buildCursorCodexClientMetadata(
   input: CursorCodexClientMetadataInput
-): Record<string, string> | undefined {
+): Record<string, string> {
   return buildCodexClientMetadata(input)
 }

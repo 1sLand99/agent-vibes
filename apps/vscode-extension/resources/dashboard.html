@@ -3217,16 +3217,10 @@
           " · " +
           esc(sourceLabel)
         h += "</div>"
-        if (effective.primary)
-          limits.push({
-            label: L("usage.limit5h"),
-            data: effective.primary,
-            color: "#4fc3f7",
-          })
-        if (effective.secondary)
+        if (effective.weekly)
           limits.push({
             label: L("quota.weeklyLimit"),
-            data: effective.secondary,
+            data: effective.weekly,
             color: "#81c784",
           })
         for (var li = 0; li < limits.length; li++) {

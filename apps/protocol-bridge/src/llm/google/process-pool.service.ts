@@ -16,6 +16,10 @@ import {
   detectCurrentAntigravityVersion,
   getAntigravityAccountsConfigPathCandidates,
 } from "../../shared/protocol-bridge-paths"
+import {
+  requireExactDurableIdentifier,
+  requireOptionalExactDurableIdentifier,
+} from "../../context/durable-identifier"
 import { UsageStatsService } from "../../usage"
 import { UpstreamRequestAbortedError } from "../shared/abort-signal"
 import {
@@ -23,6 +27,12 @@ import {
   BackendPoolModelCooldownReason,
   BackendPoolStatus,
 } from "../shared/backend-pool-status"
+import {
+  GOOGLE_WORKER_CONVERSATION_SESSION_MAX_ENTRIES,
+  GOOGLE_WORKER_CONVERSATION_SESSION_TTL_MS,
+  WorkerConversationSessionRegistry,
+  type WorkerConversationSession,
+} from "./worker-conversation-session-registry"
 
 /**
  * Account configuration for a native worker process
@@ -74,19 +84,13 @@ interface WorkerModelState {
 /**
  * A managed worker process
  */
-interface WorkerConversationSession {
-  uuid: string
-  seq: number
-}
-
 interface WorkerHandle {
   process: ChildProcess
   account: NativeAccount
   stableKey: string
   configSignature: string
   cloudCodeSessionId: string
-  conversationSessions: Map<string, WorkerConversationSession>
-  fallbackConversationSession: WorkerConversationSession
+  conversationSessionRegistry: WorkerConversationSessionRegistry
   ready: boolean
   draining: boolean
   pending: Map<string, PendingRequest>
@@ -195,36 +199,24 @@ function generateCloudCodeSessionId(): string {
   return signed.toString()
 }
 
-function extractConversationKeyFromRequestId(
+function extractWorkerConversationKey(
   payload: Record<string, unknown>
-): string {
-  const explicitKey =
-    typeof payload.__workerConversationKey === "string"
-      ? payload.__workerConversationKey.trim()
-      : ""
-  if (explicitKey) return explicitKey
-
-  const requestId =
-    typeof payload.requestId === "string" ? payload.requestId.trim() : ""
-  const match = /^agent\/\d+\/([^/]+)\/\d+$/.exec(requestId)
-  return match?.[1] || "__fallback__"
+): string | undefined {
+  return requireOptionalExactDurableIdentifier(
+    payload.__workerConversationKey,
+    "Google worker conversation key"
+  )
 }
 
 function resolveWorkerConversationSession(
   handle: WorkerHandle,
   payload: Record<string, unknown>
 ): WorkerConversationSession {
-  const conversationKey = extractConversationKeyFromRequestId(payload)
-  if (conversationKey === "__fallback__") {
-    return handle.fallbackConversationSession
+  const conversationKey = extractWorkerConversationKey(payload)
+  if (conversationKey === undefined) {
+    return handle.conversationSessionRegistry.acquire(undefined)
   }
-
-  const existing = handle.conversationSessions.get(conversationKey)
-  if (existing) return existing
-
-  const created = { uuid: crypto.randomUUID(), seq: 0 }
-  handle.conversationSessions.set(conversationKey, created)
-  return created
+  return handle.conversationSessionRegistry.acquire(conversationKey)
 }
 
 /**
@@ -246,16 +238,11 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   /**
    * Request-scoped worker context using AsyncLocalStorage.
    * Each generate/generateStream call binds the selected worker to the current
-   * async context via enterWith(), so that subsequent setCooldownForLastWorker()
+   * async context via enterWith(), so that subsequent context-worker state
    * calls in the same async chain (e.g. catch blocks in google.service.ts)
    * target the correct worker — even under concurrent requests.
    */
   private readonly workerContext = new AsyncLocalStorage<WorkerHandle>()
-  /**
-   * @deprecated Legacy fallback — only used when workerContext has no store
-   * (i.e. calls outside of generate/generateStream async context).
-   */
-  private lastUsedWorker: WorkerHandle | null = null
   /** Per-model sticky affinity: remember the last worker that succeeded for each model */
   private readonly preferredWorkerByModel = new Map<string, WorkerHandle>()
   /** Pool-level model gates for transient global model saturation (e.g. 503 capacity exhausted). */
@@ -312,7 +299,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
         `Detected Antigravity IDE version: ${this.currentAntigravityVersion}`
       )
     } else {
-      this.logger.warn(
+      this.logger.log(
         "Antigravity IDE version not detected; Go worker will use its built-in fallback"
       )
     }
@@ -530,7 +517,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     this.logger.log("Shutting down process pool...")
     this.stopAccountsWatcher()
     for (const worker of this.workers) {
-      this.killWorker(worker)
+      this.killWorker(worker, true)
     }
     this.workers.length = 0
     if (this.antigravityGoBinary && this.antigravityGoBinaryOwned) {
@@ -711,8 +698,10 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       stableKey: getNativeAccountStableKey(normalizedAccount),
       configSignature: getNativeAccountConfigSignature(normalizedAccount),
       cloudCodeSessionId: generateCloudCodeSessionId(),
-      conversationSessions: new Map(),
-      fallbackConversationSession: { uuid: crypto.randomUUID(), seq: 0 },
+      conversationSessionRegistry: new WorkerConversationSessionRegistry({
+        ttlMs: GOOGLE_WORKER_CONVERSATION_SESSION_TTL_MS,
+        maxEntries: GOOGLE_WORKER_CONVERSATION_SESSION_MAX_ENTRIES,
+      }),
       ready: false,
       draining: false,
       pending: new Map(),
@@ -746,6 +735,7 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       this.flushWorkerStderr(handle)
       this.logger.warn(`[Worker ${account.email}] exited with code ${code}`)
       handle.ready = false
+      handle.conversationSessionRegistry.dispose()
       // Reject all pending requests
       for (const [, pending] of handle.pending) {
         clearTimeout(pending.timeout)
@@ -852,6 +842,8 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
    */
   private killWorker(handle: WorkerHandle, intentional: boolean = false): void {
     handle.intentionalShutdown = intentional
+    handle.ready = false
+    handle.conversationSessionRegistry.dispose()
     try {
       handle.process.kill("SIGTERM")
     } catch {
@@ -1037,6 +1029,16 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       payload
     )
     payload.requestId = `agent/${Date.now()}/${conversationSession.uuid}/${++conversationSession.seq}`
+  }
+
+  private touchWorkerConversationScope(
+    handle: WorkerHandle,
+    payload: Record<string, unknown>
+  ): void {
+    const conversationKey = extractWorkerConversationKey(payload)
+    if (conversationKey !== undefined) {
+      handle.conversationSessionRegistry.touch(conversationKey)
+    }
   }
 
   private async preparePayloadForWorker(
@@ -1503,9 +1505,6 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     handle.draining = true
     handle.drainReason = reason
     handle.drainStartedAt = Date.now()
-    if (this.lastUsedWorker === handle) {
-      this.lastUsedWorker = null
-    }
     for (const [model, preferred] of this.preferredWorkerByModel.entries()) {
       if (preferred === handle) {
         this.preferredWorkerByModel.delete(model)
@@ -1576,32 +1575,29 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Resolve the worker for the current async context.
-   * Prefers the request-scoped workerContext (concurrency-safe),
-   * falls back to lastUsedWorker for legacy code paths.
    */
   private resolveContextWorker(): WorkerHandle | null {
-    return this.workerContext.getStore() ?? this.lastUsedWorker
+    return this.workerContext.getStore() ?? null
+  }
+
+  private requireContextWorker(operation: string): WorkerHandle {
+    const worker = this.workerContext.getStore()
+    if (!worker) {
+      throw new Error(
+        `Google worker operation ${operation} requires an active physical dispatch`
+      )
+    }
+    return worker
   }
 
   /**
    * Bind a worker to the current async context so that subsequent
-   * setCooldownForLastWorker() / markSuccessForModel() calls in the
+   * context-worker mutation calls in the
    * same async chain (e.g. catch blocks in google.service.ts) target
    * the correct worker — even under concurrent requests.
    */
   private bindWorkerToContext(worker: WorkerHandle): void {
     this.workerContext.enterWith(worker)
-    // Keep legacy fallback in sync for code paths that don't go through
-    // generate/generateStream (e.g. direct pool API calls)
-    this.lastUsedWorker = worker
-  }
-
-  /**
-   * @deprecated Use setCooldownForLastWorker() for accurate targeting.
-   * Legacy: marks the last-used worker as rate-limited.
-   */
-  setCooldown(delayMs: number): void {
-    this.setCooldownForLastWorker(delayMs)
   }
 
   /**
@@ -1611,12 +1607,11 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
    * Uses AsyncLocalStorage to resolve the correct worker even when
    * multiple requests are in-flight concurrently.
    */
-  setCooldownForLastWorker(
+  setContextWorkerCooldown(
     delayMs: number,
     reason: BackendPoolModelCooldownReason = "rate_limited"
   ): void {
-    const worker = this.resolveContextWorker()
-    if (!worker) return
+    const worker = this.requireContextWorker("set global cooldown")
     const now = Date.now()
     worker.cooldownUntil = now + delayMs
     worker.cooldownReason = reason
@@ -1628,9 +1623,9 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     )
   }
 
-  disableLastWorker(reason: string = "authentication failed"): void {
-    const worker = this.resolveContextWorker()
-    if (!worker || this.isWorkerDisabled(worker)) return
+  disableContextWorker(reason: string = "authentication failed"): void {
+    const worker = this.requireContextWorker("disable worker")
+    if (this.isWorkerDisabled(worker)) return
 
     const disabledAt = Date.now()
     worker.disabledAt = disabledAt
@@ -1639,17 +1634,24 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     worker.cooldownReason = undefined
     worker.modelStates.clear()
     this.clearWorkerPreference(worker)
-    if (this.lastUsedWorker === worker) {
-      this.lastUsedWorker = null
-    }
-
     this.logger.warn(
       `[pool-disable] [Worker ${worker.account.email}] ${reason}, removed from scheduling`
     )
   }
 
-  recycleLastOfficialClient(_reason: string): Promise<void> {
-    return Promise.resolve()
+  /**
+   * Forget a logical conversation on every worker. Cloud Code offers no
+   * separate close RPC for this request lineage, so deleting the local
+   * worker-to-lineage association is the complete resource release.
+   */
+  releaseConversationScope(conversationKey: string): void {
+    const exactConversationKey = requireExactDurableIdentifier(
+      conversationKey,
+      "Google worker conversation key"
+    )
+    for (const worker of this.workers) {
+      worker.conversationSessionRegistry.delete(exactConversationKey)
+    }
   }
 
   /**
@@ -1659,14 +1661,14 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
    * The worker may still be available for other models.
    * Also clears sticky preference so getNextWorker falls through to round-robin.
    */
-  setModelCooldownForLastWorker(
+  setContextWorkerModelCooldown(
     model: string,
     delayMs: number,
     reason: BackendPoolModelCooldownReason = "rate_limited",
     advanceIndex: boolean = true
   ): void {
-    const worker = this.resolveContextWorker()
-    if (!worker || !model) return
+    const worker = this.requireContextWorker("set model cooldown")
+    if (!model) return
     const now = Date.now()
     const quotaExhausted = reason === "quota_exhausted"
     worker.modelStates.set(model, {
@@ -1702,15 +1704,6 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       default:
         return "rate-limited"
     }
-  }
-
-  /**
-   * Clear per-model cooldown for the context worker (on success).
-   */
-  clearModelCooldownForLastWorker(model: string): void {
-    const worker = this.resolveContextWorker()
-    if (!worker || !model) return
-    worker.modelStates.delete(model)
   }
 
   setPoolModelCooldown(
@@ -1758,9 +1751,9 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
    * Called on successful request completion so subsequent requests reuse the
    * same worker instead of rotating through all accounts unnecessarily.
    */
-  markSuccessForModel(model: string): void {
-    const worker = this.resolveContextWorker()
-    if (!worker || !model) return
+  markContextWorkerModelSuccess(model: string): void {
+    const worker = this.requireContextWorker("mark model success")
+    if (!model) return
     this.preferredWorkerByModel.set(model, worker)
     // Also clear any lingering model cooldown (recovery)
     worker.modelStates.delete(model)
@@ -1898,7 +1891,13 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       )) as { available: boolean }
       return result.available
     } catch (err) {
-      this.logger.error(`Availability check failed: ${(err as Error).message}`)
+      // Availability is a boolean health probe. The caller owns the single
+      // backend-level warning and removes Google from routing; duplicating the
+      // expected negative result here as an application ERROR makes a healthy
+      // Codex/Claude bridge look failed.
+      this.logger.debug(
+        `Availability probe returned unavailable: ${(err as Error).message}`
+      )
       return false
     }
   }
@@ -1920,8 +1919,10 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     this.bindWorkerToContext(worker)
     worker.requestCount++
     worker.activeGenerationRequests++
+    let preparedConversationScope = false
     try {
       await this.preparePayloadForWorker(worker, payload)
+      preparedConversationScope = true
       this.logPreparedCloudCodePayload(worker, payload, "generate")
       const outboundPayload = this.createOutboundWorkerPayload(payload)
       // Use long timeout for non-streaming generation, especially for deep thinking models
@@ -1930,15 +1931,15 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
         "generate",
         {
           payload: outboundPayload,
-          retryPolicy: {
-            preferPoolRotation: true,
-          },
         },
         this.GENERATE_TIMEOUT_MS
       )
       this.recordGoogleUsage(worker, payload, model, result, requestStartedAt)
       return result
     } finally {
+      if (preparedConversationScope) {
+        this.touchWorkerConversationScope(worker, payload)
+      }
       worker.activeGenerationRequests = Math.max(
         0,
         worker.activeGenerationRequests - 1
@@ -1965,8 +1966,10 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     this.bindWorkerToContext(worker)
     worker.requestCount++
     worker.activeGenerationRequests++
+    let preparedConversationScope = false
     try {
       await this.preparePayloadForWorker(worker, payload)
+      preparedConversationScope = true
       this.logPreparedCloudCodePayload(worker, payload, "generateStream")
       const outboundPayload = this.createOutboundWorkerPayload(payload)
       let lastUsageMetadata: Record<string, unknown> | null = null
@@ -1976,9 +1979,6 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
         "generateStream",
         {
           payload: outboundPayload,
-          retryPolicy: {
-            preferPoolRotation: true,
-          },
         },
         (chunk) => {
           const usageMetadata = this.extractGoogleUsageMetadata(chunk)
@@ -2001,6 +2001,9 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
         requestStartedAt
       )
     } finally {
+      if (preparedConversationScope) {
+        this.touchWorkerConversationScope(worker, payload)
+      }
       worker.activeGenerationRequests = Math.max(
         0,
         worker.activeGenerationRequests - 1
@@ -2473,11 +2476,9 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Get the email of the worker that last executed a request.
-   * Uses AsyncLocalStorage context first, falls back to legacy lastUsedWorker.
-   * Useful for logging which worker encountered an error.
+   * Get the email of the worker owned by the current physical dispatch.
    */
-  getLastWorkerEmail(): string | null {
+  getContextWorkerEmail(): string | null {
     return this.resolveContextWorker()?.account.email ?? null
   }
 

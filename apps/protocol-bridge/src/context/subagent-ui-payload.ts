@@ -5,10 +5,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * A sub-agent (`task`) tool_result carries the full child-session
- * transcript in `structuredContent.taskSuccess.conversationSteps`. That
- * array exists ONLY so the IDE can replay the sub-agent's steps in its
- * transcript UI — it is never part of what the parent model is shown.
+ * A sub-agent (`task`) tool_result carries Cursor-only presentation data in
+ * `structuredContent.taskSuccess`, including the full child-session
+ * transcript, diagnostic paths, and replay metadata. It belongs exclusively
+ * to the IDE transcript UI and is never part of a provider request.
  *
  * The token counter charges a tool_result block for
  * `max(textTokens, structuredContentTokens)`
@@ -20,17 +20,18 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * `ContextProjectionBudgetExceededError` — record-granularity compaction
  * cannot shrink a single oversized record, so the parent turn dies.
  *
- * The fix is to never let this UI-only payload enter the backend
- * projection in the first place: strip it at the one authoritative
- * `state.records → backend messages` boundary (ContextProjectionService),
- * so token counting, truncation, and the final send all observe clean
- * data. This is a pure projection transform — the underlying transcript
- * record keeps the full payload for IDE replay.
+ * The fix is to never let this UI-only payload enter the backend projection
+ * in the first place: ContextProjectionService removes the whole
+ * `taskSuccess` member at the authoritative `state.records → provider`
+ * boundary. If that was the only structured member, it removes
+ * `structuredContent` too, so providers consume the semantic tool-result
+ * text. This is a pure projection transform — the durable transcript record
+ * keeps the full Cursor UI payload for replay.
  *
  * Returns the same `content` reference when nothing changed so callers
  * can cheaply detect no-ops.
  */
-export function stripSubAgentUiOnlyPayload(
+export function stripCursorUiTaskSuccessFromProviderContent(
   content: LooseMessageContent
 ): LooseMessageContent {
   if (!Array.isArray(content)) {
@@ -46,23 +47,21 @@ export function stripSubAgentUiOnlyPayload(
     if (!isPlainObject(structured)) {
       return block
     }
-    const taskSuccess = structured.taskSuccess
-    if (
-      !isPlainObject(taskSuccess) ||
-      !Array.isArray(taskSuccess.conversationSteps)
-    ) {
+    if (!Object.prototype.hasOwnProperty.call(structured, "taskSuccess")) {
       return block
     }
 
     changed = true
-    const { conversationSteps: _conversationSteps, ...taskSuccessRest } =
-      taskSuccess
+    const { taskSuccess: _taskSuccess, ...providerStructuredContent } =
+      structured
+    if (Object.keys(providerStructuredContent).length === 0) {
+      const { structuredContent: _structuredContent, ...providerBlock } = block
+      return providerBlock
+    }
+
     return {
       ...block,
-      structuredContent: {
-        ...structured,
-        taskSuccess: taskSuccessRest,
-      },
+      structuredContent: providerStructuredContent,
     }
   })
 

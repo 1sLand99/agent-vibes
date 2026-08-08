@@ -1,5 +1,9 @@
-import { forwardRef, Inject, Injectable, Logger } from "@nestjs/common"
-import { ConversationId } from "../turn/turn.types"
+import { forwardRef, Inject, Injectable } from "@nestjs/common"
+import {
+  requireExactDurableIdentifier,
+  requireOptionalExactDurableIdentifier,
+} from "../../../context/durable-identifier"
+import { ConversationId, TurnId } from "../turn/turn.types"
 import type { BackendType } from "../../../llm/shared/model-router.service"
 import { SessionLifecycleService } from "./session-lifecycle.service"
 
@@ -16,33 +20,49 @@ import { SessionLifecycleService } from "./session-lifecycle.service"
  *   - claiming continuation while a sibling tool is still unsettled
  *   - back-end mismatch (a stale batch from a different backend)
  *
- * Pre-step-4 the state lived as `session.activeAssistantToolBatch` /
- * `session.toolExecutionOrderCounter` on the giant SessionRecord
- * object; this service owns it as `Map<ConversationId, Record>`.
- *
  * `mark dirty` / `lastActivityAt` updates flow through the lifecycle
- * service via `forwardRef` so the legacy persist scheduling continues
- * to fire whenever a batch transitions.
+ * service via `forwardRef` whenever a batch transitions.
  */
 
 export interface AssistantToolBatch {
   id: string
+  /** Stable identity of the user request across all of its continuations. */
+  topLevelTurnId: TurnId
+  /** Graph turn that emitted this exact assistant tool-use batch. */
+  graphTurnId: TurnId
   backend: BackendType
   streamId?: string
   toolCallIds: string[]
   unsettledToolCallIds: string[]
-  continuationClaimed?: boolean
-  readyForContinuation?: boolean
+  completionPolicy: AssistantToolBatchCompletionPolicy
 }
+
+export type AssistantToolBatchCompletionPolicy = "continue" | "await_async_user"
 
 interface AssistantToolBatchRecord {
   toolExecutionOrderCounter: number
   activeAssistantToolBatch?: AssistantToolBatch
+  pendingInlineContinuation?: AssistantToolBatchPendingContinuation<unknown>
+}
+
+export interface AssistantToolBatchIdentity {
+  topLevelTurnId: TurnId
+  graphTurnId: TurnId
+}
+
+export interface AssistantToolBatchPendingContinuation<T> {
+  topLevelTurnId: TurnId
+  graphTurnId: TurnId
+  value: T
+}
+
+type AssistantToolBatchOptions = AssistantToolBatchIdentity & {
+  completionPolicy?: AssistantToolBatchCompletionPolicy
+  streamId?: string
 }
 
 @Injectable()
 export class AssistantToolBatchService {
-  private readonly logger = new Logger(AssistantToolBatchService.name)
   private readonly records = new Map<ConversationId, AssistantToolBatchRecord>()
   private batchSequence = 0
 
@@ -57,16 +77,17 @@ export class AssistantToolBatchService {
     conversationId: string,
     backend: BackendType,
     toolCallIds: string[],
-    options?: { readyForContinuation?: boolean; streamId?: string }
+    options: AssistantToolBatchOptions
   ): void {
     const cid = ConversationId.of(conversationId)
     const record = this.ensureRecord(cid)
 
-    const normalizedToolCallIds = toolCallIds
-      .map((id) => (typeof id === "string" ? id.trim() : ""))
-      .filter(Boolean)
+    const exactToolCallIds = this.requireExactToolCallIds(
+      toolCallIds,
+      "startAssistantToolBatch"
+    )
 
-    if (normalizedToolCallIds.length === 0) {
+    if (exactToolCallIds.length === 0) {
       record.activeAssistantToolBatch = undefined
       this.touchSession(conversationId)
       return
@@ -74,12 +95,13 @@ export class AssistantToolBatchService {
 
     record.activeAssistantToolBatch = {
       id: this.nextBatchId(),
+      topLevelTurnId: options.topLevelTurnId,
+      graphTurnId: options.graphTurnId,
       backend,
-      streamId: this.normalizeStreamId(options?.streamId),
-      toolCallIds: [...normalizedToolCallIds],
-      unsettledToolCallIds: [...normalizedToolCallIds],
-      continuationClaimed: false,
-      readyForContinuation: options?.readyForContinuation ?? true,
+      streamId: this.requireStreamId(options?.streamId),
+      toolCallIds: [...exactToolCallIds],
+      unsettledToolCallIds: [...exactToolCallIds],
+      completionPolicy: options?.completionPolicy ?? "continue",
     }
     this.touchSession(conversationId)
   }
@@ -88,34 +110,41 @@ export class AssistantToolBatchService {
     conversationId: string,
     backend: BackendType,
     toolCallIds: string[],
-    options?: { readyForContinuation?: boolean; streamId?: string }
+    options: AssistantToolBatchOptions
   ): void {
     const cid = ConversationId.of(conversationId)
     const record = this.ensureRecord(cid)
 
-    const normalizedToolCallIds = toolCallIds
-      .map((id) => (typeof id === "string" ? id.trim() : ""))
-      .filter(Boolean)
-    if (normalizedToolCallIds.length === 0) return
+    const exactToolCallIds = this.requireExactToolCallIds(
+      toolCallIds,
+      "addAssistantToolBatchTools"
+    )
+    if (exactToolCallIds.length === 0) return
 
     const batch = record.activeAssistantToolBatch
-    const streamId = this.normalizeStreamId(options?.streamId)
+    const streamId = this.requireStreamId(options?.streamId)
     if (
-      !batch ||
-      batch.backend !== backend ||
-      batch.streamId !== streamId ||
-      batch.continuationClaimed
+      batch &&
+      (batch.topLevelTurnId !== options.topLevelTurnId ||
+        batch.graphTurnId !== options.graphTurnId)
     ) {
+      throw new Error(
+        `Assistant tool batch turn ownership changed without cleanup for ${conversationId}: ` +
+          `active=${batch.topLevelTurnId}/${batch.graphTurnId}, ` +
+          `incoming=${options.topLevelTurnId}/${options.graphTurnId}`
+      )
+    }
+    if (!batch || batch.backend !== backend || batch.streamId !== streamId) {
       this.startAssistantToolBatch(
         conversationId,
         backend,
-        normalizedToolCallIds,
+        exactToolCallIds,
         options
       )
       return
     }
 
-    for (const toolCallId of normalizedToolCallIds) {
+    for (const toolCallId of exactToolCallIds) {
       // A tool already known to this batch carries authoritative settle
       // state: it is either still in `unsettledToolCallIds` (awaiting its
       // result) or was already drained by `settleAssistantToolBatchTool`
@@ -133,27 +162,30 @@ export class AssistantToolBatchService {
         batch.unsettledToolCallIds.push(toolCallId)
       }
     }
-    if (typeof options?.readyForContinuation === "boolean") {
-      batch.readyForContinuation = options.readyForContinuation
+    if (options?.completionPolicy === "await_async_user") {
+      batch.completionPolicy = "await_async_user"
     }
     this.touchSession(conversationId)
   }
 
   settleAssistantToolBatchTool(
     conversationId: string,
-    toolCallId: string
+    toolCallId: string,
+    identity: AssistantToolBatchIdentity
   ): boolean {
     const cid = ConversationId.of(conversationId)
     const record = this.records.get(cid)
     if (!record?.activeAssistantToolBatch) return false
 
-    const normalizedToolCallId =
-      typeof toolCallId === "string" ? toolCallId.trim() : ""
-    if (!normalizedToolCallId) return false
+    const exactToolCallId = requireExactDurableIdentifier(
+      toolCallId,
+      "Assistant tool batch settled tool call id"
+    )
 
     const batch = record.activeAssistantToolBatch
+    if (!this.batchMatchesIdentity(batch, identity)) return false
     const nextUnsettled = batch.unsettledToolCallIds.filter(
-      (id) => id !== normalizedToolCallId
+      (id) => id !== exactToolCallId
     )
     if (nextUnsettled.length === batch.unsettledToolCallIds.length) {
       return false
@@ -166,7 +198,8 @@ export class AssistantToolBatchService {
 
   hasUnsettledAssistantToolBatchForBackend(
     conversationId: string,
-    backend: BackendType
+    backend: BackendType,
+    identity: AssistantToolBatchIdentity
   ): boolean {
     const cid = ConversationId.of(conversationId)
     const record = this.records.get(cid)
@@ -174,28 +207,36 @@ export class AssistantToolBatchService {
 
     const batch = record.activeAssistantToolBatch
     return (
+      this.batchMatchesIdentity(batch, identity) &&
       batch.backend === backend &&
-      (batch.readyForContinuation === false ||
-        batch.unsettledToolCallIds.length > 0)
+      batch.unsettledToolCallIds.length > 0
     )
   }
 
   claimAssistantToolBatchContinuation(
     conversationId: string,
     backend: BackendType,
-    toolCallId: string
+    toolCallId: string,
+    identity: AssistantToolBatchIdentity
   ): boolean {
+    const exactToolCallId = requireExactDurableIdentifier(
+      toolCallId,
+      "Assistant tool batch continuation tool call id"
+    )
     const cid = ConversationId.of(conversationId)
     const record = this.records.get(cid)
     const batch = record?.activeAssistantToolBatch
-    if (!record || !batch) return true
-    if (batch.backend !== backend) return true
-    if (!batch.toolCallIds.includes(toolCallId)) return true
-    if (batch.readyForContinuation === false) return false
+    if (!record || !batch) return false
+    if (!this.batchMatchesIdentity(batch, identity)) return false
+    if (batch.backend !== backend) return false
+    if (!batch.toolCallIds.includes(exactToolCallId)) return false
+    if (batch.completionPolicy !== "continue") return false
     if (batch.unsettledToolCallIds.length > 0) return false
-    if (batch.continuationClaimed) return false
-
-    batch.continuationClaimed = true
+    // All results were already appended to the immutable graph before this
+    // claim. Close the in-memory barrier in the same synchronous transition as
+    // the claim so an exception in later request assembly cannot strand a
+    // claimed-but-active batch or make a retry permanently ineligible.
+    record.activeAssistantToolBatch = undefined
     this.touchSession(conversationId)
     return true
   }
@@ -210,54 +251,14 @@ export class AssistantToolBatchService {
     if (!batch) return undefined
     return {
       id: batch.id,
+      topLevelTurnId: batch.topLevelTurnId,
+      graphTurnId: batch.graphTurnId,
       backend: batch.backend,
       streamId: batch.streamId,
       toolCallIds: [...batch.toolCallIds],
       unsettledToolCallIds: [...batch.unsettledToolCallIds],
-      continuationClaimed: batch.continuationClaimed,
-      readyForContinuation: batch.readyForContinuation,
+      completionPolicy: batch.completionPolicy,
     }
-  }
-
-  /**
-   * Cross-service serialisation hook used by SessionLifecycleService
-   * when it persists the legacy session blob: returns the raw batch
-   * object (or undefined) so the lifecycle serializer can drop it
-   * into PersistedChatSessionV1.activeAssistantToolBatch verbatim.
-   * Callers must not mutate the returned reference.
-   */
-  getRawForPersistence(conversationId: string): AssistantToolBatch | undefined {
-    return this.records.get(ConversationId.of(conversationId))
-      ?.activeAssistantToolBatch
-  }
-
-  /**
-   * Restore the batch state from a persisted blob during session
-   * rehydration. Used by SessionLifecycleService.parsePersistedSession.
-   */
-  hydrateFromPersistence(
-    conversationId: string,
-    batch: AssistantToolBatch | undefined,
-    toolExecutionOrderCounter: number
-  ): void {
-    const cid = ConversationId.of(conversationId)
-    const record = this.ensureRecord(cid)
-    record.activeAssistantToolBatch = batch
-      ? {
-          ...batch,
-          streamId: this.normalizeStreamId(batch.streamId),
-          toolCallIds: [...batch.toolCallIds],
-          unsettledToolCallIds: [...batch.unsettledToolCallIds],
-        }
-      : undefined
-    record.toolExecutionOrderCounter = toolExecutionOrderCounter
-  }
-
-  getToolExecutionOrderCounter(conversationId: string): number {
-    return (
-      this.records.get(ConversationId.of(conversationId))
-        ?.toolExecutionOrderCounter ?? 0
-    )
   }
 
   bumpToolExecutionOrderCounter(conversationId: string): number {
@@ -272,31 +273,114 @@ export class AssistantToolBatchService {
     const record = this.records.get(cid)
     if (!record) return
     record.activeAssistantToolBatch = undefined
+    record.pendingInlineContinuation = undefined
     this.touchSession(conversationId)
   }
 
-  completeAssistantToolBatch(
+  setPendingInlineContinuation<T>(
     conversationId: string,
-    batchId: string | undefined,
-    reason: string
+    identity: AssistantToolBatchIdentity,
+    value: T
   ): boolean {
-    const cid = ConversationId.of(conversationId)
-    const record = this.records.get(cid)
-    const batch = record?.activeAssistantToolBatch
-    if (!record || !batch) return false
-    if (batchId && batch.id !== batchId) {
-      this.logger.debug(
-        `Ignoring stale assistant tool batch completion for ${conversationId}: ` +
-          `batch=${batchId}, active=${batch.id}, reason=${reason}`
-      )
+    const record = this.ensureRecord(ConversationId.of(conversationId))
+    const batch = record.activeAssistantToolBatch
+    if (
+      !batch ||
+      !this.batchMatchesIdentity(batch, identity) ||
+      batch.completionPolicy !== "continue" ||
+      batch.unsettledToolCallIds.length > 0
+    ) {
       return false
     }
-    record.activeAssistantToolBatch = undefined
+    record.pendingInlineContinuation = { ...identity, value }
     this.touchSession(conversationId)
-    this.logger.debug(
-      `Completed assistant tool batch ${batch.id} for ${conversationId}: ${reason}`
-    )
     return true
+  }
+
+  /**
+   * Claims the terminal edge of a batch that intentionally stops after
+   * projecting an asynchronous ask-question placeholder. Exactly one result
+   * handler may claim it, and only after every sibling tool has settled.
+   */
+  claimAsyncUserSuspension(
+    conversationId: string,
+    identity: AssistantToolBatchIdentity
+  ): boolean {
+    const record = this.records.get(ConversationId.of(conversationId))
+    const batch = record?.activeAssistantToolBatch
+    if (!record || !batch) return false
+    if (!this.batchMatchesIdentity(batch, identity)) return false
+    if (batch.completionPolicy !== "await_async_user") return false
+    if (batch.unsettledToolCallIds.length > 0) return false
+
+    record.activeAssistantToolBatch = undefined
+    record.pendingInlineContinuation = undefined
+    this.touchSession(conversationId)
+    return true
+  }
+
+  takePendingInlineContinuation<T>(
+    conversationId: string,
+    topLevelTurnId: TurnId
+  ): AssistantToolBatchPendingContinuation<T> | undefined {
+    const record = this.records.get(ConversationId.of(conversationId))
+    const pending = record?.pendingInlineContinuation
+    if (!record || !pending) return undefined
+    if (pending.topLevelTurnId !== topLevelTurnId) {
+      record.pendingInlineContinuation = undefined
+      this.touchSession(conversationId)
+      return undefined
+    }
+    record.pendingInlineContinuation = undefined
+    this.touchSession(conversationId)
+    return {
+      topLevelTurnId: pending.topLevelTurnId,
+      graphTurnId: pending.graphTurnId,
+      value: pending.value as T,
+    }
+  }
+
+  abortGraphTurn(
+    conversationId: string,
+    graphTurnId: TurnId
+  ): { batchCleared: boolean; inlineCleared: boolean } {
+    const record = this.records.get(ConversationId.of(conversationId))
+    if (!record) {
+      return {
+        batchCleared: false,
+        inlineCleared: false,
+      }
+    }
+    const batchCleared =
+      record.activeAssistantToolBatch?.graphTurnId === graphTurnId
+    if (batchCleared) record.activeAssistantToolBatch = undefined
+    const inlineCleared =
+      record.pendingInlineContinuation?.graphTurnId === graphTurnId
+    if (inlineCleared) record.pendingInlineContinuation = undefined
+    if (batchCleared || inlineCleared) {
+      this.touchSession(conversationId)
+    }
+    return { batchCleared, inlineCleared }
+  }
+
+  beginTopLevelTurn(conversationId: string, topLevelTurnId: TurnId): void {
+    const record = this.ensureRecord(ConversationId.of(conversationId))
+    const active = record.activeAssistantToolBatch
+    if (active && active.topLevelTurnId !== topLevelTurnId) {
+      throw new Error(
+        `Cannot begin top-level turn ${topLevelTurnId} while assistant batch ` +
+          `${active.id} still belongs to ${active.topLevelTurnId}/${active.graphTurnId}`
+      )
+    }
+    let changed = false
+    if (
+      record.pendingInlineContinuation &&
+      record.pendingInlineContinuation.topLevelTurnId !== topLevelTurnId
+    ) {
+      record.pendingInlineContinuation = undefined
+      changed = true
+    }
+    if (changed) this.touchSession(conversationId)
   }
 
   /**
@@ -315,6 +399,7 @@ export class AssistantToolBatchService {
       record = {
         toolExecutionOrderCounter: 0,
         activeAssistantToolBatch: undefined,
+        pendingInlineContinuation: undefined,
       }
       this.records.set(cid, record)
     }
@@ -326,15 +411,42 @@ export class AssistantToolBatchService {
     return `assistant-batch-${Date.now()}-${this.batchSequence}`
   }
 
-  private normalizeStreamId(streamId: string | undefined): string | undefined {
-    const normalized = typeof streamId === "string" ? streamId.trim() : ""
-    return normalized || undefined
+  private requireStreamId(streamId: string | undefined): string | undefined {
+    return requireOptionalExactDurableIdentifier(
+      streamId,
+      "Assistant tool batch stream id"
+    )
+  }
+
+  private requireExactToolCallIds(
+    toolCallIds: readonly unknown[],
+    operation: string
+  ): string[] {
+    const exactIds = toolCallIds.map((toolCallId, index) =>
+      requireExactDurableIdentifier(
+        toolCallId,
+        `AssistantToolBatchService.${operation} tool call id at index ${index}`
+      )
+    )
+    if (new Set(exactIds).size !== exactIds.length) {
+      throw new Error(
+        `AssistantToolBatchService.${operation}: tool call ids must be unique`
+      )
+    }
+    return exactIds
+  }
+
+  private batchMatchesIdentity(
+    batch: AssistantToolBatch,
+    identity: AssistantToolBatchIdentity
+  ): boolean {
+    return (
+      batch.topLevelTurnId === identity.topLevelTurnId &&
+      batch.graphTurnId === identity.graphTurnId
+    )
   }
 
   private touchSession(conversationId: string): void {
-    // The legacy implementation ran lastActivityAt + schedulePersist
-    // on every batch transition. Delegate through the lifecycle
-    // service so the v1 blob persistence cadence is preserved.
     this.sessionLifecycle.markSessionDirty(conversationId)
   }
 }

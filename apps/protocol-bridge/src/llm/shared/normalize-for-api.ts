@@ -93,6 +93,8 @@ interface FlatAssistant {
   uuid: string
   /** Anthropic message id — split-sibling merge key. */
   messageId?: string
+  /** Durable graph identity; Codex preserves this native binding boundary. */
+  sourceUuid?: string
   source?: ContextMessageSource
   attachmentKind?: ContextProjectionAttachment["kind"]
   content: LooseMessageContent
@@ -102,6 +104,8 @@ interface FlatUser {
   type: "user"
   uuid: string
   isMeta?: boolean
+  /** Durable graph identity; Codex preserves this native binding boundary. */
+  sourceUuid?: string
   source?: ContextMessageSource
   attachmentKind?: ContextProjectionAttachment["kind"]
   content: LooseMessageContent
@@ -114,6 +118,7 @@ function lift(messages: ReadonlyArray<SessionMessage>): FlatMessage[] {
   for (const msg of messages) {
     const metadata = msg.message as {
       source?: ContextMessageSource
+      sourceUuid?: string
       attachmentKind?: ContextProjectionAttachment["kind"]
     }
     if (msg.type === "assistant") {
@@ -121,6 +126,7 @@ function lift(messages: ReadonlyArray<SessionMessage>): FlatMessage[] {
         type: "assistant",
         uuid: msg.uuid,
         messageId: msg.message.id,
+        sourceUuid: metadata.sourceUuid,
         source: metadata.source,
         attachmentKind: metadata.attachmentKind,
         content: msg.message.content,
@@ -130,6 +136,7 @@ function lift(messages: ReadonlyArray<SessionMessage>): FlatMessage[] {
         type: "user",
         uuid: msg.uuid,
         isMeta: msg.isMeta,
+        sourceUuid: metadata.sourceUuid,
         source: metadata.source,
         attachmentKind: metadata.attachmentKind,
         content: msg.message.content,
@@ -139,8 +146,17 @@ function lift(messages: ReadonlyArray<SessionMessage>): FlatMessage[] {
   return out
 }
 
-function project(messages: ReadonlyArray<FlatMessage>): UnifiedMessage[] {
-  const out: UnifiedMessage[] = []
+export interface NormalizedProviderMessage extends Omit<
+  UnifiedMessage,
+  "role"
+> {
+  role: "user" | "assistant"
+}
+
+function project(
+  messages: ReadonlyArray<FlatMessage>
+): NormalizedProviderMessage[] {
+  const out: NormalizedProviderMessage[] = []
   for (const msg of messages) {
     out.push({
       role: msg.type === "assistant" ? "assistant" : "user",
@@ -148,6 +164,7 @@ function project(messages: ReadonlyArray<FlatMessage>): UnifiedMessage[] {
       ...(msg.type === "assistant" && msg.messageId
         ? { messageId: msg.messageId }
         : {}),
+      ...(msg.sourceUuid ? { sourceUuid: msg.sourceUuid } : {}),
       ...(msg.type === "user" && msg.isMeta ? { isMeta: true } : {}),
       ...(msg.source ? { source: msg.source } : {}),
       ...(msg.attachmentKind ? { attachmentKind: msg.attachmentKind } : {}),
@@ -264,7 +281,8 @@ export function mergeAssistantMessages(
  * ids, hence the bounded backward walk.
  */
 function mergeAssistantMessagesById(
-  messages: ReadonlyArray<FlatMessage>
+  messages: ReadonlyArray<FlatMessage>,
+  options?: { preserveSourceBoundaries?: boolean }
 ): FlatMessage[] {
   const result: FlatMessage[] = []
   for (const msg of messages) {
@@ -286,6 +304,14 @@ function mergeAssistantMessagesById(
         candidate.type === "assistant" &&
         candidate.messageId === msg.messageId
       ) {
+        if (
+          options?.preserveSourceBoundaries &&
+          candidate.sourceUuid &&
+          msg.sourceUuid &&
+          candidate.sourceUuid !== msg.sourceUuid
+        ) {
+          continue
+        }
         result[i] = mergeAssistantMessages(candidate, msg)
         merged = true
         break
@@ -361,12 +387,22 @@ function mergeAdjacentUserMessages(
   opts?: {
     preserveMetaBoundaries?: boolean
     preserveAnyMetaBoundary?: boolean
+    preserveSourceBoundaries?: boolean
   }
 ): FlatMessage[] {
   const out: FlatMessage[] = []
   for (const msg of messages) {
     const prev = out.at(-1)
     if (msg.type === "user" && prev?.type === "user") {
+      if (
+        opts?.preserveSourceBoundaries &&
+        prev.sourceUuid &&
+        msg.sourceUuid &&
+        prev.sourceUuid !== msg.sourceUuid
+      ) {
+        out.push(msg)
+        continue
+      }
       if (
         opts?.preserveMetaBoundaries &&
         (Boolean(prev.isMeta) !== Boolean(msg.isMeta) ||
@@ -577,7 +613,8 @@ function isWhitespaceOnlyTextContent(blocks: BlockLike[]): boolean {
  * dropped assistant are merged in the next pass.
  */
 export function filterWhitespaceOnlyAssistantMessages(
-  messages: ReadonlyArray<FlatMessage>
+  messages: ReadonlyArray<FlatMessage>,
+  options?: { preserveSourceBoundaries?: boolean }
 ): FlatMessage[] {
   let hasChanges = false
   const filtered = messages.filter((msg) => {
@@ -592,7 +629,9 @@ export function filterWhitespaceOnlyAssistantMessages(
   })
   if (!hasChanges) return [...messages]
   // Merge adjacent users left behind.
-  return mergeAdjacentUserMessages(filtered)
+  return mergeAdjacentUserMessages(filtered, {
+    preserveSourceBoundaries: options?.preserveSourceBoundaries,
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -885,22 +924,28 @@ function applyBackendThinkingRules(
 export function normalizeMessagesForAPI(
   messages: ReadonlyArray<SessionMessage>,
   opts: NormalizeOptions
-): UnifiedMessage[] {
+): NormalizedProviderMessage[] {
   if (!Array.isArray(messages) || messages.length === 0) return []
   const preserveCodexMetaBoundaries = opts.backend === "codex"
+  const preserveCodexSourceBoundaries = opts.backend === "codex"
 
   let pipeline: FlatMessage[] = lift(messages)
   pipeline = reorderAttachmentsForAPI(pipeline)
-  pipeline = mergeAssistantMessagesById(pipeline)
+  pipeline = mergeAssistantMessagesById(pipeline, {
+    preserveSourceBoundaries: preserveCodexSourceBoundaries,
+  })
   pipeline = mergeAdjacentUserMessages(pipeline, {
     preserveMetaBoundaries:
       opts.backend === "google" || preserveCodexMetaBoundaries,
     preserveAnyMetaBoundary: preserveCodexMetaBoundaries,
+    preserveSourceBoundaries: preserveCodexSourceBoundaries,
   })
   pipeline = relocateToolReferenceSiblings(pipeline)
   pipeline = filterOrphanedThinkingOnlyMessages(pipeline)
   pipeline = filterTrailingThinkingFromLastAssistant(pipeline)
-  pipeline = filterWhitespaceOnlyAssistantMessages(pipeline)
+  pipeline = filterWhitespaceOnlyAssistantMessages(pipeline, {
+    preserveSourceBoundaries: preserveCodexSourceBoundaries,
+  })
   pipeline = ensureNonEmptyAssistantContent(pipeline)
   pipeline = sanitizeErrorToolResultContent(pipeline)
   pipeline = hoistInUserMessages(pipeline)
@@ -915,6 +960,7 @@ export function normalizeMessagesForAPI(
     preserveMetaBoundaries:
       opts.backend === "google" || preserveCodexMetaBoundaries,
     preserveAnyMetaBoundary: preserveCodexMetaBoundaries,
+    preserveSourceBoundaries: preserveCodexSourceBoundaries,
   })
 
   return project(pipeline)
@@ -938,6 +984,8 @@ export function normalizeFlatMessagesForAPI(
     content: unknown
     /** Anthropic message id; preserved end-to-end since commit e9fc413. */
     messageId?: string
+    /** Durable graph identity used by the Codex native projection binding. */
+    sourceUuid?: string
     /** cc-style isMeta — set on infrastructure user messages
      *  (boundary / summary / attachment / hook). Used by the pipeline's
      *  mergeUserMessages step to prefer the non-meta uuid when fusing
@@ -947,9 +995,10 @@ export function normalizeFlatMessagesForAPI(
     attachmentKind?: ContextProjectionAttachment["kind"]
   }>,
   opts: NormalizeOptions
-): UnifiedMessage[] {
+): NormalizedProviderMessage[] {
   if (messages.length === 0) return []
   const preserveCodexMetaBoundaries = opts.backend === "codex"
+  const preserveCodexSourceBoundaries = opts.backend === "codex"
   let pipeline: FlatMessage[] = messages.map((msg) =>
     msg.role === "assistant"
       ? ({
@@ -961,6 +1010,7 @@ export function normalizeFlatMessagesForAPI(
           // (cursor-connect-stream.service.ts:persistSplitSiblingAssistantBlock,
           // commit 4745a63). Mirrors cc claude.ts:2281-2300.
           ...(msg.messageId ? { messageId: msg.messageId } : {}),
+          ...(msg.sourceUuid ? { sourceUuid: msg.sourceUuid } : {}),
           ...(msg.source ? { source: msg.source } : {}),
           ...(msg.attachmentKind ? { attachmentKind: msg.attachmentKind } : {}),
           content: msg.content as LooseMessageContent,
@@ -972,22 +1022,28 @@ export function normalizeFlatMessagesForAPI(
           // (line 325-326) can apply the cc uuid-preference rule when
           // fusing adjacent user messages.
           ...(msg.isMeta ? { isMeta: true as const } : {}),
+          ...(msg.sourceUuid ? { sourceUuid: msg.sourceUuid } : {}),
           ...(msg.source ? { source: msg.source } : {}),
           ...(msg.attachmentKind ? { attachmentKind: msg.attachmentKind } : {}),
           content: msg.content as LooseMessageContent,
         } as FlatUser)
   )
   pipeline = reorderAttachmentsForAPI(pipeline)
-  pipeline = mergeAssistantMessagesById(pipeline)
+  pipeline = mergeAssistantMessagesById(pipeline, {
+    preserveSourceBoundaries: preserveCodexSourceBoundaries,
+  })
   pipeline = mergeAdjacentUserMessages(pipeline, {
     preserveMetaBoundaries:
       opts.backend === "google" || preserveCodexMetaBoundaries,
     preserveAnyMetaBoundary: preserveCodexMetaBoundaries,
+    preserveSourceBoundaries: preserveCodexSourceBoundaries,
   })
   pipeline = relocateToolReferenceSiblings(pipeline)
   pipeline = filterOrphanedThinkingOnlyMessages(pipeline)
   pipeline = filterTrailingThinkingFromLastAssistant(pipeline)
-  pipeline = filterWhitespaceOnlyAssistantMessages(pipeline)
+  pipeline = filterWhitespaceOnlyAssistantMessages(pipeline, {
+    preserveSourceBoundaries: preserveCodexSourceBoundaries,
+  })
   pipeline = ensureNonEmptyAssistantContent(pipeline)
   pipeline = sanitizeErrorToolResultContent(pipeline)
   pipeline = hoistInUserMessages(pipeline)
@@ -996,6 +1052,7 @@ export function normalizeFlatMessagesForAPI(
     preserveMetaBoundaries:
       opts.backend === "google" || preserveCodexMetaBoundaries,
     preserveAnyMetaBoundary: preserveCodexMetaBoundaries,
+    preserveSourceBoundaries: preserveCodexSourceBoundaries,
   })
   return project(pipeline)
 }

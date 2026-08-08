@@ -6,6 +6,11 @@
 
 export { CursorSkillsManager } from "./cursor-skills.manager"
 export type { CursorSkillsPromptContext } from "./cursor-skills.manager"
+export {
+  CURSOR_SKILL_ACTIVATION_RECEIPTS_METADATA_KEY,
+  type CursorSkillActivationReceipt,
+  type DurableToolSkillActivationMetadata,
+} from "./skill-activation-receipt"
 
 export {
   extractCursorRuleFrontmatterName,

@@ -1,9 +1,10 @@
 import type {
+  CodexRateLimitWindow,
   CodexRateLimitSnapshot,
   CodexRateLimitSource,
 } from "../shared/backend-pool-status"
 
-export type CodexRateLimitTier = "primary" | "secondary"
+export const CODEX_WEEKLY_WINDOW_MINUTES = 7 * 24 * 60
 
 export function getEffectiveCodexRateLimitSnapshot(
   snapshots?: Partial<Record<CodexRateLimitSource, CodexRateLimitSnapshot>>
@@ -19,11 +20,24 @@ export function getEffectiveCodexRateLimitSnapshot(
   return snapshots.probe || null
 }
 
-export function getCodexQuotaRemainingPercent(
-  snapshot: CodexRateLimitSnapshot | null,
-  tier: CodexRateLimitTier
+export function getCodexWeeklyRateLimitWindow(
+  snapshot: CodexRateLimitSnapshot | null
+): CodexRateLimitWindow | null {
+  if (!snapshot) {
+    return null
+  }
+
+  return (
+    [snapshot.primary, snapshot.secondary].find(
+      (window) => window?.windowMinutes === CODEX_WEEKLY_WINDOW_MINUTES
+    ) || null
+  )
+}
+
+export function getCodexWeeklyQuotaRemainingPercent(
+  snapshot: CodexRateLimitSnapshot | null
 ): number | null {
-  const usedPercent = snapshot?.[tier]?.usedPercent
+  const usedPercent = getCodexWeeklyRateLimitWindow(snapshot)?.usedPercent
   if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent)) {
     return null
   }
@@ -31,12 +45,12 @@ export function getCodexQuotaRemainingPercent(
   return Math.max(0, 100 - usedPercent)
 }
 
-export function getCodexQuotaCooldownUntil(
-  snapshot: CodexRateLimitSnapshot | null,
-  tier: CodexRateLimitTier
+export function getCodexWeeklyQuotaCooldownUntil(
+  snapshot: CodexRateLimitSnapshot | null
 ): number {
-  const remainingPercent = getCodexQuotaRemainingPercent(snapshot, tier)
-  const resetsAt = snapshot?.[tier]?.resetsAt
+  const weekly = getCodexWeeklyRateLimitWindow(snapshot)
+  const remainingPercent = getCodexWeeklyQuotaRemainingPercent(snapshot)
+  const resetsAt = weekly?.resetsAt
 
   if (
     remainingPercent === null ||
@@ -50,35 +64,19 @@ export function getCodexQuotaCooldownUntil(
   return resetsAt * 1000
 }
 
-export function getCodexRateLimitQuotaCooldownUntil(
+export function getCodexWeeklyRateLimitCooldownUntil(
   snapshot: CodexRateLimitSnapshot | null,
   now: number
 ): number {
-  if (!snapshot) {
-    return 0
-  }
-
-  const activeResets = [
-    getCodexQuotaCooldownUntil(snapshot, "primary"),
-    getCodexQuotaCooldownUntil(snapshot, "secondary"),
-  ].filter((cooldownUntil) => cooldownUntil > now)
-
-  return activeResets.length > 0 ? Math.max(...activeResets) : 0
+  const cooldownUntil = getCodexWeeklyQuotaCooldownUntil(snapshot)
+  return cooldownUntil > now ? cooldownUntil : 0
 }
 
 export function isCodexRateLimitSnapshotExhausted(
   snapshot: CodexRateLimitSnapshot | null
 ): boolean {
-  const primaryRemaining = getCodexQuotaRemainingPercent(snapshot, "primary")
-  if (primaryRemaining != null && primaryRemaining < 1) {
-    return true
-  }
-
-  const secondaryRemaining = getCodexQuotaRemainingPercent(
-    snapshot,
-    "secondary"
-  )
-  return secondaryRemaining != null && secondaryRemaining < 1
+  const weeklyRemaining = getCodexWeeklyQuotaRemainingPercent(snapshot)
+  return weeklyRemaining != null && weeklyRemaining < 1
 }
 
 export function getAllCodexAccountsRateLimitedRetrySeconds(

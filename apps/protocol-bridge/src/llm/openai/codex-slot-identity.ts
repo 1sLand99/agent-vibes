@@ -1,5 +1,29 @@
 import * as crypto from "crypto"
 
+declare const CODEX_SLOT_KEY_BRAND: unique symbol
+declare const CODEX_RELOAD_KEY_BRAND: unique symbol
+
+/**
+ * Opaque identity for one routable Codex account slot.
+ *
+ * Slot keys cross the affinity, continuation-cache, and transport-routing
+ * boundaries. Keep their representation secret-free, delimiter-safe, and
+ * versioned so those owners cannot accidentally receive an ad hoc composite
+ * string.
+ */
+export type CodexSlotKey = string & {
+  readonly [CODEX_SLOT_KEY_BRAND]: true
+}
+
+/** Process-local reconciliation identity for a configured Codex slot. */
+export type CodexReloadKey = string & {
+  readonly [CODEX_RELOAD_KEY_BRAND]: true
+}
+
+const CODEX_SLOT_KEY_PREFIX = "codex-slot:v1:"
+const CODEX_SLOT_KEY_PATTERN = /^codex-slot:v1:[0-9a-f]{64}$/
+const CODEX_RELOAD_KEY_PREFIX = "codex-reload:v1:"
+
 export interface CodexSlotIdentityInput {
   apiKey?: string
   email?: string
@@ -16,36 +40,72 @@ export function hashCodexIdentityPart(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex").slice(0, 16)
 }
 
+function encodeCodexSlotKey(
+  kind: string,
+  identity: string,
+  baseUrl: string
+): CodexSlotKey {
+  const canonicalIdentity = JSON.stringify([kind, identity, baseUrl])
+  const digest = crypto
+    .createHash("sha256")
+    .update(canonicalIdentity)
+    .digest("hex")
+  return `${CODEX_SLOT_KEY_PREFIX}${digest}` as CodexSlotKey
+}
+
+function encodeCodexReloadKey(
+  kind: string,
+  identity: readonly (string | number)[],
+  baseUrl: string
+): CodexReloadKey {
+  const canonicalIdentity = JSON.stringify([kind, ...identity, baseUrl])
+  const digest = crypto
+    .createHash("sha256")
+    .update(canonicalIdentity)
+    .digest("hex")
+  return `${CODEX_RELOAD_KEY_PREFIX}${digest}` as CodexReloadKey
+}
+
+export function requireCodexSlotKey(
+  value: unknown,
+  label: string
+): CodexSlotKey {
+  if (typeof value !== "string" || !CODEX_SLOT_KEY_PATTERN.test(value)) {
+    throw new Error(`${label} must be a canonical Codex slot key`)
+  }
+  return value as CodexSlotKey
+}
+
 export function buildCodexSlotStickyKey(
   identity: CodexSlotIdentityInput
-): string {
+): CodexSlotKey {
   const baseUrl = identity.baseUrl?.trim() || ""
   const apiKey = identity.apiKey?.trim()
   if (apiKey) {
-    return `api_key:${apiKey}\0base:${baseUrl}`
+    return encodeCodexSlotKey("api_key", apiKey, baseUrl)
   }
 
   const accountId = identity.accountId?.trim()
   if (accountId) {
-    return `account_id:${accountId}\0base:${baseUrl}`
+    return encodeCodexSlotKey("account_id", accountId, baseUrl)
   }
 
   const email = identity.email?.trim().toLowerCase()
   if (email) {
-    return `email:${email}\0base:${baseUrl}`
+    return encodeCodexSlotKey("email", email, baseUrl)
   }
 
   const refreshToken = identity.refreshToken?.trim()
   if (refreshToken) {
-    return `refresh:${hashCodexIdentityPart(refreshToken)}\0base:${baseUrl}`
+    return encodeCodexSlotKey("refresh", refreshToken, baseUrl)
   }
 
   const accessToken = identity.accessToken?.trim()
   if (accessToken) {
-    return `access:${hashCodexIdentityPart(accessToken)}\0base:${baseUrl}`
+    return encodeCodexSlotKey("access", accessToken, baseUrl)
   }
 
-  return `label:${identity.label || ""}\0base:${baseUrl}`
+  return encodeCodexSlotKey("label", identity.label || "", baseUrl)
 }
 
 export function buildCodexSlotStateKey(
@@ -69,23 +129,10 @@ export function buildCodexSlotStateKey(
   return hashCodexIdentityPart(`codex:base:${baseUrl}`)
 }
 
-export function buildCodexOAuthCacheIdentity(input: {
-  slotKey: string
-  model: string
-  conversationId?: string
-  includeConversationId?: boolean
-}): string {
-  const conversationId = input.conversationId?.trim()
-  if ((input.includeConversationId ?? true) && conversationId) {
-    return `oauth:${input.slotKey}:conversation:${conversationId}:model:${input.model}`
-  }
-  return `oauth:${input.slotKey}:model:${input.model}`
-}
-
-export function buildCodexNormalizedReloadKey(
+export function buildCodexReloadKey(
   identity: CodexSlotIdentityInput,
   defaultBaseUrl: string
-): string {
+): CodexReloadKey {
   const baseUrl = identity.baseUrl?.trim() || defaultBaseUrl
   const email = identity.email?.trim().toLowerCase() || ""
   const accountId = identity.accountId?.trim() || ""
@@ -94,29 +141,33 @@ export function buildCodexNormalizedReloadKey(
   const accessToken = identity.accessToken?.trim() || ""
 
   if (email && accountId) {
-    return `email:${email}:${accountId}\0base:${baseUrl}`
+    return encodeCodexReloadKey("email_account", [email, accountId], baseUrl)
   }
   if (email && refreshToken) {
-    return `email_refresh:${email}:${hashCodexIdentityPart(refreshToken)}\0base:${baseUrl}`
+    return encodeCodexReloadKey("email_refresh", [email, refreshToken], baseUrl)
   }
   if (email && accessToken) {
-    return `email_access:${email}:${hashCodexIdentityPart(accessToken)}\0base:${baseUrl}`
+    return encodeCodexReloadKey("email_access", [email, accessToken], baseUrl)
   }
   if (email) {
-    return `email:${email}\0base:${baseUrl}`
+    return encodeCodexReloadKey("email", [email], baseUrl)
   }
   if (apiKey) {
-    return `api_key:${apiKey}\0base:${baseUrl}`
+    return encodeCodexReloadKey("api_key", [apiKey], baseUrl)
   }
   if (refreshToken) {
-    return `refresh:${hashCodexIdentityPart(refreshToken)}\0base:${baseUrl}`
+    return encodeCodexReloadKey("refresh", [refreshToken], baseUrl)
   }
   if (accessToken) {
-    return `access:${hashCodexIdentityPart(accessToken)}\0base:${baseUrl}`
+    return encodeCodexReloadKey("access", [accessToken], baseUrl)
   }
   if (accountId) {
-    return `account_id:${accountId}\0base:${baseUrl}`
+    return encodeCodexReloadKey("account_id", [accountId], baseUrl)
   }
 
-  return `path:${identity.configPath || ""}:${identity.index ?? 0}\0base:${baseUrl}`
+  return encodeCodexReloadKey(
+    "path",
+    [identity.configPath || "", identity.index ?? 0],
+    baseUrl
+  )
 }

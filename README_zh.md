@@ -70,7 +70,7 @@ Agent Vibes 是一个统一的 AI Agent 网关。它不只是做客户端与后�
 | 领域                 | 能力                                                                                                                                                                                          |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 协议与客户端         | 原生支持 Claude Code CLI 与 Cursor IDE；其中 Claude Code CLI 走 Anthropic API (SSE)，Cursor IDE 走原生 ConnectRPC/gRPC Agent 通道实现。                                                       |
-| Cursor 协议实现      | 直接实现 Cursor 协议本身，包含完整的流式工具调用循环（streaming tool loop）与相关工具协议映射，而不只是兼容接口或简单转发。                                                                   |
+| Cursor 协议实现      | 直接实现 Cursor 协议本身（对齐 Cursor 3.15 消息面），包含完整的流式工具调用循环与工具协议映射；非核心 RPC 走官方穿透。                                                                        |
 | 路由与后端           | 在 Antigravity IDE、Claude 兼容 API、Codex CLI、OpenAI-compatible API 与 Kiro (AWS CodeWhisperer) 之间路由请求；覆盖 Gemini、Claude、GPT / O 系列模型，并结合后端可用性与模型能力做路由决策。 |
 | 账号池与配额         | 包含原生 worker / process pool、账号池状态、cooldown、模型级 cooldown、Google / Codex / Kiro 配额视图、速率限制视图，以及面向多账号的轮转与可用性管理。                                       |
 | 扩展与运维           | 提供 Dashboard、账号管理、OAuth / token 导入、账号 JSON 手动配置、SSL 证书生成、Cursor 直连接入补丁、legacy forwarding 配置、日志查看、内置诊断、usage / analytics 与更新检查。               |
@@ -688,11 +688,17 @@ agent-vibes/
 | ---------------------------- | ---- | ------------------------ | ------------------------ |
 | `/v1/messages`               | POST | Anthropic API (SSE)      | Claude Code CLI          |
 | `/v1/messages/count_tokens`  | POST | Anthropic API            | 请求 token 计数          |
+| `/v1/realtime/calls`         | POST | WebRTC SDP               | ChatGPT OAuth 语音       |
 | `/agent.v1.AgentService/Run` | POST | ConnectRPC (HTTP/2 BiDi) | Cursor IDE（Agent 模式） |
 | `/v1/models`                 | GET  | REST JSON                | Anthropic 模型列表       |
 | `/v1/anthropic/models`       | GET  | REST JSON                | 可用模型列表             |
 | `/health`                    | GET  | REST JSON                | 健康检查                 |
 | `/docs`                      | GET  | Swagger UI               | API 文档                 |
+
+`/v1/realtime/calls` 使用已配置的 ChatGPT OAuth 账号，将浏览器 WebRTC SDP
+offer 交换为 SDP answer。该接口不使用 Platform API key，并强制要求配置
+`PROXY_API_KEY`。上游能力目前仍属实验性；未获开放的账号会收到 `503`，错误码为
+`realtime_not_available`。
 
 ## 技术栈
 

@@ -54,8 +54,9 @@ if (!CURSOR_APP_ROOT || !fs.existsSync(CURSOR_APP_ROOT)) {
 // 动态构建 bundle 路径列表
 function discoverBundlePaths() {
   const paths = [
-    // 主 workbench bundle（最大，~42MB，包含大部分定义）
+    // Workbench bundles（新版 Cursor 将部分协议拆到了 glass bundle）
     path.join(CURSOR_APP_ROOT, "out/vs/workbench/workbench.desktop.main.js"),
+    path.join(CURSOR_APP_ROOT, "out/vs/workbench/workbench.glass.main.js"),
     // 其他核心文件
     path.join(CURSOR_APP_ROOT, "out/main.js"),
     path.join(
@@ -136,6 +137,11 @@ const schema = {
   // bundle basename -> varName -> fullTypeName 映射
   // Minified identifiers are not globally unique across Cursor bundles.
   varToTypeByBundle: {},
+  // bundle basename -> varName -> [{ position, fullName }]
+  // Minified identifiers can also be reused within a single bundle.
+  varTypeOccurrencesByBundle: {},
+  // bundle basename -> Webpack module start positions
+  moduleStartsByBundle: {},
   // fullTypeName -> varName 映射
   typeToVar: {},
   // fullTypeName -> { fields: [...], sourceBundle }
@@ -155,6 +161,53 @@ function getBundleMap(bundleKey) {
   return schema.varToTypeByBundle[bundleKey]
 }
 
+function indexWebpackModules(bundleKey, content) {
+  if (schema.moduleStartsByBundle[bundleKey]) return
+  const starts = []
+  const moduleRx = /(?:^|[,{])(\d+):(?:\([^)]*\)=>|function\([^)]*\))\{/g
+  let match
+  while ((match = moduleRx.exec(content)) !== null) {
+    starts.push(match.index + (match[0].startsWith(",") ? 1 : 0))
+  }
+  schema.moduleStartsByBundle[bundleKey] = starts
+}
+
+function getWebpackModuleStart(bundleKey, position) {
+  const starts = schema.moduleStartsByBundle[bundleKey]
+  if (!starts || starts.length === 0 || !Number.isInteger(position)) return null
+
+  let low = 0
+  let high = starts.length - 1
+  let result = null
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2)
+    if (starts[mid] <= position) {
+      result = starts[mid]
+      low = mid + 1
+    } else {
+      high = mid - 1
+    }
+  }
+  return result
+}
+
+function recordVarTypeOccurrence(bundleKey, varName, fullName, position) {
+  if (!Number.isInteger(position)) return
+  if (!schema.varTypeOccurrencesByBundle[bundleKey]) {
+    schema.varTypeOccurrencesByBundle[bundleKey] = {}
+  }
+  const bundleOccurrences = schema.varTypeOccurrencesByBundle[bundleKey]
+  if (!bundleOccurrences[varName]) bundleOccurrences[varName] = []
+  const occurrences = bundleOccurrences[varName]
+  if (
+    !occurrences.some(
+      (entry) => entry.position === position && entry.fullName === fullName
+    )
+  ) {
+    occurrences.push({ position, fullName })
+  }
+}
+
 function recordVarType(
   varToBundle,
   bundleKey,
@@ -164,6 +217,7 @@ function recordVarType(
   options = {}
 ) {
   if (!varName || !fullName) return
+  recordVarTypeOccurrence(bundleKey, varName, fullName, options.position)
   const bundleMap = getBundleMap(bundleKey)
   if (options.force || !bundleMap[varName]) {
     bundleMap[varName] = fullName
@@ -182,9 +236,33 @@ function recordVarType(
   }
 }
 
-function resolveVarInBundle(bundleKey, varName) {
+function resolveVarInBundle(bundleKey, varName, position) {
+  if (Number.isInteger(position)) {
+    const occurrences =
+      schema.varTypeOccurrencesByBundle[bundleKey]?.[varName] || []
+    const currentModuleStart = getWebpackModuleStart(bundleKey, position)
+    const scopedOccurrences =
+      currentModuleStart === null
+        ? occurrences
+        : occurrences.filter(
+            (occurrence) =>
+              getWebpackModuleStart(bundleKey, occurrence.position) ===
+              currentModuleStart
+          )
+    let nearestOccurrence
+    let nearestDistance = Infinity
+    for (const occurrence of scopedOccurrences) {
+      const distance = Math.abs(occurrence.position - position)
+      if (distance < nearestDistance) {
+        nearestOccurrence = occurrence
+        nearestDistance = distance
+      }
+    }
+    if (nearestOccurrence) return nearestOccurrence.fullName
+  }
+
   const bundleMap = schema.varToTypeByBundle[bundleKey]
-  return (bundleMap && bundleMap[varName]) || schema.varToType[varName]
+  return bundleMap && bundleMap[varName]
 }
 
 function applyAliasMappings(content, bundleKey, bundleId, varToBundle) {
@@ -226,6 +304,9 @@ function findLocalTypeInModule(moduleBody, localVar) {
     new RegExp(
       `${name}\\s*=\\s*class(?:\\s+[\\w$]+)?\\s+extends\\s+[\\w$.]+[\\s\\S]{0,2500}?typeName\\s*=\\s*"([^"]+)"`
     ),
+    new RegExp(
+      `(?:[\\w$]+(?:\\.[\\w$]+)*\\.)?setEnumType\\(${name}\\s*,\\s*"([^"]+)"`
+    ),
   ]
   for (const pattern of patterns) {
     const match = moduleBody.match(pattern)
@@ -236,25 +317,125 @@ function findLocalTypeInModule(moduleBody, localVar) {
 
 function applyModuleMemberMappings(content, bundleKey, bundleId, varToBundle) {
   const moduleExports = new Map()
-  const moduleRx = /(\d+):\([^)]*\)=>\{([\s\S]*?)(?=,\d+:\([^)]*\)=>|\}\)\(\{)/g
+  const moduleImports = new Map()
+  const pendingExportRefs = new Map()
+  const exportStarDependencies = new Map()
+  const moduleRx =
+    /(?:^|[,{])(\d+):(?:(?:\(([^)]*)\)=>)|(?:function\(([^)]*)\)))\{([\s\S]*?)(?=,\d+:(?:(?:\([^)]*\)=>)|(?:function\([^)]*\)))\{|\}\)\(\{)/g
   let moduleMatch
   while ((moduleMatch = moduleRx.exec(content)) !== null) {
     const moduleId = moduleMatch[1]
-    const moduleBody = moduleMatch[2]
-    const exportMatch = moduleBody.match(/[\w$]+\.d\([\w$]+,\{([^}]+)\}\)/)
-    if (!exportMatch) continue
-
+    const moduleArgs = (moduleMatch[2] || moduleMatch[3] || "")
+      .split(",")
+      .map((value) => value.trim())
+    const exportsVar = moduleArgs[1]
+    const requireVar = moduleArgs[2]
+    const moduleBody = moduleMatch[4]
     const exportsForModule = {}
-    const exportRx = /([\w$]+):\s*\(\)\s*=>\s*([\w$]+)/g
-    let exportEntry
-    while ((exportEntry = exportRx.exec(exportMatch[1])) !== null) {
-      const exportName = exportEntry[1]
-      const localVar = exportEntry[2]
-      const typeName = findLocalTypeInModule(moduleBody, localVar)
-      if (typeName) exportsForModule[exportName] = typeName
+    const importsForModule = {}
+    const pendingRefs = []
+    const starDependencies = []
+
+    if (requireVar) {
+      const escapedRequireVar = escapeRegExp(requireVar)
+      const moduleImportRx = new RegExp(
+        `(?:^|[;,])\\s*(?:(?:let|var|const)\\s+)?([\\w$]+)\\s*=\\s*${escapedRequireVar}\\((\\d+)\\)`,
+        "g"
+      )
+      let moduleImportMatch
+      while ((moduleImportMatch = moduleImportRx.exec(moduleBody)) !== null) {
+        importsForModule[moduleImportMatch[1]] = moduleImportMatch[2]
+      }
     }
-    if (Object.keys(exportsForModule).length > 0) {
-      moduleExports.set(moduleId, exportsForModule)
+
+    const addExport = (exportName, localRef) => {
+      const typeName = findLocalTypeInModule(moduleBody, localRef)
+      if (typeName) exportsForModule[exportName] = typeName
+      else pendingRefs.push({ exportName, localRef })
+    }
+
+    const defineExportsRx = /[\w$]+\.d\([\w$]+,\{([^}]+)\}\)/g
+    let defineExportsMatch
+    while ((defineExportsMatch = defineExportsRx.exec(moduleBody)) !== null) {
+      const exportRx = /([\w$]+):\s*\(\)\s*=>\s*([\w$]+(?:\.[\w$]+)*)/g
+      let exportEntry
+      while ((exportEntry = exportRx.exec(defineExportsMatch[1])) !== null) {
+        addExport(exportEntry[1], exportEntry[2])
+      }
+    }
+
+    if (exportsVar) {
+      const escapedExportsVar = escapeRegExp(exportsVar)
+      const definePropertyRx = new RegExp(
+        `Object\\.defineProperty\\(${escapedExportsVar},"([^"]+)",\\{[\\s\\S]{0,300}?get:function\\(\\)\\{return\\s+([\\w$]+(?:\\.[\\w$]+)*)\\}\\}\\)`,
+        "g"
+      )
+      let definePropertyMatch
+      while (
+        (definePropertyMatch = definePropertyRx.exec(moduleBody)) !== null
+      ) {
+        addExport(definePropertyMatch[1], definePropertyMatch[2])
+      }
+
+      const assignmentRx = new RegExp(
+        `(?:^|[;},])\\s*${escapedExportsVar}\\.([\\w$]+)\\s*=\\s*([\\w$]+)(?=[,;}])`,
+        "g"
+      )
+      let assignmentMatch
+      while ((assignmentMatch = assignmentRx.exec(moduleBody)) !== null) {
+        addExport(assignmentMatch[1], assignmentMatch[2])
+      }
+
+      if (requireVar) {
+        const escapedRequireVar = escapeRegExp(requireVar)
+        const exportStarRx = new RegExp(
+          `[\\w$]+\\(\\s*${escapedRequireVar}\\((\\d+)\\)\\s*,\\s*${escapedExportsVar}\\s*\\)`,
+          "g"
+        )
+        let exportStarMatch
+        while ((exportStarMatch = exportStarRx.exec(moduleBody)) !== null) {
+          starDependencies.push(exportStarMatch[1])
+        }
+      }
+    }
+
+    moduleExports.set(moduleId, exportsForModule)
+    moduleImports.set(moduleId, importsForModule)
+    pendingExportRefs.set(moduleId, pendingRefs)
+    exportStarDependencies.set(moduleId, starDependencies)
+  }
+
+  let changed = true
+  let passes = 0
+  while (changed && passes < moduleExports.size) {
+    changed = false
+    passes++
+    for (const [moduleId, exportsForModule] of moduleExports) {
+      const importsForModule = moduleImports.get(moduleId) || {}
+      for (const { exportName, localRef } of pendingExportRefs.get(moduleId) ||
+        []) {
+        if (exportsForModule[exportName]) continue
+        const [alias, member] = localRef.split(".")
+        const dependencyId = member ? importsForModule[alias] : undefined
+        const typeName = dependencyId
+          ? moduleExports.get(dependencyId)?.[member]
+          : undefined
+        if (typeName) {
+          exportsForModule[exportName] = typeName
+          changed = true
+        }
+      }
+      for (const dependencyId of exportStarDependencies.get(moduleId) || []) {
+        const dependencyExports = moduleExports.get(dependencyId)
+        if (!dependencyExports) continue
+        for (const [exportName, typeName] of Object.entries(
+          dependencyExports
+        )) {
+          if (exportsForModule[exportName]) continue
+          exportsForModule[exportName] = typeName
+          changed = true
+        }
+      }
     }
   }
 
@@ -269,8 +450,9 @@ function applyModuleMemberMappings(content, bundleKey, bundleId, varToBundle) {
 
     for (const [exportName, typeName] of Object.entries(exportsForModule)) {
       const memberRef = `${alias}.${exportName}`
-      if (resolveVarInBundle(bundleKey, memberRef)) continue
-      recordVarType(varToBundle, bundleKey, bundleId, memberRef, typeName)
+      recordVarType(varToBundle, bundleKey, bundleId, memberRef, typeName, {
+        position: importMatch.index,
+      })
     }
   }
 }
@@ -308,72 +490,53 @@ function buildVarTypeMapping(bundles) {
     const content = bundle.content
     const bundleId = bundle.path || bundle.name || "unknown"
     const bundleKey = bundle.basename || bundleId
+    indexWebpackModules(bundleKey, content)
     let m
 
     // 策略 1: fromBinary 模式（最可靠）
     // typeName="xxx" ... fromBinary(e,t){return new VarName().fromBinary(e,t)}
     const rx =
-      /typeName="([^"]+)"[\s\S]{0,600}?fromBinary\(e,t\)\{return new (\w+)\(\)/g
+      /typeName="([^"]+)"[\s\S]{0,600}?fromBinary\(\w+,\w+\)\{return\s*\(?new\s+([\w$]+)\b/g
     while ((m = rx.exec(content)) !== null) {
       const fullName = m[1]
       const varName = m[2]
-      if (!schema.varToType[varName]) {
-        recordVarType(varToBundle, bundleKey, bundleId, varName, fullName)
-      }
+      recordVarType(varToBundle, bundleKey, bundleId, varName, fullName)
     }
 
     // 策略 2: fromJsonString 模式（补充 fromBinary 遗漏）
     // typeName="xxx" ... fromJsonString(e,t){return new VarName().fromJsonString(e,t)}
     const rx2 =
-      /typeName="([^"]+)"[\s\S]{0,800}?fromJsonString\(e,t\)\{return new (\w+)\(\)/g
+      /typeName="([^"]+)"[\s\S]{0,800}?fromJsonString\(\w+,\w+\)\{return\s*\(?new\s+([\w$]+)\b/g
     while ((m = rx2.exec(content)) !== null) {
-      if (!schema.varToType[m[2]]) {
-        recordVarType(varToBundle, bundleKey, bundleId, m[2], m[1])
-      }
+      recordVarType(varToBundle, bundleKey, bundleId, m[2], m[1])
     }
 
-    // 策略 3: setEnumType 模式（enum 变量映射）
+    // 策略 3: 旧 protobuf runtime 的 makeMessageType 模式
+    const makeMessageTypeRx =
+      /(?:^|[;,])\s*(?:(?:let|var|const)\s+)?([\w$]+)\s*=\s*[\w$.]+\.makeMessageType\("([^"]+)"/g
+    while ((m = makeMessageTypeRx.exec(content)) !== null) {
+      recordVarType(varToBundle, bundleKey, bundleId, m[1], m[2], {
+        position: m.index,
+      })
+    }
+
+    // 策略 4: setEnumType 模式（enum 变量映射）
     // setEnumType(VarName, "pkg.EnumName", [...])
     const enumVarRx =
       /(?:[\w$]+(?:\.[\w$]+)*\.)?setEnumType\(([\w$]+)\s*,\s*"([^"]+)"/g
     while ((m = enumVarRx.exec(content)) !== null) {
-      if (!schema.varToType[m[1]]) {
-        recordVarType(varToBundle, bundleKey, bundleId, m[1], m[2])
-      }
-    }
-
-    // 策略 4: getEnumType 引用解引用
-    // 在 field 定义中，enum 的 T 值是 b.getEnumType(VarName) 的返回值
-    // 但 minified 后，T 直接引用的是 getEnumType 的参数表达式
-    // 实际上 T:b.getEnumType(VarName) 被 minified 为一个赋值表达式
-    // 这里我们提取所有 getEnumType(VarName) 引用并建立映射
-    const getEnumRx = /getEnumType\(([\w$]+)\)/g
-    while ((m = getEnumRx.exec(content)) !== null) {
-      // m[1] 是 enum 的变量名，已在策略 3 中映射
-      // 这里主要用于确保没有遗漏
-      if (!schema.varToType[m[1]]) {
-        // 在 setEnumType 中也搜索一下这个变量
-        const enumDefRx = new RegExp(
-          "(?:[\\w$]+(?:\\.[\\w$]+)*\\.)?setEnumType\\(" +
-            m[1] +
-            '\\s*,\\s*"([^"]+)"'
-        )
-        const enumMatch = content.match(enumDefRx)
-        if (enumMatch) {
-          recordVarType(varToBundle, bundleKey, bundleId, m[1], enumMatch[1])
-        }
-      }
+      recordVarType(varToBundle, bundleKey, bundleId, m[1], m[2], {
+        position: m.index,
+      })
     }
 
     // 策略 5: equals 静态方法模式（proto-es 常见）
     // static equals(a,b){return b.util.equals(VarName,a,b)}
     // 其中 VarName 在 typeName 定义附近
     const equalsRx =
-      /typeName="([^"]+)"[\s\S]{0,800}?equals\(\w+,\w+\)\{return \w+\.util\.equals\((\w+)/g
+      /typeName="([^"]+)"[\s\S]{0,800}?equals\(\w+,\w+\)\{return\s+[\w$.]+\.util\.equals\(([\w$]+)/g
     while ((m = equalsRx.exec(content)) !== null) {
-      if (!schema.varToType[m[2]]) {
-        recordVarType(varToBundle, bundleKey, bundleId, m[2], m[1])
-      }
+      recordVarType(varToBundle, bundleKey, bundleId, m[2], m[1])
     }
 
     // 策略 6: typeName 回溯法（最全面）
@@ -398,7 +561,7 @@ function buildVarTypeMapping(bundles) {
       // 注意: 不覆盖来自其他 bundle 的映射（跨 bundle 的 minified 变量名不唯一）
       const assignClassMatches = [
         ...before.matchAll(
-          /([\w$]+)\s*=\s*class\s+[\w$]+\s+extends\s+[\w$]+\s*\{/g
+          /([\w$]+)\s*=\s*class(?:\s+[\w$]+)?\s+extends\s+[\w$.]+\s*\{/g
         ),
       ]
       if (assignClassMatches.length > 0) {
@@ -407,27 +570,23 @@ function buildVarTypeMapping(bundles) {
         // 仅在以下情况写入：
         // 1. varName 尚无映射
         // 2. varName 已有映射但来自同一 bundle（修正 InternalName → VarName）
-        if (!schema.varToType[varName] || varToBundle[varName] === bundleId) {
-          recordVarType(varToBundle, bundleKey, bundleId, varName, fullName, {
-            force: true,
-          })
-        }
+        recordVarType(varToBundle, bundleKey, bundleId, varName, fullName, {
+          force: true,
+          position: m.index,
+        })
         continue
       }
 
-      // 已有映射 则模式 A/B 不再处理
-      if (schema.typeToVar[fullName]) continue
-
       // 模式 A: class VarName extends Base{...
       const classMatches = [
-        ...before.matchAll(/class\s+([\w$]+)\s+extends\s+\w+\s*\{/g),
+        ...before.matchAll(/class\s+([\w$]+)\s+extends\s+[\w$.]+\s*\{/g),
       ]
       if (classMatches.length > 0) {
         const lastMatch = classMatches[classMatches.length - 1]
         const varName = lastMatch[1]
-        if (!schema.varToType[varName]) {
-          recordVarType(varToBundle, bundleKey, bundleId, varName, fullName)
-        }
+        recordVarType(varToBundle, bundleKey, bundleId, varName, fullName, {
+          position: m.index,
+        })
         continue
       }
 
@@ -440,9 +599,9 @@ function buildVarTypeMapping(bundles) {
       if (letAssignMatches.length > 0) {
         const lastMatch = letAssignMatches[letAssignMatches.length - 1]
         const varName = lastMatch[1]
-        if (!schema.varToType[varName]) {
-          recordVarType(varToBundle, bundleKey, bundleId, varName, fullName)
-        }
+        recordVarType(varToBundle, bundleKey, bundleId, varName, fullName, {
+          position: m.index,
+        })
       }
     }
 
@@ -514,10 +673,11 @@ function parseFieldObject(fieldStr) {
   // 格式 4: T:9 (scalar 编号)
   // 注意: minified 变量名可以包含 $ 字符（如 $Z, $xe, e$u）
   const enumTMatch = fieldStr.match(
-    /\bT:\s*[\w$]+(?:\.[\w$]+)*\.getEnumType\(([\w$]+)\)/
+    /\bT:\s*[\w$]+(?:\.[\w$]+)*\.getEnumType\(([\w$]+(?:\.[\w$]+)*)\)/
   )
   const lazyTMatch = fieldStr.match(/\bT:\s*\(\)\s*=>\s*([\w$]+)/)
   const directTMatch = fieldStr.match(/\bT:\s*([\w$]+(?:\.[\w$]+)*)/)
+  const shorthandTMatch = fieldStr.match(/(?:^|,)\s*(T)\s*(?=,|$)/)
   if (enumTMatch) {
     field.T = enumTMatch[1]
     // 将 kind 校正为 enum（有时原始 kind 可能不是 enum）
@@ -526,6 +686,8 @@ function parseFieldObject(fieldStr) {
     field.T = lazyTMatch[1]
   } else if (directTMatch) {
     field.T = directTMatch[1]
+  } else if (shorthandTMatch) {
+    field.T = shorthandTMatch[1]
   }
 
   // opt (optional)
@@ -570,7 +732,7 @@ function parseFieldObject(fieldStr) {
     const vObj = {}
     const vKindMatch = vMatch[1].match(/kind:\s*"(\w+)"/)
     if (vKindMatch) vObj.kind = vKindMatch[1]
-    const vTMatch = vMatch[1].match(/\bT:\s*([\w$]+)/)
+    const vTMatch = vMatch[1].match(/\bT:\s*([\w$]+(?:\.[\w$]+)*)/)
     if (vTMatch) vObj.T = vTMatch[1]
     field.mapValueType = vObj
   }
@@ -649,6 +811,7 @@ function extractMessages(bundles) {
       schema.messages[fullName] = {
         fields,
         sourceBundle: bundle.basename,
+        sourcePosition: m.index,
         isEmpty: fields.length === 0,
       }
     }
@@ -720,7 +883,8 @@ function extractServices(bundles) {
     const content = bundle.content
 
     // 步骤 1: 找到所有 method 定义的位置
-    const methodRx = /\{name:"(\w+)",I:(\w+),O:(\w+),kind:(\d+)\}/g
+    const methodRx =
+      /\{name:"([\w$]+)",I:([\w$]+(?:\.[\w$]+)*),O:([\w$]+(?:\.[\w$]+)*),kind:(\d+)\}/g
     let m
     const methodLocations = []
 
@@ -765,8 +929,10 @@ function extractServices(bundles) {
       const bundleKey = bundle.basename || bundle.path || "unknown"
       const methods = group.map((m) => ({
         name: m.name,
-        inputType: resolveVarInBundle(bundleKey, m.inputVar) || m.inputVar,
-        outputType: resolveVarInBundle(bundleKey, m.outputVar) || m.outputVar,
+        inputType:
+          resolveVarInBundle(bundleKey, m.inputVar, m.index) || m.inputVar,
+        outputType:
+          resolveVarInBundle(bundleKey, m.outputVar, m.index) || m.outputVar,
         inputVar: m.inputVar,
         outputVar: m.outputVar,
         kind: METHOD_KINDS[m.kind] || `kind_${m.kind}`,
@@ -804,11 +970,15 @@ function resolveTypes() {
           field.resolvedType = SCALAR_TYPES[num] || `scalar_${field.T}`
         }
       } else if (field.kind === "message" && field.T) {
-        field.resolvedType = resolveVarInBundle(bundleKey, field.T) || field.T
+        field.resolvedType =
+          resolveVarInBundle(bundleKey, field.T, msgDef.sourcePosition) ||
+          field.T
       } else if (field.kind === "enum" && field.T) {
         // enum 字段的 T 通常是 b.getEnumType(VarName) 调用的结果
         // 但在 minified 代码中直接存的是 var 引用
-        field.resolvedType = resolveVarInBundle(bundleKey, field.T) || field.T
+        field.resolvedType =
+          resolveVarInBundle(bundleKey, field.T, msgDef.sourcePosition) ||
+          field.T
       } else if (field.kind === "map") {
         // map key
         if (field.mapKeyType !== undefined) {
@@ -828,15 +998,21 @@ function resolveTypes() {
             field.mapValueType.T
           ) {
             field.resolvedMapValueType =
-              resolveVarInBundle(bundleKey, field.mapValueType.T) ||
-              field.mapValueType.T
+              resolveVarInBundle(
+                bundleKey,
+                field.mapValueType.T,
+                msgDef.sourcePosition
+              ) || field.mapValueType.T
           } else if (
             field.mapValueType.kind === "enum" &&
             field.mapValueType.T
           ) {
             field.resolvedMapValueType =
-              resolveVarInBundle(bundleKey, field.mapValueType.T) ||
-              field.mapValueType.T
+              resolveVarInBundle(
+                bundleKey,
+                field.mapValueType.T,
+                msgDef.sourcePosition
+              ) || field.mapValueType.T
           }
         }
       }
@@ -884,7 +1060,7 @@ function computeStats() {
       if (
         (field.kind === "message" || field.kind === "enum") &&
         field.T &&
-        !resolveVarInBundle(bundleKey, field.T) &&
+        !resolveVarInBundle(bundleKey, field.T, msgDef.sourcePosition) &&
         isNaN(parseInt(field.T))
       ) {
         unresolvedCount++

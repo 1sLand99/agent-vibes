@@ -3,6 +3,7 @@ import {
   type CodexAccountSelection,
 } from "./codex-account-selection"
 import { CodexSlotAffinityStore } from "./codex-slot-affinity-store"
+import type { CodexSlotKey } from "./codex-slot-identity"
 
 export interface CodexSlotRouterOptions {
   affinityTtlMs: number
@@ -16,7 +17,7 @@ export interface CodexSlotLookupOptions<TSlot> {
 
 export interface CodexStickySlotRouterLookupOptions<TSlot> {
   candidates: TSlot[]
-  getSlotKey: (slot: TSlot) => string
+  getSlotKey: (slot: TSlot) => CodexSlotKey
   isSlotUsable: (slot: TSlot) => boolean
 }
 
@@ -57,7 +58,7 @@ export class CodexSlotRouter {
     return selection.account
   }
 
-  bindConversation(conversationId: string, slotKey: string): void {
+  bindConversation(conversationId: string, slotKey: CodexSlotKey): void {
     this.affinity.bindConversation(conversationId, slotKey)
   }
 
@@ -75,7 +76,7 @@ export class CodexSlotRouter {
     return this.affinity.pruneExpired(now, onExpire)
   }
 
-  pruneBindingsForSlotKeys(slotKeys: Iterable<string>): number {
+  pruneBindingsForSlotKeys(slotKeys: Iterable<CodexSlotKey>): number {
     return this.affinity.pruneBindingsForSlotKeys(slotKeys)
   }
 

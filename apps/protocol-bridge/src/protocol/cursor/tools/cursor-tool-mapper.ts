@@ -7,6 +7,9 @@
 import { DISCOVER_TOOL_DEFINITION } from "./discover-tool-handler"
 import { SNIP_MESSAGES_TOOL_DEFINITION } from "./snip-tool-handler"
 import { CODEX_TOOL_SEARCH_NAME, shouldDeferTool } from "./tool-defer-policy"
+import type { ProjectionProvider } from "../session/projection-owner"
+import { normalizeMcpToolInputSchema } from "./mcp-call-contract"
+import { CURSOR_MODEL_CALLABLE_DEFINITION_KEYS } from "./cursor-tool-runtime-contract"
 
 // Tool definition in Anthropic format
 export interface AnthropicTool {
@@ -16,8 +19,71 @@ export interface AnthropicTool {
     type: "object"
     properties: Record<string, unknown>
     required?: string[]
+    oneOf?: Array<Record<string, unknown>>
+    additionalProperties?: boolean
   }
 }
+
+/** Exact agent.v1.GrepArgs surface for regular Cursor grep execution. */
+const CURSOR_GREP_INPUT_SCHEMA: AnthropicTool["input_schema"] = {
+  type: "object",
+  properties: {
+    pattern: {
+      type: "string",
+      description: "Ripgrep pattern. Regex semantics are preserved by Cursor.",
+    },
+    path: { type: "string", description: "Optional search root." },
+    glob: { type: "string", description: "Optional ripgrep glob filter." },
+    output_mode: {
+      type: "string",
+      description:
+        "Cursor output mode, for example content, files_with_matches, or count.",
+    },
+    context_before: { type: "number", description: "Lines before each match." },
+    context_after: { type: "number", description: "Lines after each match." },
+    context: {
+      type: "number",
+      description: "Lines before and after each match.",
+    },
+    case_insensitive: {
+      type: "boolean",
+      description: "Enable case-insensitive matching.",
+    },
+    type: { type: "string", description: "Optional ripgrep file type." },
+    head_limit: { type: "number", description: "Maximum result count." },
+    multiline: { type: "boolean", description: "Enable multiline matching." },
+    sort: { type: "string", description: "Optional Cursor/ripgrep sort key." },
+    sort_ascending: {
+      type: "boolean",
+      description: "Sort ascending when a sort key is supplied.",
+    },
+    offset: {
+      type: "number",
+      description: "Number of results to skip before returning results.",
+    },
+    sandbox_policy: {
+      type: "object",
+      description:
+        "Optional Cursor SandboxPolicy forwarded to the official GrepArgs envelope.",
+    },
+  },
+  required: ["pattern"],
+}
+
+/**
+ * `task` and `task_v2` have the same detached-execution semantics. Keep the
+ * input contract in one place so one protocol generation cannot drift into a
+ * different background capability claim.
+ */
+const BACKGROUND_TASK_INPUT_DESCRIPTION =
+  "When true, the sub-agent runs asynchronously: the tool call returns " +
+  "immediately with an `agentId` and the user can keep chatting while the " +
+  "sub-agent works. Use `await_task` with that agentId to read the durable " +
+  "terminal result. Background execution receives only the detached tool " +
+  "surface listed for the selected `subagent_type` in this tool's " +
+  "description; do not assume foreground-only tools carry over. Default " +
+  "false (foreground, blocks until the sub-agent finishes and returns its " +
+  "result inline)."
 
 // Mapping of Cursor tool names to Anthropic tool definitions
 const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
@@ -161,65 +227,15 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   CLIENT_SIDE_TOOL_V2_RIPGREP_SEARCH: {
     name: "grep_search",
     description:
-      "Search file contents. ALWAYS use this tool for repository text/code search instead of run_terminal_command with grep, rg, find, or similar shell search commands, unless the user explicitly asks for shell command execution. IMPORTANT: the query is matched as a LITERAL string by default — regex metacharacters (. | ^ $ [ ] ( ) { } * + ? \\) are treated as ordinary characters, not regex syntax. Do NOT write regex like `foo|bar` (alternation), `^foo` (anchor), or `fo.o` (wildcard); these match the literal characters and usually return zero results. To find multiple terms, issue separate searches per term. Results are capped at head_limit matches (default 50); when truncated, page with offset (e.g. offset=50 for the next page), raise head_limit, or set head_limit=0 for unlimited.",
-    input_schema: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description:
-            "Literal search string (NOT regex). Metacharacters like . | ^ $ [ ] are matched verbatim. Search one term at a time.",
-        },
-        path: { type: "string", description: "The path to search in" },
-        case_sensitive: {
-          type: "boolean",
-          description: "Case sensitive search",
-        },
-        head_limit: {
-          type: "number",
-          description:
-            "Limit the number of returned matches/files (| head -N). Defaults to 50. Pass 0 for unlimited. Page with offset when the result is truncated instead of re-running the search.",
-        },
-        offset: {
-          type: "number",
-          description:
-            "Skip the first N matches/files before applying head_limit (| tail -n +N | head). Use to page through a truncated result (e.g. offset=50 for the second default page). Defaults to 0.",
-        },
-      },
-      required: ["query"],
-    },
+      "Search repository contents through Cursor's regular GrepArgs protocol. Preserve the requested ripgrep pattern, filtering, context, ordering and pagination fields exactly.",
+    input_schema: CURSOR_GREP_INPUT_SCHEMA,
   },
 
   CLIENT_SIDE_TOOL_V2_RIPGREP_RAW_SEARCH: {
     name: "grep_search",
     description:
-      "Search file contents. ALWAYS use this tool for repository text/code search instead of run_terminal_command with grep, rg, find, or similar shell search commands, unless the user explicitly asks for shell command execution. IMPORTANT: the query is matched as a LITERAL string by default — regex metacharacters (. | ^ $ [ ] ( ) { } * + ? \\) are treated as ordinary characters, not regex syntax. Do NOT write regex like `foo|bar` (alternation), `^foo` (anchor), or `fo.o` (wildcard); these match the literal characters and usually return zero results. To find multiple terms, issue separate searches per term. Results are capped at head_limit matches (default 50); when truncated, page with offset (e.g. offset=50 for the next page), raise head_limit, or set head_limit=0 for unlimited.",
-    input_schema: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description:
-            "Literal search string (NOT regex). Metacharacters like . | ^ $ [ ] are matched verbatim. Search one term at a time.",
-        },
-        path: { type: "string", description: "The path to search in" },
-        case_sensitive: {
-          type: "boolean",
-          description: "Case sensitive search",
-        },
-        head_limit: {
-          type: "number",
-          description:
-            "Limit the number of returned matches/files (| head -N). Defaults to 50. Pass 0 for unlimited. Page with offset when the result is truncated instead of re-running the search.",
-        },
-        offset: {
-          type: "number",
-          description:
-            "Skip the first N matches/files before applying head_limit (| tail -n +N | head). Use to page through a truncated result (e.g. offset=50 for the second default page). Defaults to 0.",
-        },
-      },
-      required: ["query"],
-    },
+      "Search repository contents through Cursor's regular GrepArgs protocol. Preserve the requested ripgrep pattern, filtering, context, ordering and pagination fields exactly.",
+    input_schema: CURSOR_GREP_INPUT_SCHEMA,
   },
 
   CLIENT_SIDE_TOOL_V2_SEMANTIC_SEARCH_FULL: {
@@ -527,8 +543,8 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
         model: {
           type: "string",
           description:
-            "Optional model override. Use only when the sub-agent " +
-            "definition explicitly says to.",
+            "Optional Cursor-approved model override. Omit to inherit the " +
+            "configured parent/sub-agent model. Never invent a model id.",
         },
         subagent_type: {
           type: "string",
@@ -539,24 +555,10 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
         },
         run_in_background: {
           type: "boolean",
-          description:
-            "When true, the sub-agent runs asynchronously: the tool call " +
-            "returns immediately with an `agentId` and the user can keep " +
-            "chatting while the sub-agent works. Progress is written to " +
-            "`~/.cursor/subagents/<agentId>/transcript.jsonl` and the " +
-            "final answer to `~/.cursor/subagents/<agentId>/result.txt` " +
-            "— use read_file on those paths to follow up. Background " +
-            "sub-agents only get inline tools (no shell, no file edits, " +
-            "no run_terminal_command); they're best for parallel " +
-            "research / web fetches / MCP work that doesn't need to " +
-            "block the user. Cannot be combined with shell-dependent " +
-            "agents such as `subagent_type='bash'` or " +
-            "`subagent_type='bugbot'`, because their tool surface relies " +
-            "on run_terminal_command. Default false (foreground, blocks until " +
-            "the sub-agent finishes and returns its result inline).",
+          description: BACKGROUND_TASK_INPUT_DESCRIPTION,
         },
       },
-      required: ["description"],
+      required: ["description", "prompt"],
     },
   },
 
@@ -586,8 +588,8 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
         model: {
           type: "string",
           description:
-            "Optional model override. Use only when the sub-agent " +
-            "definition explicitly says to.",
+            "Optional Cursor-approved model override. Omit to inherit the " +
+            "configured parent/sub-agent model. Never invent a model id.",
         },
         subagent_type: {
           type: "string",
@@ -598,24 +600,10 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
         },
         run_in_background: {
           type: "boolean",
-          description:
-            "When true, the sub-agent runs asynchronously: the tool call " +
-            "returns immediately with an `agentId` and the user can keep " +
-            "chatting while the sub-agent works. Progress is written to " +
-            "`~/.cursor/subagents/<agentId>/transcript.jsonl` and the " +
-            "final answer to `~/.cursor/subagents/<agentId>/result.txt` " +
-            "— use read_file on those paths to follow up. Background " +
-            "sub-agents only get inline tools (no shell, no file edits, " +
-            "no run_terminal_command); they're best for parallel " +
-            "research / web fetches / MCP work that doesn't need to " +
-            "block the user. Cannot be combined with shell-dependent " +
-            "agents such as `subagent_type='bash'` or " +
-            "`subagent_type='bugbot'`, because their tool surface relies " +
-            "on run_terminal_command. Default false (foreground, blocks until " +
-            "the sub-agent finishes and returns its result inline).",
+          description: BACKGROUND_TASK_INPUT_DESCRIPTION,
         },
       },
-      required: ["description"],
+      required: ["description", "prompt"],
     },
   },
 
@@ -863,16 +851,13 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
       "to finish. Pass the agentId returned by the original `task` tool call. " +
       "Resolves when the sub-agent completes or fails; if it is still running " +
       "after the optional `block_until_ms` window, returns the still-running " +
-      "snapshot (turn / tool call counts) so the parent agent can decide to " +
-      "wait again, peek at the transcript, or move on.",
+      "state so the parent agent can decide whether to wait again.",
     input_schema: {
       type: "object",
       properties: {
         task_id: {
           type: "string",
-          description:
-            "The agentId returned by the spawning task tool call. Also " +
-            "accepts agent_id / agentId / taskId.",
+          description: "The agentId returned by the spawning task tool call.",
         },
         block_until_ms: {
           type: "number",
@@ -881,7 +866,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
             "Defaults to 5 minutes; capped at 30 minutes.",
         },
       },
-      required: [],
+      required: ["task_id"],
     },
   },
 
@@ -890,13 +875,12 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
   // (a ConversationAction, not a ToolCall oneof). We surface it as a
   // bridge-defined inline tool so the parent agent can stop a
   // run-away background sub-agent on demand.
-  CLIENT_SIDE_TOOL_V2_KILL_AGENT: {
+  BRIDGE_KILL_AGENT: {
     name: "kill_agent",
     description:
-      "Stop a previously spawned background sub-agent. The worker will " +
-      "halt at the next abort checkpoint and write a 'killed' terminal " +
-      "status to its metadata.json. Pass the agentId returned by the " +
-      "original `task` tool call.",
+      "Stop a previously spawned sub-agent. Pass the agentId returned by " +
+      "the original task tool call, then use await_task to read its durable " +
+      "terminal status.",
     input_schema: {
       type: "object",
       properties: {
@@ -962,7 +946,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
     },
   },
 
-  CLIENT_SIDE_TOOL_V2_DIAGNOSTICS: {
+  AGENT_V1_DIAGNOSTICS: {
     name: "read_lints",
     description:
       "Read lint/diagnostic warnings and errors for files. Paths must be inside the active workspace root — the IDE rejects paths outside the workspace with `path is outside workspace root`. Use absolute paths under the project, or workspace-relative paths (the bridge resolves them against the active project root). Use full file paths, not directories.",
@@ -998,7 +982,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
     },
   },
 
-  CLIENT_SIDE_TOOL_V2_ASK_FOLLOWUP_QUESTION: {
+  AGENT_V1_ASK_FOLLOWUP_QUESTION: {
     name: "ask_question",
     description: "Ask a follow-up question to the user",
     input_schema: {
@@ -1037,8 +1021,8 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
         run_async: {
           type: "boolean",
           description:
-            "When true, the IDE returns an async placeholder " +
-            "(`AskQuestionResult.async`) immediately and the agent " +
+            "When true, the native AskQuestion tool call completes with " +
+            "an `AskQuestionResult.async` placeholder and the agent " +
             "turn ends; the user's actual answer is delivered later " +
             "as an `AsyncAskQuestionCompletionAction` ConversationAction. " +
             "When false (default), the tool call blocks until the " +
@@ -1088,8 +1072,8 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
         run_async: {
           type: "boolean",
           description:
-            "When true, the IDE returns an async placeholder " +
-            "(`AskQuestionResult.async`) immediately and the agent " +
+            "When true, the native AskQuestion tool call completes with " +
+            "an `AskQuestionResult.async` placeholder and the agent " +
             "turn ends; the user's actual answer is delivered later " +
             "as an `AsyncAskQuestionCompletionAction` ConversationAction. " +
             "When false (default), the tool call blocks until the " +
@@ -1164,7 +1148,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
     },
   },
 
-  CLIENT_SIDE_TOOL_V2_EXA_SEARCH: {
+  BRIDGE_EXA_SEARCH: {
     name: "exa_search",
     description: "Search the web using Exa",
     input_schema: {
@@ -1181,7 +1165,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
     },
   },
 
-  CLIENT_SIDE_TOOL_V2_EXA_FETCH: {
+  BRIDGE_EXA_FETCH: {
     name: "exa_fetch",
     description: "Fetch documents by Exa ids or URLs",
     input_schema: {
@@ -1197,35 +1181,172 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
     },
   },
 
-  CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT: {
+  AGENT_V1_SETUP_VM_ENVIRONMENT: {
     name: "setup_vm_environment",
-    description: "Setup VM environment commands for the current task",
+    description:
+      "Configure the Cursor-managed task environment before running project commands",
     input_schema: {
       type: "object",
       properties: {
-        installCommand: {
+        install_command: {
           type: "string",
           description: "Install/dependency command",
         },
-        startCommand: {
+        start_command: {
           type: "string",
           description: "Start command after setup",
+        },
+        dockerfile_contents: {
+          type: "string",
+          description: "Optional Dockerfile contents for the environment",
         },
       },
       required: [],
     },
   },
 
+  AGENT_V1_REPLACE_ENV: {
+    name: "replace_env",
+    description:
+      "Replace the Cursor-managed task environment with an explicit configuration",
+    input_schema: {
+      type: "object",
+      properties: {
+        mode: {
+          type: "string",
+          enum: ["custom", "clean_slate", "default"],
+          description: "Environment replacement mode",
+        },
+        install_script: {
+          type: "string",
+          description: "Install script used in custom mode",
+        },
+        dockerfile_contents: {
+          type: "string",
+          description: "Dockerfile contents used in custom mode",
+        },
+        checkout_ref_overrides: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              repo_url: { type: "string" },
+              ref: { type: "string" },
+            },
+            required: ["repo_url", "ref"],
+          },
+          description: "Repository checkout ref overrides",
+        },
+      },
+      required: ["mode"],
+    },
+  },
+
+  AGENT_V1_PR_MANAGEMENT: {
+    name: "pr_management",
+    description:
+      "Create or update a pull request, inspect CI, update PR status, post a review comment, or resolve a review comment through Cursor",
+    input_schema: {
+      type: "object",
+      properties: {
+        create_pr: {
+          type: "object",
+          properties: {
+            title: { type: "string" },
+            body: { type: "string" },
+            base_branch: { type: "string" },
+            draft: { type: "boolean" },
+            branch_name: { type: "string" },
+            add_labels: { type: "array", items: { type: "string" } },
+            repo_url: { type: "string" },
+            skip_branch_prefix_check: { type: "boolean" },
+          },
+          required: ["title", "body", "branch_name"],
+        },
+        update_pr: {
+          type: "object",
+          properties: {
+            pr_url: { type: "string" },
+            title: { type: "string" },
+            body: { type: "string" },
+            base_branch: { type: "string" },
+            branch_name: { type: "string" },
+            add_labels: { type: "array", items: { type: "string" } },
+            remove_labels: { type: "array", items: { type: "string" } },
+            repo_url: { type: "string" },
+          },
+          required: [],
+        },
+        post_comment: {
+          type: "object",
+          properties: {
+            pr_url: { type: "string" },
+            branch_name: { type: "string" },
+            body: { type: "string" },
+            repo_url: { type: "string" },
+            in_reply_to: { type: "integer" },
+            path: { type: "string" },
+            line: { type: "integer" },
+            start_line: { type: "integer" },
+            side: { type: "string" },
+          },
+          required: ["body"],
+        },
+        resolve_comment: {
+          type: "object",
+          properties: {
+            pr_url: { type: "string" },
+            branch_name: { type: "string" },
+            comment_id: { type: "integer" },
+            repo_url: { type: "string" },
+          },
+          required: ["comment_id"],
+        },
+        get_ci_status: {
+          type: "object",
+          properties: {
+            pr_url: { type: "string" },
+            branch_name: { type: "string" },
+            repo_url: { type: "string" },
+          },
+          required: [],
+        },
+        set_pr_status: {
+          type: "object",
+          properties: {
+            pr_url: { type: "string" },
+            branch_name: { type: "string" },
+            repo_url: { type: "string" },
+            status: {
+              type: "string",
+              enum: ["open", "closed"],
+            },
+          },
+          required: ["status"],
+        },
+      },
+      oneOf: [
+        { required: ["create_pr"] },
+        { required: ["update_pr"] },
+        { required: ["post_comment"] },
+        { required: ["resolve_comment"] },
+        { required: ["get_ci_status"] },
+        { required: ["set_pr_status"] },
+      ],
+      additionalProperties: false,
+    },
+  },
+
   CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF: {
     name: "apply_agent_diff",
-    description: "Apply an agent-produced diff payload",
+    description:
+      "Apply the already-persisted diff owned by the specified Cursor agent.",
     input_schema: {
       type: "object",
       properties: {
         agent_id: { type: "string", description: "Agent identifier" },
-        diff: { type: "string", description: "Unified diff to apply" },
       },
-      required: [],
+      required: ["agent_id"],
     },
   },
 
@@ -1242,6 +1363,57 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
         },
       },
       required: ["prompt"],
+    },
+  },
+
+  AGENT_V1_SEARCH_CONVERSATIONS: {
+    name: "search_conversations",
+    description: "Search locally persisted conversations by text",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Text to search for across local conversations",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of matching conversations",
+        },
+      },
+      required: ["query"],
+    },
+  },
+
+  AGENT_V1_CREATE_GOAL: {
+    name: "create_goal",
+    description:
+      "Create a durable conversation goal that Cursor can continue across idle turns",
+    input_schema: {
+      type: "object",
+      properties: {
+        objective: {
+          type: "string",
+          description: "Goal objective the agent should keep working toward",
+        },
+      },
+      required: ["objective"],
+    },
+  },
+
+  AGENT_V1_UPDATE_GOAL: {
+    name: "update_goal",
+    description: "Update the status of the active conversation goal",
+    input_schema: {
+      type: "object",
+      properties: {
+        status: {
+          type: "string",
+          description: "Goal status: active, paused, complete, or cleared",
+          enum: ["active", "paused", "complete", "cleared"],
+        },
+      },
+      required: ["status"],
     },
   },
 
@@ -1319,7 +1491,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
     },
   },
 
-  CLIENT_SIDE_TOOL_V2_BACKGROUND_SHELL_SPAWN: {
+  AGENT_V1_BACKGROUND_SHELL_SPAWN: {
     name: "background_shell_spawn",
     description:
       "Spawn a long-running shell session that runs `command` inside a " +
@@ -1519,7 +1691,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
     },
   },
 
-  CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION: {
+  AGENT_V1_START_GRIND_EXECUTION: {
     name: "start_grind_execution",
     description: "Start grind execution workflow",
     input_schema: {
@@ -1534,7 +1706,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
     },
   },
 
-  CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING: {
+  AGENT_V1_START_GRIND_PLANNING: {
     name: "start_grind_planning",
     description: "Start grind planning workflow",
     input_schema: {
@@ -1565,7 +1737,7 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
     },
   },
 
-  CLIENT_SIDE_TOOL_V2_FETCH: {
+  AGENT_V1_FETCH: {
     name: "fetch",
     description: "Fetch content from a URL",
     input_schema: {
@@ -1576,23 +1748,48 @@ const CURSOR_TOOL_DEFINITIONS: Record<string, AnthropicTool> = {
       required: ["url"],
     },
   },
+
+  CLIENT_SIDE_TOOL_V2_CONNECT_SCM: {
+    name: "connect_scm",
+    description:
+      "Connect the current GitHub repository to Cursor source control services",
+    input_schema: {
+      type: "object",
+      properties: {
+        owner: {
+          type: "string",
+          description: "GitHub repository owner",
+        },
+        repo: {
+          type: "string",
+          description: "GitHub repository name",
+        },
+        ghe_application: {
+          type: "string",
+          description: "Optional GitHub Enterprise application identifier",
+        },
+      },
+      required: ["owner", "repo"],
+    },
+  },
 }
 
 const PREFERRED_CURSOR_KEY_BY_TOOL_NAME: Record<string, string> = {
   ask_question: "CLIENT_SIDE_TOOL_V2_ASK_QUESTION",
+  search_conversations: "AGENT_V1_SEARCH_CONVERSATIONS",
+  create_goal: "AGENT_V1_CREATE_GOAL",
+  update_goal: "AGENT_V1_UPDATE_GOAL",
   create_plan: "CLIENT_SIDE_TOOL_V2_CREATE_PLAN",
   switch_mode: "CLIENT_SIDE_TOOL_V2_SWITCH_MODE",
   mcp_tool: "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL",
   web_search: "CLIENT_SIDE_TOOL_V2_WEB_SEARCH",
   web_fetch: "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
-  exa_search: "CLIENT_SIDE_TOOL_V2_EXA_SEARCH",
-  exa_fetch: "CLIENT_SIDE_TOOL_V2_EXA_FETCH",
-  // setup_vm_environment intentionally omitted from preferred surface keys —
-  // the proxy runtime does not implement a VM environment broker, so we do
-  // not advertise it on the user-facing surface. Server-originated tool
-  // definitions for SETUP_VM_ENVIRONMENT are still recognized via the
-  // CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT definition for backward
-  // compatibility, but we never invite the model to call it.
+  exa_search: "BRIDGE_EXA_SEARCH",
+  exa_fetch: "BRIDGE_EXA_FETCH",
+  setup_vm_environment: "AGENT_V1_SETUP_VM_ENVIRONMENT",
+  replace_env: "AGENT_V1_REPLACE_ENV",
+  pr_management: "AGENT_V1_PR_MANAGEMENT",
+  connect_scm: "CLIENT_SIDE_TOOL_V2_CONNECT_SCM",
   read_lints: "CLIENT_SIDE_TOOL_V2_READ_LINTS",
   list_mcp_resources: "CLIENT_SIDE_TOOL_V2_LIST_MCP_RESOURCES",
   read_mcp_resource: "CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE",
@@ -1605,11 +1802,8 @@ const PREFERRED_CURSOR_KEY_BY_TOOL_NAME: Record<string, string> = {
   send_to_user: "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
   report_bugfix_results: "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
   read_semsearch_files: "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
-  reapply: "CLIENT_SIDE_TOOL_V2_REAPPLY",
   fetch_rules: "CLIENT_SIDE_TOOL_V2_FETCH_RULES",
   search_symbols: "CLIENT_SIDE_TOOL_V2_SEARCH_SYMBOLS",
-  background_composer_followup:
-    "CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP",
   knowledge_base: "CLIENT_SIDE_TOOL_V2_KNOWLEDGE_BASE",
   fetch_pull_request: "CLIENT_SIDE_TOOL_V2_FETCH_PULL_REQUEST",
   create_diagram: "CLIENT_SIDE_TOOL_V2_CREATE_DIAGRAM",
@@ -1620,115 +1814,8 @@ const PREFERRED_CURSOR_KEY_BY_TOOL_NAME: Record<string, string> = {
   ai_attribution: "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
   mcp_auth: "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
   read_project: "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
-  update_project: "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT",
   reflect: "CLIENT_SIDE_TOOL_V2_REFLECT",
-  start_grind_execution: "CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION",
-  start_grind_planning: "CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING",
-  // wait_agent / kill_agent: friendlier surface for the
-  // run_in_background sub-agent lifecycle. wait_agent shares the proto
-  // CLIENT_SIDE_TOOL_V2_AWAIT_TASK envelope so dispatch lands in the
-  // same registry-aware await flow; kill_agent is a bridge-defined
-  // inline tool routed through truncated_tool_call.
-  wait_agent: "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
-  kill_agent: "CLIENT_SIDE_TOOL_V2_KILL_AGENT",
-}
-
-const TOOL_KEY_ALIASES: Record<string, string> = {
-  client_side_tool_v2_ask_followup_question: "CLIENT_SIDE_TOOL_V2_ASK_QUESTION",
-  client_side_tool_v2_diagnostics: "CLIENT_SIDE_TOOL_V2_READ_LINTS",
-  client_side_tool_v2_call_mcp_tool: "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL",
-  client_side_tool_v2_read_file: "CLIENT_SIDE_TOOL_V2_READ_FILE",
-  client_side_tool_v2_list_dir: "CLIENT_SIDE_TOOL_V2_LIST_DIR",
-  client_side_tool_v2_ripgrep_search: "CLIENT_SIDE_TOOL_V2_RIPGREP_SEARCH",
-  client_side_tool_v2_record_screen: "CLIENT_SIDE_TOOL_V2_RECORD_SCREEN",
-  client_side_tool_v2_computer_use: "CLIENT_SIDE_TOOL_V2_COMPUTER_USE",
-  client_side_tool_v2_task: "CLIENT_SIDE_TOOL_V2_TASK",
-  client_side_tool_v2_task_v2: "CLIENT_SIDE_TOOL_V2_TASK_V2",
-  client_side_tool_v2_todo_read: "CLIENT_SIDE_TOOL_V2_TODO_READ",
-  client_side_tool_v2_todo_write: "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
-  client_side_tool_v2_apply_agent_diff: "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF",
-  client_side_tool_v2_generate_image: "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
-  client_side_tool_v2_send_to_user: "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
-  client_side_tool_v2_report_bugfix_results:
-    "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
-  client_side_tool_v2_read_semsearch_files:
-    "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
-  client_side_tool_v2_reapply: "CLIENT_SIDE_TOOL_V2_REAPPLY",
-  client_side_tool_v2_fetch_rules: "CLIENT_SIDE_TOOL_V2_FETCH_RULES",
-  client_side_tool_v2_search_symbols: "CLIENT_SIDE_TOOL_V2_SEARCH_SYMBOLS",
-  client_side_tool_v2_background_composer_followup:
-    "CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP",
-  client_side_tool_v2_knowledge_base: "CLIENT_SIDE_TOOL_V2_KNOWLEDGE_BASE",
-  client_side_tool_v2_fetch_pull_request:
-    "CLIENT_SIDE_TOOL_V2_FETCH_PULL_REQUEST",
-  client_side_tool_v2_create_diagram: "CLIENT_SIDE_TOOL_V2_CREATE_DIAGRAM",
-  client_side_tool_v2_fix_lints: "CLIENT_SIDE_TOOL_V2_FIX_LINTS",
-  client_side_tool_v2_go_to_definition: "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
-  client_side_tool_v2_await_task: "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
-  client_side_tool_v2_await: "CLIENT_SIDE_TOOL_V2_AWAIT",
-  client_side_tool_v2_ai_attribution: "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
-  client_side_tool_v2_mcp_auth: "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
-  client_side_tool_v2_read_project: "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
-  client_side_tool_v2_update_project: "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT",
-  client_side_tool_v2_reflect: "CLIENT_SIDE_TOOL_V2_REFLECT",
-  client_side_tool_v2_start_grind_execution:
-    "CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION",
-  client_side_tool_v2_start_grind_planning:
-    "CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING",
-  client_side_tool_v2_exa_search: "CLIENT_SIDE_TOOL_V2_EXA_SEARCH",
-  client_side_tool_v2_exa_fetch: "CLIENT_SIDE_TOOL_V2_EXA_FETCH",
-  client_side_tool_v2_setup_vm_environment:
-    "CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT",
-  web_search: "CLIENT_SIDE_TOOL_V2_WEB_SEARCH",
-  web_fetch: "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
-  ask_question: "CLIENT_SIDE_TOOL_V2_ASK_QUESTION",
-  create_plan: "CLIENT_SIDE_TOOL_V2_CREATE_PLAN",
-  switch_mode: "CLIENT_SIDE_TOOL_V2_SWITCH_MODE",
-  exa_search: "CLIENT_SIDE_TOOL_V2_EXA_SEARCH",
-  exa_fetch: "CLIENT_SIDE_TOOL_V2_EXA_FETCH",
-  // setup_vm_environment alias intentionally omitted from snake-case alias
-  // table for the same reason as above (no proxy backend).
-  list_mcp_resources: "CLIENT_SIDE_TOOL_V2_LIST_MCP_RESOURCES",
-  read_mcp_resource: "CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE",
-  client_side_tool_v2_get_mcp_tools: "CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS",
-  get_mcp_tools: "CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS",
-  read_lints: "CLIENT_SIDE_TOOL_V2_READ_LINTS",
-  task: "CLIENT_SIDE_TOOL_V2_TASK_V2",
-  read_todos: "CLIENT_SIDE_TOOL_V2_TODO_READ",
-  update_todos: "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
-  todo_read: "CLIENT_SIDE_TOOL_V2_TODO_READ",
-  todo_write: "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
-  apply_agent_diff: "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF",
-  generate_image: "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
-  send_to_user: "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
-  report_bugfix_results: "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
-  read_semsearch_files: "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
-  reapply: "CLIENT_SIDE_TOOL_V2_REAPPLY",
-  fetch_rules: "CLIENT_SIDE_TOOL_V2_FETCH_RULES",
-  search_symbols: "CLIENT_SIDE_TOOL_V2_SEARCH_SYMBOLS",
-  background_composer_followup:
-    "CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP",
-  knowledge_base: "CLIENT_SIDE_TOOL_V2_KNOWLEDGE_BASE",
-  fetch_pull_request: "CLIENT_SIDE_TOOL_V2_FETCH_PULL_REQUEST",
-  create_diagram: "CLIENT_SIDE_TOOL_V2_CREATE_DIAGRAM",
-  fix_lints: "CLIENT_SIDE_TOOL_V2_FIX_LINTS",
-  go_to_definition: "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
-  await_task: "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
-  await: "CLIENT_SIDE_TOOL_V2_AWAIT",
-  ai_attribution: "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
-  mcp_auth: "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
-  read_project: "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
-  update_project: "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT",
-  reflect: "CLIENT_SIDE_TOOL_V2_REFLECT",
-  start_grind_execution: "CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION",
-  start_grind_planning: "CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING",
-  // wait_agent / kill_agent: friendlier surface for the
-  // run_in_background sub-agent lifecycle. wait_agent shares the proto
-  // CLIENT_SIDE_TOOL_V2_AWAIT_TASK envelope so dispatch lands in the
-  // same registry-aware await flow; kill_agent is a bridge-defined
-  // inline tool routed through truncated_tool_call.
-  wait_agent: "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
-  kill_agent: "CLIENT_SIDE_TOOL_V2_KILL_AGENT",
+  kill_agent: "BRIDGE_KILL_AGENT",
 }
 
 const DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS = [
@@ -1750,17 +1837,13 @@ const DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS = [
   "CLIENT_SIDE_TOOL_V2_TASK_V2",
   "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
   "CLIENT_SIDE_TOOL_V2_AWAIT",
-  // kill_agent is bridge-defined (no proto enum value — see CURSOR_TOOL_DEFINITIONS
-  // entry near CLIENT_SIDE_TOOL_V2_KILL_AGENT). It must appear in the default
-  // agent surface so that parent agents can terminate long-running sub-agents
-  // they spawned via task(run_in_background=true). Without this entry the
-  // model never sees `kill_agent` despite the mapper having a definition for
-  // it, leaving the cancelSubagentAction ConversationAction path unreachable.
-  "CLIENT_SIDE_TOOL_V2_KILL_AGENT",
+  "BRIDGE_KILL_AGENT",
   "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
   "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
   "CLIENT_SIDE_TOOL_V2_TODO_READ",
   "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
+  "AGENT_V1_CREATE_GOAL",
+  "AGENT_V1_UPDATE_GOAL",
   "CLIENT_SIDE_TOOL_V2_ASK_QUESTION",
   "CLIENT_SIDE_TOOL_V2_CREATE_PLAN",
   "CLIENT_SIDE_TOOL_V2_SWITCH_MODE",
@@ -1768,32 +1851,26 @@ const DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS = [
   "CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE",
   "CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS",
   "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL",
-  "CLIENT_SIDE_TOOL_V2_BACKGROUND_SHELL_SPAWN",
+  "AGENT_V1_BACKGROUND_SHELL_SPAWN",
   "CLIENT_SIDE_TOOL_V2_WRITE_SHELL_STDIN",
-  "CLIENT_SIDE_TOOL_V2_FETCH",
+  "AGENT_V1_FETCH",
   "CLIENT_SIDE_TOOL_V2_RECORD_SCREEN",
   "CLIENT_SIDE_TOOL_V2_COMPUTER_USE",
   "CLIENT_SIDE_TOOL_V2_REFLECT",
-  "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF",
-  "CLIENT_SIDE_TOOL_V2_REAPPLY",
   "CLIENT_SIDE_TOOL_V2_FIX_LINTS",
   "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
-  "CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP",
   "CLIENT_SIDE_TOOL_V2_KNOWLEDGE_BASE",
   "CLIENT_SIDE_TOOL_V2_FETCH_PULL_REQUEST",
   "CLIENT_SIDE_TOOL_V2_CREATE_DIAGRAM",
-  "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT",
-  // CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT intentionally omitted from the
-  // default agent builtin tool surface — the proxy runtime does not implement
-  // a VM environment broker, so we do not advertise it on the user-facing
-  // surface to avoid wasting model tokens on a tool that always fails.
+  "AGENT_V1_SETUP_VM_ENVIRONMENT",
+  "AGENT_V1_REPLACE_ENV",
+  "AGENT_V1_PR_MANAGEMENT",
+  "CLIENT_SIDE_TOOL_V2_CONNECT_SCM",
   "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
   "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
   "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
-  "CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION",
-  "CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING",
-  "CLIENT_SIDE_TOOL_V2_EXA_SEARCH",
-  "CLIENT_SIDE_TOOL_V2_EXA_FETCH",
+  "BRIDGE_EXA_SEARCH",
+  "BRIDGE_EXA_FETCH",
   "CLIENT_SIDE_TOOL_V2_WEB_SEARCH",
   "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
 ] as const
@@ -1824,7 +1901,7 @@ const DEFAULT_CODEX_IMPLICIT_CURSOR_TOOLS = [
 ] as const
 
 const BUILTIN_CURSOR_TOOL_KEYS = new Set<string>(
-  DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS
+  Object.keys(CURSOR_TOOL_DEFINITIONS)
 )
 
 const BUILTIN_WEB_SEARCH_TOOL_KEYS = new Set<string>([
@@ -1836,7 +1913,7 @@ const BUILTIN_WEB_FETCH_TOOL_KEYS = new Set<string>([
 ])
 
 const BUILTIN_LINT_TOOL_KEYS = new Set<string>([
-  "CLIENT_SIDE_TOOL_V2_DIAGNOSTICS",
+  "AGENT_V1_DIAGNOSTICS",
   "CLIENT_SIDE_TOOL_V2_READ_LINTS",
 ])
 
@@ -1844,31 +1921,25 @@ const BUILTIN_SEND_TO_USER_TOOL_KEYS = new Set<string>([
   "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
 ])
 
-function normalizeToolIdentifier(raw: string): string {
-  return raw
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-}
+const BUILTIN_APPLY_AGENT_DIFF_TOOL_KEYS = new Set<string>([
+  "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF",
+])
 
 function resolveToolDefinitionKey(rawTool: string): string | undefined {
-  if (!rawTool) return undefined
+  const exactToolName = rawTool
+  if (!exactToolName) return undefined
 
-  const normalized = normalizeToolIdentifier(rawTool)
-  const alias = TOOL_KEY_ALIASES[normalized]
-  if (alias && CURSOR_TOOL_DEFINITIONS[alias]) {
-    return alias
+  if (CURSOR_TOOL_DEFINITIONS[exactToolName]) {
+    return exactToolName
   }
 
-  if (CURSOR_TOOL_DEFINITIONS[rawTool]) {
-    return rawTool
+  const preferred = PREFERRED_CURSOR_KEY_BY_TOOL_NAME[exactToolName]
+  if (preferred && CURSOR_TOOL_DEFINITIONS[preferred]) {
+    return preferred
   }
 
   for (const [key, definition] of Object.entries(CURSOR_TOOL_DEFINITIONS)) {
-    if (normalizeToolIdentifier(key) === normalized) {
-      return key
-    }
-    if (normalizeToolIdentifier(definition.name) === normalized) {
+    if (definition.name === exactToolName) {
       return key
     }
   }
@@ -1880,6 +1951,56 @@ export function resolveCursorToolDefinitionKey(
   rawTool: string
 ): string | undefined {
   return resolveToolDefinitionKey(rawTool)
+}
+
+/**
+ * A static Cursor descriptor captured by a sub-agent capability compiler at
+ * spawn time.  Unlike {@link resolveCursorToolDefinitionKey}, this lookup is
+ * deliberately exact: a durable `cursorDefinitionKey` is already canonical
+ * and must never be reinterpreted through aliases or normalized names while
+ * a child run is being assembled.
+ *
+ * The returned descriptor is a detached clone.  It is valid only for
+ * spawn-time compilation; a persisted child contract owns the description
+ * and schema used by later provider requests.
+ */
+export interface FrozenCursorToolDefinition {
+  readonly definitionKey: string
+  readonly name: string
+  readonly description: string
+  readonly inputSchema: Record<string, unknown>
+}
+
+export function getFrozenCursorToolDefinition(
+  definitionKey: string
+): FrozenCursorToolDefinition {
+  if (
+    !Object.prototype.hasOwnProperty.call(
+      CURSOR_TOOL_DEFINITIONS,
+      definitionKey
+    )
+  ) {
+    throw new Error(
+      `Unknown frozen Cursor tool definition key: ${JSON.stringify(definitionKey)}`
+    )
+  }
+
+  const definition = CURSOR_TOOL_DEFINITIONS[definitionKey]
+  if (!definition) {
+    throw new Error(
+      `Missing frozen Cursor tool definition: ${JSON.stringify(definitionKey)}`
+    )
+  }
+
+  return {
+    definitionKey,
+    name: definition.name,
+    description: definition.description,
+    inputSchema: JSON.parse(JSON.stringify(definition.input_schema)) as Record<
+      string,
+      unknown
+    >,
+  }
 }
 
 /**
@@ -1909,15 +2030,15 @@ export function mapCursorToolsToAnthropic(
  * Map Anthropic tool_use response back to Cursor tool name
  */
 export function mapAnthropicToolToCursor(anthropicToolName: string): string {
-  const normalizedName = normalizeToolIdentifier(anthropicToolName)
-  const preferred = PREFERRED_CURSOR_KEY_BY_TOOL_NAME[normalizedName]
+  const exactToolName = anthropicToolName.trim()
+  const preferred = PREFERRED_CURSOR_KEY_BY_TOOL_NAME[exactToolName]
   if (preferred && CURSOR_TOOL_DEFINITIONS[preferred]) {
     return preferred
   }
 
   // Reverse lookup
   for (const [cursorName, def] of Object.entries(CURSOR_TOOL_DEFINITIONS)) {
-    if (def.name === anthropicToolName) {
+    if (def.name === exactToolName) {
       return cursorName
     }
   }
@@ -1934,13 +2055,10 @@ export function getAvailableTools(): string[] {
 
 /**
  * Return the canonical set of bridge-recognised built-in tool
- * *user-facing* names — i.e. the `name` field on every
- * `CURSOR_TOOL_DEFINITIONS` entry. Per Cursor `agent.v1`, this set
- * is the authoritative "core tool surface": every name returned here
- * is something the model can call **directly** (no `discover_tool`
- * round-trip needed), regardless of whether the tool also has a
- * `CLIENT_SIDE_TOOL_V2_*` proto enum value or is a bridge-defined
- * inline tool such as `kill_agent` / `task` / `await_task`.
+ * *user-facing* names. It contains only definitions enabled by the current
+ * bridge capability set, rather than every generated Cursor protocol name.
+ * Every name returned here is directly callable without a `discover_tool`
+ * round-trip.
  *
  * P1-3 / smoke-regression #5: callers use this set to recognise when
  * a `discover_tool({ tool_name })` call targets a tool that is
@@ -1948,7 +2066,9 @@ export function getAvailableTools(): string[] {
  * response instead of the misleading `Unknown deferred tool` reject.
  */
 const CURSOR_BUILT_IN_TOOL_NAMES: ReadonlySet<string> = new Set(
-  Object.values(CURSOR_TOOL_DEFINITIONS).map((def) => def.name)
+  Object.entries(CURSOR_TOOL_DEFINITIONS)
+    .filter(([definitionKey]) => shouldIncludeBuiltInTool(definitionKey))
+    .map(([, definition]) => definition.name)
 )
 
 export function getCursorBuiltInToolNames(): ReadonlySet<string> {
@@ -1959,6 +2079,10 @@ function shouldIncludeBuiltInTool(
   definitionKey: string,
   options?: CursorBuiltInToolCapabilityOptions
 ): boolean {
+  if (!CURSOR_MODEL_CALLABLE_DEFINITION_KEYS.has(definitionKey)) {
+    return false
+  }
+
   const hasExplicitWebCapability =
     options?.webSearchEnabled !== undefined ||
     options?.webFetchEnabled !== undefined
@@ -1977,6 +2101,12 @@ function shouldIncludeBuiltInTool(
 
   if (BUILTIN_SEND_TO_USER_TOOL_KEYS.has(definitionKey)) {
     return options?.sendToUserEnabled === true
+  }
+
+  // ApplyAgentDiff can only apply a diff already owned by a real Cursor
+  // agent. Do not expose it without an explicit executor capability.
+  if (BUILTIN_APPLY_AGENT_DIFF_TOOL_KEYS.has(definitionKey)) {
+    return options?.applyAgentDiffEnabled === true
   }
 
   return true
@@ -2034,6 +2164,63 @@ export function isCursorBuiltInToolAllowed(
   return shouldIncludeBuiltInTool(toolName, options)
 }
 
+export type CursorProtocolProjectionCapability =
+  | "regular_grep"
+  | "pi_grep"
+  | "apply_agent_diff"
+
+export interface CursorProtocolProjectionDecision {
+  allowed: boolean
+  capability?: CursorProtocolProjectionCapability
+  reason?: "not_in_cursor_protocol" | "unsupported_projection"
+}
+
+/**
+ * Gate projections at the Cursor protocol boundary. In particular, Codex's
+ * freeform apply_patch is a runtime-native custom tool, not a Cursor
+ * ApplyAgentDiff or PI edit payload.
+ */
+export function getCursorProtocolProjectionDecision(
+  toolName: string
+): CursorProtocolProjectionDecision {
+  const exactToolName = toolName.trim()
+  if (exactToolName === "apply_patch") {
+    return { allowed: false, reason: "not_in_cursor_protocol" }
+  }
+  if (
+    exactToolName === "grep_search" ||
+    exactToolName === "CLIENT_SIDE_TOOL_V2_RIPGREP_SEARCH" ||
+    exactToolName === "CLIENT_SIDE_TOOL_V2_RIPGREP_RAW_SEARCH"
+  ) {
+    return { allowed: true, capability: "regular_grep" }
+  }
+  if (exactToolName === "pi_grep") {
+    return { allowed: true, capability: "pi_grep" }
+  }
+  if (
+    exactToolName === "apply_agent_diff" ||
+    exactToolName === "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF"
+  ) {
+    return { allowed: true, capability: "apply_agent_diff" }
+  }
+  return { allowed: false, reason: "unsupported_projection" }
+}
+
+/** ApplyAgentDiffArgs has exactly one protocol field: agent_id. */
+export function hasValidCursorApplyAgentDiffArgs(
+  args: unknown
+): args is { agent_id?: string; agentId?: string } {
+  if (!args || typeof args !== "object") return false
+  const record = args as Record<string, unknown>
+  const agentId = record.agent_id ?? record.agentId
+  return (
+    typeof agentId === "string" &&
+    agentId.length > 0 &&
+    agentId === agentId.trim() &&
+    !agentId.includes("\u0000")
+  )
+}
+
 // ToolDefinition format compatible with CreateMessageDto
 export interface McpToolDefinitionForApi {
   name: string
@@ -2046,6 +2233,8 @@ export interface McpToolDefinitionForApi {
 export interface BuildToolsForApiOptions {
   mcpToolDefs?: McpToolDefinitionForApi[]
   backend?: string
+  /** Logical graph projection that will own calls from this tool catalog. */
+  projectionProvider?: ProjectionProvider
   /**
    * Sub-agent definitions visible to the current session. When provided,
    * the `task` tool's description is rewritten to enumerate every agent's
@@ -2061,15 +2250,31 @@ export interface BuildToolsForApiOptions {
   subagentDefinitions?: Array<{
     agentType: string
     whenToUse: string
-    /** Pre-resolved user-facing tool names for this sub-agent. */
+    /** Pre-resolved foreground user-facing tool names for this sub-agent. */
     toolNames: string[]
+    /**
+     * Tools with a complete detached execution owner. This is intentionally
+     * separate from `toolNames`: a foreground Exec/client tool is not an
+     * implied background capability.
+     */
+    backgroundToolNames: string[]
   }>
+  /**
+   * Exact model ids Cursor advertised through
+   * `AgentRunRequest.selected_subagent_models` for this request. `undefined`
+   * preserves the static descriptor for non-Cursor/bootstrap callers; an
+   * empty array removes the invocation-level `model` property so the child
+   * inherits through Cursor settings.
+   */
+  selectedSubagentModelIds?: readonly string[]
   /**
    * Mark this tool list as being assembled for a sub-agent's own LLM turn
    * rather than the top-level agent. Sub-agents must NOT see the `task`
    * tool itself (no nested sub-agents through the `task` channel — they
-   * have no ExecServerMessage path to spawn one), so the dispatcher
-   * filters it out when this flag is set.
+   * have no ExecServerMessage path to spawn one), and cannot use the
+   * top-level session's deferred-tool discovery catalog. The mapper makes
+   * both restrictions structural rather than relying on the resolver to
+   * omit those names.
    */
   forSubAgent?: boolean
   /**
@@ -2102,6 +2307,27 @@ export interface BuildToolsDeferOptions {
    * tools array stays consistent across turns.
    */
   discoveredTools?: ReadonlySet<string>
+}
+
+function assertSubagentDoesNotUseDeferredCatalog(
+  options: BuildToolsForApiOptions | undefined
+): void {
+  if (
+    options?.forSubAgent === true &&
+    options.defer !== undefined &&
+    options.defer.strategy !== "off"
+  ) {
+    throw new Error(
+      "Sub-agent tool surfaces cannot use deferred-tool discovery catalogs"
+    )
+  }
+}
+
+function isTaskToolDefinitionKey(definitionKey: string): boolean {
+  return (
+    definitionKey === "CLIENT_SIDE_TOOL_V2_TASK" ||
+    definitionKey === "CLIENT_SIDE_TOOL_V2_TASK_V2"
+  )
 }
 
 /**
@@ -2148,6 +2374,8 @@ export interface CursorBuiltInToolCapabilityOptions {
   webFetchEnabled?: boolean
   readLintsEnabled?: boolean
   sendToUserEnabled?: boolean
+  /** A real agent-diff executor is attached for this request. */
+  applyAgentDiffEnabled?: boolean
 }
 
 export interface ToolDefinition {
@@ -2188,53 +2416,6 @@ const CODEX_TOOL_SEARCH_DEFINITION: ToolDefinition = {
     additionalProperties: false,
   },
 }
-
-function normalizeToolInputSchema(
-  schema: Record<string, unknown> | undefined
-): Record<string, unknown> {
-  if (!schema || typeof schema !== "object") {
-    return {
-      type: "object",
-      properties: {},
-    }
-  }
-  const normalizedType =
-    typeof schema.type === "string" && schema.type.length > 0
-      ? schema.type
-      : "object"
-  const properties =
-    normalizedType === "object" &&
-    schema.properties &&
-    typeof schema.properties === "object"
-      ? (schema.properties as Record<string, unknown>)
-      : {}
-  return {
-    ...schema,
-    type: normalizedType,
-    ...(normalizedType === "object" ? { properties } : {}),
-  }
-}
-
-const CODEX_APPLY_PATCH_GRAMMAR = `start: begin_patch hunk+ end_patch
-begin_patch: "*** Begin Patch" LF
-end_patch: "*** End Patch" LF?
-
-hunk: add_hunk | delete_hunk | update_hunk
-add_hunk: "*** Add File: " filename LF add_line+
-delete_hunk: "*** Delete File: " filename LF
-update_hunk: "*** Update File: " filename LF change_move? change?
-
-filename: /(.+)/
-add_line: "+" /(.*)/ LF -> line
-
-change_move: "*** Move to: " filename LF
-change: (change_context | change_line)+ eof_line?
-change_context: ("@@" | "@@ " /(.+)/) LF
-change_line: ("+" | "-" | " ") /(.*)/ LF
-eof_line: "*** End of File" LF
-
-%import common.LF
-`
 
 function cloneToolDefinition(tool: ToolDefinition): ToolDefinition {
   return JSON.parse(JSON.stringify(tool)) as ToolDefinition
@@ -2541,16 +2722,6 @@ const CODEX_NATIVE_TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
-    type: "custom",
-    name: "apply_patch",
-    description: "Apply a freeform patch using the Codex apply_patch grammar.",
-    format: {
-      type: "grammar",
-      syntax: "lark",
-      definition: CODEX_APPLY_PATCH_GRAMMAR,
-    },
-  },
-  {
     type: "web_search",
     name: "web_search",
     description: "Search the web when local and MCP context is insufficient.",
@@ -2579,145 +2750,11 @@ const CODEX_NATIVE_TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
-  {
-    type: "function",
-    name: "spawn_agent",
-    description: "Spawn a sub-agent for an explicitly delegated task.",
-    input_schema: {
-      type: "object",
-      properties: {
-        agent_type: {
-          type: "string",
-          description:
-            "Optional sub-agent role such as default, explorer, or worker.",
-        },
-        fork_context: {
-          type: "boolean",
-          description: "Fork the current thread history into the new agent.",
-        },
-        items: {
-          type: "array",
-          description: "Structured input items for the sub-agent.",
-          items: {
-            type: "object",
-            properties: {
-              image_url: { type: "string" },
-              name: { type: "string" },
-              path: { type: "string" },
-              text: { type: "string" },
-              type: { type: "string" },
-            },
-            additionalProperties: false,
-          },
-        },
-        message: {
-          type: "string",
-          description: "Initial plain-text task for the sub-agent.",
-        },
-        model: {
-          type: "string",
-          description: "Optional model override.",
-        },
-        reasoning_effort: {
-          type: "string",
-          description: "Optional reasoning effort override.",
-        },
-      },
-      required: ["message"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "send_input",
-    description: "Send additional input to an existing sub-agent.",
-    input_schema: {
-      type: "object",
-      properties: {
-        interrupt: {
-          type: "boolean",
-          description: "Interrupt the agent and handle this input immediately.",
-        },
-        items: {
-          type: "array",
-          description: "Structured input items.",
-          items: {
-            type: "object",
-            properties: {
-              image_url: { type: "string" },
-              name: { type: "string" },
-              path: { type: "string" },
-              text: { type: "string" },
-              type: { type: "string" },
-            },
-            additionalProperties: false,
-          },
-        },
-        message: {
-          type: "string",
-          description: "Plain-text message for the target agent.",
-        },
-        target: {
-          type: "string",
-          description: "Agent id to message.",
-        },
-      },
-      required: ["target"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "resume_agent",
-    description: "Resume a previously closed agent by id.",
-    input_schema: {
-      type: "object",
-      properties: {
-        id: { type: "string", description: "Agent id to resume." },
-      },
-      required: ["id"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "wait_agent",
-    description: "Wait for one or more agents to reach a final status.",
-    input_schema: {
-      type: "object",
-      properties: {
-        targets: {
-          type: "array",
-          description: "Agent ids to wait on.",
-          items: { type: "string" },
-        },
-        timeout_ms: {
-          type: "number",
-          description: "Optional wait timeout in milliseconds.",
-        },
-      },
-      required: ["targets"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "close_agent",
-    description: "Close an agent and any open descendants.",
-    input_schema: {
-      type: "object",
-      properties: {
-        target: { type: "string", description: "Agent id to close." },
-      },
-      required: ["target"],
-      additionalProperties: false,
-    },
-  },
 ]
 
 const CODEX_NATIVE_TOOL_BY_NAME = new Map(
   CODEX_NATIVE_TOOL_DEFINITIONS.map((definition) => [
-    normalizeToolIdentifier(definition.name),
+    definition.name,
     definition,
   ])
 )
@@ -2732,13 +2769,7 @@ const EXPLICIT_CODEX_NATIVE_FALLBACK_NAMES = new Set([
   "update_todos",
   "update_plan",
   "request_user_input",
-  "apply_patch",
   "view_image",
-  "spawn_agent",
-  "send_input",
-  "resume_agent",
-  "wait_agent",
-  "close_agent",
 ])
 
 function addCodexToolDefinition(
@@ -2746,13 +2777,12 @@ function addCodexToolDefinition(
   seenToolNames: Set<string>,
   toolName: string
 ): void {
-  const normalized = normalizeToolIdentifier(toolName)
-  const definition = CODEX_NATIVE_TOOL_BY_NAME.get(normalized)
-  if (!definition || seenToolNames.has(normalized)) {
+  const definition = CODEX_NATIVE_TOOL_BY_NAME.get(toolName)
+  if (!definition || seenToolNames.has(toolName)) {
     return
   }
 
-  seenToolNames.add(normalized)
+  seenToolNames.add(toolName)
   tools.push(cloneToolDefinition(definition))
 }
 
@@ -2772,7 +2802,8 @@ function buildDynamicTaskToolDescription(
   staticDescription: string,
   subagentDefinitions: NonNullable<
     BuildToolsForApiOptions["subagentDefinitions"]
-  >
+  >,
+  selectedSubagentModelIds: readonly string[] | undefined
 ): string {
   if (subagentDefinitions.length === 0) {
     return staticDescription
@@ -2780,26 +2811,46 @@ function buildDynamicTaskToolDescription(
   const lines: string[] = [
     staticDescription,
     "",
+    "Sub-agents inherit the parent model by default. Do not set `model` " +
+      "unless the user explicitly requested a different model or Cursor " +
+      "advertised an invocation-level choice that is necessary for this task.",
+    ...(selectedSubagentModelIds
+      ? selectedSubagentModelIds.length > 0
+        ? [
+            "Allowed invocation-level `model` values for this request: " +
+              selectedSubagentModelIds.join(", ") +
+              ". Any other model id is invalid.",
+          ]
+        : [
+            "Cursor advertised no invocation-level task models for this " +
+              "request, so omit `model` and inherit the configured model.",
+          ]
+      : []),
+    "",
     "Available `subagent_type` values and what each one is good for. Pass " +
       "`subagent_type` to choose; omit it to use `general-purpose`. If you " +
       "pass `subagent_type`, it must match one listed value exactly.",
     "",
   ]
+  const formatToolList = (toolNames: readonly string[]): string =>
+    toolNames.length === 0
+      ? "(no tools)"
+      : toolNames.length > 8
+        ? `${toolNames.slice(0, 8).join(", ")}, +${toolNames.length - 8} more`
+        : toolNames.join(", ")
   for (const def of subagentDefinitions) {
-    const toolList =
-      def.toolNames.length === 0
-        ? "(no tools)"
-        : def.toolNames.length > 8
-          ? `${def.toolNames.slice(0, 8).join(", ")}, +${def.toolNames.length - 8} more`
-          : def.toolNames.join(", ")
-    lines.push(`- ${def.agentType}: ${def.whenToUse} (Tools: ${toolList})`)
+    const foregroundToolList = formatToolList(def.toolNames)
+    const backgroundToolList = formatToolList(def.backgroundToolNames)
+    lines.push(
+      `- ${def.agentType}: ${def.whenToUse} ` +
+        `(Foreground tools: ${foregroundToolList}; ` +
+        `Background tools: ${backgroundToolList})`
+    )
   }
   lines.push("")
   lines.push(
-    "Sub-agents do NOT have file-system or shell tools (read_file, " +
-      "list_directory, run_terminal_command, edit_file_v2, delete_file are " +
-      "intentionally omitted). For tasks needing those, do the work yourself " +
-      "instead of delegating."
+    "When `run_in_background=true`, use only the selected sub-agent's " +
+      "Background tools. Its Foreground tools are not an implied fallback."
   )
   lines.push(
     "When you delegate, write the prompt as if briefing a colleague who " +
@@ -2810,79 +2861,39 @@ function buildDynamicTaskToolDescription(
   return lines.join("\n")
 }
 
+function buildTaskInputSchema(
+  inputSchema: AnthropicTool["input_schema"],
+  selectedSubagentModelIds: readonly string[] | undefined
+): AnthropicTool["input_schema"] {
+  if (selectedSubagentModelIds === undefined) return inputSchema
+  const properties = { ...inputSchema.properties }
+  if (selectedSubagentModelIds.length === 0) {
+    delete properties.model
+  } else {
+    properties.model = {
+      type: "string",
+      enum: [...selectedSubagentModelIds],
+      description:
+        "Optional Cursor-approved model override. Omit to inherit the " +
+        "configured parent/sub-agent model. Use only when the user " +
+        "explicitly requested a different model or the task has a clear " +
+        "model-specific requirement.",
+    }
+  }
+  return { ...inputSchema, properties }
+}
+
 function buildCodexToolsForApi(
   supportedTools: string[],
   options?: BuildToolsForApiOptions
 ): ToolDefinition[] {
   const tools: ToolDefinition[] = []
-  const executableViaExecServerMessage = new Set<string>([
-    "CLIENT_SIDE_TOOL_V2_READ_FILE",
-    "CLIENT_SIDE_TOOL_V2_READ_FILE_V2",
-    "CLIENT_SIDE_TOOL_V2_LIST_DIR",
-    "CLIENT_SIDE_TOOL_V2_LIST_DIR_V2",
-    "CLIENT_SIDE_TOOL_V2_EDIT_FILE",
-    "CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2",
-    "CLIENT_SIDE_TOOL_V2_RIPGREP_SEARCH",
-    "CLIENT_SIDE_TOOL_V2_RIPGREP_RAW_SEARCH",
-    "CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2",
-    "CLIENT_SIDE_TOOL_V2_DELETE_FILE",
-    "CLIENT_SIDE_TOOL_V2_MCP",
-    "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL",
-    "CLIENT_SIDE_TOOL_V2_DIAGNOSTICS",
-    "CLIENT_SIDE_TOOL_V2_READ_LINTS",
-    "CLIENT_SIDE_TOOL_V2_LIST_MCP_RESOURCES",
-    "CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE",
-    "CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS",
-    "CLIENT_SIDE_TOOL_V2_ASK_QUESTION",
-    "CLIENT_SIDE_TOOL_V2_CREATE_PLAN",
-    "CLIENT_SIDE_TOOL_V2_SWITCH_MODE",
-    "CLIENT_SIDE_TOOL_V2_BACKGROUND_SHELL_SPAWN",
-    "CLIENT_SIDE_TOOL_V2_WRITE_SHELL_STDIN",
-    "CLIENT_SIDE_TOOL_V2_RECORD_SCREEN",
-    "CLIENT_SIDE_TOOL_V2_COMPUTER_USE",
-    "CLIENT_SIDE_TOOL_V2_FETCH",
-    "CLIENT_SIDE_TOOL_V2_WEB_SEARCH",
-    "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
-    "CLIENT_SIDE_TOOL_V2_EXA_SEARCH",
-    "CLIENT_SIDE_TOOL_V2_EXA_FETCH",
-    "CLIENT_SIDE_TOOL_V2_TASK",
-    "CLIENT_SIDE_TOOL_V2_TASK_V2",
-    "CLIENT_SIDE_TOOL_V2_TODO_READ",
-    "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
-    "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF",
-    "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
-    "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
-    "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
-    "CLIENT_SIDE_TOOL_V2_FIX_LINTS",
-    "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
-    "CLIENT_SIDE_TOOL_V2_REAPPLY",
-    "CLIENT_SIDE_TOOL_V2_FETCH_RULES",
-    "CLIENT_SIDE_TOOL_V2_SEARCH_SYMBOLS",
-    "CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP",
-    "CLIENT_SIDE_TOOL_V2_KNOWLEDGE_BASE",
-    "CLIENT_SIDE_TOOL_V2_FETCH_PULL_REQUEST",
-    "CLIENT_SIDE_TOOL_V2_CREATE_DIAGRAM",
-    "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
-    "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
-    "CLIENT_SIDE_TOOL_V2_KILL_AGENT",
-    "CLIENT_SIDE_TOOL_V2_AWAIT",
-    "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
-    "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
-    "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
-    "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT",
-    "CLIENT_SIDE_TOOL_V2_REFLECT",
-    "CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION",
-    "CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING",
-    "CLIENT_SIDE_TOOL_V2_FILE_SEARCH",
-    "CLIENT_SIDE_TOOL_V2_SEMANTIC_SEARCH_FULL",
-    "CLIENT_SIDE_TOOL_V2_DEEP_SEARCH",
-    "CLIENT_SIDE_TOOL_V2_GLOB_FILE_SEARCH",
-  ])
+  const executableViaExecServerMessage = CURSOR_MODEL_CALLABLE_DEFINITION_KEYS
   const seenDefinitionKeys = new Set<string>()
   const seenToolNames = new Set<string>()
   const resolvedDefinitionKeys = new Set<string>()
-  const normalizedSupported = new Set<string>()
-  const mcpDefByNormalizedName = new Map<string, McpToolDefinitionForApi>()
+  const exactSupported = new Set<string>()
+  const mcpDefByExactName = new Map<string, McpToolDefinitionForApi>()
 
   const addCursorToolDefinition = (definitionKey: string): void => {
     if (
@@ -2897,13 +2908,12 @@ function buildCodexToolsForApi(
       return
     }
 
-    const normalizedToolName = normalizeToolIdentifier(definition.name)
     seenDefinitionKeys.add(definitionKey)
-    if (seenToolNames.has(normalizedToolName)) {
+    if (seenToolNames.has(definition.name)) {
       return
     }
 
-    seenToolNames.add(normalizedToolName)
+    seenToolNames.add(definition.name)
     tools.push({
       type: "function",
       ...definition,
@@ -2911,10 +2921,7 @@ function buildCodexToolsForApi(
   }
 
   for (const supportedTool of supportedTools) {
-    const normalizedSupportedTool = normalizeToolIdentifier(supportedTool)
-    if (normalizedSupportedTool) {
-      normalizedSupported.add(normalizedSupportedTool)
-    }
+    exactSupported.add(supportedTool)
 
     const definitionKey = resolveToolDefinitionKey(supportedTool)
     if (!definitionKey) {
@@ -2922,26 +2929,21 @@ function buildCodexToolsForApi(
     }
 
     resolvedDefinitionKeys.add(definitionKey)
-    normalizedSupported.add(normalizeToolIdentifier(definitionKey))
+    exactSupported.add(definitionKey)
     const definition = CURSOR_TOOL_DEFINITIONS[definitionKey]
     if (definition?.name) {
-      normalizedSupported.add(normalizeToolIdentifier(definition.name))
+      exactSupported.add(definition.name)
     }
   }
 
   for (const mcpToolDef of options?.mcpToolDefs || []) {
     if (!mcpToolDef || typeof mcpToolDef.name !== "string") continue
-    const normalizedFullName = normalizeToolIdentifier(mcpToolDef.name)
-    if (normalizedFullName && !mcpDefByNormalizedName.has(normalizedFullName)) {
-      mcpDefByNormalizedName.set(normalizedFullName, mcpToolDef)
+    if (mcpToolDef.name && !mcpDefByExactName.has(mcpToolDef.name)) {
+      mcpDefByExactName.set(mcpToolDef.name, mcpToolDef)
     }
     if (typeof mcpToolDef.toolName === "string" && mcpToolDef.toolName) {
-      const normalizedToolName = normalizeToolIdentifier(mcpToolDef.toolName)
-      if (
-        normalizedToolName &&
-        !mcpDefByNormalizedName.has(normalizedToolName)
-      ) {
-        mcpDefByNormalizedName.set(normalizedToolName, mcpToolDef)
+      if (!mcpDefByExactName.has(mcpToolDef.toolName)) {
+        mcpDefByExactName.set(mcpToolDef.toolName, mcpToolDef)
       }
     }
   }
@@ -2949,10 +2951,14 @@ function buildCodexToolsForApi(
   for (const supportedTool of supportedTools) {
     const definitionKey = resolveToolDefinitionKey(supportedTool)
     if (definitionKey) {
+      if (options?.forSubAgent && isTaskToolDefinitionKey(definitionKey)) {
+        seenDefinitionKeys.add(definitionKey)
+        continue
+      }
       if (
         (definitionKey === "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL" ||
           definitionKey === "CLIENT_SIDE_TOOL_V2_MCP") &&
-        mcpDefByNormalizedName.size > 0
+        mcpDefByExactName.size > 0
       ) {
         continue
       }
@@ -2960,21 +2966,19 @@ function buildCodexToolsForApi(
       continue
     }
 
-    const normalizedCursorTool = normalizeToolIdentifier(supportedTool)
-    const mcpToolDef = mcpDefByNormalizedName.get(normalizedCursorTool)
+    const mcpToolDef = mcpDefByExactName.get(supportedTool)
     if (!mcpToolDef || !mcpToolDef.name) continue
 
-    const normalizedMcpName = normalizeToolIdentifier(mcpToolDef.name)
-    if (!normalizedMcpName || seenToolNames.has(normalizedMcpName)) continue
+    if (seenToolNames.has(mcpToolDef.name)) continue
 
-    seenToolNames.add(normalizedMcpName)
+    seenToolNames.add(mcpToolDef.name)
     tools.push({
       type: "function",
       name: mcpToolDef.name,
       description:
         mcpToolDef.description ||
         `MCP tool ${mcpToolDef.toolName || mcpToolDef.name}`,
-      input_schema: normalizeToolInputSchema(mcpToolDef.inputSchema),
+      input_schema: normalizeMcpToolInputSchema(mcpToolDef.inputSchema),
     })
   }
 
@@ -2983,13 +2987,13 @@ function buildCodexToolsForApi(
       if (resolvedDefinitionKeys.has(toolAlias)) {
         return true
       }
-      return normalizedSupported.has(normalizeToolIdentifier(toolAlias))
+      return exactSupported.has(toolAlias)
     })
 
   if (
     hasSupportedTool(
       "CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2",
-      "CLIENT_SIDE_TOOL_V2_BACKGROUND_SHELL_SPAWN",
+      "AGENT_V1_BACKGROUND_SHELL_SPAWN",
       "run_terminal_command",
       "run_terminal_command_v2",
       "background_shell_spawn",
@@ -3009,24 +3013,22 @@ function buildCodexToolsForApi(
   ) {
     for (const mcpToolDef of options?.mcpToolDefs || []) {
       if (!mcpToolDef || typeof mcpToolDef.name !== "string") continue
-      const normalizedMcpName = normalizeToolIdentifier(mcpToolDef.name)
-      if (!normalizedMcpName || seenToolNames.has(normalizedMcpName)) continue
+      if (!mcpToolDef.name || seenToolNames.has(mcpToolDef.name)) continue
 
-      seenToolNames.add(normalizedMcpName)
+      seenToolNames.add(mcpToolDef.name)
       tools.push({
         type: "function",
         name: mcpToolDef.name,
         description:
           mcpToolDef.description ||
           `MCP tool ${mcpToolDef.toolName || mcpToolDef.name}`,
-        input_schema: normalizeToolInputSchema(mcpToolDef.inputSchema),
+        input_schema: normalizeMcpToolInputSchema(mcpToolDef.inputSchema),
       })
     }
   }
 
   for (const supportedTool of supportedTools) {
-    const normalizedSupportedTool = normalizeToolIdentifier(supportedTool)
-    if (!EXPLICIT_CODEX_NATIVE_FALLBACK_NAMES.has(normalizedSupportedTool)) {
+    if (!EXPLICIT_CODEX_NATIVE_FALLBACK_NAMES.has(supportedTool)) {
       continue
     }
     addCodexToolDefinition(tools, seenToolNames, supportedTool)
@@ -3044,6 +3046,7 @@ export function buildToolsForApi(
   supportedTools: string[],
   options?: BuildToolsForApiOptions
 ): ToolDefinition[] {
+  assertSubagentDoesNotUseDeferredCatalog(options)
   if (options?.backend === "codex") {
     return buildCodexToolsForApi(supportedTools, options)
   }
@@ -3054,100 +3057,19 @@ export function buildToolsForApi(
   // MCP-provided tools (definition came from mcpToolDefs).  Used by
   // applyDeferPolicy() at the end of this function.
   const isBuiltInByName = new Map<string, boolean>()
-  const executableViaExecServerMessage = new Set<string>([
-    "CLIENT_SIDE_TOOL_V2_READ_FILE",
-    "CLIENT_SIDE_TOOL_V2_READ_FILE_V2",
-    "CLIENT_SIDE_TOOL_V2_LIST_DIR",
-    "CLIENT_SIDE_TOOL_V2_LIST_DIR_V2",
-    "CLIENT_SIDE_TOOL_V2_EDIT_FILE",
-    "CLIENT_SIDE_TOOL_V2_EDIT_FILE_V2",
-    "CLIENT_SIDE_TOOL_V2_RIPGREP_SEARCH",
-    "CLIENT_SIDE_TOOL_V2_RIPGREP_RAW_SEARCH",
-    "CLIENT_SIDE_TOOL_V2_RUN_TERMINAL_COMMAND_V2",
-    "CLIENT_SIDE_TOOL_V2_DELETE_FILE",
-    "CLIENT_SIDE_TOOL_V2_MCP",
-    "CLIENT_SIDE_TOOL_V2_CALL_MCP_TOOL",
-    "CLIENT_SIDE_TOOL_V2_DIAGNOSTICS",
-    "CLIENT_SIDE_TOOL_V2_READ_LINTS",
-    "CLIENT_SIDE_TOOL_V2_LIST_MCP_RESOURCES",
-    "CLIENT_SIDE_TOOL_V2_READ_MCP_RESOURCE",
-    "CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS",
-    "CLIENT_SIDE_TOOL_V2_ASK_QUESTION",
-    "CLIENT_SIDE_TOOL_V2_ASK_FOLLOWUP_QUESTION",
-    "CLIENT_SIDE_TOOL_V2_CREATE_PLAN",
-    "CLIENT_SIDE_TOOL_V2_SWITCH_MODE",
-    "CLIENT_SIDE_TOOL_V2_BACKGROUND_SHELL_SPAWN",
-    "CLIENT_SIDE_TOOL_V2_WRITE_SHELL_STDIN",
-    "CLIENT_SIDE_TOOL_V2_RECORD_SCREEN",
-    "CLIENT_SIDE_TOOL_V2_COMPUTER_USE",
-    "CLIENT_SIDE_TOOL_V2_FETCH",
-    // Deferred / inline interaction tools.
-    "CLIENT_SIDE_TOOL_V2_WEB_SEARCH",
-    "CLIENT_SIDE_TOOL_V2_WEB_FETCH",
-    "CLIENT_SIDE_TOOL_V2_EXA_SEARCH",
-    "CLIENT_SIDE_TOOL_V2_EXA_FETCH",
-    // CLIENT_SIDE_TOOL_V2_SETUP_VM_ENVIRONMENT intentionally omitted —
-    // the proxy runtime does not implement a VM environment broker, so we
-    // do not advertise it on the user-facing surface to avoid wasting model
-    // tokens on a tool that always fails with "backend not configured".
-    "CLIENT_SIDE_TOOL_V2_TASK",
-    "CLIENT_SIDE_TOOL_V2_TASK_V2",
-    "CLIENT_SIDE_TOOL_V2_TODO_READ",
-    "CLIENT_SIDE_TOOL_V2_TODO_WRITE",
-    "CLIENT_SIDE_TOOL_V2_APPLY_AGENT_DIFF",
-    "CLIENT_SIDE_TOOL_V2_GENERATE_IMAGE",
-    "CLIENT_SIDE_TOOL_V2_SEND_TO_USER",
-    "CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS",
-    "CLIENT_SIDE_TOOL_V2_FIX_LINTS",
-    "CLIENT_SIDE_TOOL_V2_READ_SEMSEARCH_FILES",
-    "CLIENT_SIDE_TOOL_V2_REAPPLY",
-    "CLIENT_SIDE_TOOL_V2_FETCH_RULES",
-    "CLIENT_SIDE_TOOL_V2_SEARCH_SYMBOLS",
-    "CLIENT_SIDE_TOOL_V2_BACKGROUND_COMPOSER_FOLLOWUP",
-    "CLIENT_SIDE_TOOL_V2_KNOWLEDGE_BASE",
-    "CLIENT_SIDE_TOOL_V2_FETCH_PULL_REQUEST",
-    "CLIENT_SIDE_TOOL_V2_CREATE_DIAGRAM",
-    "CLIENT_SIDE_TOOL_V2_GO_TO_DEFINITION",
-    "CLIENT_SIDE_TOOL_V2_AWAIT_TASK",
-    "CLIENT_SIDE_TOOL_V2_KILL_AGENT",
-    "CLIENT_SIDE_TOOL_V2_READ_PROJECT",
-    "CLIENT_SIDE_TOOL_V2_UPDATE_PROJECT",
-    "CLIENT_SIDE_TOOL_V2_REFLECT",
-    "CLIENT_SIDE_TOOL_V2_START_GRIND_EXECUTION",
-    "CLIENT_SIDE_TOOL_V2_START_GRIND_PLANNING",
-    "CLIENT_SIDE_TOOL_V2_FILE_SEARCH",
-    "CLIENT_SIDE_TOOL_V2_SEMANTIC_SEARCH_FULL",
-    "CLIENT_SIDE_TOOL_V2_DEEP_SEARCH",
-    "CLIENT_SIDE_TOOL_V2_GLOB_FILE_SEARCH",
-    // MCP auth + AI attribution: mapper has full proto-aligned definitions
-    // and proto v1_pb.ts ships matching McpAuthArgs / AiAttributionArgs
-    // envelopes. The codex parent path already executes them; this
-    // non-codex parent path used to silently drop them because they were
-    // missing from this set, so the model could see the tool name in the
-    // catalog but invocation would fall through to the generic
-    // "tool is not executable via ExecServerMessage" inline error.
-    // Including them here matches the codex set and the
-    // DEFAULT_AGENT_BUILTIN_CURSOR_TOOLS surface.
-    "CLIENT_SIDE_TOOL_V2_MCP_AUTH",
-    "CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION",
-  ])
+  const executableViaExecServerMessage = CURSOR_MODEL_CALLABLE_DEFINITION_KEYS
   const seenDefinitionKeys = new Set<string>()
   const seenToolNames = new Set<string>()
-  const mcpDefByNormalizedName = new Map<string, McpToolDefinitionForApi>()
+  const mcpDefByExactName = new Map<string, McpToolDefinitionForApi>()
 
   for (const mcpToolDef of options?.mcpToolDefs || []) {
     if (!mcpToolDef || typeof mcpToolDef.name !== "string") continue
-    const normalizedFullName = normalizeToolIdentifier(mcpToolDef.name)
-    if (normalizedFullName && !mcpDefByNormalizedName.has(normalizedFullName)) {
-      mcpDefByNormalizedName.set(normalizedFullName, mcpToolDef)
+    if (mcpToolDef.name && !mcpDefByExactName.has(mcpToolDef.name)) {
+      mcpDefByExactName.set(mcpToolDef.name, mcpToolDef)
     }
     if (typeof mcpToolDef.toolName === "string" && mcpToolDef.toolName) {
-      const normalizedToolName = normalizeToolIdentifier(mcpToolDef.toolName)
-      if (
-        normalizedToolName &&
-        !mcpDefByNormalizedName.has(normalizedToolName)
-      ) {
-        mcpDefByNormalizedName.set(normalizedToolName, mcpToolDef)
+      if (!mcpDefByExactName.has(mcpToolDef.toolName)) {
+        mcpDefByExactName.set(mcpToolDef.toolName, mcpToolDef)
       }
     }
   }
@@ -3166,23 +3088,18 @@ export function buildToolsForApi(
       // sub-agents because there is no ExecServerMessage path for the
       // child task envelope. Drop it from the tool list when assembling
       // for a sub-agent's own LLM turn.
-      if (
-        options?.forSubAgent &&
-        (definitionKey === "CLIENT_SIDE_TOOL_V2_TASK" ||
-          definitionKey === "CLIENT_SIDE_TOOL_V2_TASK_V2")
-      ) {
+      if (options?.forSubAgent && isTaskToolDefinitionKey(definitionKey)) {
         seenDefinitionKeys.add(definitionKey)
         continue
       }
 
       const definition = CURSOR_TOOL_DEFINITIONS[definitionKey]
       if (definition) {
-        const normalizedToolName = normalizeToolIdentifier(definition.name)
-        if (seenToolNames.has(normalizedToolName)) {
+        if (seenToolNames.has(definition.name)) {
           continue
         }
         seenDefinitionKeys.add(definitionKey)
-        seenToolNames.add(normalizedToolName)
+        seenToolNames.add(definition.name)
 
         // For the parent agent's `task` tool, rewrite the description so
         // the model can see the available sub-agents (mirrors claude-code's
@@ -3196,35 +3113,41 @@ export function buildToolsForApi(
           isTaskTool && options?.subagentDefinitions
             ? buildDynamicTaskToolDescription(
                 definition.description,
-                options.subagentDefinitions
+                options.subagentDefinitions,
+                options.selectedSubagentModelIds
               )
             : definition.description
+        const inputSchema = isTaskTool
+          ? buildTaskInputSchema(
+              definition.input_schema,
+              options?.selectedSubagentModelIds
+            )
+          : definition.input_schema
 
         tools.push({
           type: "function",
           ...definition,
           description,
+          input_schema: inputSchema,
         })
         isBuiltInByName.set(definition.name, true)
       }
       continue
     }
 
-    const normalizedCursorTool = normalizeToolIdentifier(cursorTool)
-    const mcpToolDef = mcpDefByNormalizedName.get(normalizedCursorTool)
+    const mcpToolDef = mcpDefByExactName.get(cursorTool)
     if (!mcpToolDef || !mcpToolDef.name) continue
 
-    const normalizedMcpName = normalizeToolIdentifier(mcpToolDef.name)
-    if (!normalizedMcpName || seenToolNames.has(normalizedMcpName)) continue
+    if (seenToolNames.has(mcpToolDef.name)) continue
 
-    seenToolNames.add(normalizedMcpName)
+    seenToolNames.add(mcpToolDef.name)
     tools.push({
       type: "function",
       name: mcpToolDef.name,
       description:
         mcpToolDef.description ||
         `MCP tool ${mcpToolDef.toolName || mcpToolDef.name}`,
-      input_schema: normalizeToolInputSchema(mcpToolDef.inputSchema),
+      input_schema: normalizeMcpToolInputSchema(mcpToolDef.inputSchema),
     })
     isBuiltInByName.set(mcpToolDef.name, false)
   }
@@ -3236,14 +3159,22 @@ export function buildToolsForApi(
   // signature; the structured form (which exposes the deferred
   // descriptors) is `buildToolsForApiWithDefer()`.
   if (options?.defer && options.defer.strategy !== "off") {
-    const split = applyDeferPolicy(tools, isBuiltInByName, options.defer)
+    const split = applyDeferPolicy(
+      tools,
+      isBuiltInByName,
+      options.defer,
+      options.backend,
+      options.projectionProvider
+    )
     return split.tools
   }
-  // No-defer path still needs the bridge-internal `snip_messages` tool so
-  // the model can proactively prune history when topics shift (Claude Code
-  // parity — the Snip tool is always available regardless of defer state).
+  // Snip rewrites the detached Claude conversation projection. Codex owns an
+  // append-only native rollout and other providers have no compatible
+  // replacement log, so they must never receive this tool.
   const sorted = sortToolDefinitionsForPromptCache(tools)
   if (
+    options?.projectionProvider === "claude" &&
+    options.forSubAgent !== true &&
     !sorted.some((tool) => tool.name === SNIP_MESSAGES_TOOL_DEFINITION.name)
   ) {
     sorted.push(SNIP_MESSAGES_TOOL_DEFINITION)
@@ -3267,6 +3198,7 @@ export function buildToolsForApiWithDefer(
   supportedTools: string[],
   options?: BuildToolsForApiOptions
 ): BuildToolsForApiResult {
+  assertSubagentDoesNotUseDeferredCatalog(options)
   // Re-run the main path but capture provenance so we can split.
   // Inlining the logic is cleaner than threading two return shapes
   // through `buildToolsForApi` itself.
@@ -3287,7 +3219,13 @@ export function buildToolsForApiWithDefer(
   if (!options?.defer || options.defer.strategy === "off") {
     return { tools: allTools, deferred: [] }
   }
-  return applyDeferPolicy(allTools, provenance, options.defer, options.backend)
+  return applyDeferPolicy(
+    allTools,
+    provenance,
+    options.defer,
+    options.backend,
+    options.projectionProvider
+  )
 }
 
 /**
@@ -3298,12 +3236,19 @@ function applyDeferPolicy(
   tools: ToolDefinition[],
   isBuiltInByName: ReadonlyMap<string, boolean>,
   defer: BuildToolsDeferOptions,
-  backend?: string
+  backend?: string,
+  projectionProvider?: ProjectionProvider
 ): BuildToolsForApiResult {
   const discovered = defer.discoveredTools ?? new Set<string>()
   const core: ToolDefinition[] = []
   const deferred: DeferredToolDescriptor[] = []
   for (const tool of tools) {
+    if (tool.name === SNIP_MESSAGES_TOOL_DEFINITION.name) {
+      if (projectionProvider === "claude") {
+        core.push(tool)
+      }
+      continue
+    }
     const isBuiltIn = isBuiltInByName.get(tool.name) ?? true
     const isCore = !shouldDeferTool(
       { name: tool.name, isBuiltIn },
@@ -3337,10 +3282,9 @@ function applyDeferPolicy(
     )
   }
 
-  // Always inject the bridge-internal `snip_messages` tool so the model
-  // can proactively trim conversation history when topics shift. Mirrors
-  // Claude Code's behaviour where Snip is registered in every session.
+  // Snip is a Claude projection mutation, not a generic history operation.
   if (
+    projectionProvider === "claude" &&
     !sortedCore.some((tool) => tool.name === SNIP_MESSAGES_TOOL_DEFINITION.name)
   ) {
     sortedCore.push(SNIP_MESSAGES_TOOL_DEFINITION)
@@ -3435,10 +3379,15 @@ export function getToolTypeEnumValue(toolName: string): number {
     CLIENT_SIDE_TOOL_V2_WRITE_SHELL_STDIN: 55,
     CLIENT_SIDE_TOOL_V2_RECORD_SCREEN: 56,
     CLIENT_SIDE_TOOL_V2_REPORT_BUGFIX_RESULTS: 58,
+    CLIENT_SIDE_TOOL_V2_AI_ATTRIBUTION: 59,
+    CLIENT_SIDE_TOOL_V2_MCP_AUTH: 60,
+    CLIENT_SIDE_TOOL_V2_REFLECT: 61,
+    CLIENT_SIDE_TOOL_V2_AWAIT: 62,
     CLIENT_SIDE_TOOL_V2_GET_MCP_TOOLS: 63,
     CLIENT_SIDE_TOOL_V2_READ_LINTS: 30,
     CLIENT_SIDE_TOOL_V2_TODO_READ: 34,
     CLIENT_SIDE_TOOL_V2_TODO_WRITE: 35,
+    CLIENT_SIDE_TOOL_V2_CONNECT_SCM: 66,
   }
 
   // 1. Direct match on tool name

@@ -66,6 +66,8 @@ export interface ToolResultBlock {
  */
 export interface ImageBlock {
   type: "image"
+  /** Responses API image fidelity retained by the provider-neutral graph. */
+  detail?: "auto" | "low" | "high" | "original"
   source: {
     type: "base64"
     media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp"
@@ -90,6 +92,21 @@ export interface ThinkingBlock {
   }
 }
 
+/**
+ * Opaque reasoning payload emitted by providers that intentionally do not
+ * expose the underlying chain of thought.  It is a first-class content block:
+ * coercing it into text would both lose the provider boundary and make the
+ * redacted bytes appear as user-visible prose.
+ */
+export interface RedactedThinkingBlock {
+  type: "redacted_thinking"
+  data: string
+  cache_control?: {
+    type: string
+    ttl?: string
+  }
+}
+
 export interface CacheEditsBlock {
   type: "cache_edits"
   edits: Array<{
@@ -107,6 +124,7 @@ export type ContentBlock =
   | ToolResultBlock
   | ImageBlock
   | ThinkingBlock
+  | RedactedThinkingBlock
   | CacheEditsBlock
 
 /**
@@ -125,7 +143,6 @@ export type ContextMessageSource =
   | "record"
   | "boundary"
   | "summary"
-  | "context_collapse"
   | "attachment"
   | "snip"
   | "microcompact"
@@ -188,10 +205,30 @@ export interface UnifiedMessage {
    */
   source?: ContextMessageSource
 
+  /** Durable graph identity carried only between projection layers. */
+  sourceUuid?: string
+
   /**
    * More specific attachment classifier when source === "attachment".
    */
   attachmentKind?: ContextProjectionAttachment["kind"]
+}
+
+/**
+ * A message projected from an already-persisted graph fragment.
+ *
+ * Unlike a raw API message, this input has a durable source identity which
+ * must survive every intermediate context representation. Callers use the
+ * strict graph projection API rather than the raw-message API so an
+ * incremental provider ledger can bind the resulting native input to the
+ * same graph record on every request.
+ */
+export interface DurableGraphProjectionMessage extends Omit<
+  UnifiedMessage,
+  "role" | "sourceUuid"
+> {
+  role: "user" | "assistant"
+  sourceUuid: string
 }
 
 /**
@@ -215,6 +252,27 @@ export interface ContextUsageSnapshot {
 
 export interface ContextTranscriptRecord {
   id: string
+  /** Durable graph edge. The provider message id is never used as identity. */
+  parentUuid?: string
+  /** Logical predecessor used when a compacted segment reconnects the graph. */
+  logicalParentUuid?: string
+  /** Assistant fragment that emitted the tool_use matched by this result. */
+  sourceToolAssistantUuid?: string
+  /** Provider that emitted this graph fragment. */
+  provider?: string
+  /** Provider-native id. Multiple records may intentionally share it. */
+  providerMessageId?: string
+  /** Stable occurrence within a provider message's streamed content blocks. */
+  blockIndex?: number
+  turnId?: string
+  threadId?: string
+  branchId?: string
+  agentId?: string
+  isSidechain?: boolean
+  forkSourceUuid?: string
+  forkLineage?: string[]
+  /** Retained for audit/replay but excluded from subsequent provider prompts. */
+  excludedFromProviderProjection?: boolean
   role: "user" | "assistant"
   content: LooseMessageContent
   createdAt: number
@@ -238,7 +296,6 @@ export interface ContextTranscriptRecord {
     | "message"
     | "compact_boundary"
     | "compact_summary"
-    | "context_collapse_summary"
     | "snip_boundary"
     | "microcompact_boundary"
     | "attachment"
@@ -247,26 +304,15 @@ export interface ContextTranscriptRecord {
     commit?: ContextCompactionCommit
     summary?: string
   }
-  contextCollapseMetadata?: {
-    commit?: ContextCollapseCommit
-    summary?: string
-  }
   attachmentMetadata?: ContextProjectionAttachment
   hookMetadata?: {
     trigger: "manual" | "auto" | "reactive"
     compactionId: string
   }
   snipMetadata?: {
+    /** Immutable main-graph record immediately preceding this boundary. */
+    afterGraphUuid: string
     removedRecordIds: string[]
-    /**
-     * Human-readable digest of the records that this boundary represents,
-     * built from a deterministic textual heuristic at snip time. The
-     * projection layer uses it to render a non-empty boundary message so
-     * the model gets a hint of what it explored before, instead of a bare
-     * "Context snipped" placeholder. Optional for back-compat with
-     * persisted records that were snipped before summaries existed.
-     */
-    summary?: string
   }
   microcompactMetadata?: {
     trigger: "auto" | "idle"
@@ -284,7 +330,6 @@ export interface ContextProjectionAttachment {
     | "file_states"
     | "file_snapshots"
     | "todos"
-    | "investigation_memory"
   label: string
   content: string
   tokenCount: number
@@ -310,31 +355,65 @@ export interface ContextCompactionCommit {
   summary: string
   summaryTokenCount: number
   projectedTokenCount: number
-  codexReplacementHistory?: CodexReplacementHistory
 }
 
-export interface ContextCollapseCommit {
+export interface ClaudeProjectionCapabilitySnapshot {
+  model: string
+  toolCatalogHash: string
+  betaFlags: string[]
+  supportsThinking: boolean
+  supportsImages: boolean
+}
+
+export interface ClaudePreservedSegment {
+  headUuid: string
+  anchorUuid: string
+  tailUuid: string
+}
+
+/**
+ * Exact, ordered recipe for reconstructing a Claude model window. It is not a
+ * generic checkpoint and does not infer membership from a linear sequence.
+ */
+export interface ClaudeProjectionRecipe {
   id: string
   createdAt: number
-  strategy: "auto" | "manual" | "reactive"
-  parentCollapseId?: string
-  archivedRecordIds: string[]
-  archivedThroughRecordId: string
+  boundaryRecordId: string
   summaryRecordId: string
-  sourceRecordCount: number
-  sourceMessageCount: number
-  sourceTokenCount: number
-  retainedStartRecordId?: string
-  retainedRecordCount: number
-  retainedTokenCount?: number
-  summary: string
-  summaryTokenCount: number
-  projectedTokenCount: number
+  orderedRecordIds: string[]
+  attachmentRecordIds: string[]
+  hookResultRecordIds: string[]
+  excludedRecordIds: string[]
+  preservedSegment?: ClaudePreservedSegment
+  capability: ClaudeProjectionCapabilitySnapshot
 }
 
-export interface ContextCollapseState {
-  commits: ContextCollapseCommit[]
-  updatedAt?: number
+export type ProjectionExclusionReason =
+  | "checkpoint_excluded"
+  | "snipped"
+  | "provider_exclusion"
+  | "incomplete_tool_use"
+  | "orphan_tool_result"
+  | "duplicate_tool_use"
+  | "provider_capability"
+  | "internal_marker"
+  | "ui_only"
+
+export interface ProjectionManifestEntry {
+  sourceUuid: string
+  included: boolean
+  reason?: ProjectionExclusionReason
+}
+
+export interface ProjectionManifest {
+  provider: "claude" | "codex"
+  generation: string
+  sourceEntries: ProjectionManifestEntry[]
+  toolCatalogHash: string
+  capabilityHash: string
+  /** Last durable graph fragment visible in this provider projection. */
+  activeLeafUuid?: string
+  tokenBreakdown?: Record<string, number>
 }
 
 export interface ContextUsageLedgerState {
@@ -373,6 +452,9 @@ export interface ContextToolResultReplacementRecord {
   kind: "tool-result"
   toolUseId: string
   replacement: string
+  /** Exact provider-visible replacement format version. */
+  projectionVersion?: number
+  provider?: "claude"
   documentId?: string
   reason?: "per_tool" | "aggregate" | "empty" | "microcompact" | "snip"
   createdAt: number
@@ -385,15 +467,30 @@ export interface ContextToolResultReplacementState {
   records?: ContextToolResultReplacementRecord[]
 }
 
+/**
+ * One immutable, replay-safe change to Claude's tool-result projection.
+ *
+ * Tool-result graph rows are committed before their provider projection is
+ * installed.  Passing a semantic mutation across that boundary, rather than
+ * a mutable state snapshot, lets the projection owner merge independently
+ * committed results in order without overwriting a sibling tool result.
+ */
+export type ContextToolResultReplacementMutation =
+  | {
+      kind: "seen"
+      toolUseId: string
+    }
+  | {
+      kind: "replacement"
+      toolUseId: string
+      replacement: string
+      record: ContextToolResultReplacementRecord
+      storedReference?: ContextStoredToolResultReference
+    }
+
 export interface CodexTruncationPolicy {
   mode: "bytes" | "tokens"
   limit: number
-}
-
-export interface CodexContextTokenInfo {
-  totalTokens: number
-  modelContextWindow?: number
-  updatedAt: number
 }
 
 export interface CodexReferenceContextItem {
@@ -408,98 +505,6 @@ export interface CodexReferenceContextItem {
   updatedAt: number
 }
 
-export interface CodexMetaMessageLedgerEntry {
-  key: string
-  signature: string
-  beforeVisibleIndex: number
-  role: "user" | "assistant"
-  content: LooseMessageContent
-  source?: ContextMessageSource
-  isMeta?: boolean
-  attachmentKind?: ContextProjectionAttachment["kind"]
-}
-
-export interface CodexMetaMessageLedgerState {
-  initialized: boolean
-  messages: CodexMetaMessageLedgerEntry[]
-  latestSignaturesByKey: Record<string, string>
-  latestKindsByKey: Record<string, ContextProjectionAttachment["kind"]>
-}
-
-export interface CodexAppendOnlyAttachmentLedgerEntry {
-  kind: ContextProjectionAttachment["kind"]
-  label: string
-  signature: string
-  beforeVisibleIndex: number
-  role: "user"
-  content: LooseMessageContent
-  source: "attachment"
-  isMeta: true
-  attachmentKind: ContextProjectionAttachment["kind"]
-  commitId?: string
-  createdAt: number
-}
-
-export interface CodexAppendOnlyAttachmentLedgerState {
-  version: number
-  entries: CodexAppendOnlyAttachmentLedgerEntry[]
-  latestSignaturesByKind: Partial<
-    Record<ContextProjectionAttachment["kind"], string>
-  >
-}
-
-export interface CodexReplacementHistory {
-  compactionId: string
-  createdAt: number
-  injectionMode: "pre_turn" | "mid_turn"
-  windowNumber: number
-  firstWindowId: string
-  previousWindowId?: string
-  windowId: string
-  anchorRecordId?: string
-  anchorRecordCount: number
-  summary: string
-  items: CodexReplacementHistoryItem[]
-}
-
-export interface CodexContextWindowState {
-  windowNumber: number
-  firstWindowId: string
-  previousWindowId?: string
-  windowId: string
-  createdAt: number
-  compactionId?: string
-  replacementHistory?: CodexReplacementHistory
-}
-
-export interface CodexContextState {
-  historyVersion: number
-  tokenInfo?: CodexContextTokenInfo
-  referenceContextItem?: CodexReferenceContextItem
-  metaMessageLedger?: CodexMetaMessageLedgerState
-  appendOnlyAttachmentLedger?: CodexAppendOnlyAttachmentLedgerState
-  activeWindow?: CodexContextWindowState
-  truncationPolicy: CodexTruncationPolicy
-}
-
-export interface ContextInvestigationMemoryEntry {
-  batchId: string
-  label: string
-  details: string
-  toolCallIds: string[]
-  toolCount: number
-  readOnly: boolean
-  createdAt: number
-}
-
-export interface InvestigationMemorySummaryLike {
-  label: string
-  details: string
-  toolCount?: number
-  readOnly?: boolean
-  createdAt?: number
-}
-
 export type ContextSessionMemoryKind =
   | "objective"
   | "decision"
@@ -512,12 +517,78 @@ export type ContextSessionMemoryKind =
   | "sub_agent"
   | "open_item"
 
+/**
+ * A compact fact produced from one concrete sub-agent tool step.  This is
+ * deliberately structured before it is rendered into either the parent task
+ * result or durable session memory; no reader is allowed to recover it by
+ * scanning a report string later.
+ */
+export interface SubAgentMemoryEvidence {
+  toolName: string
+  summary: string
+}
+
+/**
+ * Provider-neutral payload for a completed/interrupted sub-agent event.
+ * `resultText` is the sub-agent's own final answer; it is bounded by the
+ * writer before persistence and is not reconstructed from a transcript.
+ */
+export interface SubAgentMemoryPayload {
+  agentId: string
+  agentType?: string
+  status: string
+  turnCount?: number
+  toolCallCount?: number
+  durationMs?: number
+  modifiedFiles?: string[]
+  resultText?: string
+  evidence: SubAgentMemoryEvidence[]
+  task?: string
+}
+
+/**
+ * The durable terminal graph fragment that proves where a session-memory
+ * event came from. A memory event is never anchored to a task invocation:
+ * only the accepted task result or the exact Cursor control notification that
+ * delivered the terminal report can be its source.
+ */
+export type SessionMemorySourceKind = "tool_result" | "control_notification"
+
+/**
+ * Structured domain event owned by a sub-agent lifecycle. The event is
+ * persisted append-only; a later state change is a new revision of the same
+ * `sourceEventId`, never an update of the original row.
+ */
+export interface SubAgentMemoryEvent {
+  /** Conversation scope; event identities are unique only inside it. */
+  conversationId: string
+  /** Stable lifecycle identity, normally `sub_agent:<agentId>`. */
+  sourceEventId: string
+  /** Parent task tool-call identity. */
+  sourceToolUseId: string
+  /** Exact accepted graph fragment verified by the event store. */
+  sourceRecordUuid: string
+  sourceKind: SessionMemorySourceKind
+  payload: SubAgentMemoryPayload
+  weight: number
+  createdAt: number
+}
+
 export interface ContextSessionMemoryEntry {
+  /** Stable durable event identity, not a wording-derived key. */
   id: string
   kind: ContextSessionMemoryKind
   text: string
-  sourceCompactionId: string
-  sourceRecordId?: string
+  /** Stable domain event identity, e.g. `sub_agent:<agentId>`. */
+  sourceEventId: string
+  /** Exact parent task tool-use identity for the terminal delivery. */
+  sourceToolUseId: string
+  /** Exact durable graph fragment that accepted the terminal delivery. */
+  sourceRecordUuid: string
+  /** Formal terminal delivery route that owns the graph fragment. */
+  sourceKind: SessionMemorySourceKind
+  /** Monotonic revision within one durable event identity. */
+  revision: number
   createdAt: number
   weight: number
 }
@@ -527,6 +598,9 @@ export interface SessionMemorySummaryLike {
   text: string
   createdAt?: number
   weight?: number
+  sourceToolUseId: string
+  sourceRecordUuid: string
+  sourceKind: SessionMemorySourceKind
 }
 
 /**
@@ -536,7 +610,7 @@ export interface SessionMemorySummaryLike {
  *
  * This object is mutated in place by `ContextCompactionService` and
  * related services (records pushed, compaction history appended,
- * investigation memory filtered, replacement state pruned, etc.).  The
+ * replacement state pruned, etc.).  The
  * design only stays sound under a single-writer assumption: at any
  * moment exactly one async task should be calling into the context
  * services for a given state.
@@ -579,12 +653,11 @@ export interface ContextConversationState {
   compactionEpoch?: number
   lastAppliedCompaction?: ContextCompactionBasis
   usageLedger: ContextUsageLedgerState
-  codexContext?: CodexContextState
   toolResultReplacementState?: ContextToolResultReplacementState
-  investigationMemory: ContextInvestigationMemoryEntry[]
   sessionMemory: ContextSessionMemoryEntry[]
   compactWarningState?: ContextCompactWarningState
-  contextCollapseState?: ContextCollapseState
+  /** Exact last fragment in this projection owner's mounted durable graph. */
+  graphWatermarkUuid?: string
 }
 
 export interface ProjectedContextMessage {
@@ -592,6 +665,7 @@ export interface ProjectedContextMessage {
   content: LooseMessageContent
   source: ContextMessageSource
   recordId?: string
+  sourceUuid?: string
   /**
    * Anthropic message id (when source === "record" and the underlying
    * `ContextTranscriptRecord.messageId` was set). Carries the same

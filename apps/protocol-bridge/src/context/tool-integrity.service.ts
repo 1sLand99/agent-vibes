@@ -226,6 +226,51 @@ export class ToolIntegrityService {
     return orphans
   }
 
+  assertProjectionIntegrity(
+    messages: UnifiedMessage[],
+    options?: EnforceToolProtocolOptions
+  ): void {
+    const mode = options?.mode ?? "global"
+    const pendingToolUseIds = new Set(options?.pendingToolUseIds || [])
+    const toolUseIds = new Set<string>()
+    const duplicateToolUseIds = new Set<string>()
+    const toolResultIds = new Set<string>()
+
+    for (const message of messages) {
+      for (const id of this.extractToolUseIds(message)) {
+        if (toolUseIds.has(id)) duplicateToolUseIds.add(id)
+        toolUseIds.add(id)
+      }
+      for (const id of this.extractToolResultIds(message)) {
+        toolResultIds.add(id)
+      }
+    }
+
+    const orphanedResults =
+      mode === "strict-adjacent"
+        ? this.findStrictAdjacentOrphanedToolResults(messages, toolUseIds)
+        : this.findOrphanedToolResults(messages, toolUseIds)
+    const orphanedUses = this.findOrphanedToolUses(
+      messages,
+      toolResultIds
+    ).filter((entry) => !pendingToolUseIds.has(entry.tool_use_id))
+
+    if (
+      duplicateToolUseIds.size === 0 &&
+      orphanedResults.length === 0 &&
+      orphanedUses.length === 0
+    ) {
+      return
+    }
+
+    throw new Error(
+      `Invalid ${mode} tool projection: ` +
+        `duplicate uses=[${[...duplicateToolUseIds].join(",")}], ` +
+        `orphan results=[${orphanedResults.map((entry) => entry.tool_use_id).join(",")}], ` +
+        `orphan uses=[${orphanedUses.map((entry) => entry.tool_use_id).join(",")}]`
+    )
+  }
+
   /**
    * Find the optimal truncation point that maintains tool integrity
    *

@@ -2,34 +2,24 @@ import type { ParsedCursorRequest } from "./tools/cursor-request-parser"
 
 type AgentControlType = ParsedCursorRequest["agentControlType"]
 
-export interface RestartRecoveryControlResolution {
-  resolve: boolean
-  emitNotice: boolean
-  endStream: boolean
+export interface PendingToolRecoveryControlPolicy {
+  blocksContinuation: boolean
 }
 
 /**
- * True for Cursor control actions that must settle restartRecovery before the
- * bridge can safely continue the stream. Attach-only is included because it is
- * Cursor's passive reattach path for an already-loading conversation; leaving a
- * recovered interrupted turn open there keeps the UI spinning forever.
- * Heartbeats, provider prewarm, and exec result frames remain passive.
+ * Control actions that must wait while a durable client-owned tool remains
+ * unresolved. Cursor's terminal exec frames stay passive so they can provide
+ * the fact that releases the pending edge.
  */
-export function shouldResolveRestartRecoveryBeforeControlAction(
+export function getPendingToolRecoveryControlPolicy(
   agentControlType: AgentControlType
-): boolean {
-  return getRestartRecoveryControlResolution(agentControlType).resolve
-}
-
-export function getRestartRecoveryControlResolution(
-  agentControlType: AgentControlType
-): RestartRecoveryControlResolution {
+): PendingToolRecoveryControlPolicy {
   switch (agentControlType) {
     case "attachOnly":
     case "unknownConversationAction":
-      return { resolve: true, emitNotice: true, endStream: true }
+      return { blocksContinuation: true }
     case "cancelAction":
-      return { resolve: true, emitNotice: false, endStream: true }
+      return { blocksContinuation: true }
     case "summarizeAction":
     case "shellCommandAction":
     case "startPlanAction":
@@ -39,7 +29,9 @@ export function getRestartRecoveryControlResolution(
     case "backgroundTaskCompletionAction":
     case "backgroundShellAction":
     case "backgroundSubagentAction":
-      return { resolve: true, emitNotice: false, endStream: false }
+    case "goalContinuationAction":
+    case "injectContextAction":
+      return { blocksContinuation: true }
     case "heartbeat":
     case "execHeartbeat":
     case "execStreamClose":
@@ -48,18 +40,14 @@ export function getRestartRecoveryControlResolution(
     case "streamClose":
     case "other":
     case undefined:
-      return { resolve: false, emitNotice: false, endStream: false }
+      return { blocksContinuation: false }
     default:
-      return exhaustiveControlResolution(agentControlType)
+      return exhaustiveControlPolicy(agentControlType)
   }
 }
 
-function exhaustiveControlResolution(
+function exhaustiveControlPolicy(
   _agentControlType: never
-): RestartRecoveryControlResolution {
-  return {
-    resolve: false,
-    emitNotice: false,
-    endStream: false,
-  }
+): PendingToolRecoveryControlPolicy {
+  return { blocksContinuation: false }
 }

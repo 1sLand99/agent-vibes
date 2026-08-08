@@ -99,6 +99,8 @@ export const CORE_TOOL_NAMES: ReadonlySet<string> = new Set([
   // ── Planning / todos ──────────────────────────────────────
   "create_plan",
   "update_plan",
+  "create_goal",
+  "update_goal",
   "read_todos",
   "update_todos",
   // ── User interaction ──────────────────────────────────────
@@ -106,7 +108,6 @@ export const CORE_TOOL_NAMES: ReadonlySet<string> = new Set([
   // ── Sub-agent / await ─────────────────────────────────────
   "task",
   "await_task",
-  "wait_agent",
   "kill_agent",
   // ── Lightweight web ───────────────────────────────────────
   "web_search",

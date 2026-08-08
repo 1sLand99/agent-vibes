@@ -1,4 +1,5 @@
 import { fromBinary } from "@bufbuild/protobuf"
+import { createHash } from "crypto"
 import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
@@ -8,23 +9,40 @@ import {
   AgentServerMessage,
   AgentServerMessageSchema,
   ToolCall,
+  ToolCallSchema,
 } from "../../gen/agent/v1_pb"
 
-type TraceDirection = "inbound" | "outbound"
+type TraceDirection = "inbound" | "outbound" | "internal"
+
+interface CapabilitySnapshotTrace {
+  readonly backend: string
+  readonly model: string
+  readonly clientSupportedTools: readonly string[]
+  readonly providerCoreTools: readonly string[]
+  readonly providerDeferredTools: readonly string[]
+  readonly providerMcpTools: readonly string[]
+}
 
 interface TraceRecord {
   ts: string
   direction: TraceDirection
-  messageType: "AgentClientMessage" | "AgentServerMessage"
+  messageType:
+    | "AgentClientMessage"
+    | "AgentServerMessage"
+    | "CapabilitySnapshot"
   topCase?: string
   nestedCase?: string
   toolCase?: string
+  toolResultCase?: string
+  toolOutcome?: "success" | "failure" | "unknown"
+  hookCase?: string
   callId?: string
   id?: number
   execId?: string
   toolCallId?: string
   modelCallId?: string
   conversationId?: string
+  streamEpoch?: string
   model?: string
   bytes?: number
   compressedBytes?: number
@@ -40,6 +58,23 @@ interface TraceRecord {
   // summary_completed (summaryId), prompt_suggestion (suggestionId), etc.
   // Values are flat string|number for cheap JSONL grep.
   nestedExtras?: Record<string, string | number>
+  capabilitySnapshot?: CapabilitySnapshotTrace
+}
+
+interface TraceScope {
+  readonly conversationId?: string
+  readonly streamEpoch?: string
+}
+
+interface ClientTraceMeta extends TraceScope {
+  readonly bytes?: number
+  readonly compressedBytes?: number
+  readonly context?: string
+}
+
+interface ServerTraceMeta extends TraceScope {
+  readonly bytes?: number
+  readonly context?: string
 }
 
 function firstString(...values: unknown[]): string | undefined {
@@ -63,7 +98,12 @@ function extractToolCase(toolCall: ToolCall | undefined): string | undefined {
 function extractGenericToolCallId(value: unknown): string | undefined {
   if (!value || typeof value !== "object") return undefined
   const record = value as Record<string, unknown>
-  return firstString(record.toolCallId, record.callId, record.id)
+  return firstString(
+    record.toolCallId,
+    record.originalToolCallId,
+    record.callId,
+    record.id
+  )
 }
 
 /**
@@ -136,6 +176,150 @@ function extractAnyToolCase(value: unknown): string | undefined {
   return undefined
 }
 
+const NON_FAILURE_TOOL_RESULT_CASES = new Set([
+  "success",
+  "startSuccess",
+  "saveSuccess",
+  "discardSuccess",
+  "async",
+  "registered",
+  "needsConfirmation",
+  "complete",
+  "stillRunning",
+])
+
+const FAILURE_TOOL_RESULT_CASES = new Set([
+  "failure",
+  "timeout",
+  "rejected",
+  "spawnError",
+  "sandboxUnsupported",
+  "permissionDenied",
+  "fileNotFound",
+  "notFile",
+  "fileBusy",
+  "error",
+  "readPermissionDenied",
+  "writePermissionDenied",
+  "notFound",
+])
+
+const TOOL_RESULT_OUTCOMES = buildToolResultOutcomeTable()
+
+function buildToolResultOutcomeTable(): ReadonlyMap<
+  string,
+  ReadonlyMap<string, "success" | "failure">
+> {
+  const table = new Map<string, ReadonlyMap<string, "success" | "failure">>()
+  const toolFields = ToolCallSchema.fields.filter(
+    (field) => field.oneof?.name === "tool"
+  )
+  for (const toolField of toolFields) {
+    const resultField = toolField.message?.fields.find(
+      (field) => field.localName === "result"
+    )
+    const resultCases = resultField?.message?.fields.filter(
+      (field) => field.oneof?.name === "result"
+    )
+    if (!resultCases || resultCases.length === 0) {
+      throw new Error(
+        `Cursor protocol trace cannot classify ${toolField.localName}: result oneof is missing`
+      )
+    }
+    const outcomes = new Map<string, "success" | "failure">()
+    for (const resultCase of resultCases) {
+      const isSuccess = NON_FAILURE_TOOL_RESULT_CASES.has(resultCase.localName)
+      const isFailure = FAILURE_TOOL_RESULT_CASES.has(resultCase.localName)
+      if (isSuccess === isFailure) {
+        throw new Error(
+          `Cursor protocol trace has no exact outcome for ${toolField.localName}.${resultCase.localName}`
+        )
+      }
+      outcomes.set(resultCase.localName, isSuccess ? "success" : "failure")
+    }
+    table.set(toolField.localName, outcomes)
+  }
+  return table
+}
+
+export function classifyCursorToolResultCase(
+  toolCase: string | undefined,
+  resultCase: string | undefined
+): TraceRecord["toolOutcome"] {
+  if (!toolCase || !resultCase) return "unknown"
+  return TOOL_RESULT_OUTCOMES.get(toolCase)?.get(resultCase) || "unknown"
+}
+
+function extractResultOneofCase(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const resultOneof = (value as Record<string, unknown>).result
+  if (!resultOneof || typeof resultOneof !== "object") return undefined
+  const resultCase = (resultOneof as { case?: unknown }).case
+  return typeof resultCase === "string" && resultCase.length > 0
+    ? resultCase
+    : undefined
+}
+
+function extractToolResultCase(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const update = value as Record<string, unknown>
+  const toolCall = (update.toolCall || update.tool_call) as
+    | { tool?: { value?: unknown } }
+    | undefined
+  const callValue = toolCall?.tool?.value
+  if (!callValue || typeof callValue !== "object") return undefined
+  return extractResultOneofCase((callValue as Record<string, unknown>).result)
+}
+
+function extractToolOutcome(
+  value: unknown,
+  toolCase: string | undefined
+): TraceRecord["toolOutcome"] {
+  const resultCase = extractToolResultCase(value)
+  return resultCase
+    ? classifyCursorToolResultCase(toolCase, resultCase)
+    : "unknown"
+}
+
+function extractToolResultExtras(
+  value: unknown,
+  toolCase: string | undefined
+): Record<string, string | number> {
+  if (
+    toolCase !== "listMcpResourcesToolCall" ||
+    !value ||
+    typeof value !== "object"
+  ) {
+    return {}
+  }
+  const update = value as Record<string, unknown>
+  const toolCall = (update.toolCall || update.tool_call) as
+    | { tool?: { value?: unknown } }
+    | undefined
+  const callValue = toolCall?.tool?.value
+  const resultMessage =
+    callValue && typeof callValue === "object"
+      ? (callValue as Record<string, unknown>).result
+      : undefined
+  const resultOneof =
+    resultMessage && typeof resultMessage === "object"
+      ? (resultMessage as Record<string, unknown>).result
+      : undefined
+  if (
+    !resultOneof ||
+    typeof resultOneof !== "object" ||
+    (resultOneof as { case?: unknown }).case !== "success"
+  ) {
+    return {}
+  }
+  const success = (resultOneof as { value?: unknown }).value
+  const resources =
+    success && typeof success === "object"
+      ? (success as Record<string, unknown>).resources
+      : undefined
+  return Array.isArray(resources) ? { resourceCount: resources.length } : {}
+}
+
 const INTERACTION_UPDATE_EXTRA_KEYS: Record<string, readonly string[]> = {
   textDelta: ["modelCallId", "callId", "isFinal"],
   thinkingDelta: ["modelCallId", "callId", "thinkingStyle"],
@@ -181,7 +365,7 @@ const CONVERSATION_ACTION_EXTRA_KEYS: Record<string, readonly string[]> = {
   shellCommandAction: ["execId", "shellId", "command"],
   startPlanAction: ["planId"],
   executePlanAction: ["planId", "stepId"],
-  asyncAskQuestionCompletionAction: ["callId", "questionId"],
+  asyncAskQuestionCompletionAction: ["originalToolCallId"],
   cancelSubagentAction: ["subagentId", "reason"],
   backgroundTaskCompletionAction: ["taskId", "status"],
   backgroundShellAction: ["shellId", "status"],
@@ -190,7 +374,7 @@ const CONVERSATION_ACTION_EXTRA_KEYS: Record<string, readonly string[]> = {
 
 function summarizeClientMessage(
   msg: AgentClientMessage,
-  meta?: { bytes?: number; compressedBytes?: number; context?: string }
+  meta?: ClientTraceMeta
 ): TraceRecord {
   const record: TraceRecord = {
     ts: new Date().toISOString(),
@@ -200,6 +384,8 @@ function summarizeClientMessage(
     bytes: meta?.bytes,
     compressedBytes: meta?.compressedBytes,
     context: meta?.context,
+    conversationId: meta?.conversationId,
+    streamEpoch: meta?.streamEpoch,
   }
 
   switch (msg.message.case) {
@@ -219,6 +405,9 @@ function summarizeClientMessage(
       record.id = value.id
       record.execId = value.execId || undefined
       record.toolCallId = extractGenericToolCallId(value.message.value)
+      if (value.message.case === "executeHookResult") {
+        record.hookCase = value.message.value.response?.response.case
+      }
       break
     }
     case "execClientControlMessage": {
@@ -251,6 +440,16 @@ function summarizeClientMessage(
           record,
           pickScalarFields(action.value, conversationExtraKeys)
         )
+      }
+      if (
+        action.case === "asyncAskQuestionCompletionAction" &&
+        action.value &&
+        typeof action.value === "object"
+      ) {
+        const resultCase = extractResultOneofCase(
+          (action.value as Record<string, unknown>).result
+        )
+        if (resultCase) mergeExtras(record, { resultCase })
       }
       // Persist triggering metadata when Cursor includes it on the
       // ConversationAction envelope. Cursor 3.x carries the authId on
@@ -301,7 +500,7 @@ function summarizeClientMessage(
 
 function summarizeServerMessage(
   msg: AgentServerMessage,
-  meta?: { bytes?: number; context?: string }
+  meta?: ServerTraceMeta
 ): TraceRecord {
   const record: TraceRecord = {
     ts: new Date().toISOString(),
@@ -310,6 +509,8 @@ function summarizeServerMessage(
     topCase: msg.message.case || undefined,
     bytes: meta?.bytes,
     context: meta?.context,
+    conversationId: meta?.conversationId,
+    streamEpoch: meta?.streamEpoch,
   }
 
   switch (msg.message.case) {
@@ -326,6 +527,11 @@ function summarizeServerMessage(
       if (!record.toolCase && value?.toolCallDelta) {
         const delta = value.toolCallDelta as { delta?: { case?: string } }
         record.toolCase = delta.delta?.case
+      }
+      if (update.case === "toolCallCompleted") {
+        record.toolResultCase = extractToolResultCase(value)
+        record.toolOutcome = extractToolOutcome(value, record.toolCase)
+        mergeExtras(record, extractToolResultExtras(value, record.toolCase))
       }
       // Capture sub-case-specific scalars so audit / replay can distinguish
       // turn_ended vs step_completed vs summary_completed without decoding
@@ -363,6 +569,19 @@ function summarizeServerMessage(
       record.id = exec.id
       record.execId = exec.execId || undefined
       record.toolCallId = extractGenericToolCallId(exec.message.value)
+      if (exec.message.case === "executeHookArgs") {
+        record.hookCase = exec.message.value.request?.request.case
+      }
+      if (
+        exec.message.case === "shellArgs" ||
+        exec.message.case === "shellStreamArgs"
+      ) {
+        mergeExtras(record, {
+          commandSha256: createHash("sha256")
+            .update(exec.message.value.command)
+            .digest("hex"),
+        })
+      }
       break
     }
     case "execServerControlMessage": {
@@ -509,21 +728,21 @@ export class CursorProtocolTraceService {
 
   static recordClientMessage(
     msg: AgentClientMessage,
-    meta?: { bytes?: number; compressedBytes?: number; context?: string }
+    meta?: ClientTraceMeta
   ): void {
     this.append(summarizeClientMessage(msg, meta))
   }
 
   static recordServerMessage(
     msg: AgentServerMessage,
-    meta?: { bytes?: number; context?: string }
+    meta?: ServerTraceMeta
   ): void {
     this.append(summarizeServerMessage(msg, meta))
   }
 
   static recordServerEnvelope(
     buffer: Uint8Array | Buffer,
-    meta?: { context?: string }
+    meta?: TraceScope & { readonly context?: string }
   ): void {
     if (!this.enabled()) return
     try {
@@ -533,9 +752,52 @@ export class CursorProtocolTraceService {
       this.recordServerMessage(msg, {
         bytes: payload.length,
         context: meta?.context || "envelope",
+        conversationId: meta?.conversationId,
+        streamEpoch: meta?.streamEpoch,
       })
     } catch {
       // Ignore malformed trace-only decode failures.
     }
+  }
+
+  static recordCapabilitySnapshot(input: {
+    readonly conversationId: string
+    readonly streamEpoch?: string
+    readonly backend: string
+    readonly model: string
+    readonly clientSupportedTools: readonly string[]
+    readonly providerCoreTools: readonly string[]
+    readonly providerDeferredTools: readonly string[]
+    readonly providerMcpTools: readonly string[]
+  }): void {
+    const normalizeNames = (values: readonly string[]): readonly string[] =>
+      Object.freeze(
+        Array.from(
+          new Set(
+            values.filter(
+              (value): value is string =>
+                typeof value === "string" && value.length > 0
+            )
+          )
+        ).sort((left, right) => left.localeCompare(right))
+      )
+
+    this.append({
+      ts: new Date().toISOString(),
+      direction: "internal",
+      messageType: "CapabilitySnapshot",
+      topCase: "capabilitySnapshot",
+      conversationId: input.conversationId,
+      streamEpoch: input.streamEpoch,
+      model: input.model,
+      capabilitySnapshot: {
+        backend: input.backend,
+        model: input.model,
+        clientSupportedTools: normalizeNames(input.clientSupportedTools),
+        providerCoreTools: normalizeNames(input.providerCoreTools),
+        providerDeferredTools: normalizeNames(input.providerDeferredTools),
+        providerMcpTools: normalizeNames(input.providerMcpTools),
+      },
+    })
   }
 }

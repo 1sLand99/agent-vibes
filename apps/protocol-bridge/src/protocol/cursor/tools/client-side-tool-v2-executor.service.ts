@@ -4,10 +4,15 @@ import * as path from "path"
 import { promises as fs } from "fs"
 import { execFile } from "child_process"
 import { promisify } from "util"
+import {
+  WorkspaceScope,
+  WorkspaceScopeError,
+  type WorkspaceTarget,
+} from "../session/workspace-scope"
 
 type FixExecutionStatus = "success" | "failure" | "error"
 
-interface LintDiagnostic {
+export interface LintDiagnostic {
   source: string
   code?: string
   message: string
@@ -18,7 +23,7 @@ interface LintDiagnostic {
   }
 }
 
-interface LintFileDiagnostics {
+export interface LintFileDiagnostics {
   path: string
   relativePath: string
   diagnostics: LintDiagnostic[]
@@ -58,18 +63,92 @@ export interface ClientSideFixLintsExecutionResult {
   replay: ClientSideFixLintsReplay
 }
 
+export interface ClientSideReadLintsExecutionResult {
+  status: "success" | "error"
+  message?: string
+  content: string
+  diagnostics: {
+    totalDiagnostics: number
+    files: LintFileDiagnostics[]
+  }
+}
+
+type ResolvedLintTarget =
+  | { kind: "ok"; absPath: string; relPath: string; rootPath: string }
+  | { kind: "error"; absPath: string; relPath: string; error: string }
+
+type ValidLintTarget = Extract<ResolvedLintTarget, { kind: "ok" }>
+type FailedLintTarget = Extract<ResolvedLintTarget, { kind: "error" }>
+
+interface PreparedLintTargets {
+  requestedPaths: string[]
+  validTargets: ValidLintTarget[]
+  failedTargets: FailedLintTarget[]
+}
+
 @Injectable()
 export class ClientSideToolV2ExecutorService {
   private readonly logger = new Logger(ClientSideToolV2ExecutorService.name)
   private readonly execFileAsync = promisify(execFile)
 
+  /**
+   * Read diagnostics without applying any fixes. `read_lints` is a
+   * read-only Cursor tool; it must never reuse the `eslint --fix` path used
+   * by `fix_lints`.
+   */
+  async executeReadLints(
+    workspaceScope: WorkspaceScope,
+    input: Record<string, unknown>
+  ): Promise<ClientSideReadLintsExecutionResult> {
+    const prepared = this.prepareLintTargets(workspaceScope, input)
+    if (prepared.requestedPaths.length === 0) {
+      return {
+        status: "error",
+        message: "missing paths",
+        content: "[read_lints error] Missing required paths/files payload",
+        diagnostics: { totalDiagnostics: 0, files: [] },
+      }
+    }
+    if (
+      prepared.failedTargets.length > 0 ||
+      prepared.validTargets.length === 0
+    ) {
+      const details = prepared.failedTargets
+        .map((target) => `${target.relPath}: ${target.error}`)
+        .join("; ")
+      const message = details || "no valid target files"
+      return {
+        status: "error",
+        message,
+        content: `[read_lints error] ${message}`,
+        diagnostics: { totalDiagnostics: 0, files: [] },
+      }
+    }
+
+    try {
+      const diagnostics = await this.collectDiagnostics(prepared.validTargets)
+      return {
+        status: "success",
+        content: this.formatReadLintsContent(diagnostics),
+        diagnostics,
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        status: "error",
+        message,
+        content: `[read_lints error] ${message}`,
+        diagnostics: { totalDiagnostics: 0, files: [] },
+      }
+    }
+  }
+
   async executeFixLints(
-    rootPath: string,
+    workspaceScope: WorkspaceScope,
     input: Record<string, unknown>
   ): Promise<ClientSideFixLintsExecutionResult> {
-    const resolvedRoot = path.resolve(rootPath)
-    const requestedPaths = this.pickRequestedPaths(input)
-    if (requestedPaths.length === 0) {
+    const prepared = this.prepareLintTargets(workspaceScope, input)
+    if (prepared.requestedPaths.length === 0) {
       return {
         status: "error",
         message: "missing paths",
@@ -82,24 +161,7 @@ export class ClientSideToolV2ExecutorService {
       }
     }
 
-    const resolvedTargets = this.resolveTargetFiles(
-      resolvedRoot,
-      requestedPaths
-    )
-    const validTargets = resolvedTargets.filter(
-      (entry): entry is { kind: "ok"; absPath: string; relPath: string } =>
-        entry.kind === "ok"
-    )
-    const failedTargets = resolvedTargets.filter(
-      (
-        entry
-      ): entry is {
-        kind: "error"
-        absPath: string
-        relPath: string
-        error: string
-      } => entry.kind !== "ok"
-    )
+    const { validTargets, failedTargets } = prepared
 
     if (validTargets.length === 0) {
       const fileResults = failedTargets.map((entry) => ({
@@ -135,10 +197,7 @@ export class ClientSideToolV2ExecutorService {
       )
     }
 
-    const beforeDiagnostics = await this.collectDiagnostics(
-      resolvedRoot,
-      validTargets.map((entry) => entry.absPath)
-    )
+    const beforeDiagnostics = await this.collectDiagnostics(validTargets)
     const beforeDiagnosticsByFile = new Map(
       beforeDiagnostics.files.map((entry) => [
         entry.path,
@@ -148,12 +207,11 @@ export class ClientSideToolV2ExecutorService {
 
     const fixCommand =
       "npx eslint --fix --format json --no-error-on-unmatched-pattern <paths...>"
-    const fixRun = await this.runEslint(resolvedRoot, [
+    const fixRun = await this.runEslintForTargets(validTargets, [
       "--fix",
       "--format",
       "json",
       "--no-error-on-unmatched-pattern",
-      ...validTargets.map((entry) => entry.absPath),
     ])
 
     const afterContents = new Map<string, string>()
@@ -164,10 +222,7 @@ export class ClientSideToolV2ExecutorService {
       )
     }
 
-    const afterDiagnostics = await this.collectDiagnostics(
-      resolvedRoot,
-      validTargets.map((entry) => entry.absPath)
-    )
+    const afterDiagnostics = await this.collectDiagnostics(validTargets)
     const afterDiagnosticsByFile = new Map(
       afterDiagnostics.files.map((entry) => [
         entry.path,
@@ -259,74 +314,101 @@ export class ClientSideToolV2ExecutorService {
     const out: string[] = []
     for (const entry of raw) {
       if (typeof entry !== "string") continue
-      const normalized = entry.trim()
-      if (!normalized || seen.has(normalized)) continue
-      seen.add(normalized)
-      out.push(normalized)
+      // A filesystem path is not an identifier. In particular, a trailing
+      // space can name a distinct POSIX file, so this boundary must hand the
+      // exact raw value to WorkspaceScope rather than quietly repairing it.
+      // WorkspaceScope.resolveTarget owns the empty/NUL and containment
+      // checks for every accepted path.
+      if (seen.has(entry)) continue
+      seen.add(entry)
+      out.push(entry)
     }
     return out
+  }
+
+  private prepareLintTargets(
+    workspaceScope: WorkspaceScope,
+    input: Record<string, unknown>
+  ): PreparedLintTargets {
+    const requestedPaths = this.pickRequestedPaths(input)
+    const resolvedTargets = this.resolveTargetFiles(
+      workspaceScope,
+      requestedPaths
+    )
+    return {
+      requestedPaths,
+      validTargets: resolvedTargets.filter(
+        (entry): entry is ValidLintTarget => entry.kind === "ok"
+      ),
+      failedTargets: resolvedTargets.filter(
+        (entry): entry is FailedLintTarget => entry.kind === "error"
+      ),
+    }
   }
 
   private resolveTargetFiles(
-    rootPath: string,
+    workspaceScope: WorkspaceScope,
     requestedPaths: string[]
-  ): Array<
-    | { kind: "ok"; absPath: string; relPath: string }
-    | { kind: "error"; absPath: string; relPath: string; error: string }
-  > {
-    const normalizedRoot = path.resolve(rootPath)
+  ): ResolvedLintTarget[] {
     const seen = new Set<string>()
-    const out: Array<
-      | { kind: "ok"; absPath: string; relPath: string }
-      | { kind: "error"; absPath: string; relPath: string; error: string }
-    > = []
+    const out: ResolvedLintTarget[] = []
     for (const rawPath of requestedPaths) {
-      const candidate = path.isAbsolute(rawPath)
-        ? path.resolve(rawPath)
-        : path.resolve(normalizedRoot, rawPath)
-      if (seen.has(candidate)) continue
-      seen.add(candidate)
-
-      const rel = path.relative(normalizedRoot, candidate)
-      const relPath = rel || path.basename(candidate)
-      const isWithinRoot =
-        candidate === normalizedRoot ||
-        (!rel.startsWith("..") && !path.isAbsolute(rel))
-      if (!isWithinRoot) {
+      try {
+        const target = workspaceScope.resolveTarget(rawPath)
+        if (seen.has(target.absolutePath)) continue
+        seen.add(target.absolutePath)
+        out.push({
+          kind: "ok",
+          absPath: target.absolutePath,
+          relPath: this.displayLintTargetPath(workspaceScope, target),
+          rootPath: target.root.path,
+        })
+      } catch (error) {
+        const message =
+          error instanceof WorkspaceScopeError
+            ? error.message
+            : "path is outside workspace scope"
         out.push({
           kind: "error",
-          absPath: candidate,
-          relPath,
-          error: "path is outside workspace root",
+          absPath: rawPath,
+          relPath: rawPath,
+          error: message,
         })
         continue
       }
-      out.push({ kind: "ok", absPath: candidate, relPath })
     }
     return out
   }
 
+  private displayLintTargetPath(
+    workspaceScope: WorkspaceScope,
+    target: WorkspaceTarget
+  ): string {
+    if (target.root.path !== workspaceScope.primaryRoot) {
+      return target.absolutePath
+    }
+    return target.relativePath || path.basename(target.absolutePath)
+  }
+
   private async collectDiagnostics(
-    rootPath: string,
-    absPaths: string[]
+    targets: readonly ValidLintTarget[]
   ): Promise<{ totalDiagnostics: number; files: LintFileDiagnostics[] }> {
-    const eslintByFile = await this.collectEslintDiagnostics(rootPath, absPaths)
+    const eslintByFile = await this.collectEslintDiagnostics(targets)
     const files: LintFileDiagnostics[] = []
     let totalDiagnostics = 0
 
-    for (const absPath of absPaths) {
-      const content = await fs.readFile(absPath, "utf8")
+    for (const target of targets) {
+      const content = await fs.readFile(target.absPath, "utf8")
       const tsDiagnostics = await this.collectTypeScriptSyntaxDiagnostics(
-        absPath,
+        target.absPath,
         content
       )
-      const eslintDiagnostics = eslintByFile.get(absPath) || []
+      const eslintDiagnostics = eslintByFile.get(target.absPath) || []
       const diagnostics = [...tsDiagnostics, ...eslintDiagnostics]
       totalDiagnostics += diagnostics.length
       files.push({
-        path: absPath,
-        relativePath:
-          path.relative(rootPath, absPath) || path.basename(absPath),
+        path: target.absPath,
+        relativePath: target.relPath,
         diagnostics,
         diagnosticsCount: diagnostics.length,
       })
@@ -335,27 +417,94 @@ export class ClientSideToolV2ExecutorService {
     return { totalDiagnostics, files }
   }
 
+  private formatReadLintsContent(diagnostics: {
+    totalDiagnostics: number
+    files: LintFileDiagnostics[]
+  }): string {
+    const maxRenderedDiagnostics = 240
+    let remaining = maxRenderedDiagnostics
+    const lines = [
+      `[read_lints success] files=${diagnostics.files.length} diagnostics=${diagnostics.totalDiagnostics}`,
+    ]
+
+    for (const file of diagnostics.files) {
+      lines.push(
+        `\n${file.relativePath}: ${file.diagnosticsCount} diagnostic(s)`
+      )
+      const rendered = file.diagnostics.slice(0, remaining)
+      for (const diagnostic of rendered) {
+        const line = diagnostic.range?.start?.line
+        const column = diagnostic.range?.start?.column
+        const location =
+          typeof line === "number" && typeof column === "number"
+            ? `:${line + 1}:${column + 1}`
+            : ""
+        const code = diagnostic.code ? `/${diagnostic.code}` : ""
+        lines.push(
+          `- ${file.relativePath}${location} [${diagnostic.source}${code}] ${diagnostic.message}`
+        )
+      }
+      remaining -= rendered.length
+      if (file.diagnostics.length > rendered.length) {
+        lines.push(
+          `- [${file.diagnostics.length - rendered.length} more diagnostic(s) retained in the structured result]`
+        )
+      }
+    }
+
+    const omitted = Math.max(
+      0,
+      diagnostics.totalDiagnostics - maxRenderedDiagnostics
+    )
+    if (omitted > 0) {
+      lines.push(
+        `\n[${omitted} additional diagnostic(s) retained in the structured result]`
+      )
+    }
+    return lines.join("\n")
+  }
+
   private async collectEslintDiagnostics(
-    rootPath: string,
-    absPaths: string[]
+    targets: readonly ValidLintTarget[]
   ): Promise<Map<string, LintDiagnostic[]>> {
     const out = new Map<string, LintDiagnostic[]>()
-    if (absPaths.length === 0) return out
+    if (targets.length === 0) return out
+    const grouped = this.groupLintTargetsByRoot(targets)
+    const collected = await Promise.all(
+      Array.from(grouped.entries()).map(async ([rootPath, rootTargets]) =>
+        this.collectEslintDiagnosticsForRoot(rootPath, rootTargets)
+      )
+    )
+    for (const entries of collected) {
+      for (const [filePath, diagnostics] of entries) {
+        out.set(filePath, diagnostics)
+      }
+    }
+    return out
+  }
+
+  private async collectEslintDiagnosticsForRoot(
+    rootPath: string,
+    targets: readonly ValidLintTarget[]
+  ): Promise<Map<string, LintDiagnostic[]>> {
+    const out = new Map<string, LintDiagnostic[]>()
+    const targetPaths = new Set(targets.map((target) => target.absPath))
     const result = await this.runEslint(rootPath, [
       "--format",
       "json",
       "--no-error-on-unmatched-pattern",
-      ...absPaths,
+      ...targetPaths,
     ])
-
     const parsed = this.parseEslintJson(result.stdout)
     if (!parsed) return out
 
     for (const entry of parsed) {
       const filePathRaw = this.coerceScalarString(entry.filePath)
       if (!filePathRaw) continue
-      const filePath = path.resolve(filePathRaw)
-      if (!filePath) continue
+      const filePath = path.isAbsolute(filePathRaw)
+        ? path.normalize(filePathRaw)
+        : path.resolve(rootPath, filePathRaw)
+      if (!targetPaths.has(filePath)) continue
       const diagnostics: LintDiagnostic[] = []
       const messages = Array.isArray(entry.messages) ? entry.messages : []
       for (const message of messages) {
@@ -390,6 +539,18 @@ export class ClientSideToolV2ExecutorService {
     }
 
     return out
+  }
+
+  private groupLintTargetsByRoot(
+    targets: readonly ValidLintTarget[]
+  ): ReadonlyMap<string, readonly ValidLintTarget[]> {
+    const grouped = new Map<string, ValidLintTarget[]>()
+    for (const target of targets) {
+      const rootTargets = grouped.get(target.rootPath) ?? []
+      rootTargets.push(target)
+      grouped.set(target.rootPath, rootTargets)
+    }
+    return grouped
   }
 
   private normalizeOneBasedPosition(
@@ -462,6 +623,39 @@ export class ClientSideToolV2ExecutorService {
         `TypeScript diagnostics unavailable for ${absPath}: ${String(error)}`
       )
       return []
+    }
+  }
+
+  private async runEslintForTargets(
+    targets: readonly ValidLintTarget[],
+    args: readonly string[]
+  ): Promise<{
+    stdout: string
+    stderr: string
+    fatalError?: string
+  }> {
+    const grouped = this.groupLintTargetsByRoot(targets)
+    const runs = await Promise.all(
+      Array.from(grouped.entries()).map(async ([rootPath, rootTargets]) =>
+        this.runEslint(rootPath, [
+          ...args,
+          ...rootTargets.map((target) => target.absPath),
+        ])
+      )
+    )
+    const fatalErrors = runs
+      .map((run) => run.fatalError)
+      .filter((error): error is string => Boolean(error))
+    return {
+      stdout: runs
+        .map((run) => run.stdout)
+        .filter(Boolean)
+        .join("\n"),
+      stderr: runs
+        .map((run) => run.stderr)
+        .filter(Boolean)
+        .join("\n"),
+      ...(fatalErrors.length > 0 ? { fatalError: fatalErrors.join("; ") } : {}),
     }
   }
 

@@ -3,6 +3,39 @@ package agent.v1;
 
 import "google/protobuf/value.proto";
 
+enum AgentHostBackgroundWorkKind {
+  AGENT_HOST_BACKGROUND_WORK_KIND_UNSPECIFIED = 0;
+  AGENT_HOST_BACKGROUND_WORK_KIND_SHELL = 1;
+  AGENT_HOST_BACKGROUND_WORK_KIND_SUBAGENT = 2;
+}
+
+enum AgentHostBackgroundWorkState {
+  AGENT_HOST_BACKGROUND_WORK_STATE_UNSPECIFIED = 0;
+  AGENT_HOST_BACKGROUND_WORK_STATE_RUNNING = 1;
+  AGENT_HOST_BACKGROUND_WORK_STATE_QUEUED = 2;
+}
+
+enum AgentHostInteractionResponseStatus {
+  AGENT_HOST_INTERACTION_RESPONSE_STATUS_UNSPECIFIED = 0;
+  AGENT_HOST_INTERACTION_RESPONSE_STATUS_ACCEPTED = 1;
+  AGENT_HOST_INTERACTION_RESPONSE_STATUS_ALREADY_RESOLVED = 2;
+  AGENT_HOST_INTERACTION_RESPONSE_STATUS_NOT_FOUND = 3;
+}
+
+enum AgentHostSessionStatus {
+  AGENT_HOST_SESSION_STATUS_UNSPECIFIED = 0;
+  AGENT_HOST_SESSION_STATUS_IDLE = 1;
+  AGENT_HOST_SESSION_STATUS_RUNNING = 2;
+  AGENT_HOST_SESSION_STATUS_AWAITING_INPUT = 3;
+}
+
+enum AgentHostTurnOutcome {
+  AGENT_HOST_TURN_OUTCOME_UNSPECIFIED = 0;
+  AGENT_HOST_TURN_OUTCOME_COMPLETED = 1;
+  AGENT_HOST_TURN_OUTCOME_INTERRUPTED = 2;
+  AGENT_HOST_TURN_OUTCOME_FAILED = 3;
+}
+
 enum AgentMode {
   AGENT_MODE_UNSPECIFIED = 0;
   AGENT_MODE_AGENT = 1;
@@ -12,37 +45,7 @@ enum AgentMode {
   AGENT_MODE_TRIAGE = 5;
   AGENT_MODE_PROJECT = 6;
   AGENT_MODE_MULTITASK = 7;
-}
-
-enum ArtifactPathErrorKind {
-  ARTIFACT_PATH_ERROR_KIND_UNSPECIFIED = 0;
-  ARTIFACT_PATH_ERROR_KIND_MISSING = 1;
-  ARTIFACT_PATH_ERROR_KIND_PERMISSION = 2;
-  ARTIFACT_PATH_ERROR_KIND_NOT_A_FILE = 3;
-  ARTIFACT_PATH_ERROR_KIND_INVALID_PATH = 4;
-  ARTIFACT_PATH_ERROR_KIND_UNKNOWN = 5;
-}
-
-enum ArtifactRestoreStatus {
-  ARTIFACT_RESTORE_STATUS_UNSPECIFIED = 0;
-  ARTIFACT_RESTORE_STATUS_RESTORED = 1;
-  ARTIFACT_RESTORE_STATUS_SKIPPED_ALREADY_EXISTS = 2;
-  ARTIFACT_RESTORE_STATUS_REJECTED = 3;
-}
-
-enum ArtifactUploadDispatchStatus {
-  ARTIFACT_UPLOAD_DISPATCH_STATUS_UNSPECIFIED = 0;
-  ARTIFACT_UPLOAD_DISPATCH_STATUS_ACCEPTED = 1;
-  ARTIFACT_UPLOAD_DISPATCH_STATUS_REJECTED = 2;
-  ARTIFACT_UPLOAD_DISPATCH_STATUS_SKIPPED_ALREADY_IN_PROGRESS = 3;
-}
-
-enum ArtifactUploadStatus {
-  ARTIFACT_UPLOAD_STATUS_UNSPECIFIED = 0;
-  ARTIFACT_UPLOAD_STATUS_NOT_STARTED = 1;
-  ARTIFACT_UPLOAD_STATUS_IN_PROGRESS = 2;
-  ARTIFACT_UPLOAD_STATUS_COMPLETED = 3;
-  ARTIFACT_UPLOAD_STATUS_FAILED = 4;
+  AGENT_MODE_CUSTOM = 8;
 }
 
 enum BackgroundTaskCompletionReason {
@@ -57,20 +60,16 @@ enum BackgroundTaskKind {
   BACKGROUND_TASK_KIND_SUBAGENT = 2;
 }
 
+enum BackgroundTaskNotificationContext {
+  BACKGROUND_TASK_NOTIFICATION_CONTEXT_UNSPECIFIED = 0;
+  BACKGROUND_TASK_NOTIFICATION_CONTEXT_USER_DRIVEN_INTERACTIVE_CHILD = 1;
+}
+
 enum BackgroundTaskStatus {
   BACKGROUND_TASK_STATUS_UNSPECIFIED = 0;
   BACKGROUND_TASK_STATUS_SUCCESS = 1;
   BACKGROUND_TASK_STATUS_ERROR = 2;
   BACKGROUND_TASK_STATUS_ABORTED = 3;
-}
-
-enum BatchGetDiffErrorKind {
-  BATCH_GET_DIFF_ERROR_KIND_UNSPECIFIED = 0;
-  BATCH_GET_DIFF_ERROR_KIND_FETCH_FAILED = 1;
-  BATCH_GET_DIFF_ERROR_KIND_DIFF_FAILED = 2;
-  BATCH_GET_DIFF_ERROR_KIND_UNAUTHENTICATED = 3;
-  BATCH_GET_DIFF_ERROR_KIND_NOT_FOUND = 4;
-  BATCH_GET_DIFF_ERROR_KIND_INTERNAL = 5;
 }
 
 enum BugfixVerdict {
@@ -88,6 +87,12 @@ enum ClickType {
   CLICK_TYPE_TRIPLE = 3;
   CLICK_TYPE_RIGHT = 4;
   CLICK_TYPE_MIDDLE = 5;
+}
+
+enum ConversationSearchSource {
+  CONVERSATION_SEARCH_SOURCE_UNSPECIFIED = 0;
+  CONVERSATION_SEARCH_SOURCE_LOCAL = 1;
+  CONVERSATION_SEARCH_SOURCE_CLOUD_CACHE = 2;
 }
 
 enum CursorRuleSource {
@@ -113,6 +118,14 @@ enum CursorType {
   CURSOR_TYPE_GRABBING = 13;
 }
 
+enum CustomModeSource {
+  CUSTOM_MODE_SOURCE_UNSPECIFIED = 0;
+  CUSTOM_MODE_SOURCE_AGENT_SKILL = 1;
+  CUSTOM_MODE_SOURCE_PLUGIN_SKILL = 2;
+  CUSTOM_MODE_SOURCE_REPO_SKILL = 3;
+  CUSTOM_MODE_SOURCE_MANAGED_SKILL = 4;
+}
+
 enum CustomSubagentPermissionMode {
   CUSTOM_SUBAGENT_PERMISSION_MODE_UNSPECIFIED = 0;
   CUSTOM_SUBAGENT_PERMISSION_MODE_DEFAULT = 1;
@@ -128,13 +141,6 @@ enum DiagnosticSeverity {
   DIAGNOSTIC_SEVERITY_HINT = 4;
 }
 
-enum EntryType {
-  ENTRY_TYPE_UNSPECIFIED = 0;
-  ENTRY_TYPE_FILE = 1;
-  ENTRY_TYPE_DIRECTORY = 2;
-  ENTRY_TYPE_SYMLINK = 3;
-}
-
 enum ForceBackgroundShellStatus {
   FORCE_BACKGROUND_SHELL_STATUS_UNSPECIFIED = 0;
   FORCE_BACKGROUND_SHELL_STATUS_ACCEPTED = 1;
@@ -145,6 +151,14 @@ enum ForceBackgroundSubagentStatus {
   FORCE_BACKGROUND_SUBAGENT_STATUS_UNSPECIFIED = 0;
   FORCE_BACKGROUND_SUBAGENT_STATUS_ACCEPTED = 1;
   FORCE_BACKGROUND_SUBAGENT_STATUS_NOT_FOUND = 2;
+}
+
+enum GoalStatus {
+  GOAL_STATUS_UNSPECIFIED = 0;
+  GOAL_STATUS_ACTIVE = 1;
+  GOAL_STATUS_PAUSED = 2;
+  GOAL_STATUS_COMPLETE = 3;
+  GOAL_STATUS_CLEARED = 4;
 }
 
 enum IdleClassification {
@@ -162,12 +176,27 @@ enum KeystrokeEventType {
   KEYSTROKE_EVENT_TYPE_TEXT_TYPED = 3;
 }
 
+enum LocalPromptQualityInvocationStatus {
+  LOCAL_PROMPT_QUALITY_INVOCATION_STATUS_UNSPECIFIED = 0;
+  LOCAL_PROMPT_QUALITY_INVOCATION_STATUS_SUCCESS = 1;
+  LOCAL_PROMPT_QUALITY_INVOCATION_STATUS_ERRORED = 2;
+  LOCAL_PROMPT_QUALITY_INVOCATION_STATUS_ABORTED = 3;
+}
+
 enum MotionStyle {
   MOTION_STYLE_UNSPECIFIED = 0;
   MOTION_STYLE_SLOW = 1;
   MOTION_STYLE_MELLOW = 2;
   MOTION_STYLE_QUICK = 3;
   MOTION_STYLE_RAPID = 4;
+}
+
+enum MountedAgentStoreKind {
+  MOUNTED_AGENT_STORE_KIND_UNSPECIFIED = 0;
+  MOUNTED_AGENT_STORE_KIND_SELF = 1;
+  MOUNTED_AGENT_STORE_KIND_PEER = 2;
+  MOUNTED_AGENT_STORE_KIND_SHARE = 3;
+  MOUNTED_AGENT_STORE_KIND_PRINCIPAL = 4;
 }
 
 enum MouseButton {
@@ -187,11 +216,10 @@ enum PackageType {
   PACKAGE_TYPE_CLAUDE_PLUGIN = 4;
 }
 
-enum PrivateWorkerStatus {
-  PRIVATE_WORKER_STATUS_UNSPECIFIED = 0;
-  PRIVATE_WORKER_STATUS_DISCONNECTED = 1;
-  PRIVATE_WORKER_STATUS_READY = 2;
-  PRIVATE_WORKER_STATUS_CLAIMED = 3;
+enum PullRequestStatus {
+  PULL_REQUEST_STATUS_UNSPECIFIED = 0;
+  PULL_REQUEST_STATUS_OPEN = 1;
+  PULL_REQUEST_STATUS_CLOSED = 2;
 }
 
 enum RecordingMode {
@@ -211,6 +239,20 @@ enum ReplaceEnvMode {
 enum RequestedFilePathRejectedReason {
   REQUESTED_FILE_PATH_REJECTED_REASON_UNSPECIFIED = 0;
   REQUESTED_FILE_PATH_REJECTED_REASON_SLASHES_NOT_ALLOWED = 1;
+}
+
+enum ResponseComparisonDisplayOrder {
+  RESPONSE_COMPARISON_DISPLAY_ORDER_UNSPECIFIED = 0;
+  RESPONSE_COMPARISON_DISPLAY_ORDER_PARENT_FIRST = 1;
+  RESPONSE_COMPARISON_DISPLAY_ORDER_ALTERNATE_FIRST = 2;
+}
+
+enum ResponseComparisonSkipReason {
+  RESPONSE_COMPARISON_SKIP_REASON_UNSPECIFIED = 0;
+  RESPONSE_COMPARISON_SKIP_REASON_ALTERNATE_TOOL_CALL = 1;
+  RESPONSE_COMPARISON_SKIP_REASON_INFERENCE_ERROR = 2;
+  RESPONSE_COMPARISON_SKIP_REASON_TIMEOUT = 3;
+  RESPONSE_COMPARISON_SKIP_REASON_CANCELLED = 4;
 }
 
 enum ScrollDirection {
@@ -269,6 +311,10 @@ enum SimulatedMsgReason {
   SIMULATED_MSG_REASON_FSD_START = 26;
   SIMULATED_MSG_REASON_FSD_PR_INTERRUPT = 27;
   SIMULATED_MSG_REASON_SUBSCRIPTION = 28;
+  SIMULATED_MSG_REASON_DIFF_TAB_CREATE_BRANCH = 29;
+  SIMULATED_MSG_REASON_AGENT_STORE_CONFLICT = 30;
+  SIMULATED_MSG_REASON_GOAL_CONTINUATION = 31;
+  SIMULATED_MSG_REASON_PROJECT_KICKOFF = 32;
 }
 
 enum SmartModeClassifierDecision {
@@ -290,6 +336,13 @@ enum SubagentExecutionEnvironment {
   SUBAGENT_EXECUTION_ENVIRONMENT_CLOUD = 2;
 }
 
+enum SubagentInteractionPolicy {
+  SUBAGENT_INTERACTION_POLICY_UNSPECIFIED = 0;
+  SUBAGENT_INTERACTION_POLICY_AUTO_REJECT = 1;
+  SUBAGENT_INTERACTION_POLICY_BUBBLE_TO_PARENT = 2;
+  SUBAGENT_INTERACTION_POLICY_SURFACE_TO_USER = 3;
+}
+
 enum SubagentRunStatus {
   SUBAGENT_RUN_STATUS_UNSPECIFIED = 0;
   SUBAGENT_RUN_STATUS_RUNNING = 1;
@@ -303,6 +356,7 @@ enum SubscriptionSource {
   SUBSCRIPTION_SOURCE_UNSPECIFIED = 0;
   SUBSCRIPTION_SOURCE_SLACK = 1;
   SUBSCRIPTION_SOURCE_GITHUB = 2;
+  SUBSCRIPTION_SOURCE_LINEAR = 3;
 }
 
 enum TaskMode {
@@ -324,19 +378,32 @@ enum TimeoutBehavior {
   TIMEOUT_BEHAVIOR_BACKGROUND = 2;
 }
 
-enum TmuxSessionKind {
-  TMUX_SESSION_KIND_UNSPECIFIED = 0;
-  TMUX_SESSION_KIND_USER_MANUAL = 1;
-  TMUX_SESSION_KIND_AGENT_BACKGROUND = 2;
-  TMUX_SESSION_KIND_AGENT_INTERACTIVE = 3;
-}
-
 enum TodoStatus {
   TODO_STATUS_UNSPECIFIED = 0;
   TODO_STATUS_PENDING = 1;
   TODO_STATUS_IN_PROGRESS = 2;
   TODO_STATUS_COMPLETED = 3;
   TODO_STATUS_CANCELLED = 4;
+}
+
+message AbortAgentHostBackgroundWorkRequest {
+  string session_id = 1;
+  string work_id = 2;
+}
+
+message AbortAgentHostBackgroundWorkResponse {
+  bool aborted = 1;
+}
+
+message AbortAllAgentHostBackgroundWorkRequest {
+  string session_id = 1;
+  optional AgentHostBackgroundWorkKind kind = 2;
+  optional AgentHostBackgroundWorkState state = 3;
+  optional string owner_id = 4;
+}
+
+message AbortAllAgentHostBackgroundWorkResponse {
+  uint32 aborted_count = 1;
 }
 
 message AbortArgs {
@@ -348,6 +415,35 @@ message AbortResult {
 message ActiveBranchChange {
   string path = 1;
   string branch_name = 2;
+}
+
+message AfterAgentResponseRequestQuery {
+  string text = 1;
+  optional string conversation_id = 2;
+  optional string generation_id = 3;
+  optional string model = 4;
+  optional string model_id = 5;
+  repeated RequestedModel.ModelParameterValue model_params = 6;
+  optional int64 input_tokens = 7;
+  optional int64 output_tokens = 8;
+  optional int64 cache_read_tokens = 9;
+  optional int64 cache_write_tokens = 10;
+}
+
+message AfterAgentResponseRequestResponse {
+}
+
+message AfterAgentThoughtRequestQuery {
+  string text = 1;
+  optional int64 duration_ms = 2;
+  optional string conversation_id = 3;
+  optional string generation_id = 4;
+  optional string model = 5;
+  optional string model_id = 6;
+  repeated RequestedModel.ModelParameterValue model_params = 7;
+}
+
+message AfterAgentThoughtRequestResponse {
 }
 
 message AgentClientMessage {
@@ -374,6 +470,135 @@ message AgentConversationTurnStructure {
   repeated bytes steps = 2;
   optional string request_id = 3;
   optional string encrypted_model = 4;
+  optional uint32 dynamic_tool_count = 5;
+  repeated uint32 send_message_step_indices = 6;
+}
+
+message AgentHostBackgroundWork {
+  string id = 1;
+  AgentHostBackgroundWorkKind kind = 2;
+  AgentHostBackgroundWorkState state = 3;
+  optional string owner_id = 4;
+  bool has_abort = 5;
+  map<string, string> metadata = 6;
+}
+
+message AgentHostInteractionCancelled {
+  optional string reason = 1;
+}
+
+message AgentHostInteractionFailed {
+  string error = 1;
+}
+
+message AgentHostInteractionResolved {
+  oneof resolution {
+    InteractionResponse responded = 3;
+    AgentHostInteractionCancelled cancelled = 4;
+    AgentHostInteractionFailed failed = 5;
+  }
+  string turn_id = 1;
+  string interaction_id = 2;
+}
+
+message AgentHostPendingInteraction {
+  string interaction_id = 1;
+  string turn_id = 2;
+  InteractionQuery query = 3;
+}
+
+message AgentHostSession {
+  string session_id = 1;
+  AgentHostSessionStatus status = 2;
+  uint64 last_event_id = 3;
+  optional string forked_from_session_id = 4;
+  optional SessionParent parent = 5;
+}
+
+message AgentHostSessionAdded {
+  AgentHostSession session = 1;
+}
+
+message AgentHostSessionBackgroundWorkSnapshot {
+  repeated AgentHostBackgroundWork work = 1;
+}
+
+message AgentHostSessionBackgroundWorkState {
+  repeated AgentHostBackgroundWork work = 1;
+}
+
+message AgentHostSessionDeleted {
+  string session_id = 1;
+}
+
+message AgentHostSessionEvent {
+  oneof event {
+    InteractionUpdate interaction_update = 2;
+    ConversationStateStructure conversation_state = 3;
+    AgentHostTurnStarted turn_started = 4;
+    AgentHostTurnAwaitingInput turn_awaiting_input = 8;
+    AgentHostTurnSettled turn_settled = 9;
+    AgentHostInteractionResolved interaction_resolved = 10;
+    AgentHostSubagentStarted subagent_started = 11;
+  }
+  uint64 event_id = 1;
+}
+
+message AgentHostSessionInteractionsSnapshot {
+  repeated AgentHostPendingInteraction interactions = 1;
+}
+
+message AgentHostSessionInteractionsState {
+  repeated AgentHostPendingInteraction interactions = 1;
+}
+
+message AgentHostSessionOptions {
+  repeated string workspace_paths = 1;
+  optional string worktree_main_path = 2;
+  optional bool is_glass_root = 3;
+  optional SubagentInteractionPolicy interaction_policy = 4;
+}
+
+message AgentHostSessionsSnapshot {
+  repeated AgentHostSession sessions = 1;
+}
+
+message AgentHostSessionUpdated {
+  AgentHostSession session = 1;
+}
+
+message AgentHostSubagentStarted {
+  string turn_id = 1;
+  string parent_tool_call_id = 2;
+  string child_session_id = 3;
+  string root_session_id = 4;
+}
+
+message AgentHostTurnAwaitingInput {
+  string turn_id = 1;
+  string request_id = 2;
+  string interaction_id = 3;
+  InteractionQuery query = 4;
+}
+
+message AgentHostTurnOptions {
+  optional string generation_uuid = 1;
+  optional string custom_system_prompt = 2;
+  optional bool exclude_workspace_context = 3;
+  optional bool enable_agent_retries = 4;
+  optional uint32 fixed_retry_delay_ms = 5;
+  optional bool endless_retries = 6;
+  optional string agent_session_id = 7;
+}
+
+message AgentHostTurnSettled {
+  string turn_id = 1;
+  AgentHostTurnOutcome outcome = 2;
+  optional string detail = 3;
+}
+
+message AgentHostTurnStarted {
+  string turn_id = 1;
 }
 
 message AgentRunRequest {
@@ -400,6 +625,10 @@ message AgentRunRequest {
   optional bool can_create_cloud_subagents = 21;
   optional bool suppress_subagent_progress_update_tool = 22;
   optional bool client_supports_send_to_user = 23;
+  optional string computer_use_coordinate_mode = 24;
+  optional string run_id = 25;
+  optional string agent_session_id = 26;
+  optional bool client_supports_prompt_context_usage_rpc = 27;
 }
 
 message AgentServerMessage {
@@ -411,6 +640,7 @@ message AgentServerMessage {
     ExecServerControlMessage exec_server_control_message = 5;
     InteractionQuery interaction_query = 7;
   }
+  TtftBreakdown ttft_breakdown = 8;
 }
 
 message AgentSkill {
@@ -444,6 +674,49 @@ message AgentSkillMetadata {
   optional string marketplace_id = 11;
   repeated string globs = 12;
   repeated string scoped_to = 13;
+}
+
+message AgentStoreConflictArgs {
+  optional AgentStoreConflictCursor cursor = 1;
+  optional bool advance = 2;
+}
+
+message AgentStoreConflictCursor {
+  string journal_epoch = 1;
+  uint64 seq = 2;
+  string last_event_id = 3;
+}
+
+message AgentStoreConflictError {
+  string error = 1;
+}
+
+message AgentStoreConflictEvent {
+  uint32 v = 1;
+  string event_id = 2;
+  string journal_epoch = 3;
+  uint64 seq = 4;
+  uint64 ts_ms = 5;
+  string kind = 6;
+  optional string store_id = 7;
+  optional string original_rel_path = 8;
+  optional string conflict_rel_path = 9;
+  optional string original_abs_path = 10;
+  optional string conflict_abs_path = 11;
+  optional uint64 preserved_bytes = 12;
+}
+
+message AgentStoreConflictResult {
+  oneof result {
+    AgentStoreConflictSuccess success = 1;
+    AgentStoreConflictError error = 2;
+  }
+}
+
+message AgentStoreConflictSuccess {
+  repeated AgentStoreConflictEvent events = 1;
+  AgentStoreConflictCursor next_cursor = 2;
+  bool gap = 3;
 }
 
 message AiAttributionArgs {
@@ -523,42 +796,6 @@ message ApplyAgentDiffToolCall {
   ApplyAgentDiffResult result = 2;
 }
 
-message ArtifactPathError {
-  ArtifactPathErrorKind kind = 1;
-  string code = 2;
-  string message = 3;
-}
-
-message ArtifactUploadDispatchResult {
-  string absolute_path = 1;
-  ArtifactUploadDispatchStatus status = 2;
-  string message = 3;
-  optional string slack_file_id = 4;
-}
-
-message ArtifactUploadInstruction {
-  string absolute_path = 1;
-  string upload_url = 2;
-  string method = 3;
-  map<string, string> headers = 4;
-  optional string content_type = 5;
-  optional string slack_upload_url = 6;
-  optional string slack_file_id = 7;
-}
-
-message ArtifactUploadMetadata {
-  string absolute_path = 1;
-  uint64 size_bytes = 2;
-  int64 updated_at_unix_ms = 3;
-  ArtifactUploadStatus status = 4;
-  uint64 bytes_uploaded = 5;
-  string last_error = 6;
-  uint32 upload_attempts = 7;
-  int64 last_started_at_unix_ms = 8;
-  int64 last_finished_at_unix_ms = 9;
-  string upload_id = 10;
-}
-
 message AskQuestionArgs {
   message Option {
     string id = 1;
@@ -632,20 +869,9 @@ message AsyncAskQuestionCompletionAction {
   AskQuestionResult result = 3;
 }
 
-message AttachPtyRequest {
-  string pty_id = 1;
-  optional string last_event_id = 2;
-}
-
-message AttachTmuxSessionRequest {
+message AttachAgentHostSessionRequest {
   string session_id = 1;
-  uint32 cols = 2;
-  uint32 rows = 3;
-}
-
-message AttachTmuxSessionResponse {
-  string pty_id = 1;
-  TmuxSession session = 2;
+  optional uint64 last_event_id = 2;
 }
 
 message AwaitArgs {
@@ -682,6 +908,7 @@ message AwaitTaskComplete {
   bool regex_requested = 5;
   optional string regex_match = 6;
   optional sint32 exit_code = 7;
+  optional string wake_reason = 8;
 }
 
 message AwaitTaskStillRunning {
@@ -691,6 +918,7 @@ message AwaitTaskStillRunning {
   uint64 output_length = 4;
   bool regex_requested = 5;
   optional string regex_match = 6;
+  optional string wake_reason = 7;
 }
 
 message AwaitToolCall {
@@ -722,6 +950,7 @@ message BackgroundShellSpawnArgs {
   optional ShellHookApprovalRequirement hook_approval_requirement = 11;
   bool skip_approval = 12;
   optional string conversation_id = 13;
+  repeated string admin_command_denylist = 14;
 }
 
 message BackgroundShellSpawnError {
@@ -736,6 +965,7 @@ message BackgroundShellSpawnResult {
     BackgroundShellSpawnError error = 2;
     ShellRejected rejected = 3;
     ShellPermissionDenied permission_denied = 4;
+    ShellSandboxUnsupported sandbox_unsupported = 5;
   }
 }
 
@@ -761,38 +991,11 @@ message BackgroundTaskCompletion {
   BackgroundTaskCompletionReason reason = 8;
   optional string subagent_id = 9;
   optional string tool_call_id = 10;
+  BackgroundTaskNotificationContext notification_context = 11;
 }
 
 message BackgroundTaskCompletionAction {
   repeated BackgroundTaskCompletion completions = 1;
-}
-
-message BatchGetDiffError {
-  BatchGetDiffErrorKind kind = 1;
-  string message = 2;
-}
-
-message BatchGetDiffItem {
-  PH_aiserver_v1_GetDiffRequest diff_request = 1;
-  repeated string fetch_branches = 2;
-}
-
-message BatchGetDiffRequest {
-  repeated BatchGetDiffItem items = 1;
-}
-
-message BatchGetDiffResponse {
-  repeated BatchGetDiffResult results = 1;
-}
-
-message BatchGetDiffResult {
-  oneof result {
-    PH_aiserver_v1_GetDiffResponse diff = 2;
-    BatchGetDiffError error = 3;
-  }
-  uint32 item_index = 1;
-  repeated string fetched_branches = 4;
-  repeated string failed_branches = 5;
 }
 
 message BedrockCredentials {
@@ -800,6 +1003,28 @@ message BedrockCredentials {
   string secret_key = 2;
   string region = 3;
   optional string session_token = 4;
+}
+
+message BeforeSubmitPromptAttachment {
+  string type = 1;
+  string file_path = 2;
+}
+
+message BeforeSubmitPromptRequestQuery {
+  string prompt = 1;
+  repeated BeforeSubmitPromptAttachment attachments = 2;
+  optional string composer_mode = 3;
+  optional string conversation_id = 4;
+  optional string generation_id = 5;
+  optional string model = 6;
+  optional string model_id = 7;
+  repeated RequestedModel.ModelParameterValue model_params = 8;
+}
+
+message BeforeSubmitPromptRequestResponse {
+  optional bool continue = 1;
+  optional string user_message = 2;
+  optional string additional_context = 3;
 }
 
 message BlameByFilePathArgs {
@@ -853,6 +1078,16 @@ message CancelAction {
   optional InterruptedPendingToolCallResolutions interrupted_pending_tool_call_resolutions = 3;
 }
 
+message CancelQueuedAgentHostTurnRequest {
+  string session_id = 1;
+  string turn_id = 2;
+  optional string reason = 3;
+}
+
+message CancelQueuedAgentHostTurnResponse {
+  bool cancelled = 1;
+}
+
 message CancelSubagentAction {
   string subagent_id = 1;
 }
@@ -879,12 +1114,6 @@ message CanvasDiagnosticsSuccess {
   repeated Diagnostic diagnostics = 2;
 }
 
-message ClaimWorkerRequest {
-  string http_mcp_config_json = 1;
-  string mcp_config_json = 2;
-  string bc_id = 3;
-}
-
 message ClickAction {
   optional Coordinate coordinate = 1;
   MouseButton button = 2;
@@ -896,7 +1125,7 @@ message ClickEffectKeyframe {
   int64 video_timestamp_ms = 1;
   int32 x = 2;
   int32 y = 3;
-  SubagentTypeCursorGuide click_type = 4;
+  ClickType click_type = 4;
   int32 action_index = 5;
   bool has_modifiers = 6;
 }
@@ -996,6 +1225,7 @@ message ComputerUseAction {
 message ComputerUseArgs {
   string tool_call_id = 1;
   repeated ComputerUseAction actions = 2;
+  optional string description = 3;
 }
 
 message ComputerUseError {
@@ -1028,6 +1258,104 @@ message ComputerUseToolCall {
   ComputerUseResult result = 2;
 }
 
+message ConnectScmArgs {
+  oneof target {
+    ConnectScmGithub github = 2;
+  }
+  string tool_call_id = 1;
+}
+
+message ConnectScmError {
+  string error = 1;
+}
+
+message ConnectScmGithub {
+  ConnectScmGithubRepository repository = 1;
+  optional string ghe_application = 2;
+}
+
+message ConnectScmGithubRepository {
+  string owner = 1;
+  string repo = 2;
+}
+
+message ConnectScmRejected {
+  string reason = 1;
+}
+
+message ConnectScmRequestQuery {
+  ConnectScmArgs args = 1;
+}
+
+message ConnectScmRequestResponse {
+  message Approved {
+  }
+
+  message Failed {
+    string error = 1;
+  }
+
+  message Rejected {
+    string reason = 1;
+  }
+
+  oneof result {
+    ConnectScmRequestResponse.Approved approved = 1;
+    ConnectScmRequestResponse.Rejected rejected = 2;
+    ConnectScmRequestResponse.Failed failed = 3;
+  }
+}
+
+message ConnectScmResult {
+  oneof result {
+    ConnectScmSuccess success = 1;
+    ConnectScmError error = 2;
+    ConnectScmRejected rejected = 3;
+  }
+}
+
+message ConnectScmSuccess {
+}
+
+message ConnectScmToolCall {
+  ConnectScmArgs args = 1;
+  ConnectScmResult result = 2;
+}
+
+message ContextInjectionCancelled {
+}
+
+message ContextInjectionDelivered {
+  int32 step = 1;
+  string delivery_batch_id = 2;
+  int64 delivered_at_ms = 3;
+}
+
+message ContextInjectionQueued {
+}
+
+message ContextInjectionQueuedForNextTurn {
+}
+
+message ContextInjectionRejected {
+  string reason = 1;
+}
+
+message ContextInjectionState {
+  oneof state {
+    ContextInjectionQueued queued = 1;
+    ContextInjectionDelivered delivered = 2;
+    ContextInjectionQueuedForNextTurn queued_for_next_turn = 3;
+    ContextInjectionCancelled cancelled = 4;
+    ContextInjectionRejected rejected = 5;
+  }
+}
+
+message ContextInjectionStateUpdate {
+  string injection_id = 1;
+  ContextInjectionState state = 2;
+}
+
 message ConversationAction {
   oneof action {
     UserMessageAction user_message_action = 1;
@@ -1042,9 +1370,13 @@ message ConversationAction {
     BackgroundTaskCompletionAction background_task_completion_action = 12;
     BackgroundShellAction background_shell_action = 13;
     BackgroundSubagentAction background_subagent_action = 14;
+    SubscriptionNotificationAction subscription_notification_action = 16;
+    GoalContinuationAction goal_continuation_action = 18;
+    InjectContextAction inject_context_action = 19;
   }
   optional string triggering_auth_id = 11;
   optional TriggeringUserInfo triggering_user_info = 15;
+  optional RequestContextPartReferences request_context_parts = 17;
 }
 
 message ConversationHistory {
@@ -1127,6 +1459,38 @@ message ConversationPlan {
   string plan = 1;
 }
 
+message ConversationSearchArgs {
+  string query = 1;
+  string tool_call_id = 2;
+  optional int32 limit = 3;
+}
+
+message ConversationSearchError {
+  string error = 1;
+}
+
+message ConversationSearchHit {
+  string conversation_id = 1;
+  string title = 2;
+  ConversationSearchSource source = 3;
+  int64 updated_at_ms = 4;
+  optional string snippet = 5;
+}
+
+message ConversationSearchResult {
+  oneof result {
+    ConversationSearchSuccess success = 1;
+    ConversationSearchError error = 2;
+  }
+}
+
+message ConversationSearchSuccess {
+  repeated ConversationSearchHit hits = 1;
+  bool truncated = 2;
+  bool partial = 3;
+  bool rebuilding = 4;
+}
+
 message ConversationState {
   repeated string root_prompt_messages_json = 1;
   repeated TodoItem todos = 3;
@@ -1175,6 +1539,9 @@ message ConversationStateStructure {
   optional string communicate_update_completed_subtitle = 28;
   map<string, CommunicateUpdateTurnState> communicate_update_states_by_parent_tool_call_id = 29;
   map<string, SubagentRunState> subagent_runs_by_parent_tool_call_id = 30;
+  map<string, bytes> subagent_state_refs = 31;
+  optional GoalState goal_state = 32;
+  optional bool is_root_project_conversation = 33;
 }
 
 message ConversationStep {
@@ -1201,6 +1568,7 @@ message ConversationTokenDetails {
   uint32 max_tokens = 2;
   optional PromptTokenBreakdownSnapshot breakdown = 3;
   optional PromptContextUsageTree prompt_context_usage_tree = 4;
+  optional bytes prompt_context_usage_snapshot_blob_id = 5;
 }
 
 message ConversationTurn {
@@ -1220,6 +1588,34 @@ message ConversationTurnStructure {
 message Coordinate {
   int32 x = 1;
   int32 y = 2;
+}
+
+message CreateAgentHostSessionRequest {
+  string session_id = 1;
+  optional ConversationStateStructure initial_history = 2;
+  optional AgentHostSessionOptions session_options = 3;
+}
+
+message CreateAgentHostSessionResponse {
+}
+
+message CreateGoalArgs {
+  string objective = 1;
+}
+
+message CreateGoalResult {
+  oneof result {
+    CreateGoalSuccess success = 1;
+    GoalError error = 2;
+  }
+}
+
+message CreateGoalSuccess {
+}
+
+message CreateGoalToolCall {
+  CreateGoalArgs args = 1;
+  CreateGoalResult result = 2;
 }
 
 message CreatePlanArgs {
@@ -1269,19 +1665,7 @@ message CreatePrAction {
   repeated string add_labels = 6;
   optional string repo_url = 7;
   optional bool skip_branch_prefix_check = 8;
-}
-
-message CreateTmuxSessionRequest {
-  optional string session_name = 1;
-  string display_name = 2;
-  TmuxSessionKind kind = 3;
-  optional Process process = 4;
-  string cwd = 5;
-  map<string, string> env = 6;
-}
-
-message CreateTmuxSessionResponse {
-  TmuxSession session = 1;
+  optional int64 stack_on_pr_number = 9;
 }
 
 message CreateTranscriptOverviewRequest {
@@ -1309,15 +1693,15 @@ message CursorPackagePrompt {
 }
 
 message CursorPath {
-  SubagentTypeCustom style = 1;
-  repeated LsDirectoryTreeNode.File keyframes = 2;
+  MotionStyle style = 1;
+  repeated CursorPathKeyframe keyframes = 2;
 }
 
 message CursorPathKeyframe {
   int64 video_timestamp_ms = 1;
   int32 x = 2;
   int32 y = 3;
-  SubagentTypeWatchVideo cursor_type = 4;
+  CursorType cursor_type = 4;
   float velocity = 5;
 }
 
@@ -1365,6 +1749,32 @@ message CursorRuleTypeGlobal {
 message CursorRuleTypeManuallyAttached {
 }
 
+message CustomModeDescriptor {
+  string id = 1;
+  string label = 2;
+  optional string description = 3;
+  optional string icon = 4;
+  optional string color = 5;
+  CustomModeSource source = 6;
+  optional string source_path = 7;
+  optional string source_hash = 8;
+  optional string managed_skill_id = 9;
+  optional string plugin_id = 10;
+  optional string plugin_snapshot_token = 11;
+}
+
+message CustomModeExitIntent {
+  AgentMode next_mode = 1;
+  SubmittedExitedCustomMode exited_mode = 2;
+}
+
+message CustomModeIntent {
+  oneof intent {
+    SubmittedCustomMode enter = 1;
+    CustomModeExitIntent exit = 2;
+  }
+}
+
 message CustomSubagent {
   string full_path = 1;
   string name = 2;
@@ -1394,21 +1804,28 @@ message DecisionInput {
   int32 video_width = 3;
   int32 video_height = 4;
   int32 action_count = 5;
-  repeated LsError zoom_candidates = 10;
-  repeated LsRejected idle_periods = 11;
-  repeated TerminalMetadata click_effects = 12;
-  repeated PH_aiserver_v1_ComposerCapabilityRequest_LoopOnTestsCapability keystroke_events = 13;
-  repeated LsTimeout cursor_paths = 20;
+  repeated ZoomCandidate zoom_candidates = 10;
+  repeated IdlePeriod idle_periods = 11;
+  repeated ClickEffectKeyframe click_effects = 12;
+  repeated KeystrokeEvent keystroke_events = 13;
+  repeated CursorPath cursor_paths = 20;
 }
 
 message DecisionOutput {
-  SubagentTypeCustom cursor_style = 1;
-  repeated PH_aiserver_v1_ComposerCapabilityRequest_ToolCallCapability selected_zooms = 2;
-  repeated MouseMoveAction selected_speedups = 3;
+  MotionStyle cursor_style = 1;
+  repeated ZoomSelection selected_zooms = 2;
+  repeated SpeedupSelection selected_speedups = 3;
   bool show_click_effects = 4;
   repeated int32 selected_click_effects = 5;
   bool show_keystrokes = 6;
-  repeated TypeAction cuts = 7;
+  repeated VideoCut cuts = 7;
+}
+
+message DeleteAgentHostSessionRequest {
+  string session_id = 1;
+}
+
+message DeleteAgentHostSessionResponse {
 }
 
 message DeleteArgs {
@@ -1531,25 +1948,10 @@ message DiagnosticsSuccess {
   int32 total_diagnostics = 3;
 }
 
-message DirectoryEntry {
-  string name = 1;
-  string path = 2;
-  EntryType type = 3;
-  uint64 size_bytes = 4;
-  int64 modified_at_unix_ms = 5;
-}
-
-message DownloadCursorServerRequest {
-  string commit = 1;
-}
-
-message DownloadCursorServerResponse {
-  bool already_downloaded = 1;
-}
-
 message DragAction {
   repeated Coordinate path = 1;
   MouseButton button = 2;
+  optional string modifier_keys = 3;
 }
 
 message EditArgs {
@@ -1641,9 +2043,6 @@ message EditWritePermissionDenied {
   bool is_readonly = 3;
 }
 
-message Empty {
-}
-
 message Error {
   string message = 1;
 }
@@ -1699,6 +2098,9 @@ message ExecClientMessage {
     PiGrepExecResult pi_grep_result = 50;
     PiFindExecResult pi_find_result = 51;
     PiLsExecResult pi_ls_result = 52;
+    ConversationSearchResult conversation_search_result = 53;
+    AgentStoreConflictResult agent_store_conflict_result = 54;
+    ShellResult mini_swe_agent_bash_result = 55;
   }
   uint32 id = 1;
   string exec_id = 15;
@@ -1715,21 +2117,6 @@ message ExecClientThrow {
   string error = 2;
   optional string stack_trace = 3;
   optional string error_code = 4;
-}
-
-message ExecRequest {
-  string command = 1;
-  optional string cwd = 2;
-  repeated string args = 3;
-  map<string, string> environment = 4;
-}
-
-message ExecResponse {
-  oneof event {
-    StdoutEvent stdout_event = 1;
-    StderrEvent stderr_event = 2;
-    ExitEvent exit_event = 3;
-  }
 }
 
 message ExecServerAbort {
@@ -1781,17 +2168,14 @@ message ExecServerMessage {
     PiGrepExecArgs pi_grep_args = 49;
     PiFindExecArgs pi_find_args = 50;
     PiLsExecArgs pi_ls_args = 51;
+    ShellArgs mini_swe_agent_bash_args = 52;
+    ConversationSearchArgs conversation_search_args = 53;
+    AgentStoreConflictArgs agent_store_conflict_args = 54;
   }
   uint32 id = 1;
   string exec_id = 15;
   optional SpanContext span_context = 19;
-}
-
-message ExecStreamElement {
-  oneof element {
-    ExecClientMessage exec_client_message = 1;
-    ExecClientControlMessage exec_client_control_message = 2;
-  }
+  optional bool accept_hook_additional_contexts = 55;
 }
 
 message ExecuteHookArgs {
@@ -1806,6 +2190,10 @@ message ExecuteHookRequest {
     PreToolUseRequestQuery pre_tool_use = 4;
     PostToolUseRequestQuery post_tool_use = 5;
     PostToolUseFailureRequestQuery post_tool_use_failure = 6;
+    BeforeSubmitPromptRequestQuery before_submit_prompt = 7;
+    AfterAgentResponseRequestQuery after_agent_response = 8;
+    AfterAgentThoughtRequestQuery after_agent_thought = 9;
+    StopRequestQuery stop = 11;
   }
 }
 
@@ -1817,6 +2205,10 @@ message ExecuteHookResponse {
     PreToolUseRequestResponse pre_tool_use = 4;
     PostToolUseRequestResponse post_tool_use = 5;
     PostToolUseFailureRequestResponse post_tool_use_failure = 6;
+    BeforeSubmitPromptRequestResponse before_submit_prompt = 7;
+    AfterAgentResponseRequestResponse after_agent_response = 8;
+    AfterAgentThoughtRequestResponse after_agent_thought = 9;
+    StopRequestResponse stop = 11;
   }
 }
 
@@ -1838,10 +2230,6 @@ message ExecutePlanAction {
 message ExecutePlanInfo {
   string plan_id = 1;
   string plan_title = 2;
-}
-
-message ExitEvent {
-  int32 exit_code = 1;
 }
 
 message ExtraContextEntry {
@@ -1969,25 +2357,20 @@ message ForceBackgroundSubagentResult {
   ForceBackgroundSubagentStatus status = 1;
 }
 
-message Frame {
-  enum Kind {
-    KIND_UNSPECIFIED = 0;
-    KIND_REQUEST = 1;
-    KIND_RESPONSE = 2;
-    KIND_ERROR = 3;
-  }
+message ForkAgentHostSessionRequest {
+  string session_id = 1;
+  optional string last_turn_id = 2;
+}
 
-  string id = 1;
-  string method = 2;
-  bytes data = 3;
-  Frame.Kind kind = 4;
-  string error = 5;
+message ForkAgentHostSessionResponse {
+  string session_id = 1;
 }
 
 message GenerateImageArgs {
   string description = 1;
   optional string file_path = 2;
   repeated string reference_image_paths = 5;
+  optional string aspect_ratio = 6;
 }
 
 message GenerateImageError {
@@ -2044,14 +2427,13 @@ message GetBlobArgs {
 
 message GetBlobResult {
   optional bytes blob_data = 1;
+  optional Error error = 2;
 }
 
-message GetCapabilitiesRequest {
-}
-
-message GetCapabilitiesResponse {
-  optional bool computer_use_supported = 1;
-  optional bool install_plugin_artifact_supported = 2;
+message GetCiStatusAction {
+  optional string pr_url = 1;
+  optional string branch_name = 2;
+  optional string repo_url = 3;
 }
 
 message GetDefaultModelForCliRequest {
@@ -2059,13 +2441,6 @@ message GetDefaultModelForCliRequest {
 
 message GetDefaultModelForCliResponse {
   ModelDetails model = 1;
-}
-
-message GetMcpRefreshTokensRequest {
-}
-
-message GetMcpRefreshTokensResponse {
-  map<string, string> refresh_tokens = 1;
 }
 
 message GetMcpToolsAgentResult {
@@ -2113,6 +2488,15 @@ message GetNewChatNudgeParameterizedModelPickerResponse {
   optional NewChatNudgeV2 nudge = 1;
 }
 
+message GetPromptContextUsageRequest {
+  string conversation_id = 1;
+  bytes snapshot_blob_id = 2;
+}
+
+message GetPromptContextUsageResponse {
+  PromptContextUsageSnapshot snapshot = 1;
+}
+
 message GetSignedUrlForAttachedMediaRequest {
   optional string key = 1;
   optional string mime_type = 2;
@@ -2138,25 +2522,13 @@ message GetUsableModelsResponse {
   repeated ModelDetails models = 1;
 }
 
-message GetWorkerIdResponse {
-  string worker_id = 1;
-}
-
-message GetWorkspaceChangesHashRequest {
-  string root_path = 1;
-  string base_ref = 2;
-}
-
-message GetWorkspaceChangesHashResponse {
-  string hash = 1;
-}
-
 message GitRepoInfo {
   string path = 1;
   string status = 2;
   string branch_name = 3;
   optional string remote_url = 4;
   optional bool previous_branch_is_ancestor = 5;
+  optional bool is_origin_backed = 6;
 }
 
 message GlobToolArgs {
@@ -2187,6 +2559,25 @@ message GlobToolSuccess {
   int32 total_files = 4;
   bool client_truncated = 5;
   bool ripgrep_truncated = 6;
+}
+
+message GoalContinuationAction {
+}
+
+message GoalError {
+  string error = 1;
+}
+
+message GoalState {
+  string conversation_id = 1;
+  string goal_id = 2;
+  string objective = 3;
+  GoalStatus status = 4;
+  uint32 idle_continuations_without_tool_calls = 5;
+  optional uint64 active_duration_ms = 6;
+  optional uint64 last_accrued_at_ms = 7;
+  uint32 continuation_count = 8;
+  optional string agent_session_id = 9;
 }
 
 message GrepArgs {
@@ -2319,7 +2710,7 @@ message IdlePeriod {
   int64 start_ms = 1;
   int64 end_ms = 2;
   int64 duration_ms = 3;
-  PH_aiserver_v1_McpAuthResult classification = 4;
+  IdleClassification classification = 4;
   float suggested_speed = 5;
   string preceding_action_type = 6;
   string following_action_type = 7;
@@ -2339,22 +2730,22 @@ message ImageProto {
   string mime_type = 7;
 }
 
+message InjectContextAction {
+  oneof payload {
+    UserContextInjection user_context = 3;
+    SystemContextInjection system_context = 4;
+  }
+  string injection_id = 1;
+  string expected_run_id = 2;
+}
+
 message InputEvent {
   int64 execution_timestamp_ms = 1;
   ComputerUseAction action = 2;
   int64 command_duration_ms = 3;
   Coordinate position_before = 4;
   Coordinate position_after = 5;
-  SubagentTypeWatchVideo cursor_type_after = 6;
-}
-
-message InstallPluginArtifactRequest {
-  string download_url = 1;
-  string target_root = 2;
-  string artifact_digest = 3;
-}
-
-message InstallPluginArtifactResponse {
+  CursorType cursor_type_after = 6;
 }
 
 message InteractionQuery {
@@ -2369,6 +2760,7 @@ message InteractionQuery {
     McpAuthRequestQuery mcp_auth_request_query = 11;
     GenerateImageRequestQuery generate_image_request_query = 12;
     ReplaceEnvArgs replace_env_args = 13;
+    ConnectScmRequestQuery connect_scm_request_query = 14;
   }
   uint32 id = 1;
 }
@@ -2385,6 +2777,7 @@ message InteractionResponse {
     McpAuthRequestResponse mcp_auth_request_response = 11;
     GenerateImageRequestResponse generate_image_request_response = 12;
     ReplaceEnvResult replace_env_result = 13;
+    ConnectScmRequestResponse connect_scm_request_response = 14;
   }
   uint32 id = 1;
 }
@@ -2412,7 +2805,19 @@ message InteractionUpdate {
     PostRequestPromptUpdate post_request_prompt = 19;
     ActiveBranchChange active_branch_change = 20;
     FeedbackRequestUpdate feedback_request = 21;
+    ResponseComparisonUpdate response_comparison = 22;
+    ContextInjectionStateUpdate context_injection_state = 23;
   }
+}
+
+message InterruptAgentHostTurnRequest {
+  string session_id = 1;
+  string turn_id = 2;
+  optional string reason = 3;
+}
+
+message InterruptAgentHostTurnResponse {
+  bool interrupted = 1;
 }
 
 message InterruptedPendingToolCallResolution {
@@ -2476,6 +2881,10 @@ message InvocationContext {
     optional string channel_name = 2;
     optional string channel_purpose = 3;
     optional string channel_topic = 4;
+    optional string sender_name = 5;
+    optional string sender_id = 6;
+    optional string sender_type = 7;
+    optional bool is_directly_addressed = 8;
   }
 
   oneof data {
@@ -2495,17 +2904,9 @@ message KeyAction {
 message KeystrokeEvent {
   int64 video_timestamp_ms = 1;
   string display_text = 2;
-  LsArgs event_type = 3;
+  KeystrokeEventType event_type = 3;
   int64 display_duration_ms = 4;
   int32 action_index = 5;
-}
-
-message KillTmuxSessionRequest {
-  string session_id = 1;
-}
-
-message KillTmuxSessionResponse {
-  bool success = 1;
 }
 
 message KvClientMessage {
@@ -2525,22 +2926,13 @@ message KvServerMessage {
   optional SpanContext span_context = 4;
 }
 
-message ListArtifactsRequest {
-  repeated string extra_paths = 1;
+message ListAgentHostSessionsRequest {
+  optional bool include_children = 1;
+  optional string parent_session_id = 2;
 }
 
-message ListArtifactsResponse {
-  repeated ArtifactUploadMetadata artifacts = 1;
-  map<string, ArtifactPathError> path_errors = 2;
-}
-
-message ListDirectoryRequest {
-  string path = 1;
-  bool include_hidden = 2;
-}
-
-message ListDirectoryResponse {
-  repeated DirectoryEntry entries = 1;
+message ListAgentHostSessionsResponse {
+  repeated AgentHostSession sessions = 1;
 }
 
 message ListMcpResourcesError {
@@ -2581,18 +2973,23 @@ message ListMcpResourcesToolCall {
   ListMcpResourcesExecResult result = 2;
 }
 
-message ListPtysRequest {
-}
-
-message ListPtysResponse {
-  repeated PtyInfo ptys = 1;
-}
-
-message ListTmuxSessionsRequest {
-}
-
-message ListTmuxSessionsResponse {
-  repeated TmuxSession sessions = 1;
+message LocalPromptQualityInvocation {
+  string invocation_id = 1;
+  string attempt_request_id = 2;
+  int32 attempt = 3;
+  string started_at = 4;
+  string completed_at = 5;
+  string model_id = 6;
+  string provider_name = 7;
+  LocalPromptQualityInvocationStatus status = 8;
+  repeated bytes messages = 9;
+  repeated bytes response_messages = 10;
+  string tools_json = 11;
+  int64 prompt_tokens = 12;
+  int64 completion_tokens = 13;
+  int64 total_tokens = 14;
+  optional int64 token_limit = 15;
+  optional string error_message = 16;
 }
 
 message LsArgs {
@@ -2683,6 +3080,7 @@ message McpArgs {
   optional SmartModeApproval smart_mode_approval = 6;
   bool smart_mode_approval_only = 7;
   bool skip_approval = 8;
+  string server_identifier = 9;
 }
 
 message McpAuthArgs {
@@ -2803,6 +3201,8 @@ message McpStateError {
 }
 
 message McpStateExecArgs {
+  repeated string server_identifiers = 1;
+  bool kick_only = 2;
 }
 
 message McpStateExecResult {
@@ -2854,6 +3254,7 @@ message McpToolDefinition {
   google.protobuf.Value input_schema = 3;
   string provider_identifier = 4;
   string tool_name = 5;
+  optional string input_schema_json = 6;
 }
 
 message McpToolDescriptor {
@@ -2861,6 +3262,8 @@ message McpToolDescriptor {
   optional string definition_path = 2;
   optional string description = 3;
   optional google.protobuf.Value input_schema = 4;
+  optional string input_schema_json = 5;
+  optional string annotations_json = 6;
 }
 
 message McpToolError {
@@ -2906,6 +3309,13 @@ message ModelDetails {
   string display_name_short = 5;
   repeated string aliases = 6;
   optional bool max_mode = 7;
+}
+
+message MountedAgentStore {
+  string path = 1;
+  MountedAgentStoreKind kind = 2;
+  optional string alias = 3;
+  bool read_only = 4;
 }
 
 message MouseDownAction {
@@ -2967,6 +3377,11 @@ message NewChatNudgeV2 {
   string nudge_id = 1;
   RequestedModel target_model = 2;
   string experiment_name = 3;
+}
+
+message NewCloudVmTarget {
+  optional string environment_build_id = 1;
+  optional string base_branch = 2;
 }
 
 message NotifyConversationCloneRequest {
@@ -3293,12 +3708,6 @@ message PiLsToolSuccess {
   optional uint32 entry_limit_reached = 3;
 }
 
-message PingRequest {
-}
-
-message PingResponse {
-}
-
 message PiReadExecArgs {
   string path = 1;
   optional int32 offset = 2;
@@ -3425,6 +3834,19 @@ message Position {
   uint32 column = 2;
 }
 
+message PostCommentAction {
+  optional string pr_url = 1;
+  optional string branch_name = 2;
+  string body = 3;
+  optional string repo_url = 4;
+  optional int64 in_reply_to = 5;
+  optional string path = 6;
+  optional int32 line = 7;
+  optional int32 start_line = 8;
+  optional string side = 9;
+  optional string reply_to_reference = 10;
+}
+
 message PostRequestPromptUpdate {
   string title = 1;
   string message = 2;
@@ -3542,6 +3964,8 @@ message PreparedTaskSubagent {
   optional string plugin_id = 31;
   optional string marketplace_id = 32;
   optional string subagent_source = 33;
+  optional string cloud_subagent_bc_id = 34;
+  optional string provider_tool_name = 35;
 }
 
 message PreToolUseRequestQuery {
@@ -3587,12 +4011,19 @@ message PrewarmRequest {
   optional bool can_create_cloud_subagents = 20;
   optional bool suppress_subagent_progress_update_tool = 21;
   optional bool client_supports_send_to_user = 22;
+  optional string computer_use_coordinate_mode = 23;
+  optional string agent_session_id = 24;
+  optional bool client_supports_prompt_context_usage_rpc = 25;
 }
 
 message PrManagementArgs {
   oneof action {
     CreatePrAction create_pr = 2;
     UpdatePrAction update_pr = 3;
+    PostCommentAction post_comment = 4;
+    ResolveCommentAction resolve_comment = 5;
+    GetCiStatusAction get_ci_status = 6;
+    SetPrStatusAction set_pr_status = 7;
   }
   string tool_call_id = 1;
 }
@@ -3647,9 +4078,18 @@ message PrManagementToolCall {
   PrManagementResult result = 2;
 }
 
-message Process {
-  string shell = 1;
-  repeated string args = 2;
+message ProjectDetails {
+  optional string name = 1;
+  optional ProjectSubagentDetails subagent = 2;
+  optional ProjectSideChatDetails side_chat = 3;
+}
+
+message ProjectSideChatDetails {
+  string store_dir = 1;
+}
+
+message ProjectSubagentDetails {
+  optional string store_dir = 2;
 }
 
 message PromptContextNode {
@@ -3671,6 +4111,11 @@ message PromptContextSourceRef {
   string content_path = 4;
   uint32 start_offset = 5;
   uint32 end_offset = 6;
+}
+
+message PromptContextUsageSnapshot {
+  PromptContextUsageTree prompt_context_usage_tree = 1;
+  repeated bytes root_prompt_messages_json = 2;
 }
 
 message PromptContextUsageTree {
@@ -3695,31 +4140,8 @@ message PromptTokenBreakdownSnapshot {
   repeated PromptTokenBreakdownCategory categories = 3;
 }
 
-message PtyData {
-  bytes data = 1;
-}
-
-message PtyEvent {
-  oneof data {
-    PtyData pty_data = 2;
-    PtyExited pty_exited = 3;
-  }
-  string event_id = 1;
-}
-
-message PtyExited {
-  int32 exit_code = 1;
-  optional int32 signal = 2;
-}
-
-message PtyInfo {
-  string pty_id = 1;
-  string shell = 2;
-  string cwd = 3;
-  uint32 cols = 4;
-  uint32 rows = 5;
-  int32 pid = 6;
-  repeated string process_args = 7;
+message PromptUploadRef {
+  string upload_id = 1;
 }
 
 message Range {
@@ -3733,14 +4155,6 @@ message ReadArgs {
   optional int32 offset = 4;
   optional uint32 limit = 5;
   optional string encoding_hint = 6;
-}
-
-message ReadBinaryFileRequest {
-  string path = 1;
-}
-
-message ReadBinaryFileResponse {
-  bytes content = 1;
 }
 
 message ReadError {
@@ -3825,6 +4239,7 @@ message ReadMcpResourceSuccess {
   optional string mime_type = 4;
   map<string, string> annotations = 7;
   optional string download_path = 8;
+  optional OutputLocation output_location = 9;
 }
 
 message ReadMcpResourceToolCall {
@@ -3868,14 +4283,6 @@ message ReadSuccess {
   bool truncated = 6;
   optional bytes output_blob_id = 7;
   bool range_applied = 8;
-}
-
-message ReadTextFileRequest {
-  string path = 1;
-}
-
-message ReadTextFileResponse {
-  string content = 1;
 }
 
 message ReadTodosArgs {
@@ -4023,6 +4430,25 @@ message RecordCiInvestigationOverall {
   repeated string check_keys = 5;
 }
 
+message RecordingDataPackage {
+  string raw_video_path = 1;
+  int64 duration_ms = 2;
+  int32 display_width = 3;
+  int32 display_height = 4;
+  int32 api_width = 5;
+  int32 api_height = 6;
+  int64 recording_start_epoch_ms = 7;
+  repeated InputEvent input_events = 10;
+  repeated CursorPath cursor_paths = 20;
+  repeated ZoomCandidate zoom_candidates = 30;
+  repeated IdlePeriod idle_periods = 31;
+  repeated ClickEffectKeyframe click_effects = 32;
+  repeated KeystrokeEvent keystroke_events = 33;
+  DecisionInput decision_input = 40;
+  DecisionOutput decision_output = 41;
+  string polished_video_path = 50;
+}
+
 message RecordScreenArgs {
   RecordingMode mode = 1;
   string tool_call_id = 2;
@@ -4087,31 +4513,6 @@ message ReflectSuccess {
 message ReflectToolCall {
   ReflectArgs args = 1;
   ReflectResult result = 2;
-}
-
-message RefreshGithubAccessTokenRequest {
-  string github_access_token = 1;
-  string hostname = 2;
-  optional string repo_url = 3;
-}
-
-message RefreshGithubAccessTokenResponse {
-}
-
-message ReleaseWorkerRequest {
-}
-
-message ReloadAgentSkillsRequest {
-}
-
-message ReloadAgentSkillsResponse {
-}
-
-message ReloadPluginsRequest {
-  repeated string reload_targets = 1;
-}
-
-message ReloadPluginsResponse {
 }
 
 message ReplaceEnvArgs {
@@ -4270,6 +4671,9 @@ message RequestContext {
   optional PermissionsAutoRunInstructions project_permissions_auto_run = 47;
   optional PermissionsAutoRunInstructions admin_permissions_auto_run = 48;
   repeated string disabled_team_rules = 49;
+  optional bool search_conversations_enabled = 50;
+  optional bool send_message_enabled = 51;
+  repeated string admin_command_denylist = 52;
 }
 
 message RequestContextArgs {
@@ -4277,6 +4681,7 @@ message RequestContextArgs {
   optional string workspace_id = 3;
   optional string read_only_pinned_tree_sha = 4;
   optional string read_only_plugin_cache_root = 5;
+  optional bool use_cached = 7;
 }
 
 message RequestContextEnv {
@@ -4301,10 +4706,30 @@ message RequestContextEnv {
   optional bool smart_mode_classifier_auto_mode_enabled = 22;
   optional string dev_force_next_smart_mode_classifier_block_token = 23;
   optional string dev_delay_next_smart_mode_classifier_token = 24;
+  repeated MountedAgentStore mounted_agent_stores = 25;
 }
 
 message RequestContextError {
   string error = 1;
+}
+
+message RequestContextMcpsPart {
+  repeated McpToolDefinition tools = 1;
+  repeated McpInstructions mcp_instructions = 2;
+  optional McpFileSystemOptions mcp_file_system_options = 3;
+  optional McpMetaToolOptions mcp_meta_tool_options = 4;
+}
+
+message RequestContextPartReferences {
+  bytes rules_blob_id = 1;
+  uint32 rules_byte_length = 2;
+  bytes skills_blob_id = 3;
+  uint32 skills_byte_length = 4;
+  bytes subagents_blob_id = 5;
+  uint32 subagents_byte_length = 6;
+  bytes mcps_blob_id = 7;
+  uint32 mcps_byte_length = 8;
+  RequestContext dynamic_context = 9;
 }
 
 message RequestContextRejected {
@@ -4319,8 +4744,24 @@ message RequestContextResult {
   }
 }
 
+message RequestContextRulesPart {
+  repeated CursorRule rules = 1;
+  repeated CursorRule non_file_rules = 2;
+  optional string cloud_rule = 3;
+}
+
+message RequestContextSkillsPart {
+  repeated AgentSkill agent_skills = 1;
+  optional SkillOptions skill_options = 2;
+}
+
+message RequestContextSubagentsPart {
+  repeated CustomSubagent custom_subagents = 1;
+}
+
 message RequestContextSuccess {
   RequestContext request_context = 1;
+  optional bool served_from_disk_cache = 2;
 }
 
 message RequestedModel {
@@ -4341,40 +4782,69 @@ message RequestedModel {
   bool is_variant_string_representation = 8;
 }
 
-message ResizePtyRequest {
-  string pty_id = 1;
-  uint32 cols = 2;
-  uint32 rows = 3;
+message ResolveCommentAction {
+  optional string pr_url = 1;
+  optional string branch_name = 2;
+  int64 comment_id = 3;
+  optional string repo_url = 4;
+  optional string comment_reference = 5;
 }
 
-message ResizePtyResponse {
-  bool success = 1;
+message RespondToAgentHostInteractionRequest {
+  string session_id = 1;
+  string interaction_id = 2;
+  InteractionResponse response = 3;
 }
 
-message RestoreArtifactInstruction {
-  string absolute_path = 1;
-  string download_url = 2;
-  int64 updated_at_unix_ms = 3;
+message RespondToAgentHostInteractionResponse {
+  AgentHostInteractionResponseStatus status = 1;
 }
 
-message RestoreArtifactResult {
-  ArtifactRestoreStatus status = 2;
-  string error_message = 3;
+message ResponseComparisonCompleted {
 }
 
-message RestoreArtifactsRequest {
-  repeated RestoreArtifactInstruction artifacts = 1;
+message ResponseComparisonSkipped {
+  ResponseComparisonSkipReason reason = 1;
 }
 
-message RestoreArtifactsResponse {
-  repeated RestoreArtifactResult results = 1;
+message ResponseComparisonStarted {
+  ResponseComparisonDisplayOrder display_order = 1;
+  string parent_invocation_id = 2;
+  string alternate_invocation_id = 3;
+  string parent_response = 4;
+  string comparison_config_id = 5;
+  string alternate_model_id = 6;
+}
+
+message ResponseComparisonTextDelta {
+  string text = 1;
+}
+
+message ResponseComparisonUpdate {
+  oneof event {
+    ResponseComparisonStarted started = 2;
+    ResponseComparisonTextDelta text_delta = 3;
+    ResponseComparisonCompleted completed = 4;
+    ResponseComparisonSkipped skipped = 5;
+  }
+  string comparison_id = 1;
 }
 
 message ResumeAction {
   RequestContext request_context = 2;
 }
 
+message SameMachineTarget {
+}
+
 message SandboxPolicy {
+  enum ReadBoundaryMode {
+    READ_BOUNDARY_MODE_UNSPECIFIED = 0;
+    READ_BOUNDARY_MODE_SYSTEM = 1;
+    READ_BOUNDARY_MODE_WORKSPACE = 2;
+    READ_BOUNDARY_MODE_CUSTOM = 3;
+  }
+
   enum Type {
     TYPE_UNSPECIFIED = 0;
     TYPE_INSECURE_NONE = 1;
@@ -4394,6 +4864,8 @@ message SandboxPolicy {
   optional bool network_policy_strict = 11;
   optional bool capture_denies = 12;
   optional bool skip_statsig_defaults = 13;
+  SandboxPolicy.ReadBoundaryMode read_boundary = 14;
+  repeated string additional_read_paths = 15;
 }
 
 message SandboxPolicyMergeSources {
@@ -4412,6 +4884,11 @@ message ScrollAction {
   optional string modifier_keys = 4;
 }
 
+message SearchConversationsToolCall {
+  ConversationSearchArgs args = 1;
+  ConversationSearchResult result = 2;
+}
+
 message SelectedAgenticGitAction {
   oneof params {
     SelectedAgenticGitActionCommitParams commit_params = 2;
@@ -4426,6 +4903,7 @@ message SelectedAgenticGitAction {
     SelectedAgenticGitActionPullLocallyParams apply_locally_params = 14;
     SelectedAgenticGitActionPullLocallyParams checkout_branch_params = 15;
     SelectedAgenticGitActionUpdateBranchParams update_branch_params = 16;
+    SelectedAgenticGitActionCreateBranchParams create_branch_params = 17;
   }
   optional SelectedGitBranchContext branch_context = 5;
   optional string path_to_template_file = 9;
@@ -4445,8 +4923,12 @@ message SelectedAgenticGitActionCommitParams {
   repeated SelectedAgenticGitFileWithStatus files_to_exclude_from_commit_with_status = 6;
 }
 
+message SelectedAgenticGitActionCreateBranchParams {
+}
+
 message SelectedAgenticGitActionFixMergeConflictsParams {
   optional string base_branch = 1;
+  optional string pr_url = 2;
 }
 
 message SelectedAgenticGitActionPullLocallyParams {
@@ -4525,6 +5007,8 @@ message SelectedCursorCommand {
   string name = 1;
   string content = 2;
   optional SelectedPluginCapabilityRef plugin_capability = 3;
+  optional string full_path = 4;
+  optional string display_name = 5;
 }
 
 message SelectedCursorRule {
@@ -4541,6 +5025,7 @@ message SelectedDocument {
     bytes blob_id = 1;
     bytes data = 8;
     SelectedDocument.BlobIdWithData blob_id_with_data = 9;
+    PromptUploadRef prompt_upload_ref = 10;
   }
   string uuid = 2;
   string filename = 3;
@@ -4705,6 +5190,20 @@ message SelectedVideo {
   bool materialize_to_filesystem = 12;
 }
 
+message SelfHostedPoolTarget {
+  optional string pool = 1;
+  repeated SelfHostedWorkerLabel labels = 2;
+}
+
+message SelfHostedWorkerLabel {
+  string key = 1;
+  string value = 2;
+}
+
+message SelfHostedWorkerTarget {
+  string worker_id = 1;
+}
+
 message SemSearchToolArgs {
   string query = 1;
   repeated string target_directories = 2;
@@ -4732,6 +5231,33 @@ message SemSearchToolSuccess {
   repeated PH_aiserver_v1_CodeResult code_results = 2;
 }
 
+message SendAgentHostActionRequest {
+  string session_id = 1;
+  ConversationAction action = 2;
+  optional string model_id = 3;
+  optional ModelDetails model_details = 4;
+  optional AgentHostTurnOptions turn_options = 5;
+  optional RequestedModel requested_model = 6;
+  optional ConversationStateStructure base_history = 7;
+}
+
+message SendAgentHostActionResponse {
+  string turn_id = 1;
+}
+
+message SendAgentHostMessageRequest {
+  string session_id = 1;
+  string text = 2;
+  optional string model_id = 3;
+  optional ModelDetails model_details = 4;
+  optional AgentHostTurnOptions turn_options = 5;
+  optional RequestedModel requested_model = 6;
+}
+
+message SendAgentHostMessageResponse {
+  string turn_id = 1;
+}
+
 message SendFinalSummaryArgs {
   optional string final_summary = 1;
 }
@@ -4754,15 +5280,6 @@ message SendFinalSummarySuccess {
 message SendFinalSummaryToolCall {
   SendFinalSummaryArgs args = 1;
   SendFinalSummaryResult result = 2;
-}
-
-message SendInputRequest {
-  string pty_id = 1;
-  bytes data = 2;
-}
-
-message SendInputResponse {
-  bool success = 1;
 }
 
 message SendMessageArgs {
@@ -4790,6 +5307,7 @@ message SendMessageResult {
 
 message SendMessageSuccess {
   uint64 timestamp = 1;
+  string message_id = 2;
 }
 
 message SendMessageText {
@@ -4824,6 +5342,12 @@ message SendToUserToolCall {
   SendToUserResult result = 2;
 }
 
+message SessionParent {
+  string parent_session_id = 1;
+  string parent_tool_call_id = 2;
+  string root_session_id = 3;
+}
+
 message SetActiveBranchArgs {
   string path = 1;
   string branch_name = 2;
@@ -4855,6 +5379,13 @@ message SetBlobArgs {
 
 message SetBlobResult {
   optional Error error = 1;
+}
+
+message SetPrStatusAction {
+  optional string pr_url = 1;
+  optional string branch_name = 2;
+  optional string repo_url = 3;
+  PullRequestStatus status = 4;
 }
 
 message SetupVmEnvironmentArgs {
@@ -4911,6 +5442,7 @@ message ShellArgs {
   optional SmartModeApproval smart_mode_approval = 19;
   optional ShellHookApprovalRequirement hook_approval_requirement = 20;
   optional string conversation_id = 21;
+  repeated string admin_command_denylist = 22;
 }
 
 message ShellCommand {
@@ -4972,6 +5504,9 @@ message ShellFailure {
   optional ShellAbortReason abort_reason = 10;
   bool aborted = 11;
   optional int32 local_execution_time_ms = 12;
+  optional string output_head = 13;
+  optional string output_tail = 14;
+  optional uint32 elided_chars = 15;
 }
 
 message ShellHookApprovalRequirement {
@@ -5040,6 +5575,14 @@ message ShellResult {
   optional uint32 pid = 104;
 }
 
+message ShellSandboxUnsupported {
+  string command = 1;
+  string working_directory = 2;
+  string sandbox_policy_type = 3;
+  string reason = 4;
+  bool is_readonly = 5;
+}
+
 message ShellSpawnError {
   string command = 1;
   string working_directory = 2;
@@ -5056,6 +5599,7 @@ message ShellStream {
     ShellPermissionDenied permission_denied = 6;
     ShellStreamBackgrounded backgrounded = 7;
     ShellStreamHookContext hook_context = 8;
+    ShellSandboxUnsupported sandbox_unsupported = 9;
   }
 }
 
@@ -5108,6 +5652,9 @@ message ShellSuccess {
   optional int32 ms_to_wait = 12;
   optional int32 local_execution_time_ms = 13;
   optional ShellBackgroundReason background_reason = 14;
+  optional string output_head = 15;
+  optional string output_tail = 16;
+  optional uint32 elided_chars = 17;
 }
 
 message ShellTimeout {
@@ -5196,18 +5743,6 @@ message SpanContext {
   optional string trace_state = 4;
 }
 
-message SpawnPtyRequest {
-  optional Process process = 1;
-  string cwd = 2;
-  map<string, string> env = 3;
-  uint32 cols = 4;
-  uint32 rows = 5;
-}
-
-message SpawnPtyResponse {
-  string pty_id = 1;
-}
-
 message SpeedupSelection {
   int32 candidate_index = 1;
   optional float speed_override = 2;
@@ -5272,14 +5807,6 @@ message StartPlanAction {
   bool is_spec = 3;
 }
 
-message StderrEvent {
-  string data = 1;
-}
-
-message StdoutEvent {
-  string data = 1;
-}
-
 message StepCompletedUpdate {
   uint64 step_id = 1;
   int64 step_duration_ms = 2;
@@ -5294,63 +5821,22 @@ message StepTiming {
   uint64 timestamp_ms = 2;
 }
 
-message StrReplaceArgs {
-  string path = 1;
-  string old_text = 2;
-  string new_text = 3;
+message StopRequestQuery {
+  string status = 1;
+  int32 loop_count = 2;
+  optional string conversation_id = 3;
+  optional string generation_id = 4;
+  optional string model = 5;
+  optional string model_id = 6;
+  repeated RequestedModel.ModelParameterValue model_params = 7;
+  optional int64 input_tokens = 8;
+  optional int64 output_tokens = 9;
+  optional int64 cache_read_tokens = 10;
+  optional int64 cache_write_tokens = 11;
 }
 
-message StrReplaceError {
-  string path = 1;
-  string error = 2;
-}
-
-message StrReplaceFileNotFound {
-  string path = 1;
-}
-
-message StrReplaceMultipleMatches {
-  string path = 1;
-  string old_text = 2;
-  int32 matches = 3;
-}
-
-message StrReplaceNoMatch {
-  string path = 1;
-  string old_text = 2;
-}
-
-message StrReplaceReadPermissionDenied {
-  string path = 1;
-}
-
-message StrReplaceRejected {
-  string path = 1;
-  string reason = 2;
-}
-
-message StrReplaceResult {
-  oneof result {
-    PH_aiserver_v1_CppContextItem success = 1;
-    PH_aiserver_v1_CptFileDiffHistory file_not_found = 2;
-    PH_aiserver_v1_RemoveRepositoryResponse_Status read_permission_denied = 3;
-    PH_aiserver_v1_MarkCppRequest_RangeTransformation write_permission_denied = 4;
-    PH_aiserver_v1_AddTabRequestToEvalRequest no_match = 5;
-    PH_aiserver_v1_RefreshTabContextResponse multiple_matches = 6;
-    PH_aiserver_v1_AddTabRequestToEvalResponse rejected = 7;
-    PH_aiserver_v1_OneIndexedPosition error = 8;
-  }
-}
-
-message StrReplaceSuccess {
-  string path = 1;
-  string old_text = 2;
-  string new_text = 3;
-  int32 lines_changed = 4;
-}
-
-message StrReplaceWritePermissionDenied {
-  string path = 1;
+message StopRequestResponse {
+  optional string followup_message = 1;
 }
 
 message SubagentArgs {
@@ -5443,6 +5929,9 @@ message SubagentPersistedState {
   optional string model_id = 5;
   SubagentExecutionEnvironment environment = 6;
   optional CloudSubagentReference cloud_subagent = 7;
+  optional string first_class_bc_id = 8;
+  optional string cloud_requested_environment_build_id = 9;
+  optional TargetMachine machine = 10;
 }
 
 message SubagentResult {
@@ -5576,6 +6065,34 @@ message SubagentTypeVmSetupHelper {
 message SubagentTypeWatchVideo {
 }
 
+message SubmittedCustomMode {
+  string id = 1;
+  string label = 2;
+  CustomModeSource source = 5;
+  optional string source_path = 6;
+  optional string source_hash = 7;
+  optional string managed_skill_id = 10;
+  optional string plugin_id = 11;
+  optional string plugin_snapshot_token = 12;
+}
+
+message SubmittedExitedCustomMode {
+  string id = 1;
+  string label = 2;
+}
+
+message SubscriptionEventDisplay {
+  optional string display_label = 1;
+  optional string resource_url = 2;
+  optional string subscription_id = 3;
+}
+
+message SubscriptionNotificationAction {
+  repeated UserMessage notifications = 1;
+  RequestContext request_context = 2;
+  optional bool send_to_interaction_listener = 3;
+}
+
 message SummarizeAction {
 }
 
@@ -5640,6 +6157,20 @@ message SwitchModeToolCall {
   SwitchModeResult result = 2;
 }
 
+message SystemContextInjection {
+  string producer = 1;
+  string content = 2;
+}
+
+message TargetMachine {
+  oneof machine {
+    SameMachineTarget same_machine = 1;
+    NewCloudVmTarget new_cloud_vm = 2;
+    SelfHostedWorkerTarget self_hosted_worker = 3;
+    SelfHostedPoolTarget self_hosted_pool = 4;
+  }
+}
+
 message TaskArgs {
   string description = 1;
   string prompt = 2;
@@ -5651,6 +6182,7 @@ message TaskArgs {
   TaskMode mode = 8;
   repeated string responding_to_message_ids = 9;
   SubagentExecutionEnvironment environment = 10;
+  optional TargetMachine machine = 11;
 }
 
 message TaskError {
@@ -5677,6 +6209,7 @@ message TaskSuccess {
 message TaskToolCall {
   TaskArgs args = 1;
   TaskResult result = 2;
+  optional string cloud_agent_bc_id = 3;
 }
 
 message TaskToolCallArgsProto {
@@ -5690,6 +6223,8 @@ message TaskToolCallArgsProto {
   repeated string attachments = 8;
   SubagentExecutionEnvironment environment = 9;
   optional string cloud_base_branch = 10;
+  optional string cloud_requested_environment_build_id = 11;
+  optional TargetMachine machine = 12;
 }
 
 message TaskToolCallDelta {
@@ -5710,16 +6245,9 @@ message TerminalMetadata {
   optional TerminalMetadata.Command current_command = 4;
 }
 
-message TerminatePtyRequest {
-  string pty_id = 1;
-}
-
-message TerminatePtyResponse {
-  bool success = 1;
-}
-
 message TextDeltaUpdate {
   string text = 1;
+  bool is_server_notice = 2;
 }
 
 message ThinkingCompletedUpdate {
@@ -5737,18 +6265,6 @@ message ThinkingDetails {
 message ThinkingMessage {
   string text = 1;
   uint32 duration_ms = 2;
-}
-
-message TmuxSession {
-  string session_id = 1;
-  string session_name = 2;
-  string display_name = 3;
-  TmuxSessionKind kind = 4;
-  string cwd = 5;
-  string shell = 6;
-  repeated string process_args = 7;
-  int64 created_at_unix_ms = 8;
-  uint32 attached_client_count = 9;
 }
 
 message TodoItem {
@@ -5822,6 +6338,10 @@ message ToolCall {
     PiGrepToolCall pi_grep_tool_call = 65;
     PiFindToolCall pi_find_tool_call = 66;
     PiLsToolCall pi_ls_tool_call = 67;
+    ConnectScmToolCall connect_scm_tool_call = 68;
+    SearchConversationsToolCall search_conversations_tool_call = 69;
+    CreateGoalToolCall create_goal_tool_call = 70;
+    UpdateGoalToolCall update_goal_tool_call = 71;
   }
   repeated HookAdditionalContext hook_additional_contexts = 54;
   optional string tool_call_id = 57;
@@ -5889,6 +6409,14 @@ message TruncatedToolCallResult {
 message TruncatedToolCallSuccess {
 }
 
+message TtftBreakdown {
+  double server_first_token_ms = 1;
+  double pre_stream_setup_ms = 2;
+  double wait_for_first_event_ms = 3;
+  optional double provider_ttft_ms = 4;
+  double slow_pool_wait_ms = 5;
+}
+
 message TurnEndedUpdate {
   optional int64 input_tokens = 1;
   optional int64 output_tokens = 2;
@@ -5911,14 +6439,24 @@ message UpdateConversationMetadataRequest {
 message UpdateConversationMetadataResponse {
 }
 
-message UpdateEnvironmentVariablesRequest {
-  map<string, string> env = 1;
-  bool replace = 2;
+message UpdateGoalArgs {
+  GoalStatus status = 1;
 }
 
-message UpdateEnvironmentVariablesResponse {
-  uint32 applied = 1;
-  uint32 removed = 2;
+message UpdateGoalResult {
+  oneof result {
+    UpdateGoalSuccess success = 1;
+    GoalError error = 2;
+  }
+}
+
+message UpdateGoalSuccess {
+  GoalStatus status = 1;
+}
+
+message UpdateGoalToolCall {
+  UpdateGoalArgs args = 1;
+  UpdateGoalResult result = 2;
 }
 
 message UpdatePrAction {
@@ -5930,6 +6468,9 @@ message UpdatePrAction {
   repeated string add_labels = 6;
   repeated string remove_labels = 7;
   optional string repo_url = 8;
+  optional int64 stack_on_pr_number = 9;
+  optional bool clear_stack = 10;
+  optional bool draft = 11;
 }
 
 message UpdatePrCodeTourArgs {
@@ -5985,15 +6526,6 @@ message UpdateTodosToolCall {
   UpdateTodosResult result = 2;
 }
 
-message UploadArtifactsRequest {
-  repeated ArtifactUploadInstruction uploads = 1;
-  bool wait_for_completion = 2;
-}
-
-message UploadArtifactsResponse {
-  repeated ArtifactUploadDispatchResult results = 1;
-}
-
 message UploadConversationBlobsRequest {
   string conversation_id = 1;
   repeated BlobEntry blobs = 2;
@@ -6002,6 +6534,26 @@ message UploadConversationBlobsRequest {
 }
 
 message UploadConversationBlobsResponse {
+}
+
+message UploadLocalAgentRunToPromptQualityRequest {
+  int32 schema_version = 1;
+  string generation_uuid = 2;
+  string conversation_id = 3;
+  string payload_digest = 4;
+  repeated LocalPromptQualityInvocation invocations = 5;
+  LocalPromptQualityInvocationStatus terminal_status = 6;
+  string created_at = 7;
+}
+
+message UploadLocalAgentRunToPromptQualityResponse {
+  string request_id = 1;
+  string primary_invocation_id = 2;
+}
+
+message UserContextInjection {
+  UserMessage user_message = 1;
+  RequestContext request_context = 2;
 }
 
 message UserDisplayInfo {
@@ -6023,6 +6575,7 @@ message UserMessage {
     optional string fsd_finding_action = 3;
     optional string url = 4;
     optional SubscriptionSource subscription_source = 5;
+    optional SubscriptionEventDisplay subscription_event_display = 6;
   }
 
   string text = 1;
@@ -6044,6 +6597,8 @@ message UserMessage {
   optional bytes text_blob_id = 18;
   optional bytes rich_text_blob_id = 19;
   repeated HookAdditionalContext hook_additional_contexts = 21;
+  optional CustomModeIntent custom_mode_intent = 22;
+  optional ProjectDetails project_details = 23;
 }
 
 message UserMessageAction {
@@ -6069,20 +6624,41 @@ message WaitAction {
   int32 duration_ms = 1;
 }
 
-message WarmRemoteAccessServerRequest {
-  string commit = 1;
-  int32 port = 2;
-  string connection_token = 3;
+message WatchAgentHostSessionBackgroundWorkEvent {
+  oneof event {
+    AgentHostSessionBackgroundWorkSnapshot snapshot = 1;
+    AgentHostSessionBackgroundWorkState state = 2;
+  }
 }
 
-message WarmRemoteAccessServerResponse {
+message WatchAgentHostSessionBackgroundWorkRequest {
+  string session_id = 1;
+  optional AgentHostBackgroundWorkKind kind = 2;
+  optional AgentHostBackgroundWorkState state = 3;
+  optional string owner_id = 4;
 }
 
-message WatchStatusResponse {
-  string worker_id = 1;
-  PrivateWorkerStatus status = 2;
-  bool connected = 3;
-  bool claimed = 4;
+message WatchAgentHostSessionInteractionsEvent {
+  oneof event {
+    AgentHostSessionInteractionsSnapshot snapshot = 1;
+    AgentHostSessionInteractionsState state = 2;
+  }
+}
+
+message WatchAgentHostSessionInteractionsRequest {
+  string session_id = 1;
+}
+
+message WatchAgentHostSessionsEvent {
+  oneof event {
+    AgentHostSessionsSnapshot snapshot = 1;
+    AgentHostSessionAdded added = 2;
+    AgentHostSessionUpdated updated = 3;
+    AgentHostSessionDeleted deleted = 4;
+  }
+}
+
+message WatchAgentHostSessionsRequest {
 }
 
 message WebFetchAllowlistPrecheckArgs {
@@ -6210,14 +6786,6 @@ message WriteArgs {
   optional string encoding_hint = 6;
 }
 
-message WriteBinaryFileRequest {
-  string path = 1;
-  bytes content = 2;
-}
-
-message WriteBinaryFileResponse {
-}
-
 message WriteError {
   string path = 1;
   string error = 2;
@@ -6283,14 +6851,6 @@ message WriteSuccess {
   optional string file_content_after_write = 4;
 }
 
-message WriteTextFileRequest {
-  string path = 1;
-  string content = 2;
-}
-
-message WriteTextFileResponse {
-}
-
 message ZoomCandidate {
   int64 start_ms = 1;
   int64 end_ms = 2;
@@ -6311,15 +6871,8 @@ message ZoomSelection {
 }
 
 // ============================
-// Placeholder types (14 direct + 17 recursive-shell + 0 opaque)
+// Placeholder types (3 direct + 13 recursive-shell + 0 opaque)
 // ============================
-
-message PH_aiserver_v1_AddTabRequestToEvalRequest { // placeholder for aiserver.v1.AddTabRequestToEvalRequest
-  string request_id = 1;
-  string expected_behavior = 2;
-}
-
-message PH_aiserver_v1_AddTabRequestToEvalResponse {} // placeholder for aiserver.v1.AddTabRequestToEvalResponse
 
 message PH_aiserver_v1_CodeBlock {} // placeholder for aiserver.v1.CodeBlock (recursive)
 
@@ -6330,51 +6883,11 @@ message PH_aiserver_v1_CodeResult { // placeholder for aiserver.v1.CodeResult
   float score = 2;
 }
 
-message PH_aiserver_v1_ComposerCapabilityRequest_LoopOnTestsCapability { // placeholder for aiserver.v1.ComposerCapabilityRequest.LoopOnTestsCapability
-  repeated string test_names = 1;
-  optional string custom_instructions = 2;
-}
-
-message PH_aiserver_v1_ComposerCapabilityRequest_SchemaProperty {} // placeholder for aiserver.v1.ComposerCapabilityRequest.SchemaProperty (recursive)
-
-message PH_aiserver_v1_ComposerCapabilityRequest_ToolCallCapability { // placeholder for aiserver.v1.ComposerCapabilityRequest.ToolCallCapability
-  optional string custom_instructions = 1;
-  repeated PH_aiserver_v1_ComposerCapabilityRequest_ToolSchema tool_schemas = 2;
-  repeated string relevant_files = 3;
-  repeated string files_in_context = 4;
-  repeated string semantic_search_files = 5;
-}
-
-message PH_aiserver_v1_ComposerCapabilityRequest_ToolSchema {} // placeholder for aiserver.v1.ComposerCapabilityRequest.ToolSchema (recursive)
-
-// placeholder for aiserver.v1.ComposerCapabilityRequest.ToolType (recursive)
-enum PH_aiserver_v1_ComposerCapabilityRequest_ToolType {
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_TOOLTYPE_TOOL_TYPE_UNSPECIFIED = 0;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_TOOLTYPE_TOOL_TYPE_ADD_FILE_TO_CONTEXT = 1;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_TOOLTYPE_TOOL_TYPE_ITERATE = 3;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_TOOLTYPE_TOOL_TYPE_REMOVE_FILE_FROM_CONTEXT = 4;
-  PH_AISERVER_V1_COMPOSERCAPABILITYREQUEST_TOOLTYPE_TOOL_TYPE_SEMANTIC_SEARCH_CODEBASE = 5;
-}
-
-message PH_aiserver_v1_CppContextItem { // placeholder for aiserver.v1.CppContextItem
-  string contents = 1;
-  optional string symbol = 2;
-  string relative_workspace_path = 3;
-  float score = 4;
-}
-
-message PH_aiserver_v1_CptFileDiffHistory { // placeholder for aiserver.v1.CptFileDiffHistory
-  string file_name = 1;
-  repeated PH_aiserver_v1_EditPatch edit_patches = 2;
-}
-
 message PH_aiserver_v1_CursorPosition {} // placeholder for aiserver.v1.CursorPosition (recursive)
 
 message PH_aiserver_v1_CursorRange {} // placeholder for aiserver.v1.CursorRange (recursive)
 
 message PH_aiserver_v1_DetailedLine {} // placeholder for aiserver.v1.DetailedLine (recursive)
-
-message PH_aiserver_v1_EditPatch {} // placeholder for aiserver.v1.EditPatch (recursive)
 
 message PH_aiserver_v1_FileDiff {} // placeholder for aiserver.v1.FileDiff (recursive)
 
@@ -6427,32 +6940,4 @@ enum PH_aiserver_v1_GitDiff_DiffType {
   PH_AISERVER_V1_GITDIFF_DIFFTYPE_DIFF_TYPE_UNSPECIFIED = 0;
   PH_AISERVER_V1_GITDIFF_DIFFTYPE_DIFF_TYPE_DIFF_TO_HEAD = 1;
   PH_AISERVER_V1_GITDIFF_DIFFTYPE_DIFF_TYPE_DIFF_FROM_BRANCH_TO_MAIN = 2;
-}
-
-message PH_aiserver_v1_MarkCppRequest_RangeTransformation { // placeholder for aiserver.v1.MarkCppRequest.RangeTransformation
-  int32 start_line_number = 1;
-  int32 end_line_number = 2;
-}
-
-message PH_aiserver_v1_McpAuthResult { // placeholder for aiserver.v1.McpAuthResult
-  bool success = 1;
-  string message = 2;
-}
-
-message PH_aiserver_v1_OneIndexedPosition { // placeholder for aiserver.v1.OneIndexedPosition
-  int32 line_number_one_indexed = 1;
-  int32 column_one_indexed = 2;
-}
-
-message PH_aiserver_v1_RefreshTabContextResponse { // placeholder for aiserver.v1.RefreshTabContextResponse
-  repeated PH_aiserver_v1_CodeResult code_results = 1;
-}
-
-// placeholder for aiserver.v1.RemoveRepositoryResponse.Status
-enum PH_aiserver_v1_RemoveRepositoryResponse_Status {
-  PH_AISERVER_V1_REMOVEREPOSITORYRESPONSE_STATUS_STATUS_UNSPECIFIED = 0;
-  PH_AISERVER_V1_REMOVEREPOSITORYRESPONSE_STATUS_STATUS_NOT_FOUND = 1;
-  PH_AISERVER_V1_REMOVEREPOSITORYRESPONSE_STATUS_STATUS_NOT_AUTHORIZED = 2;
-  PH_AISERVER_V1_REMOVEREPOSITORYRESPONSE_STATUS_STATUS_STARTED = 3;
-  PH_AISERVER_V1_REMOVEREPOSITORYRESPONSE_STATUS_STATUS_SUCCESS = 4;
 }

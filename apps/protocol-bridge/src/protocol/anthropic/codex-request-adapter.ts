@@ -2,7 +2,10 @@ import {
   appendLanguageDirectiveToAnthropicSystem,
   appendStableLanguageDirectiveToAnthropicSystem,
 } from "../../llm/shared/language-directive"
+import { requireOptionalExactDurableIdentifier } from "../../context/durable-identifier"
+import { randomUUID } from "crypto"
 import type { CodexExecutionRequest } from "../../llm/openai/codex-native-types"
+import { createCodexRootProviderIdentity } from "../../llm/openai/codex-provider-identity"
 import { resolveThinkingIntentFromDto } from "../../llm/shared/thinking-intent"
 import type { CreateMessageDto } from "./dto/create-message.dto"
 
@@ -25,9 +28,15 @@ export function adaptAnthropicMessageToCodexExecutionRequest(
   modelName: string = dto.model,
   options: { languageDirectiveMode?: "stable" | "dynamic" } = {}
 ): CodexExecutionRequest {
-  const metadata = dto.metadata as { user_id?: unknown } | undefined
-  const cacheUserId =
-    typeof metadata?.user_id === "string" ? metadata.user_id.trim() : ""
+  // This adapter is the root boundary for a generic Anthropic request. The
+  // generated identity is retained by the request object through transport
+  // retries; `_conversationId` remains only a local continuation key.
+  const upstreamIdentity = createCodexRootProviderIdentity()
+  const localProjectionKey =
+    requireOptionalExactDurableIdentifier(
+      dto._conversationId,
+      "Anthropic Codex local projection key"
+    ) ?? `anthropic:${randomUUID()}`
   const languageOptions = { skip: dto._clientIsClaudeCode === true }
   const system =
     options.languageDirectiveMode === "dynamic"
@@ -46,13 +55,11 @@ export function adaptAnthropicMessageToCodexExecutionRequest(
     system: system as CodexExecutionRequest["system"],
     messages: dto.messages as CodexExecutionRequest["messages"],
     tools: dto.tools as CodexExecutionRequest["tools"],
-    conversationId:
-      typeof dto._conversationId === "string" ? dto._conversationId : undefined,
-    pendingToolUseIds: dto._pendingToolUseIds,
+    upstreamIdentity,
+    localProjectionKey,
     thinkingIntent: resolveThinkingIntentFromDto(dto),
     includeThinkingSummary: dto._includeThinkingSummary === true,
     serviceTier: dto.service_tier,
     parallelToolCalls: resolveParallelToolCalls(dto.tool_choice),
-    cacheUserId: cacheUserId || undefined,
   }
 }

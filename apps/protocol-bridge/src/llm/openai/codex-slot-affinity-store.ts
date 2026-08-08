@@ -1,5 +1,8 @@
+import { requireExactDurableIdentifier } from "../../context/durable-identifier"
+import { requireCodexSlotKey, type CodexSlotKey } from "./codex-slot-identity"
+
 export interface CodexSlotBinding {
-  slotKey: string
+  slotKey: CodexSlotKey
   expire: number
 }
 
@@ -10,7 +13,7 @@ export interface CodexSlotAffinityStoreOptions {
 
 export interface CodexStickySlotLookupOptions<TSlot> {
   candidates: TSlot[]
-  getSlotKey: (slot: TSlot) => string
+  getSlotKey: (slot: TSlot) => CodexSlotKey
   isSlotUsable: (slot: TSlot) => boolean
 }
 
@@ -28,13 +31,19 @@ export class CodexSlotAffinityStore {
     return this.bindings.size
   }
 
-  bindConversation(conversationId: string, slotKey: string): void {
-    const normalizedConversationId = conversationId.trim()
-    if (!normalizedConversationId || !slotKey) return
+  bindConversation(conversationId: string, slotKey: CodexSlotKey): void {
+    const exactConversationId = requireExactDurableIdentifier(
+      conversationId,
+      "Codex slot-affinity conversation id"
+    )
+    const exactSlotKey = requireCodexSlotKey(
+      slotKey,
+      "Codex slot-affinity slot key"
+    )
 
     this.pruneExpired()
-    this.bindings.set(normalizedConversationId, {
-      slotKey,
+    this.bindings.set(exactConversationId, {
+      slotKey: exactSlotKey,
       expire: this.now() + this.ttlMs,
     })
   }
@@ -43,15 +52,15 @@ export class CodexSlotAffinityStore {
     conversationId: string,
     options: CodexStickySlotLookupOptions<TSlot>
   ): TSlot | null {
-    const normalizedConversationId = conversationId.trim()
-    if (!normalizedConversationId) {
-      return null
-    }
+    const exactConversationId = requireExactDurableIdentifier(
+      conversationId,
+      "Codex slot-affinity conversation id"
+    )
 
     const now = this.now()
     this.pruneExpired(now)
 
-    const binding = this.bindings.get(normalizedConversationId)
+    const binding = this.bindings.get(exactConversationId)
     if (!binding) {
       return null
     }
@@ -61,12 +70,12 @@ export class CodexSlotAffinityStore {
         (candidate) => options.getSlotKey(candidate) === binding.slotKey
       ) || null
     if (!slot || !options.isSlotUsable(slot)) {
-      this.bindings.delete(normalizedConversationId)
+      this.bindings.delete(exactConversationId)
       return null
     }
 
     binding.expire = now + this.ttlMs
-    this.bindings.set(normalizedConversationId, binding)
+    this.bindings.set(exactConversationId, binding)
     return slot
   }
 
@@ -85,8 +94,12 @@ export class CodexSlotAffinityStore {
     return removed
   }
 
-  pruneBindingsForSlotKeys(slotKeys: Iterable<string>): number {
-    const staleKeys = new Set([...slotKeys].filter(Boolean))
+  pruneBindingsForSlotKeys(slotKeys: Iterable<CodexSlotKey>): number {
+    const staleKeys = new Set(
+      [...slotKeys].map((slotKey) =>
+        requireCodexSlotKey(slotKey, "Codex slot-affinity slot key")
+      )
+    )
     if (staleKeys.size === 0 || this.bindings.size === 0) {
       return 0
     }

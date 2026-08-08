@@ -1,4 +1,12 @@
-import { normalizeCodexPromptCacheKey } from "./codex-prompt-cache-key"
+import {
+  assertCodexProviderIdentity,
+  type CodexProviderIdentity,
+  type CodexSubagentProviderIdentity,
+} from "./codex-provider-identity"
+import {
+  requireExactDurableIdentifier,
+  requireOptionalExactDurableIdentifier,
+} from "../../context/durable-identifier"
 
 export type CodexForwardHeaders = Record<string, string>
 
@@ -30,13 +38,36 @@ export const CODEX_WS_STREAM_REQUEST_START_MS_METADATA_KEY =
   "x-codex-ws-stream-request-start-ms"
 export const CODEX_TURN_STATE_HEADER = "x-codex-turn-state"
 
-interface BuildCodexHttpHeadersParams {
+/**
+ * Requests that do not create or continue an upstream Codex turn. Keep their
+ * header shape separate so they cannot become a way around the typed
+ * bridge-native transport scope below.
+ */
+interface BuildCodexNonTurnHttpHeadersParams {
+  token: string
+  isApiKey: boolean
+  identity: CodexClientIdentity
+  accountId?: string
+  workspaceId?: string
+  accept: "application/json" | "text/event-stream"
+}
+
+/**
+ * Bridge-native transport scope. Local continuation state and the upstream
+ * Responses identity are both required, so no header can silently promote a
+ * local projection key into a Codex session or thread id.
+ */
+export interface CodexBridgeNativeTransportScope {
+  localProjectionKey: string
+  upstreamIdentity: CodexProviderIdentity
+  clientMetadata: CodexForwardHeaders
+}
+
+export interface BuildCodexBridgeNativeHttpHeadersParams extends CodexBridgeNativeTransportScope {
   token: string
   isApiKey: boolean
   stream: boolean
   identity: CodexClientIdentity
-  conversationId?: string
-  clientMetadata?: CodexForwardHeaders
   accountId?: string
   workspaceId?: string
   forwardHeaders?: CodexForwardHeaders
@@ -45,12 +76,10 @@ interface BuildCodexHttpHeadersParams {
   includeInstallationIdHeader?: boolean
 }
 
-interface BuildCodexWebSocketHeadersParams {
+export interface BuildCodexBridgeNativeWebSocketHeadersParams extends CodexBridgeNativeTransportScope {
   token: string
   isApiKey: boolean
   identity: CodexClientIdentity
-  conversationId?: string
-  clientMetadata?: CodexForwardHeaders
   accountId?: string
   workspaceId?: string
   forwardHeaders?: CodexForwardHeaders
@@ -129,52 +158,6 @@ function ensureHeader(
   }
 }
 
-function ensureCodexIdentityHeader(
-  target: Record<string, string>,
-  source: CodexForwardHeaders | undefined,
-  key: string,
-  defaultValue: string,
-  aliases: string[] = []
-): void {
-  const sourceValue = getForwardHeader(source, key, ...aliases)
-  if (sourceValue) {
-    const normalizedSource = normalizeCodexHeaderIdentityValue(sourceValue)
-    if (normalizedSource) {
-      target[key] = normalizedSource
-    }
-    return
-  }
-
-  if (getExistingHeader(target, key, ...aliases)) {
-    return
-  }
-
-  const normalizedDefault = normalizeCodexHeaderIdentityValue(defaultValue)
-  if (normalizedDefault) {
-    target[key] = normalizedDefault
-  }
-}
-
-function ensureCompatibilityHeader(
-  target: Record<string, string>,
-  forwardHeaders: CodexForwardHeaders | undefined,
-  clientMetadata: CodexForwardHeaders | undefined,
-  key: string,
-  aliases: string[] = []
-): void {
-  const sourceValue =
-    getForwardHeader(forwardHeaders, key, ...aliases) ||
-    getForwardHeader(clientMetadata, key, ...aliases)
-  if (sourceValue) {
-    target[key] = sourceValue
-    return
-  }
-
-  if (getExistingHeader(target, key, ...aliases)) {
-    return
-  }
-}
-
 function sanitizeHeaders(
   headers: Record<string, string>
 ): Record<string, string> {
@@ -185,47 +168,152 @@ function sanitizeHeaders(
   )
 }
 
-function resolveCodexIdentityHeaders(
-  forwardHeaders: CodexForwardHeaders | undefined,
-  clientMetadata: CodexForwardHeaders | undefined,
-  defaultConversationId: string
-): { sessionId: string; threadId: string } {
-  const sessionId = normalizeCodexHeaderIdentityValue(
-    getForwardHeader(forwardHeaders, "session-id", "session_id") ||
-      getForwardHeader(clientMetadata, "session_id", "session-id") ||
-      defaultConversationId
-  )
-  const threadId = normalizeCodexHeaderIdentityValue(
-    getForwardHeader(forwardHeaders, "thread-id", "thread_id") ||
-      getForwardHeader(clientMetadata, "thread_id", "thread-id") ||
-      sessionId
-  )
-
-  return {
-    sessionId,
-    threadId,
-  }
-}
-
-function normalizeCodexHeaderIdentityValue(value: string): string {
-  return normalizeCodexPromptCacheKey(value)
-}
-
-function ensureCodexSessionHeaders(
-  target: Record<string, string>,
-  identity: { sessionId: string; threadId: string }
+function assertBridgeNativeTransportScope(
+  scope: CodexBridgeNativeTransportScope
 ): void {
-  if (!getExistingHeader(target, "session-id")) {
-    const sessionId = identity.sessionId.trim()
-    if (sessionId) {
-      target["session-id"] = sessionId
-    }
+  requireExactDurableIdentifier(
+    scope.localProjectionKey,
+    "Codex bridge-native localProjectionKey"
+  )
+  assertCodexProviderIdentity(scope.upstreamIdentity)
+
+  const metadataSessionId = requireExactDurableIdentifier(
+    scope.clientMetadata.session_id,
+    "Codex client_metadata session_id"
+  )
+  const metadataThreadId = requireExactDurableIdentifier(
+    scope.clientMetadata.thread_id,
+    "Codex client_metadata thread_id"
+  )
+  const metadataTurnId = requireExactDurableIdentifier(
+    scope.clientMetadata.turn_id,
+    "Codex client_metadata turn_id"
+  )
+  const metadataWindowId = requireExactDurableIdentifier(
+    scope.clientMetadata["x-codex-window-id"],
+    "Codex client_metadata x-codex-window-id"
+  )
+  const turnMetadata = requireExactDurableIdentifier(
+    scope.clientMetadata["x-codex-turn-metadata"],
+    "Codex client_metadata x-codex-turn-metadata"
+  )
+  requireExactDurableIdentifier(
+    scope.clientMetadata["x-codex-installation-id"],
+    "Codex client_metadata x-codex-installation-id"
+  )
+  if (
+    metadataSessionId !== scope.upstreamIdentity.sessionId ||
+    metadataThreadId !== scope.upstreamIdentity.threadId
+  ) {
+    throw new Error(
+      "Codex bridge-native client metadata does not match upstream identity"
+    )
   }
-  if (!getExistingHeader(target, "thread-id")) {
-    const threadId = identity.threadId.trim()
-    if (threadId) {
-      target["thread-id"] = threadId
+
+  let parsedTurnMetadata: Record<string, unknown>
+  try {
+    const parsed: unknown = JSON.parse(turnMetadata)
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("not an object")
     }
+    parsedTurnMetadata = parsed as Record<string, unknown>
+  } catch {
+    throw new Error(
+      "Codex bridge-native client metadata must contain valid turn metadata"
+    )
+  }
+  if (
+    parsedTurnMetadata.session_id !== scope.upstreamIdentity.sessionId ||
+    parsedTurnMetadata.thread_id !== scope.upstreamIdentity.threadId ||
+    parsedTurnMetadata.thread_source !== scope.upstreamIdentity.threadSource ||
+    parsedTurnMetadata.turn_id !== metadataTurnId ||
+    parsedTurnMetadata.window_id !== metadataWindowId
+  ) {
+    throw new Error(
+      "Codex bridge-native turn metadata does not match upstream identity"
+    )
+  }
+
+  if (isSubagentIdentity(scope.upstreamIdentity)) {
+    const parentThreadId = requireExactDurableIdentifier(
+      scope.clientMetadata["x-codex-parent-thread-id"],
+      "Codex client_metadata x-codex-parent-thread-id"
+    )
+    const subagentHeader = requireExactDurableIdentifier(
+      scope.clientMetadata["x-openai-subagent"],
+      "Codex client_metadata x-openai-subagent"
+    )
+    if (
+      parentThreadId !== scope.upstreamIdentity.parentThreadId ||
+      subagentHeader !== scope.upstreamIdentity.subagentHeader ||
+      parsedTurnMetadata.parent_thread_id !==
+        scope.upstreamIdentity.parentThreadId ||
+      parsedTurnMetadata.subagent_kind !== scope.upstreamIdentity.subagentKind
+    ) {
+      throw new Error(
+        "Codex bridge-native subagent metadata does not match upstream identity"
+      )
+    }
+    return
+  }
+
+  if (
+    requireOptionalExactDurableIdentifier(
+      scope.clientMetadata["x-codex-parent-thread-id"],
+      "Codex client_metadata x-codex-parent-thread-id"
+    ) !== undefined ||
+    requireOptionalExactDurableIdentifier(
+      scope.clientMetadata["x-openai-subagent"],
+      "Codex client_metadata x-openai-subagent"
+    ) !== undefined ||
+    parsedTurnMetadata.parent_thread_id !== undefined ||
+    parsedTurnMetadata.subagent_kind !== undefined
+  ) {
+    throw new Error(
+      "Codex bridge-native root metadata cannot declare a subagent lineage"
+    )
+  }
+}
+
+function isSubagentIdentity(
+  identity: CodexProviderIdentity
+): identity is CodexSubagentProviderIdentity {
+  return identity.threadSource === "subagent"
+}
+
+function installBridgeNativeIdentityHeaders(
+  target: Record<string, string>,
+  identity: CodexProviderIdentity
+): void {
+  target["session-id"] = identity.sessionId
+  target["thread-id"] = identity.threadId
+  target["x-client-request-id"] = identity.threadId
+  if (isSubagentIdentity(identity)) {
+    target["x-codex-parent-thread-id"] = identity.parentThreadId
+    target["x-openai-subagent"] = identity.subagentHeader
+  }
+}
+
+function installBridgeNativeMetadataHeaders(
+  target: Record<string, string>,
+  clientMetadata: CodexForwardHeaders,
+  options: { includeInstallationIdHeader: boolean }
+): void {
+  for (const header of [
+    "x-codex-window-id",
+    "x-codex-turn-metadata",
+  ] as const) {
+    target[header] = requireExactDurableIdentifier(
+      clientMetadata[header],
+      `Codex client_metadata ${header}`
+    )
+  }
+  if (options.includeInstallationIdHeader) {
+    const installationId = requireExactDurableIdentifier(
+      clientMetadata["x-codex-installation-id"],
+      "Codex client_metadata x-codex-installation-id"
+    )
+    target["x-codex-installation-id"] = installationId
   }
 }
 
@@ -247,15 +335,48 @@ function ensureCodexOriginatorHeader(
   }
 }
 
-export function buildCodexHttpHeaders(
-  params: BuildCodexHttpHeadersParams
+export function buildCodexNonTurnHttpHeaders(
+  params: BuildCodexNonTurnHttpHeadersParams
 ): Record<string, string> {
-  const normalizedConversationId = params.conversationId?.trim() || ""
-  const codexIdentity = resolveCodexIdentityHeaders(
-    params.forwardHeaders,
-    params.clientMetadata,
-    normalizedConversationId
-  )
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${params.token}`,
+    Accept: params.accept,
+    Connection: "Keep-Alive",
+  }
+
+  ensureHeader(headers, undefined, "version", params.identity.version, [
+    "Version",
+  ])
+  ensureHeader(headers, undefined, "User-Agent", params.identity.userAgent, [
+    "user-agent",
+  ])
+
+  if (!params.isApiKey) {
+    ensureCodexOriginatorHeader(headers, undefined, params.identity.originator)
+    const accountId = params.accountId?.trim() || ""
+    if (accountId) {
+      headers["Chatgpt-Account-Id"] = accountId
+    }
+    const workspaceId = params.workspaceId?.trim() || ""
+    if (workspaceId) {
+      headers["OpenAI-Organization"] = workspaceId
+    }
+  }
+
+  return sanitizeHeaders(headers)
+}
+
+/**
+ * Header builder for requests assembled by the bridge's native Codex path.
+ * It never consults forward headers or client metadata for identity values:
+ * `localProjectionKey` remains local, while session/thread/request ids are
+ * emitted only from the typed upstream identity.
+ */
+export function buildCodexBridgeNativeHttpHeaders(
+  params: BuildCodexBridgeNativeHttpHeadersParams
+): Record<string, string> {
+  assertBridgeNativeTransportScope(params)
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${params.token}`,
@@ -281,46 +402,9 @@ export function buildCodexHttpHeaders(
     params.identity.version,
     ["Version"]
   )
-  ensureCompatibilityHeader(
-    headers,
-    params.forwardHeaders,
-    params.clientMetadata,
-    "x-codex-window-id"
-  )
-  ensureCompatibilityHeader(
-    headers,
-    params.forwardHeaders,
-    params.clientMetadata,
-    "x-codex-turn-metadata",
-    ["X-Codex-Turn-Metadata"]
-  )
-  ensureCompatibilityHeader(
-    headers,
-    params.forwardHeaders,
-    params.clientMetadata,
-    "x-codex-parent-thread-id"
-  )
-  ensureCompatibilityHeader(
-    headers,
-    params.forwardHeaders,
-    params.clientMetadata,
-    "x-openai-subagent"
-  )
-  if (params.includeInstallationIdHeader) {
-    ensureCompatibilityHeader(
-      headers,
-      params.forwardHeaders,
-      params.clientMetadata,
-      "x-codex-installation-id"
-    )
-  }
-  ensureHeader(
-    headers,
-    params.forwardHeaders,
-    "X-Client-Request-Id",
-    codexIdentity.threadId || normalizedConversationId,
-    ["x-client-request-id"]
-  )
+  installBridgeNativeMetadataHeaders(headers, params.clientMetadata, {
+    includeInstallationIdHeader: params.includeInstallationIdHeader === true,
+  })
   ensureHeader(
     headers,
     params.forwardHeaders,
@@ -328,7 +412,7 @@ export function buildCodexHttpHeaders(
     params.identity.userAgent,
     ["user-agent"]
   )
-  ensureCodexSessionHeaders(headers, codexIdentity)
+  installBridgeNativeIdentityHeaders(headers, params.upstreamIdentity)
 
   if (!params.isApiKey) {
     ensureCodexOriginatorHeader(
@@ -349,15 +433,15 @@ export function buildCodexHttpHeaders(
   return sanitizeHeaders(headers)
 }
 
-export function buildCodexWebSocketHeaders(
-  params: BuildCodexWebSocketHeadersParams
+/**
+ * WebSocket equivalent of `buildCodexBridgeNativeHttpHeaders`. The physical
+ * socket remains keyed by the local projection scope, but all upstream
+ * identity headers are written from the typed native identity.
+ */
+export function buildCodexBridgeNativeWebSocketHeaders(
+  params: BuildCodexBridgeNativeWebSocketHeadersParams
 ): Record<string, string> {
-  const normalizedConversationId = params.conversationId?.trim() || ""
-  const codexIdentity = resolveCodexIdentityHeaders(
-    params.forwardHeaders,
-    params.clientMetadata,
-    normalizedConversationId
-  )
+  assertBridgeNativeTransportScope(params)
   const headers: Record<string, string> = {
     Authorization: `Bearer ${params.token}`,
   }
@@ -372,37 +456,9 @@ export function buildCodexWebSocketHeaders(
   ensureHeader(headers, params.forwardHeaders, "x-codex-turn-state", "", [
     "x-codex-turn-state",
   ])
-  ensureCompatibilityHeader(
-    headers,
-    params.forwardHeaders,
-    params.clientMetadata,
-    "x-codex-window-id"
-  )
-  ensureCompatibilityHeader(
-    headers,
-    params.forwardHeaders,
-    params.clientMetadata,
-    "x-codex-turn-metadata"
-  )
-  ensureCompatibilityHeader(
-    headers,
-    params.forwardHeaders,
-    params.clientMetadata,
-    "x-codex-parent-thread-id"
-  )
-  ensureCompatibilityHeader(
-    headers,
-    params.forwardHeaders,
-    params.clientMetadata,
-    "x-openai-subagent"
-  )
-  ensureCodexIdentityHeader(
-    headers,
-    params.forwardHeaders,
-    "x-client-request-id",
-    codexIdentity.threadId || normalizedConversationId,
-    ["x-client-request-id"]
-  )
+  installBridgeNativeMetadataHeaders(headers, params.clientMetadata, {
+    includeInstallationIdHeader: false,
+  })
   ensureHeader(
     headers,
     params.forwardHeaders,
@@ -430,8 +486,7 @@ export function buildCodexWebSocketHeaders(
     openAiBeta && openAiBeta.includes("responses_websockets=")
       ? openAiBeta
       : CODEX_WS_BETA_HEADER
-
-  ensureCodexSessionHeaders(headers, codexIdentity)
+  installBridgeNativeIdentityHeaders(headers, params.upstreamIdentity)
 
   if (!params.isApiKey) {
     ensureCodexOriginatorHeader(
@@ -486,9 +541,11 @@ export function buildCodexWebSocketRequestBody(
       Math.trunc(options.streamRequestStartMs)
     )
   }
-  const turnState = options.turnState?.trim()
-  if (turnState) {
-    websocketMetadata[CODEX_TURN_STATE_HEADER] = turnState
+  if (options.turnState !== undefined) {
+    websocketMetadata[CODEX_TURN_STATE_HEADER] = requireExactDurableIdentifier(
+      options.turnState,
+      "Codex turn state"
+    )
   }
 
   const traceparent = getForwardHeader(options.forwardHeaders, "traceparent")

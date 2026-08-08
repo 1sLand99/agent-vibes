@@ -1,9 +1,17 @@
+import { requireExactDurableIdentifier } from "../../context/durable-identifier"
+import {
+  createCodexWsCacheKey,
+  isValidCodexCachedWsEntry,
+} from "./codex-runtime-cache-store"
 import type {
   CodexCachedWsEntry,
   CodexTakenWsEntry,
 } from "./codex-runtime-cache-store"
-import { createCodexWsCacheKey } from "./codex-runtime-cache-store"
-import { hashCodexIdentityPart } from "./codex-slot-identity"
+import {
+  hashCodexIdentityPart,
+  requireCodexSlotKey,
+  type CodexSlotKey,
+} from "./codex-slot-identity"
 import type { CodexTurnContinuationState } from "./codex-turn-state"
 
 /**
@@ -14,6 +22,8 @@ import type { CodexTurnContinuationState } from "./codex-turn-state"
 export interface CodexTurnContext extends CodexTurnContinuationState {
   /** Current WebSocket session ID (key in wsService.sessions) */
   wsSessionId: string
+  /** Exact logical upstream ModelClientSession identity for this chain. */
+  modelClientSessionId: string
   /** Stable Codex turn metadata key used to scope sticky routing state */
   turnKey: string | undefined
   /** x-codex-turn-state captured from the WebSocket upgrade response */
@@ -26,10 +36,12 @@ export interface CreateCodexTurnContextOptions {
   conversationId: string
   turnKey?: string
   takenCache?: CodexTakenWsEntry
+  /** True only when the cache belongs to this exact conversation and turn. */
+  reuseCachedLogicalSession?: boolean
 }
 
 export interface CodexScopedWsCacheKeyInput {
-  slotKey: string
+  slotKey: CodexSlotKey
   modelName: string
   conversationId?: string
 }
@@ -37,23 +49,38 @@ export interface CodexScopedWsCacheKeyInput {
 export function buildCodexScopedWsCacheKey(
   input: CodexScopedWsCacheKeyInput
 ): string {
-  const normalizedConversationId = input.conversationId?.trim()
+  const slotKey = requireCodexSlotKey(input.slotKey, "Codex cache slot key")
+  const conversationId =
+    input.conversationId === undefined
+      ? undefined
+      : requireExactDurableIdentifier(
+          input.conversationId,
+          "Codex cache conversation id"
+        )
   return createCodexWsCacheKey({
-    slotKeyHash: hashCodexIdentityPart(input.slotKey),
+    slotKeyHash: hashCodexIdentityPart(slotKey),
     modelName: input.modelName,
-    conversationIdHash: normalizedConversationId
-      ? hashCodexIdentityPart(normalizedConversationId)
-      : undefined,
+    conversationIdHash:
+      conversationId === undefined
+        ? undefined
+        : hashCodexIdentityPart(conversationId),
   })
 }
 
 export function reuseCodexActiveTurnContext(
   context: CodexTurnContext,
+  conversationId: string,
   turnKey?: string
 ): CodexTurnContext {
   if (context.turnKey !== turnKey) {
     context.turnKey = turnKey
     context.turnState = undefined
+    context.lastRequest = undefined
+    context.lastResponse = undefined
+    context.modelClientSessionId = buildCodexTurnWsSessionId(
+      conversationId,
+      turnKey
+    )
     context.connectionReused = true
   }
   return context
@@ -62,25 +89,40 @@ export function reuseCodexActiveTurnContext(
 export function createCodexTurnContext(
   options: CreateCodexTurnContextOptions
 ): CodexTurnContext {
+  const conversationId = requireExactDurableIdentifier(
+    options.conversationId,
+    "Codex turn conversation id"
+  )
+  const turnKey =
+    options.turnKey === undefined
+      ? undefined
+      : requireExactDurableIdentifier(options.turnKey, "Codex turn key")
   const cached = options.takenCache?.entry
   if (cached) {
-    const turnKeyMatches = cached.turnKey === options.turnKey
+    if (!isValidCodexCachedWsEntry(cached)) {
+      throw new Error(
+        "Codex turn context rejected a cached entry without an exact ModelClientSession identity"
+      )
+    }
+    const reuseLogicalSession =
+      options.reuseCachedLogicalSession === true && cached.turnKey === turnKey
     return {
       wsSessionId: cached.wsSessionId,
-      turnKey: options.turnKey,
-      turnState: turnKeyMatches ? cached.turnState : undefined,
-      lastResponse: cached.lastResponse,
-      lastRequest: cached.lastRequest,
+      modelClientSessionId: reuseLogicalSession
+        ? cached.modelClientSessionId
+        : buildCodexTurnWsSessionId(conversationId, turnKey),
+      turnKey,
+      turnState: reuseLogicalSession ? cached.turnState : undefined,
+      lastResponse: reuseLogicalSession ? cached.lastResponse : undefined,
+      lastRequest: reuseLogicalSession ? cached.lastRequest : undefined,
       connectionReused: true,
     }
   }
 
   return {
-    wsSessionId: buildCodexTurnWsSessionId(
-      options.conversationId,
-      options.turnKey
-    ),
-    turnKey: options.turnKey,
+    wsSessionId: buildCodexTurnWsSessionId(conversationId, turnKey),
+    modelClientSessionId: buildCodexTurnWsSessionId(conversationId, turnKey),
+    turnKey,
     turnState: undefined,
     lastResponse: undefined,
     lastRequest: undefined,
@@ -92,12 +134,16 @@ export function buildCodexTurnWsSessionId(
   conversationId: string,
   turnKey?: string
 ): string {
-  const normalizedConversationId = conversationId.trim()
-  const normalizedTurnKey = turnKey?.trim()
-  if (!normalizedTurnKey) {
-    return `${normalizedConversationId}:turn:unkeyed`
+  const exactConversationId = requireExactDurableIdentifier(
+    conversationId,
+    "Codex WebSocket conversation id"
+  )
+  if (turnKey === undefined) {
+    return `${exactConversationId}:turn:unkeyed`
   }
-  return `${normalizedConversationId}:turn:${hashCodexIdentityPart(normalizedTurnKey)}`
+  return `${exactConversationId}:turn:${hashCodexIdentityPart(
+    requireExactDurableIdentifier(turnKey, "Codex WebSocket turn key")
+  )}`
 }
 
 export function codexTurnContextToCachedWsEntry(
@@ -106,6 +152,7 @@ export function codexTurnContextToCachedWsEntry(
 ): CodexCachedWsEntry {
   return {
     wsSessionId: context.wsSessionId,
+    modelClientSessionId: context.modelClientSessionId,
     turnKey: context.turnKey,
     turnState: context.turnState,
     lastResponse: context.lastResponse,

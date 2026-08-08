@@ -343,6 +343,7 @@ export class ConnectRPCHandler {
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "unknown"
         this.logger.error(`>>> bidiPayload error: ${errorMessage}`)
+        throw error
       }
 
       this.logger.log(">>> Input stream completed")
@@ -422,6 +423,7 @@ export class ConnectRPCHandler {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "unknown"
       this.logger.error(`>>> Stream error: ${errorMessage}`)
+      throw error
     }
 
     this.logger.log(">>> Input stream completed")

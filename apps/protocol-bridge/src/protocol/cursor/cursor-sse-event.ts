@@ -24,6 +24,8 @@ export interface CursorSseEventData {
     [key: string]: unknown
   }
   index?: number
+  /** Native Responses output-item identity carried through the internal SSE bridge. */
+  item_id?: string
   usage?: {
     input_tokens?: number
     cache_read_input_tokens?: number
@@ -31,6 +33,11 @@ export interface CursorSseEventData {
     output_tokens?: number
   }
   item?: Record<string, unknown>
+  status?: "completed" | "incomplete" | "failed"
+  responseId?: string
+  incompleteReason?: string
+  errorCode?: string
+  errorMessage?: string
 }
 
 export interface CursorSseEvent {

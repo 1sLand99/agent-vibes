@@ -9,15 +9,12 @@ import { Controller, Get, Logger, Post, Req, Res } from "@nestjs/common"
 import { FastifyReply, FastifyRequest } from "fastify"
 import {
   GetDefaultModelForCliResponseSchema,
-  GetNewChatNudgeLegacyModelPickerRequestSchema,
   GetNewChatNudgeLegacyModelPickerResponseSchema,
-  GetNewChatNudgeParameterizedModelPickerRequestSchema,
   GetNewChatNudgeParameterizedModelPickerResponseSchema,
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
 } from "../../../gen/agent/v1_pb"
 import {
-  AvailableCppModelsResponseSchema,
   AvailableModelsRequestSchema,
   AvailableModelsResponseSchema,
   AvailableModelsResponse_FeatureModelConfigSchema,
@@ -27,7 +24,6 @@ import {
   AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfigSchema,
   AvailableModelsResponse_ModelPickerDisplayConfiguration_RoutedModelViewConfig_RoutedModelViewToNamedViewToggleSchema,
   AvailableModelsScope,
-  BackgroundComposerSource,
   BootstrapStatsigRequestSchema,
   BootstrapStatsigResponseSchema,
   CheckFeatureStatusRequestSchema,
@@ -37,27 +33,19 @@ import {
   CheckFeaturesStatusResponse_FeatureStatusSchema,
   CheckQueuePositionResponseSchema,
   CheckUsageBasedPriceResponseSchema,
-  DeletePendingFollowupRequestSchema,
-  DeletePendingFollowupResponseSchema,
   FindBugsResponseSchema,
   GetCloudSetupBlockersResponseSchema,
   GetCurrentPeriodUsageResponseSchema,
   GetDefaultModelNudgeDataResponseSchema,
   GetDefaultModelResponseSchema,
-  GetEmailResponseSchema,
-  GetEmailResponse_SignUpType,
   GetLastDefaultModelNudgeResponseSchema,
   GetModelLabelsResponseSchema,
   GetServerConfigResponseSchema,
   GetUsageLimitPolicyStatusResponseSchema,
-  HasSeenAdResponseSchema,
   IsAllowedFreeTrialUsageResponseSchema,
   IsOnNewPricingResponseSchema,
   KnowledgeBaseAddRequestSchema,
   KnowledgeBaseAddResponseSchema,
-  KnowledgeBaseGetRequestSchema,
-  KnowledgeBaseGetResponseSchema,
-  KnowledgeBaseGetResponse_ItemSchema,
   KnowledgeBaseListResponseSchema,
   KnowledgeBaseListResponse_ItemSchema,
   KnowledgeBaseRemoveRequestSchema,
@@ -66,14 +54,15 @@ import {
   KnowledgeBaseUpdateResponseSchema,
   ListBackgroundComposersResponseSchema,
   ListPersonalEnvironmentsResponseSchema,
-  ListPendingFollowupsRequestSchema,
-  ListPendingFollowupsResponseSchema,
   ListTeamEnvironmentsResponseSchema,
   NameTabRequestSchema,
   NameTabResponseSchema,
-  PendingFollowupSchema,
   PrivacyCheckResponseSchema,
   ReportAgentFeedbackResponseSchema,
+  RunGenerateImageErrorSchema,
+  RunGenerateImageRequestSchema,
+  RunGenerateImageResponseSchema,
+  RunGenerateImageSuccessSchema,
   SubmitSpansResponseSchema,
   TestBidiRequestSchema,
   TestBidiResponseSchema,
@@ -83,15 +72,14 @@ import { AnthropicApiService } from "../../../llm/anthropic/anthropic-api.servic
 import { GoogleModelCacheService } from "../../../llm/google/google-model-cache.service"
 import { GoogleService } from "../../../llm/google/google.service"
 import { KiroService } from "../../../llm/aws/kiro.service"
+import { ImageGenerationService } from "../../../llm/image-generation/image-generation.service"
 import { CodexService } from "../../../llm/openai/codex.service"
 import { OpenaiCompatService } from "../../../llm/openai/openai-compat.service"
 import {
-  DEFAULT_GEMINI_MODEL,
   canPublicClaudeModelUseGoogle,
   getCursorDisplayModels,
   resolveCloudCodeModel,
 } from "../../../llm/shared/model-registry"
-import { parseModelRequest } from "../../../llm/shared/model-request"
 import { ModelRouterService } from "../../../llm/shared/model-router.service"
 import { connectRPCHandler } from "../connect-rpc-handler"
 import {
@@ -100,14 +88,11 @@ import {
   buildCursorModelLabel,
   buildCursorUsableModel,
   buildLegacyCursorAvailableModels,
-  parseCursorVariantString,
   resolveCursorDefaultSelection,
   selectPreferredCursorModelName,
 } from "../cursor-model-protocol"
-import { CursorConnectStreamService } from "../cursor-connect-stream.service"
 import { KnowledgeBaseService } from "../knowledge-base.service"
 import { SessionLifecycleService } from "../session/session-lifecycle.service"
-import { SessionStreamService } from "../session/session-stream.service"
 
 const ENABLED_CURSOR_FEATURES = new Set<string>([
   "react_shell_tool",
@@ -219,8 +204,6 @@ function djb2Hash(str: string): string {
 const MOCK_DEFAULTS = {
   /** Email shown in Cursor account UI */
   email: "protocol-bridge@local",
-  /** Sign-up provider reported to the IDE */
-  signUpType: GetEmailResponse_SignUpType.GOOGLE,
   /** Stripe membership level — affects feature gates in the IDE */
   membershipType: "ultra" as const,
   /** Subscription status — must be "active" for agent features */
@@ -229,8 +212,6 @@ const MOCK_DEFAULTS = {
   tabName: "New Tab",
   /** Queue position (-1 = no queue, bypasses waiting UI) */
   queuePosition: -1,
-  /** Whether the user has seen the in-app ad (true = skip) */
-  hasSeen: true,
   /** Whether free trial usage is allowed */
   isAllowed: true,
   /** Preferred default model shown in pickers when available */
@@ -270,10 +251,9 @@ export class AiserverMockController {
     private readonly kiroService: KiroService,
     private readonly modelRouter: ModelRouterService,
     private readonly openaiCompatService: OpenaiCompatService,
+    private readonly imageGenerationService: ImageGenerationService,
     private readonly knowledgeBaseService: KnowledgeBaseService,
-    private readonly sessionManager: SessionLifecycleService,
-    private readonly sessionStream: SessionStreamService,
-    private readonly streamService: CursorConnectStreamService
+    private readonly sessionManager: SessionLifecycleService
   ) {}
 
   private isGptBackendAvailable(): boolean {
@@ -482,105 +462,6 @@ export class AiserverMockController {
     )
   }
 
-  private scheduleCodexWarmupForCursorModel(
-    cursorModel: string | undefined,
-    reason: string
-  ): void {
-    const normalizedModel = cursorModel?.trim()
-    if (!normalizedModel) {
-      return
-    }
-    const variantSelection = parseCursorVariantString(normalizedModel)
-    const routableModel =
-      variantSelection?.baseModel ||
-      parseModelRequest(normalizedModel).baseModel ||
-      normalizedModel
-
-    let route:
-      | {
-          backend: string
-          model: string
-        }
-      | undefined
-    try {
-      route = this.modelRouter.resolveModel(routableModel)
-    } catch (error) {
-      this.logger.debug(
-        `Skipped Codex warmup for model=${normalizedModel}: ${error instanceof Error ? error.message : String(error)}`
-      )
-      return
-    }
-
-    if (route.backend !== "codex") {
-      return
-    }
-
-    void this.codexService
-      .prewarmSessionConnection(
-        {
-          model: route.model,
-        },
-        { reason }
-      )
-      .catch((error) => {
-        this.logger.debug(
-          `Codex warmup failed for model=${normalizedModel}: ${error instanceof Error ? error.message : String(error)}`
-        )
-      })
-  }
-
-  private schedulePreferredCodexWarmup(
-    models: Array<{ name: string; family: string; isThinking: boolean }>,
-    reason: string
-  ): void {
-    const preferredModel = this.getPreferredDefaultModelName(models)
-    this.scheduleCodexWarmupForCursorModel(preferredModel, reason)
-  }
-
-  private parseLegacyNudgeCurrentModel(
-    req?: FastifyRequest
-  ): string | undefined {
-    const body = req?.body
-    if (!(body instanceof Uint8Array || Buffer.isBuffer(body))) {
-      return undefined
-    }
-
-    try {
-      const request = fromBinary(
-        GetNewChatNudgeLegacyModelPickerRequestSchema,
-        new Uint8Array(body)
-      )
-      return request.currentModel?.trim() || undefined
-    } catch (error) {
-      this.logger.debug(
-        `GetNewChatNudgeLegacyModelPicker request parse failed: ${error instanceof Error ? error.message : String(error)}`
-      )
-      return undefined
-    }
-  }
-
-  private parseParameterizedNudgeCurrentModel(
-    req?: FastifyRequest
-  ): string | undefined {
-    const body = req?.body
-    if (!(body instanceof Uint8Array || Buffer.isBuffer(body))) {
-      return undefined
-    }
-
-    try {
-      const request = fromBinary(
-        GetNewChatNudgeParameterizedModelPickerRequestSchema,
-        new Uint8Array(body)
-      )
-      return request.currentModel?.modelId?.trim() || undefined
-    } catch (error) {
-      this.logger.debug(
-        `GetNewChatNudgeParameterizedModelPicker request parse failed: ${error instanceof Error ? error.message : String(error)}`
-      )
-      return undefined
-    }
-  }
-
   private getPreferredDefaultModelName(
     models: Array<{ name: string; family: string; isThinking: boolean }>
   ): string {
@@ -650,110 +531,93 @@ export class AiserverMockController {
             ),
           }
         ),
+        // Local bridge is not an admin-restricted model catalog: keep the
+        // picker open (Cursor 3.15+ display_configuration fields).
+        hideAddModels: false,
       }
     )
   }
 
-  // ── AiService: PendingFollowup reconcile ──
-  //
-  // The IDE's queued-followup panel is a server-authoritative list:
-  // on reconnect / supersede / cross-device sync, the IDE asks
-  // `ListPendingFollowups` to learn which async ask_question calls
-  // the bridge is still tracking, and renders one "queued" entry per
-  // returned PendingFollowup. The bridge is the source of truth —
-  // any followup the bridge no longer remembers is dropped from the
-  // IDE's local state. This is what closes the queued-badge leak
-  // path 1:13:51 / 1:18:47 produced before deadlines + reconcile
-  // were wired in.
-
-  @Post("aiserver.v1.AiService/ListPendingFollowups")
-  handleListPendingFollowups(
+  @Post("aiserver.v1.AiService/RunGenerateImage")
+  async runGenerateImage(
     @Req() req: FastifyRequest,
     @Res() res: FastifyReply
-  ): void {
-    let bcId: string | undefined
-    const body = req?.body
-    if (body instanceof Uint8Array || Buffer.isBuffer(body)) {
-      try {
-        const request = fromBinary(
-          ListPendingFollowupsRequestSchema,
-          new Uint8Array(body)
-        )
-        bcId = request.bcId
-      } catch (err) {
-        this.logger.warn(
-          `ListPendingFollowups: failed to parse request body: ${(err as Error).message}`
-        )
-      }
-    }
-
-    const followups = this.sessionStream.listAsyncAskFollowups(bcId)
-    const response = create(ListPendingFollowupsResponseSchema, {
-      pendingFollowups: followups.map((f) =>
-        create(PendingFollowupSchema, {
-          followupId: f.followupId,
-          text: f.text,
-          richText: "",
-          createdAtMs: BigInt(f.createdAtMs),
-          source: BackgroundComposerSource.UNSPECIFIED,
-          cursorCommands: [],
-          cursorCommandsExplicitlySet: false,
-          pastChats: [],
-          pastChatsExplicitlySet: false,
-          blobData: [],
+  ): Promise<void> {
+    const sendError = (error: string): void => {
+      this.sendProto(
+        res,
+        RunGenerateImageResponseSchema,
+        create(RunGenerateImageResponseSchema, {
+          result: {
+            case: "error",
+            value: create(RunGenerateImageErrorSchema, {
+              error,
+              modelRestricted: false,
+            }),
+          },
         })
-      ),
-    })
-    this.logger.log(
-      `ListPendingFollowups: bcId=${bcId ?? "(any)"} returned=${followups.length}`
-    )
-    this.sendProto(res, ListPendingFollowupsResponseSchema, response)
-  }
-
-  @Post("aiserver.v1.AiService/DeletePendingFollowup")
-  handleDeletePendingFollowup(
-    @Req() req: FastifyRequest,
-    @Res() res: FastifyReply
-  ): void {
-    let followupId: string | undefined
-    const body = req?.body
-    if (body instanceof Uint8Array || Buffer.isBuffer(body)) {
-      try {
-        const request = fromBinary(
-          DeletePendingFollowupRequestSchema,
-          new Uint8Array(body)
-        )
-        followupId = request.followupId
-      } catch (err) {
-        this.logger.warn(
-          `DeletePendingFollowup: failed to parse request body: ${(err as Error).message}`
-        )
-      }
+      )
     }
 
-    if (followupId) {
-      const found = this.sessionStream.findAsyncAskFollowupById(followupId)
-      if (found) {
-        this.streamService.expireAsyncAskQuestion(
-          found.conversationId,
-          found.queryId,
-          "user_deleted"
-        )
-        this.logger.log(
-          `DeletePendingFollowup: followupId=${followupId} cleared from ${found.conversationId}`
-        )
-      } else {
-        this.logger.warn(
-          `DeletePendingFollowup: followupId=${followupId} not found in any in-memory session`
-        )
-      }
+    const body = req.body
+    if (!(body instanceof Uint8Array) && !Buffer.isBuffer(body)) {
+      sendError("RunGenerateImage request body must be protobuf bytes")
+      return
     }
 
-    this.sendProto(
-      res,
-      DeletePendingFollowupResponseSchema,
-      create(DeletePendingFollowupResponseSchema, {})
+    let request
+    try {
+      request = fromBinary(RunGenerateImageRequestSchema, new Uint8Array(body))
+    } catch (error) {
+      sendError(
+        `Invalid RunGenerateImage request: ${error instanceof Error ? error.message : String(error)}`
+      )
+      return
+    }
+
+    const description = request.description.trim()
+    if (!description) {
+      sendError("Image generation description is required")
+      return
+    }
+
+    const invalidReference = request.referenceImages.find(
+      (reference) => !reference.data.trim() || !reference.mimeType.trim()
     )
+    if (invalidReference) {
+      sendError("Reference images require both data and mime_type")
+      return
+    }
+
+    try {
+      const result = await this.imageGenerationService.generateImage({
+        prompt: description,
+        model: request.modelId || undefined,
+        referenceImages: request.referenceImages.map((reference, index) => ({
+          path: `inline-reference-${index}`,
+          data: reference.data,
+          mimeType: reference.mimeType,
+        })),
+      })
+      if (!result.mimeType) {
+        throw new Error("Image provider returned no MIME type")
+      }
+      this.sendProto(
+        res,
+        RunGenerateImageResponseSchema,
+        create(RunGenerateImageResponseSchema, {
+          result: {
+            case: "success",
+            value: create(RunGenerateImageSuccessSchema, {
+              imageData: result.imageData,
+              mimeType: result.mimeType,
+            }),
+          },
+        })
+      )
+    } catch (error) {
+      sendError(error instanceof Error ? error.message : String(error))
+    }
   }
 
   // ── NetworkService ──
@@ -1206,10 +1070,6 @@ export class AiserverMockController {
       maxMode: selection.maxMode,
       nextDefaultSetDate: "",
     })
-    this.scheduleCodexWarmupForCursorModel(
-      selection.model,
-      "aiserver-default-model"
-    )
     this.sendProto(res, GetDefaultModelResponseSchema, response)
   }
 
@@ -1232,7 +1092,6 @@ export class AiserverMockController {
     })
     const models = cursorModels.map((model) => buildCursorUsableModel(model))
     const response = create(GetUsableModelsResponseSchema, { models })
-    this.schedulePreferredCodexWarmup(cursorModels, "aiserver-usable-models")
     this.sendProto(res, GetUsableModelsResponseSchema, response)
   }
 
@@ -1251,10 +1110,6 @@ export class AiserverMockController {
     const response = create(GetDefaultModelForCliResponseSchema, {
       model: selectedModel ? buildCursorUsableModel(selectedModel) : undefined,
     })
-    this.scheduleCodexWarmupForCursorModel(
-      selectedModel?.name || selection.model,
-      "aiserver-default-model-cli"
-    )
     this.sendProto(res, GetDefaultModelForCliResponseSchema, response)
   }
 
@@ -1376,36 +1231,6 @@ export class AiserverMockController {
     }
   }
 
-  @Post("aiserver.v1.AiService/KnowledgeBaseGet")
-  handleKnowledgeBaseGet(
-    @Req() req: FastifyRequest,
-    @Res() res: FastifyReply
-  ): void {
-    try {
-      const body = req.body as Buffer | undefined
-      if (body && body.length > 0) {
-        const request = fromBinary(KnowledgeBaseGetRequestSchema, body)
-        const item = this.knowledgeBaseService.get(request.id)
-        if (item) {
-          const response = create(KnowledgeBaseGetResponseSchema, {
-            result: create(KnowledgeBaseGetResponse_ItemSchema, {
-              id: item.id,
-              knowledge: item.knowledge,
-              title: item.title,
-              createdAt: item.createdAt,
-            }),
-          })
-          this.sendProto(res, KnowledgeBaseGetResponseSchema, response)
-          return
-        }
-      }
-      this.sendEmpty(res)
-    } catch (error) {
-      this.logger.error(`KnowledgeBaseGet failed: ${String(error)}`)
-      this.sendEmpty(res)
-    }
-  }
-
   @Post("aiserver.v1.AiService/KnowledgeBaseList")
   handleKnowledgeBaseList(@Res() res: FastifyReply): void {
     try {
@@ -1481,11 +1306,6 @@ export class AiserverMockController {
     this.sendEmpty(res)
   }
 
-  @Post("aiserver.v1.AiService/ReportBug")
-  handleReportBug(@Res() res: FastifyReply): void {
-    this.sendEmpty(res)
-  }
-
   @Post("aiserver.v1.AiService/ReportClientNumericMetrics")
   handleReportClientNumericMetrics(@Res() res: FastifyReply): void {
     this.sendEmpty(res)
@@ -1506,15 +1326,6 @@ export class AiserverMockController {
   @Post("aiserver.v1.AuthService/RefreshToken")
   handleRefreshToken(@Res() res: FastifyReply): void {
     this.sendEmpty(res)
-  }
-
-  @Post("aiserver.v1.AuthService/GetEmail")
-  handleGetEmail(@Res() res: FastifyReply): void {
-    const response = create(GetEmailResponseSchema, {
-      email: MOCK_DEFAULTS.email,
-      signUpType: MOCK_DEFAULTS.signUpType,
-    })
-    this.sendProto(res, GetEmailResponseSchema, response)
   }
 
   // ── Other Services ──
@@ -1623,17 +1434,6 @@ export class AiserverMockController {
     this.sendEmpty(res)
   }
 
-  @Post("aiserver.v1.CppService/AvailableModels")
-  handleCppAvailableModels(@Res() res: FastifyReply): void {
-    const models = this.buildCursorModels().map((model) => model.name)
-    const response = create(AvailableCppModelsResponseSchema, {
-      models,
-      defaultModel: DEFAULT_GEMINI_MODEL,
-    })
-    this.logModelNames("CppService.AvailableModels response", models)
-    this.sendProto(res, AvailableCppModelsResponseSchema, response)
-  }
-
   @Post(
     "aiserver.v1.BackgroundComposerService/GetBackgroundComposerUserSettings"
   )
@@ -1678,14 +1478,6 @@ export class AiserverMockController {
     this.sendEmpty(res)
   }
 
-  @Post("aiserver.v1.InAppAdService/HasSeenAd")
-  handleHasSeenAd(@Res() res: FastifyReply): void {
-    const response = create(HasSeenAdResponseSchema, {
-      hasSeen: MOCK_DEFAULTS.hasSeen,
-    })
-    this.sendProto(res, HasSeenAdResponseSchema, response)
-  }
-
   // ── REST endpoints ──
 
   @Post("v1/traces")
@@ -1715,18 +1507,8 @@ export class AiserverMockController {
   // ── agent.v1 supplementary endpoints ──
 
   @Post("agent.v1.AgentService/GetNewChatNudgeLegacyModelPicker")
-  handleGetNewChatNudgeLegacyModelPicker(
-    @Req() req: FastifyRequest,
-    @Res() res: FastifyReply
-  ): void {
+  handleGetNewChatNudgeLegacyModelPicker(@Res() res: FastifyReply): void {
     const response = create(GetNewChatNudgeLegacyModelPickerResponseSchema, {})
-    const requestedModel =
-      this.parseLegacyNudgeCurrentModel(req) ||
-      this.getPreferredDefaultModelName(this.buildCursorModels())
-    this.scheduleCodexWarmupForCursorModel(
-      requestedModel,
-      "agent-new-chat-nudge-legacy"
-    )
     this.sendProto(
       res,
       GetNewChatNudgeLegacyModelPickerResponseSchema,
@@ -1736,19 +1518,11 @@ export class AiserverMockController {
 
   @Post("agent.v1.AgentService/GetNewChatNudgeParameterizedModelPicker")
   handleGetNewChatNudgeParameterizedModelPicker(
-    @Req() req: FastifyRequest,
     @Res() res: FastifyReply
   ): void {
     const response = create(
       GetNewChatNudgeParameterizedModelPickerResponseSchema,
       {}
-    )
-    const requestedModel =
-      this.parseParameterizedNudgeCurrentModel(req) ||
-      this.getPreferredDefaultModelName(this.buildCursorModels())
-    this.scheduleCodexWarmupForCursorModel(
-      requestedModel,
-      "agent-new-chat-nudge-parameterized"
     )
     this.sendProto(
       res,

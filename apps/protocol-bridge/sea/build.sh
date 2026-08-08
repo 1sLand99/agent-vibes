@@ -17,8 +17,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DIST_DIR="$PROJECT_DIR/dist"
 GENERATED_SEA_CONFIG="$DIST_DIR/sea-config.generated.json"
-SOURCE_MIGRATIONS_DIR="$PROJECT_DIR/src/persistence/migrations"
-DIST_MIGRATIONS_DIR="$DIST_DIR/persistence/migrations"
 
 # Output binary name
 RAW_PLATFORM=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -37,26 +35,6 @@ esac
 
 BINARY_NAME="agent-vibes-bridge-${PLATFORM}-${ARCH}"
 
-sync_migration_assets() {
-  if [[ ! -d "$SOURCE_MIGRATIONS_DIR" ]]; then
-    echo "Missing source migrations directory: $SOURCE_MIGRATIONS_DIR" >&2
-    exit 1
-  fi
-
-  mkdir -p "$DIST_MIGRATIONS_DIR"
-  find "$DIST_MIGRATIONS_DIR" -maxdepth 1 -type f -name '*.sql' -delete
-  find "$SOURCE_MIGRATIONS_DIR" -maxdepth 1 -type f -name '*.sql' -exec cp {} "$DIST_MIGRATIONS_DIR/" \;
-
-  local migration_count
-  migration_count=$(find "$DIST_MIGRATIONS_DIR" -maxdepth 1 -type f -name '*.sql' | wc -l | tr -d ' ')
-  if [[ "$migration_count" == "0" ]]; then
-    echo "No SQL migrations were copied into $DIST_MIGRATIONS_DIR" >&2
-    exit 1
-  fi
-
-  echo "  ✓ Synced ${migration_count} migration(s) to dist/persistence/migrations"
-}
-
 echo "🔨 Building Protocol Bridge SEA binary"
 echo "   Platform: ${PLATFORM}-${ARCH}"
 echo "   Node.js:  $(node --version)"
@@ -69,25 +47,23 @@ if [[ "${1:-}" == "--clean" ]]; then
 fi
 
 # ── Step 1: esbuild bundle ───────────────────────────────────────────
-echo "▸ Step 1/4: Bundling with esbuild..."
+echo "▸ Step 1/5: Bundling with esbuild..."
 node "$PROJECT_DIR/sea/esbuild.js"
 
 echo "  ✓ Bundle complete: dist/sea-entry.js"
 
-# ── Step 1.5: Sync migration assets and generate SEA config ──────────
-echo "▸ Step 1.5/4: Syncing migration assets..."
-sync_migration_assets
-echo "▸ Step 1.6/4: Generating SEA config from dist migrations..."
+# ── Step 2: Generate SEA config from canonical source migrations ─────
+echo "▸ Step 2/5: Generating SEA config from source migrations..."
 node "$PROJECT_DIR/sea/generate-config.mjs"
 echo "  ✓ SEA config ready: $GENERATED_SEA_CONFIG"
 
-# ── Step 2: Generate SEA blob ─────────────────────────────────────────
-echo "▸ Step 2/4: Generating SEA preparation blob..."
+# ── Step 3: Generate SEA blob ─────────────────────────────────────────
+echo "▸ Step 3/5: Generating SEA preparation blob..."
 node --experimental-sea-config "$GENERATED_SEA_CONFIG"
 echo "  ✓ SEA blob generated: $DIST_DIR/sea-prep.blob"
 
-# ── Step 3: Copy Node binary ─────────────────────────────────────────
-echo "▸ Step 3/4: Creating binary from Node.js..."
+# ── Step 4: Copy Node binary ─────────────────────────────────────────
+echo "▸ Step 4/5: Creating binary from Node.js..."
 NODE_BIN=$(which node)
 cp "$NODE_BIN" "$DIST_DIR/$BINARY_NAME"
 
@@ -98,8 +74,8 @@ fi
 
 echo "  ✓ Binary copied: $DIST_DIR/$BINARY_NAME"
 
-# ── Step 4: Inject SEA blob ──────────────────────────────────────────
-echo "▸ Step 4/4: Injecting SEA blob into binary..."
+# ── Step 5: Inject SEA blob ──────────────────────────────────────────
+echo "▸ Step 5/5: Injecting SEA blob into binary..."
 POSTJECT_ARGS=(
   "$DIST_DIR/$BINARY_NAME" NODE_SEA_BLOB "$DIST_DIR/sea-prep.blob"
   --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
@@ -118,6 +94,12 @@ if [[ "$PLATFORM" == "darwin" ]]; then
 fi
 
 echo "  ✓ SEA blob injected"
+
+# A successful bundle is not enough: Nest dependency metadata and SEA asset
+# loading are exercised only when the final executable boots. Use an isolated
+# data directory and port so this gate never touches the installed runtime.
+echo "▸ Verifying final SEA executable startup..."
+node "$PROJECT_DIR/sea/smoke.mjs" "$DIST_DIR/$BINARY_NAME"
 
 # ── Done ──────────────────────────────────────────────────────────────
 BINARY_SIZE=$(du -sh "$DIST_DIR/$BINARY_NAME" | cut -f1)

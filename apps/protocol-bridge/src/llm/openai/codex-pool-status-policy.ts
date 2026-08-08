@@ -9,8 +9,8 @@ import type {
   CodexRateLimitSource,
 } from "../shared/backend-pool-status"
 import {
-  getCodexRateLimitQuotaCooldownUntil,
   getEffectiveCodexRateLimitSnapshot,
+  getCodexWeeklyRateLimitCooldownUntil,
 } from "./codex-rate-limit-policy"
 
 export interface CodexPoolStatusAccount extends CooldownableAccount {
@@ -21,18 +21,52 @@ export interface CodexPoolStatusAccount extends CooldownableAccount {
 }
 
 export function getActiveCodexModelCooldowns(
-  account: Pick<CooldownableAccount, "modelStates">,
+  account: CodexPoolStatusAccount,
   now: number
 ): BackendPoolModelCooldownStatus[] {
-  return Array.from(account.modelStates.entries())
-    .filter(([, state]) => state.cooldownUntil > now)
-    .map(([model, state]) => ({
+  const cooldowns = new Map<string, BackendPoolModelCooldownStatus>()
+
+  for (const [model, state] of account.modelStates) {
+    if (state.cooldownUntil <= now) {
+      continue
+    }
+    cooldowns.set(model, {
       model,
       cooldownUntil: state.cooldownUntil,
       quotaExhausted: state.quotaExhausted,
+      reason: state.quotaExhausted ? "rate_limited" : "transient",
       backoffLevel: state.backoffLevel,
-    }))
-    .sort((left, right) => left.cooldownUntil - right.cooldownUntil)
+    })
+  }
+
+  // Rate-limit headers describe the quota bucket observed for the model that
+  // produced them. Project an exhausted bucket as a per-model status instead
+  // of promoting it to the account-wide cooldown used for transport/auth
+  // failures. Other models (for example Spark) may use a different bucket.
+  for (const [model, snapshots] of account.rateLimitSnapshots) {
+    const cooldownUntil = getCodexWeeklyRateLimitCooldownUntil(
+      getEffectiveCodexRateLimitSnapshot(snapshots),
+      now
+    )
+    if (cooldownUntil <= now) {
+      continue
+    }
+
+    const existing = cooldowns.get(model)
+    cooldowns.set(model, {
+      model,
+      cooldownUntil: Math.max(existing?.cooldownUntil || 0, cooldownUntil),
+      quotaExhausted: true,
+      reason: "quota_exhausted",
+      ...(existing?.backoffLevel !== undefined
+        ? { backoffLevel: existing.backoffLevel }
+        : {}),
+    })
+  }
+
+  return Array.from(cooldowns.values()).sort(
+    (left, right) => left.cooldownUntil - right.cooldownUntil
+  )
 }
 
 export function resolveCodexPoolEntryState(
@@ -42,22 +76,6 @@ export function resolveCodexPoolEntryState(
 ): BackendPoolEntryState {
   if (isAccountDisabled(account)) {
     return "disabled"
-  }
-
-  const activeQuotaCooldowns = Array.from(account.rateLimitSnapshots.values())
-    .map((snapshots) =>
-      getCodexRateLimitQuotaCooldownUntil(
-        getEffectiveCodexRateLimitSnapshot(snapshots),
-        now
-      )
-    )
-    .filter((cooldownUntil) => cooldownUntil > now)
-
-  if (activeQuotaCooldowns.length > 0) {
-    account.cooldownUntil = Math.max(
-      account.cooldownUntil,
-      ...activeQuotaCooldowns
-    )
   }
 
   if (account.cooldownUntil > now) {
