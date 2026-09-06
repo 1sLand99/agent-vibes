@@ -62,6 +62,7 @@ export type ProviderPromptContext = Pick<
   | "skillOptions"
   | "cursorCommands"
   | "customSystemPrompt"
+  | "cursorProtocolState"
   | "hooksAdditionalContext"
   | "explicitContext"
   | "mcpToolDefs"

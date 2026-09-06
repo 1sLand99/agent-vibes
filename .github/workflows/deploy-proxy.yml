@@ -88,6 +88,15 @@ jobs:
           } else {
             fs.mkdirSync(path.join(bundleDir, "data"), { recursive: true })
           }
+          fs.cpSync(
+            path.join(sourceDir, "python"),
+            path.join(bundleDir, "python"),
+            { recursive: true },
+          )
+          fs.copyFileSync(
+            path.join(sourceDir, "requirements-chatgpt-web.txt"),
+            path.join(bundleDir, "requirements-chatgpt-web.txt"),
+          )
           const envExample = [
             ".env.production.example",
             ".env.example",
@@ -110,7 +119,7 @@ jobs:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          source: ".deploy-bundle/dist/,.deploy-bundle/package.json,.deploy-bundle/node_modules/,.deploy-bundle/.env.production.example,.deploy-bundle/data/"
+          source: ".deploy-bundle/dist/,.deploy-bundle/package.json,.deploy-bundle/node_modules/,.deploy-bundle/.env.production.example,.deploy-bundle/data/,.deploy-bundle/python/,.deploy-bundle/requirements-chatgpt-web.txt"
           target: "/opt/protocol-bridge"
           strip_components: 1
 
@@ -144,7 +153,16 @@ jobs:
                 printf '%s=%s\n' "$key" "$value" >> .env
               fi
             }
+            ensure_env_default() {
+              key="$1"
+              value="$2"
+              if ! grep -q "^${key}=." .env 2>/dev/null; then
+                printf '%s=%s\n' "$key" "$value" >> .env
+              fi
+            }
             ensure_env_var AGENT_VIBES_DATA_DIR /opt/protocol-bridge
+            ensure_env_default NODE_ENV production
+            ensure_env_default CHATGPT_WEB_VOICE_PYTHON /opt/protocol-bridge/.venv-chatgpt-web/bin/python
             if ! grep -q '^PROXY_API_KEY=.' .env 2>/dev/null; then
               echo "PROXY_API_KEY is required in PROXY_ENV_PRODUCTION"
               exit 1
@@ -153,6 +171,16 @@ jobs:
             if ! node --version 2>/dev/null | grep -q '^v24'; then
               curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
               apt-get install -y nodejs
+            fi
+            # Browser-profile transport used when native fetch is rejected or
+            # an account has a dedicated proxy.
+            if [ ! -x /opt/protocol-bridge/.venv-chatgpt-web/bin/python ]; then
+              apt-get update
+              apt-get install -y --no-install-recommends python3 python3-venv
+              python3 -m venv /opt/protocol-bridge/.venv-chatgpt-web
+            fi
+            if ! /opt/protocol-bridge/.venv-chatgpt-web/bin/python -c 'import curl_cffi' 2>/dev/null; then
+              /opt/protocol-bridge/.venv-chatgpt-web/bin/pip install --disable-pip-version-check -r requirements-chatgpt-web.txt
             fi
             # node_modules are bundled from CI (monorepo workspace deps cannot install on server)
             rm -f package-lock.json

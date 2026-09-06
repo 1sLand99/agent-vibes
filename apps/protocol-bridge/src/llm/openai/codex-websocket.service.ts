@@ -1,3 +1,4 @@
+import { readCodexResponseOutcome } from "./codex-response-outcome"
 /**
  * Codex WebSocket Transport Service
  *
@@ -16,7 +17,7 @@
  *   The Codex WebSocket API uses the "responses_websockets=2026-02-06" beta.
  *   Each request is sent as a JSON message with type "response.create".
  *   Responses are received as individual JSON messages (not SSE-wrapped).
- *   The response.completed/response.done event signals end of response.
+ *   The response.completed event signals end of response.
  */
 
 import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common"
@@ -562,6 +563,7 @@ export class CodexWebSocketService implements OnModuleDestroy {
     const collectedItems: Array<Record<string, unknown>> = []
 
     for await (const msg of this.streamViaWebSocket(ws, requestBody)) {
+      readCodexResponseOutcome(msg)
       options.onMessage?.(msg)
       if (msg.type === "response.output_item.done") {
         const item = msg.item as Record<string, unknown> | undefined
@@ -853,7 +855,7 @@ export class CodexWebSocketService implements OnModuleDestroy {
     if (parsed.type === "error") {
       const status =
         (parsed.status as number) || (parsed.status_code as number) || 500
-      const errorBody = JSON.stringify(parsed.error || parsed)
+      const errorBody = JSON.stringify(parsed)
       // 协议级逻辑错误：previous_response_id 失效。TCP/WS 帧通道仍健康，
       // 标记 preserveConnection=true 让上层在保留 ws 的前提下重发完整 input。
       const preserveConnection =
@@ -863,9 +865,7 @@ export class CodexWebSocketService implements OnModuleDestroy {
       })
     }
 
-    if (parsed.type === "response.done") {
-      parsed.type = "response.completed"
-    }
+    readCodexResponseOutcome(parsed, { allowMaxOutputIncomplete: true })
 
     return parsed
   }
@@ -886,7 +886,13 @@ export class CodexWebSocketService implements OnModuleDestroy {
         }
         resolve()
       }
-      const timeoutId = setTimeout(finish, WS_IDLE_TIMEOUT_MS)
+      const timeoutId = setTimeout(() => {
+        activeStream.done = true
+        activeStream.queue.push({
+          error: new Error("Codex WebSocket idle timeout"),
+        })
+        finish()
+      }, WS_IDLE_TIMEOUT_MS)
       activeStream.waiter = finish
     })
   }
@@ -968,8 +974,12 @@ export class CodexWebSocketService implements OnModuleDestroy {
           continue
         }
 
-        if (parsed.type === "response.completed") {
-          responseCompleted = true
+        if (
+          parsed.type === "response.completed" ||
+          parsed.type === "response.incomplete"
+        ) {
+          // Only completed responses can retain a reusable continuation baseline.
+          responseCompleted = parsed.type === "response.completed"
           activeStream.done = true
           yield parsed
           return
@@ -1048,7 +1058,13 @@ export class CodexWebSocketService implements OnModuleDestroy {
               }
               resolve()
             }
-            const timeoutId = setTimeout(finish, WS_IDLE_TIMEOUT_MS)
+            const timeoutId = setTimeout(() => {
+              done = true
+              messageQueue.push({
+                error: new Error("Codex WebSocket idle timeout"),
+              })
+              finish()
+            }, WS_IDLE_TIMEOUT_MS)
             resolveWaiter = finish
           })
           continue
@@ -1076,7 +1092,10 @@ export class CodexWebSocketService implements OnModuleDestroy {
           continue
         }
 
-        if (parsed.type === "response.completed") {
+        if (
+          parsed.type === "response.completed" ||
+          parsed.type === "response.incomplete"
+        ) {
           done = true
           yield parsed
           return

@@ -18,6 +18,7 @@ export interface PersistedCodexAccountRecord {
   expire?: string
   baseUrl?: string
   proxyUrl?: string
+  deviceId?: string
 }
 
 export interface LoadedCodexAccountRecord extends PersistedCodexAccountRecord {
@@ -63,6 +64,7 @@ export interface CodexFileSlotRecordFields {
   planType?: CodexModelTier
   baseUrl: string
   proxyUrl?: string
+  deviceId?: string
   configPath: string
   persistedMatch: {
     apiKey?: string
@@ -82,6 +84,7 @@ export interface CodexFileSlotMetadataTarget {
   planType?: CodexModelTier
   baseUrl: string
   proxyUrl?: string
+  deviceId?: string
   configPath?: string
   persistedMatch?: CodexFileSlotRecordFields["persistedMatch"]
 }
@@ -93,6 +96,7 @@ export interface CodexPersistedAccountSlotInput {
   accountId?: string
   baseUrl?: string
   proxyUrl?: string
+  deviceId?: string
   persistedMatch?: {
     apiKey?: string
     email?: string
@@ -146,6 +150,7 @@ export function buildCodexFileSlotRecordFields(
     planType: normalizeCodexModelTier(record.planType) || undefined,
     baseUrl: record.baseUrl || fallbackBaseUrl,
     proxyUrl: record.proxyUrl || fallbackProxyUrl || undefined,
+    deviceId: record.deviceId || undefined,
     configPath: record.configPath,
     persistedMatch: {
       apiKey: record.apiKey || undefined,
@@ -169,6 +174,7 @@ export function applyCodexFileSlotRecordMetadata(
   target.planType = fields.planType
   target.baseUrl = fields.baseUrl
   target.proxyUrl = fields.proxyUrl
+  target.deviceId = fields.deviceId
   target.configPath = fields.configPath
   target.persistedMatch = fields.persistedMatch
 }
@@ -206,6 +212,7 @@ export function upsertCodexPersistedAccountRecord(
     ...(account.email ? { email: account.email } : {}),
     ...(account.baseUrl ? { baseUrl: account.baseUrl } : {}),
     ...(account.proxyUrl ? { proxyUrl: account.proxyUrl } : {}),
+    ...(account.deviceId ? { deviceId: account.deviceId } : {}),
     accessToken: tokenData.accessToken,
     refreshToken: tokenData.refreshToken,
     idToken: tokenData.idToken,

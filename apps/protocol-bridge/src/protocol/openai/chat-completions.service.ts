@@ -1,3 +1,7 @@
+import {
+  CodexResponsesService,
+  type CodexResponsesContext,
+} from "./codex-responses.service"
 import { Injectable, Logger } from "@nestjs/common"
 import { MessagesService } from "../anthropic/messages.service"
 import type { AnthropicResponse } from "../../shared/anthropic"
@@ -40,7 +44,10 @@ import type {
 export class ChatCompletionsService {
   private readonly logger = new Logger(ChatCompletionsService.name)
 
-  constructor(private readonly messagesService: MessagesService) {}
+  constructor(
+    private readonly messagesService: MessagesService,
+    private readonly codexResponses: CodexResponsesService
+  ) {}
 
   // ── Chat Completions ──────────────────────────────────────────────────
 
@@ -90,8 +97,11 @@ export class ChatCompletionsService {
   // ── Responses API ─────────────────────────────────────────────────────
 
   async createResponse(
-    req: OpenAiResponsesRequest
-  ): Promise<OpenAiResponsesResponse> {
+    req: OpenAiResponsesRequest,
+    context: CodexResponsesContext = { owner: "local" }
+  ): Promise<OpenAiResponsesResponse | Record<string, unknown>> {
+    if (this.codexResponses.usesCodex(req.model))
+      return this.codexResponses.create(req, context)
     const dto = translateOpenAiResponseToCreateMessage(req)
     dto.stream = false
     const response: AnthropicResponse =
@@ -104,8 +114,13 @@ export class ChatCompletionsService {
   }
 
   async *createResponseStream(
-    req: OpenAiResponsesRequest
+    req: OpenAiResponsesRequest,
+    context: CodexResponsesContext = { owner: "local" }
   ): AsyncGenerator<string, void, unknown> {
+    if (this.codexResponses.usesCodex(req.model)) {
+      yield* this.codexResponses.stream(req, context)
+      return
+    }
     const dto = translateOpenAiResponseToCreateMessage(req)
     dto.stream = true
     const translator = new OpenAiResponsesStreamTranslator({

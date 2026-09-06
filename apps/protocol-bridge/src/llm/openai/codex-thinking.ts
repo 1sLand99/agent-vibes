@@ -1,3 +1,4 @@
+import type { CodexModelProfile } from "./codex-model-catalog"
 import { resolveModelThinkingCapability } from "../shared/model-registry"
 import type { ThinkingIntent } from "../shared/thinking-types"
 
@@ -12,11 +13,19 @@ const STANDARD_LEVEL_ORDER = [
   "ultra",
 ] as const
 
-function normalizeSupportedLevels(modelName: string): {
+function normalizeSupportedLevels(
+  modelName: string,
+  profile?: CodexModelProfile
+): {
   supported: string[]
   defaultLevel: string
 } {
-  const capability = resolveModelThinkingCapability(modelName)
+  const capability = profile
+    ? {
+        levels: profile.supported_reasoning_levels.map((x) => x.effort),
+        defaultLevel: profile.default_reasoning_level,
+      }
+    : resolveModelThinkingCapability(modelName)
   const supported =
     capability?.levels
       ?.map((level) => level.trim().toLowerCase())
@@ -120,9 +129,14 @@ function convertBudgetToThinkingLevel(budgetTokens: number): string {
 
 export function resolveCodexReasoningEffort(
   intent: ThinkingIntent | null | undefined,
-  modelName: string
-): string {
-  const { supported, defaultLevel } = normalizeSupportedLevels(modelName)
+  modelName: string,
+  profile?: CodexModelProfile
+): string | undefined {
+  if (profile && !intent) return profile.default_reasoning_level
+  const { supported, defaultLevel } = normalizeSupportedLevels(
+    modelName,
+    profile
+  )
   if (!intent) {
     return defaultLevel
   }

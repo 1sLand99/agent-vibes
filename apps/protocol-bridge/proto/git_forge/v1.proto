@@ -23,6 +23,7 @@ enum CompareCommitsStatus {
   COMPARE_COMMITS_STATUS_AHEAD = 2;
   COMPARE_COMMITS_STATUS_BEHIND = 3;
   COMPARE_COMMITS_STATUS_DIVERGED = 4;
+  COMPARE_COMMITS_STATUS_NO_MERGE_BASE = 5;
 }
 
 enum FileMode {
@@ -87,6 +88,7 @@ message BatchGetRepoContentRequest {
   string repo_uuid = 1;
   string revision = 2;
   repeated string paths = 3;
+  optional uint64 max_file_size = 4;
 }
 
 message BatchGetRepoContentResponse {
@@ -148,6 +150,24 @@ message Commit {
   repeated string parent_shas = 5;
   string tree_sha = 7;
   optional string change_id = 8;
+}
+
+message CommitDiff2Chunk {
+  optional PH_git_forge_v1_CommitDiff2Header header = 1;
+  repeated PH_git_forge_v1_CommitDiff2Entry entries = 2;
+  optional PH_git_forge_v1_CommitDiffStats trailer = 3;
+}
+
+message CommitDiff2Entry {
+  uint32 header_index = 1;
+  PH_git_forge_v1_FileStats stats = 2;
+  optional string patch = 3;
+}
+
+message CommitDiff2Header {
+  PH_git_forge_v1_Commit commit = 1;
+  optional string base_commit_sha = 2;
+  repeated PH_git_forge_v1_DiffEntry entries = 3;
 }
 
 message CommitDiffChunk {
@@ -223,6 +243,18 @@ message ComputeMergeCommitResponse {
   bytes packfile = 2;
 }
 
+message CreateBranchRequest {
+  string repo_uuid = 1;
+  string target_ref = 2;
+  string new_head_sha = 3;
+}
+
+message CreateBranchResponse {
+  string new_head_sha = 1;
+  string wal_entry_key = 2;
+  bool unchanged = 3;
+}
+
 message CreateCommitFromFilesRequest {
   string repo_uuid = 1;
   string target_ref = 2;
@@ -251,6 +283,7 @@ message CreateMergeCommitRequest {
   PH_git_forge_v1_Signature committer = 8;
   uint64 change_number = 9;
   PH_git_forge_v1_MergeMode mode = 10;
+  optional string push_authorization = 11;
 }
 
 message CreateMergeCommitResponse {
@@ -263,6 +296,33 @@ message CreateRepoRequest {
 }
 
 message CreateRepoResponse {
+}
+
+message CreateRevertBranchConflict {
+  repeated string conflicted_paths = 1;
+}
+
+message CreateRevertBranchRequest {
+  string repo_uuid = 1;
+  string commit_sha = 2;
+  string base_ref = 3;
+  string branch_ref = 4;
+  string message = 5;
+  PH_git_forge_v1_Signature author = 6;
+  optional PH_git_forge_v1_Signature committer = 7;
+}
+
+message CreateRevertBranchResponse {
+  oneof result {
+    PH_git_forge_v1_CreateRevertBranchSuccess success = 1;
+    PH_git_forge_v1_CreateRevertBranchConflict conflict = 2;
+  }
+}
+
+message CreateRevertBranchSuccess {
+  string revert_commit_sha = 1;
+  string base_sha = 2;
+  string wal_entry_key = 3;
 }
 
 message DeleteBranchesRequest {
@@ -287,6 +347,7 @@ message DiffEntry {
   optional string new_sha = 7;
   optional PH_git_forge_v1_FileStats stats = 8;
   optional string patch = 9;
+  optional bool is_generated = 10;
 }
 
 message DiffHeader {
@@ -331,6 +392,8 @@ message FileHistoryCommitEntry {
 message FileHistoryWithDiffStatsChunk {
   repeated PH_git_forge_v1_FileHistoryCommitEntry entries = 1;
   bool exhausted = 2;
+  bool scan_truncated = 3;
+  optional string resume_commit_sha = 4;
 }
 
 message FileStats {
@@ -354,6 +417,25 @@ message GetBlobResponse {
   PH_git_forge_v1_FileContent blob = 1;
 }
 
+message GetCommitChangedPathsRequest {
+  string repo_uuid = 1;
+  string commit_sha = 2;
+  optional string base_commit_sha = 3;
+}
+
+message GetCommitChangedPathsResponse {
+  optional string base_commit_sha = 1;
+  repeated PH_git_forge_v1_DiffEntry entries = 2;
+}
+
+message GetCommitDiff2Request {
+  string repo_uuid = 1;
+  string commit_sha = 2;
+  optional string base_commit_sha = 3;
+  bool include_patches = 4;
+  repeated string paths = 5;
+}
+
 message GetCommitDiffRequest {
   string repo_uuid = 1;
   string commit_sha = 2;
@@ -364,6 +446,17 @@ message GetCommitDiffRequest {
   optional string page_cursor = 7;
 }
 
+message GetCommitDiffStatsRequest {
+  string repo_uuid = 1;
+  string commit_sha = 2;
+  optional string base_commit_sha = 3;
+}
+
+message GetCommitDiffStatsResponse {
+  optional string base_commit_sha = 1;
+  PH_git_forge_v1_CommitDiffStats stats = 2;
+}
+
 message GetCommitRequest {
   string repo_uuid = 1;
   string commit_sha = 2;
@@ -371,6 +464,14 @@ message GetCommitRequest {
 
 message GetCommitResponse {
   PH_git_forge_v1_Commit commit = 1;
+}
+
+message GetDefaultBranchRequest {
+  string repo_uuid = 1;
+}
+
+message GetDefaultBranchResponse {
+  string default_branch = 1;
 }
 
 message GetFileHistoryPageWithDiffStatsResponse {
@@ -397,6 +498,7 @@ message GetFileHistoryWithDiffStatsRequest {
   uint32 max_commits = 4;
   optional string next_cursor = 5;
   bool include_diff_stats = 6;
+  optional uint32 max_commits_scanned = 7;
 }
 
 message GetFileHistoryWithDiffStatsResponse {
@@ -433,6 +535,7 @@ message GetPullRequestDiffRequest {
   optional uint32 page_size = 5;
   optional string page_cursor = 6;
   optional bool include_file_stats = 7;
+  optional bool include_generated = 8;
 }
 
 message GetRepoContentDetailsRequest {
@@ -452,6 +555,7 @@ message GetRepoContentRequest {
     string ref_and_path = 3;
   }
   string repo_uuid = 1;
+  optional uint64 max_file_size = 4;
 }
 
 message GetRepoContentResponse {
@@ -567,14 +671,13 @@ message ListRefsRequest {
   bool names_only = 3;
   string prefix = 4;
   optional uint32 limit = 5;
-  optional uint32 offset = 6;
+  optional string page_token = 7;
 }
 
 message ListRefsResponse {
   repeated string refs = 1;
   repeated PH_git_forge_v1_RefInfo ref_infos = 2;
-  optional uint32 total_count = 3;
-  optional uint32 next_offset = 4;
+  optional string next_page_token = 5;
 }
 
 message ListTreePathsRequest {
@@ -693,6 +796,18 @@ message ResolveRefPathResponse {
   string resolved_commit_sha = 2;
 }
 
+message SearchRefsRequest {
+  string repo_uuid = 1;
+  PH_git_forge_v1_ListRefsFilter filter = 2;
+  string query = 3;
+  optional uint32 limit = 4;
+}
+
+message SearchRefsResponse {
+  repeated PH_git_forge_v1_RefInfo ref_infos = 1;
+  bool exact_match = 2;
+}
+
 message ShortCommit {
   bytes sha = 1;
   string summary = 2;
@@ -737,7 +852,7 @@ message TreeEntryBlame {
 }
 
 // ============================
-// Placeholder types (0 direct + 0 recursive-shell + 43 opaque)
+// Placeholder types (0 direct + 0 recursive-shell + 47 opaque)
 // ============================
 
 message PH_git_forge_v1_BatchGetCommitMetadataResult {} // opaque placeholder for git_forge.v1.BatchGetCommitMetadataResult
@@ -754,6 +869,10 @@ message PH_git_forge_v1_ChangeKind {} // opaque placeholder for git_forge.v1.Cha
 
 message PH_git_forge_v1_Commit {} // opaque placeholder for git_forge.v1.Commit
 
+message PH_git_forge_v1_CommitDiff2Entry {} // opaque placeholder for git_forge.v1.CommitDiff2Entry
+
+message PH_git_forge_v1_CommitDiff2Header {} // opaque placeholder for git_forge.v1.CommitDiff2Header
+
 message PH_git_forge_v1_CommitDiffHeader {} // opaque placeholder for git_forge.v1.CommitDiffHeader
 
 message PH_git_forge_v1_CommitDiffStats {} // opaque placeholder for git_forge.v1.CommitDiffStats
@@ -769,6 +888,10 @@ message PH_git_forge_v1_CommitFileUpsert {} // opaque placeholder for git_forge.
 message PH_git_forge_v1_CommitMetadata {} // opaque placeholder for git_forge.v1.CommitMetadata
 
 message PH_git_forge_v1_CompareCommitsStatus {} // opaque placeholder for git_forge.v1.CompareCommitsStatus
+
+message PH_git_forge_v1_CreateRevertBranchConflict {} // opaque placeholder for git_forge.v1.CreateRevertBranchConflict
+
+message PH_git_forge_v1_CreateRevertBranchSuccess {} // opaque placeholder for git_forge.v1.CreateRevertBranchSuccess
 
 message PH_git_forge_v1_DiffEntry {} // opaque placeholder for git_forge.v1.DiffEntry
 

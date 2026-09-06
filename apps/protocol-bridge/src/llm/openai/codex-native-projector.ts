@@ -538,12 +538,16 @@ export function normalizeCodexServiceTier(
 function buildCodexReasoning(
   request: Pick<
     CodexExecutionRequest,
-    "thinkingIntent" | "includeThinkingSummary"
+    "thinkingIntent" | "includeThinkingSummary" | "modelProfile"
   >,
   modelName: string
 ): CodexRequest["reasoning"] {
   const reasoning: CodexRequest["reasoning"] = {
-    effort: resolveCodexReasoningEffort(request.thinkingIntent, modelName),
+    effort: resolveCodexReasoningEffort(
+      request.thinkingIntent,
+      modelName,
+      request.modelProfile
+    ),
   }
   if (request.includeThinkingSummary) {
     reasoning.summary = "auto"

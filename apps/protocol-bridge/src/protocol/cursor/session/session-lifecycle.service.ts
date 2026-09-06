@@ -1,4 +1,9 @@
 import {
+  decodeCursorProtocolSessionState,
+  mergeCursorProtocolSessionState,
+  type CursorProtocolSessionState,
+} from "./cursor-protocol-state"
+import {
   forwardRef,
   Inject,
   Injectable,
@@ -939,6 +944,7 @@ export interface SessionLifecycleRecord {
   goalState?: BridgeGoalState
   /** Durable ConversationStateStructure.is_root_project_conversation. */
   isRootProjectConversation?: boolean
+  cursorProtocolState?: CursorProtocolSessionState
   explicitContext?: string
   contextTokenLimit?: number
   contextTokenLimitSource?: ContextTokenLimitSource
@@ -1348,6 +1354,7 @@ interface PersistedChatSession {
   hooksAdditionalContext?: ParsedCursorRequest["hooksAdditionalContext"]
   goalState?: BridgeGoalState
   isRootProjectConversation?: boolean
+  cursorProtocolState?: CursorProtocolSessionState
   explicitContext?: string
   contextTokenLimit?: number
   contextTokenLimitSource?: ContextTokenLimitSource
@@ -1393,6 +1400,7 @@ type RestoredSessionConfig = Pick<
   | "hooksAdditionalContext"
   | "goalState"
   | "isRootProjectConversation"
+  | "cursorProtocolState"
   | "explicitContext"
   | "contextTokenLimit"
   | "contextTokenLimitSource"
@@ -1435,6 +1443,7 @@ const SERIALIZED_SESSION_CONFIG_OPTIONAL_FIELDS = [
   "hooksAdditionalContext",
   "goalState",
   "isRootProjectConversation",
+  "cursorProtocolState",
   "explicitContext",
   "contextTokenLimit",
   "contextTokenLimitSource",
@@ -1590,6 +1599,13 @@ function decodeSerializedSessionConfig(
   if (isRootProjectConversation !== undefined) {
     decoded.isRootProjectConversation = isRootProjectConversation
   }
+  const cursorProtocolState = decodeOptionalConfigField(
+    config,
+    "cursorProtocolState",
+    decodeCursorProtocolSessionState
+  )
+  if (cursorProtocolState !== undefined)
+    decoded.cursorProtocolState = cursorProtocolState
   const explicitContext = decodeOptionalConfigField(
     config,
     "explicitContext",
@@ -1720,7 +1736,7 @@ function decodeMcpToolDefs(value: unknown, label: string): McpToolDef[] {
         "description",
         "ideRegistryKey",
       ],
-      ["inputSchema"]
+      ["inputSchema", "outputSchema", "annotations"]
     )
     const decoded: McpToolDef = {
       name: requireCanonicalIdentifier(definition.name, `${entryLabel}.name`),
@@ -1751,6 +1767,12 @@ function decodeMcpToolDefs(value: unknown, label: string): McpToolDef[] {
     )
     if (inputSchema !== undefined) {
       decoded.inputSchema = inputSchema
+    }
+    for (const key of ["outputSchema", "annotations"] as const) {
+      const metadata = decodeOptionalConfigField(definition, key, (field) =>
+        decodeProtoJsonRecord(field, `${entryLabel}.${key}`)
+      )
+      if (metadata !== undefined) decoded[key] = metadata
     }
     return decoded
   })
@@ -3432,6 +3454,9 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       ...(session.goalState
         ? { goalState: serializeBridgeGoalState(session.goalState) }
         : {}),
+      ...(session.cursorProtocolState
+        ? { cursorProtocolState: structuredClone(session.cursorProtocolState) }
+        : {}),
       ...(session.isRootProjectConversation !== undefined
         ? { isRootProjectConversation: session.isRootProjectConversation }
         : {}),
@@ -3564,6 +3589,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       hooksAdditionalContext: config.hooksAdditionalContext,
       goalState: config.goalState,
       isRootProjectConversation: config.isRootProjectConversation,
+      cursorProtocolState: config.cursorProtocolState,
       explicitContext: config.explicitContext,
       contextTokenLimit: config.contextTokenLimit,
       contextTokenLimitSource: config.contextTokenLimitSource,
@@ -4754,6 +4780,7 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       hooksAdditionalContext: persisted.hooksAdditionalContext,
       goalState: persisted.goalState,
       isRootProjectConversation: persisted.isRootProjectConversation,
+      cursorProtocolState: persisted.cursorProtocolState,
       explicitContext: persisted.explicitContext,
       contextTokenLimit: persisted.contextTokenLimit,
       contextTokenLimitSource: persisted.contextTokenLimitSource,
@@ -5053,6 +5080,10 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
       hooksAdditionalContext: initialRequest?.hooksAdditionalContext,
       goalState: initialRequest?.goalState,
       isRootProjectConversation: initialRequest?.isRootProjectConversation,
+      cursorProtocolState: mergeCursorProtocolSessionState(
+        undefined,
+        initialRequest?.cursorProtocolState
+      ),
       explicitContext: initialRequest?.explicitContext,
       contextTokenLimit: initialRequest?.contextTokenLimit,
       contextTokenLimitSource: initialRequest?.contextTokenLimitSource,
@@ -5485,6 +5516,12 @@ export class SessionLifecycleService implements OnModuleInit, OnModuleDestroy {
     if (initialRequest?.hooksAdditionalContext !== undefined) {
       preparedSession.hooksAdditionalContext =
         initialRequest.hooksAdditionalContext
+    }
+    if (initialRequest?.cursorProtocolState) {
+      preparedSession.cursorProtocolState = mergeCursorProtocolSessionState(
+        preparedSession.cursorProtocolState,
+        initialRequest.cursorProtocolState
+      )
     }
     // Inbound ConversationStateStructure.goal_state is authoritative when the
     // client reattaches with an explicit goal record. Omitting the field keeps

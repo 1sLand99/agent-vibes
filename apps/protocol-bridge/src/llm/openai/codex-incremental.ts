@@ -1,3 +1,4 @@
+import { isPrefixedCodexItemId } from "./codex-request-sanitizer"
 import { createHash } from "crypto"
 import { CONTEXT_MICROCOMPACT_CLEARED_MARKER } from "../../shared/context-compaction"
 import type { CodexInputItem } from "./codex-native-types"
@@ -417,7 +418,7 @@ function areMicrocompactedToolOutputsEquivalent(
     typeof baselineRecord.call_id === "string" ? baselineRecord.call_id : ""
   const requestCallId =
     typeof requestRecord.call_id === "string" ? requestRecord.call_id : ""
-  if (baselineCallId !== requestCallId) return false
+  if (!baselineCallId || baselineCallId !== requestCallId) return false
 
   return (
     isMicrocompactClearedOutput(baselineRecord.output) ||
@@ -618,7 +619,7 @@ function canonicalizeCodexInputItemForContinuation(
       : undefined
     return stripCodexContinuationMetadata({
       ...output,
-      call_id: typeof output.call_id === "string" ? output.call_id : "",
+      ...(output.call_id === undefined ? {} : { call_id: output.call_id }),
       output: outputParts
         ? outputParts.length > 0
           ? outputParts
@@ -640,7 +641,7 @@ function canonicalizeCodexInputItemForContinuation(
       ...output,
       call_id: typeof output.call_id === "string" ? output.call_id : "",
       output:
-        typeof output.output === "string"
+        typeof output.output === "string" || Array.isArray(output.output)
           ? output.output
           : JSON.stringify(
               (output as unknown as Record<string, unknown>).output ?? ""
@@ -659,8 +660,7 @@ function canonicalizeCodexInputItemForContinuation(
 
 function stripCodexContinuationMetadata<T extends object>(item: T): T {
   const copy = { ...(item as Record<string, unknown>) }
-  delete copy.id
-  delete copy.internal_chat_message_metadata_passthrough
+  if (!isPrefixedCodexItemId(copy.id)) delete copy.id
   return copy as T
 }
 

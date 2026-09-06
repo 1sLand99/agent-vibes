@@ -593,6 +593,7 @@ export class AiserverMockController {
       const result = await this.imageGenerationService.generateImage({
         prompt: description,
         model: request.modelId || undefined,
+        aspectRatio: request.aspectRatio,
         referenceImages: request.referenceImages.map((reference, index) => ({
           path: `inline-reference-${index}`,
           data: reference.data,

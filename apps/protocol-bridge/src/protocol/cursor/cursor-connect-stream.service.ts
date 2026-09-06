@@ -1,3 +1,10 @@
+import { getCodexModelProfile } from "../../llm/openai/codex-model-catalog"
+import { recordCodexRolloutMetadata } from "../../llm/openai/codex-projection-state"
+import { CursorCloudAttachmentError } from "./codec/cursor-attachment-reference"
+import {
+  applyCursorSystemPromptSpec,
+  readCursorUserMessageMetadata,
+} from "./session/cursor-protocol-state"
 import {
   create,
   fromBinary,
@@ -490,6 +497,7 @@ import {
   cursorRequestParser,
   type CursorWireFrameRef,
   isTerminalBackgroundTaskCompletion,
+  isBackgroundWorkerNotification,
   type McpToolDef,
   ParsedCursorRequest,
   ParsedToolResult,
@@ -1177,6 +1185,7 @@ interface AssistantTurnStreamOutcome {
      */
     | "transport_recovery_requested"
     | "stop_hook_followup_requested"
+    | "provider_followup_requested"
   accumulatedText: string
   finalUsage?: ContextUsageSnapshot
   stopReason?: string | null
@@ -1186,7 +1195,7 @@ interface AssistantTurnStreamOutcome {
 }
 
 type ProviderTurnTerminal =
-  | { status: "completed"; responseId?: string }
+  | { status: "completed"; responseId?: string; endTurn?: boolean }
   | { status: "incomplete"; reason: string; responseId?: string }
   | {
       status: "failed"
@@ -1375,6 +1384,7 @@ interface ToolCompletedExtraData {
 interface MaterializedConversationTurnForCheckpoint {
   userText: string
   userMessageId: string
+  userMetadata?: Record<string, unknown>
   steps: ConversationStep[]
 }
 
@@ -6042,6 +6052,7 @@ export class CursorConnectStreamService {
 
     return {
       workspaceScope,
+      cursorProtocolState: session.cursorProtocolState,
       codeChunks: session.codeChunks,
       cursorRules: session.cursorRules,
       skillOptions: session.skillOptions,
@@ -6579,6 +6590,8 @@ export class CursorConnectStreamService {
       signal: options.signal,
       operation: async (signal) => {
         signal.throwIfAborted()
+        if (route.backend === "codex")
+          await this.codexService.refreshModelCatalogs(signal)
         const target = this.resolveSubagentCompactionTarget(scope, options)
         const assertCandidate = (
           candidate: T,
@@ -7258,11 +7271,15 @@ export class CursorConnectStreamService {
             route.model
           ),
         })
+    const cursorSystemPrompt = applyCursorSystemPromptSpec(
+      systemPrompt,
+      promptContext.cursorProtocolState?.systemPrompt
+    )
     const effectiveSystemPrompt = options.additionalSystemPrompt
-      ? [systemPrompt, options.additionalSystemPrompt]
+      ? [cursorSystemPrompt, options.additionalSystemPrompt]
           .filter((part) => typeof part === "string" && part.trim().length > 0)
           .join("\n\n")
-      : systemPrompt
+      : cursorSystemPrompt
     const budget = this.resolveMessageBudget(route.backend, {
       session: options.session,
       protectedContextMessages: contextMessages as UnifiedMessage[],
@@ -7790,7 +7807,10 @@ export class CursorConnectStreamService {
     const requestScope = options.requestScope
     const promptContext = requestScope.promptContext
     const model = route.model || options.model
-    const systemPrompt = this.buildCodexSystemPrompt(model)
+    const systemPrompt = applyCursorSystemPromptSpec(
+      this.buildCodexSystemPrompt(model),
+      promptContext.cursorProtocolState?.systemPrompt
+    )
     const scope = options.scope
     const projection = scope.projection
     assertCodexProviderIdentity(options.upstreamIdentity)
@@ -11683,7 +11703,7 @@ export class CursorConnectStreamService {
     strategy: "auto" | "manual" | "reactive"
     injectionMode: "pre_turn" | "mid_turn"
   }): CodexRemoteCompactProvider {
-    return async ({ preTriggerInput, signal }) => {
+    return async ({ preTriggerInput, signal, model }) => {
       signal.throwIfAborted()
       const upstreamIdentity = input.runtime.upstreamIdentity
       assertCodexProviderIdentity(upstreamIdentity)
@@ -11693,8 +11713,11 @@ export class CursorConnectStreamService {
         )
       }
       const result = await this.codexService.compactConversationHistory({
-        model: input.runtime.model,
-        system: input.runtime.systemPrompt,
+        model: model ?? input.runtime.model,
+        system:
+          model && model !== input.runtime.model
+            ? resolveCodexModelInstructions(model).instructions
+            : input.runtime.systemPrompt,
         nativeInput: preTriggerInput.map((item) => structuredClone(item)),
         tools: input.toolDefinitions,
         upstreamIdentity,
@@ -11865,6 +11888,8 @@ export class CursorConnectStreamService {
       signal: options.signal,
       operation: async (innerSignal) => {
         innerSignal.throwIfAborted()
+        if (route.backend === "codex")
+          await this.codexService.refreshModelCatalogs(innerSignal)
         const scope = createMainProjectionRequestScope({
           conversationId,
           attempt,
@@ -12100,7 +12125,10 @@ export class CursorConnectStreamService {
     const upstreamIdentity = session.codexProviderIdentity
     return {
       model: target.model,
-      systemPrompt: this.buildCodexSystemPrompt(target.model),
+      systemPrompt: applyCursorSystemPromptSpec(
+        this.buildCodexSystemPrompt(target.model),
+        session.cursorProtocolState?.systemPrompt
+      ),
       upstreamIdentity,
       referenceConversationId: session.conversationId,
       serviceTier: this.resolveRequestedCodexServiceTier(
@@ -12973,6 +13001,7 @@ ${raw}
       selectedCursorRuleNames: session.selectedCursorRuleNames,
       cursorCommands: session.cursorCommands,
       customSystemPrompt: session.customSystemPrompt,
+      cursorProtocolState: session.cursorProtocolState,
       explicitContext: session.explicitContext,
       contextTokenLimit: session.contextTokenLimit,
       contextMaxMode: session.contextMaxMode,
@@ -13365,6 +13394,7 @@ ${raw}
         summaryArchiveBlobIds: summaryArchiveBlobs.summaryArchiveBlobIds,
         goalState: session.goalState,
         isRootProjectConversation: session.isRootProjectConversation,
+        cursorProtocolState: session.cursorProtocolState,
       }
     )
     return { checkpoint, blobMessages: summaryArchiveBlobs.blobMessages }
@@ -13429,6 +13459,7 @@ ${raw}
 
     for (const turn of materializedTurns) {
       const userMessage = create(UserMessageSchema, {
+        ...readCursorUserMessageMetadata(turn.userMetadata),
         text: turn.userText,
         messageId: turn.userMessageId,
         mode: AgentMode.AGENT,
@@ -13479,6 +13510,12 @@ ${raw}
       this.contextState.getContextRecord(session.conversationId)!.mainProjection
         .messageRecords
     )
+    const userMetadataById = new Map(
+      this.contextState
+        .getContextRecord(session.conversationId)!
+        .mainProjection.messages.filter((message) => message.type === "user")
+        .map((message) => [message.uuid, message.metadata])
+    )
     const turns: MaterializedConversationTurnForCheckpoint[] = []
     let currentTurn: MaterializedConversationTurnForCheckpoint | undefined
 
@@ -13501,6 +13538,7 @@ ${raw}
         currentTurn = {
           userText: extractText(record.content),
           userMessageId: record.id,
+          userMetadata: userMetadataById.get(record.id),
           steps: [],
         }
         continue
@@ -14090,7 +14128,11 @@ ${raw}
             "Codex terminal responseId"
           )
           if (event.data.status === "completed") {
-            providerTerminal = { status: "completed", responseId }
+            providerTerminal = {
+              status: "completed",
+              responseId,
+              endTurn: event.data.endTurn,
+            }
           } else if (event.data.status === "incomplete") {
             providerTerminal = {
               status: "incomplete",
@@ -14631,6 +14673,29 @@ ${raw}
             )
           )
 
+          if (
+            providerTerminal?.status === "completed" &&
+            providerTerminal.endTurn === false &&
+            preparedTools.length === 0
+          ) {
+            const lastMessage = turnAssistantMessages.at(-1)
+            if (lastMessage && finalUsage)
+              this.commitAssistantUsageLedger(
+                session,
+                lastMessage.uuid,
+                finalUsage,
+                accumulatedText
+              )
+            return {
+              kind: "provider_followup_requested",
+              accumulatedText,
+              finalUsage,
+              stopReason: "continue",
+              toolCallCount: 0,
+              turnAssistantMessages,
+            }
+          }
+
           if (turnAssistantMessages.length === 0) {
             return {
               kind: "empty",
@@ -14884,6 +14949,11 @@ ${raw}
           params.emitInitialHeartbeat === true && !emittedInitialHeartbeat,
       })
       emittedInitialHeartbeat = true
+
+      if (outcome.kind === "provider_followup_requested") {
+        this.sessionManager.markSessionDirty(params.conversationId)
+        continue
+      }
 
       if (outcome.kind === "transport_recovery_requested") {
         transportRecoveryRound += 1
@@ -22254,6 +22324,7 @@ ${raw}
           assistantNativeSources,
           rawResponseItems,
           providerResponseId,
+          needsFollowUp,
         } = sseTurn.finish(activeProviderRoute.backend)
         if (!acceptedRequest) {
           throw new Error(
@@ -22267,7 +22338,11 @@ ${raw}
         const acceptedToolCalls = assistantContent.flatMap((block) =>
           block.type === "tool_use" ? [block] : []
         )
-        if (acceptedToolCalls.length === 0 && !fullText.trim()) {
+        if (
+          acceptedToolCalls.length === 0 &&
+          !fullText.trim() &&
+          !needsFollowUp
+        ) {
           await this.failSubAgent(
             conversationId,
             run.agentId,
@@ -22278,6 +22353,18 @@ ${raw}
           return
         }
         let assistantGraphAppend: GraphAppendResult | undefined
+        if (
+          assistantContent.length === 0 &&
+          activeProviderRoute.backend === "codex"
+        )
+          this.codexProjectionStore.commitUnrenderedResponse(
+            this.createSubagentCodexProjectionScope(
+              acceptedRequest.owner,
+              acceptedRequest.codexIdentity
+            ),
+            rawResponseItems,
+            providerResponseId
+          )
         if (assistantContent.length > 0) {
           const codexResponseCommit =
             activeProviderRoute.backend === "codex"
@@ -22309,7 +22396,8 @@ ${raw}
           )
         }
 
-        // No tool calls → sub-agent is done
+        // A completed response can explicitly request another sampling step.
+        if (acceptedToolCalls.length === 0 && needsFollowUp) continue
         if (acceptedToolCalls.length === 0) {
           const completed = await this.completeSubAgent(
             conversationId,
@@ -22806,6 +22894,18 @@ ${raw}
     }
     const assistantContent = result.assistantContent
     const responseId = result.providerResponseId
+    if (
+      assistantContent.length === 0 &&
+      activeProviderRoute.backend === "codex"
+    )
+      this.codexProjectionStore.commitUnrenderedResponse(
+        this.createSubagentCodexProjectionScope(
+          acceptedRequest.owner,
+          acceptedRequest.codexIdentity
+        ),
+        result.rawResponseItems,
+        responseId
+      )
     const codexResponseCommit =
       activeProviderRoute.backend === "codex" && assistantContent.length > 0
         ? this.buildCodexGraphResponseCommit({
@@ -24439,7 +24539,9 @@ ${raw}
     >[number]
   ): string {
     const lines = [
-      "[background_task completed]",
+      isBackgroundWorkerNotification(completion)
+        ? "[background_task notification]"
+        : "[background_task completed]",
       `taskId: ${completion.taskId}`,
       `kind: ${this.describeBackgroundTaskKind(completion.kind)}`,
       `status: ${this.describeBackgroundTaskStatus(completion.status)}`,
@@ -24449,6 +24551,10 @@ ${raw}
     if (completion.outputPath)
       lines.push(`output_path: ${completion.outputPath}`)
     if (completion.threadId) lines.push(`thread_id: ${completion.threadId}`)
+    if (completion.reason !== undefined)
+      lines.push(`reason: ${completion.reason}`)
+    if (completion.completedAtMs)
+      lines.push(`completed_at_ms: ${completion.completedAtMs}`)
     return this.truncateBackgroundTaskText(lines.join("\n"), 4000)
   }
 
@@ -24834,7 +24940,11 @@ ${raw}
     }
 
     for (const completion of completions) {
-      if (!isTerminalBackgroundTaskCompletion(completion)) continue
+      if (
+        !isTerminalBackgroundTaskCompletion(completion) &&
+        !isBackgroundWorkerNotification(completion)
+      )
+        continue
       if (handledCompletions.has(completion)) continue
       completionMessages.push(
         this.renderGenericBackgroundCompletion(completion)
@@ -31537,7 +31647,18 @@ ${raw}
     stopReason: string | null | undefined,
     codexResponseCommitMode: "durable" | "isolated"
   ): SessionAssistantMessage[] {
-    if (draft.length === 0) return []
+    if (draft.length === 0) {
+      if (
+        providerRoute.backend === "codex" &&
+        codexResponseCommitMode === "durable"
+      )
+        this.codexProjectionStore.commitUnrenderedResponse(
+          this.createMainCodexProjectionScope(session),
+          codexRawResponseItems,
+          providerResponseId
+        )
+      return []
+    }
 
     const messageIds = new Set(
       draft.flatMap((entry) => (entry.messageId ? [entry.messageId] : []))
@@ -32390,6 +32511,7 @@ ${raw}
       summaryArchiveBlobIds: summaryArchiveBlobs.summaryArchiveBlobIds,
       goalState: session.goalState,
       isRootProjectConversation: session.isRootProjectConversation,
+      cursorProtocolState: session.cursorProtocolState,
     }
 
     return {
@@ -33645,6 +33767,7 @@ ${raw}
         frame.assignWireFrameRef?.(ref)
       }
     }
+    let attachmentFailure: CursorCloudAttachmentError | undefined
     const inputPump = this.runWithTurnContext(
       umbrellaHandle,
       async (): Promise<void> => {
@@ -33815,6 +33938,23 @@ ${raw}
                     ? "cancel_action"
                     : "control_action"
                 )
+              }
+
+              const completions =
+                parsed.agentControlBackgroundTaskCompletions || []
+              if (
+                conversationId &&
+                parsed.agentControlType === "backgroundTaskCompletionAction" &&
+                completions.length > 0 &&
+                completions.every((completion) => completion.recordOnly)
+              ) {
+                // The inbound frame is already durable. Record-only actions
+                // stay passive even while a client-owned tool is unresolved.
+                this.emit(
+                  conversationId,
+                  this.grpcService.createServerHeartbeatResponse()
+                )
+                continue
               }
 
               const recoveryControlPolicy = getPendingToolRecoveryControlPolicy(
@@ -34710,6 +34850,8 @@ ${raw}
 
           this.logger.log(`Stream ended for conversation: ${conversationId}`)
         } catch (error) {
+          if (error instanceof CursorCloudAttachmentError)
+            attachmentFailure = error
           this.logger.error("Error in bidi stream", error)
           // Don't throw raw error — it may contain circular references
           // (e.g. TLS certificates). Surface a clean message; the
@@ -34748,6 +34890,7 @@ ${raw}
       for await (const frame of controller.handle()) {
         yield frame
       }
+      if (attachmentFailure) throw attachmentFailure
     } finally {
       // Whether we exited cleanly or the consumer dropped us, seal
       // the controller so the supervisor cancels the umbrella turn
@@ -36456,6 +36599,12 @@ ${raw}
     }
     const route = this.modelRouter.resolveModel(effectiveModel)
     const backendModel = route.model
+    if (session.cursorProtocolState?.clientSupportsRoutedModelUpdate) {
+      this.emit(
+        conversationId,
+        this.grpcService.createRoutedModelResponse(backendModel)
+      )
+    }
     this.logger.debug(
       `Mapped Cursor model "${effectiveModel}" to backend model "${backendModel}" (backend=${route.backend})`
     )
@@ -41946,6 +42095,9 @@ ${raw}
     if (context.customSystemPrompt) {
       parts.push(context.customSystemPrompt)
     }
+    parts.push(
+      ...(context.cursorProtocolState?.conversation?.durableSkillBlocks || [])
+    )
 
     parts.push(this.buildCursorToolUsageSection())
 
@@ -42143,6 +42295,11 @@ ${raw}
 
     pushEntry("language_directive", "developer", buildStableLanguageDirective())
     pushEntry("custom_system_prompt", "developer", context.customSystemPrompt)
+    for (const [index, block] of (
+      context.cursorProtocolState?.conversation?.durableSkillBlocks || []
+    ).entries()) {
+      pushEntry(`cursor_durable_skill_${index}`, "developer", block)
+    }
     pushEntry("tool_usage", "developer", this.buildCodexToolUsageSection())
 
     const cursorSkillPolicy = this.resolveCursorSkillPolicyForPrompt(context)
@@ -42710,6 +42867,21 @@ ${raw}
         `Codex attempt ${plan.attemptKey} staged an invalid rollout length`
       )
     }
+    const compHash = getCodexModelProfile(plan.model)?.comp_hash ?? undefined
+    if (
+      installed.activeWindow.modelContext?.model !== plan.model ||
+      installed.activeWindow.modelContext?.compHash !== compHash
+    ) {
+      recordCodexRolloutMetadata(installed, {
+        rolloutId: `${plan.attemptKey}:model-context`,
+        kind: "turn_context",
+        item: {
+          type: "model_context",
+          model: plan.model,
+          ...(compHash ? { compHash } : {}),
+        },
+      })
+    }
     if (getCodexPendingRollout(installed).length > 0) {
       return this.codexProjectionStore.commitDelta({
         scope: plan.scope,
@@ -42827,6 +42999,9 @@ ${raw}
     if (context.customSystemPrompt) {
       parts.push(context.customSystemPrompt)
     }
+    parts.push(
+      ...(context.cursorProtocolState?.conversation?.durableSkillBlocks || [])
+    )
     parts.push(this.buildGoogleToolUsageSection())
     parts.push(this.buildGooglePlanningOverrideSection())
     if (context.explicitContext) {

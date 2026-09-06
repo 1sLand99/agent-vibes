@@ -552,6 +552,24 @@ export const CURSOR_TOOL_CALL_CAPABILITIES: readonly CursorToolCallCapability[] 
       [],
       "guard/fallback projection for explicitly known tools without a dedicated oneof; never a capability claim"
     ),
+    ...[
+      ["adoptToolCall", "adopt"],
+      ["getAgentStatusToolCall", "get_agent_status"],
+      ["sendToAgentToolCall", "send_to_agent"],
+      ["readAgentTranscriptToolCall", "read_agent_transcript"],
+      ["createAgentToolCall", "create_agent"],
+      ["stopAgentToolCall", "stop_agent"],
+      ["getPrCodeTourToolCall", "get_pr_code_tour"],
+    ].map(([caseId, toolName]) =>
+      capability(
+        caseId!,
+        "scm_pr_cloud",
+        "unsupported",
+        "unsupported",
+        [toolName!],
+        "requires the official cloud agent/store or PR service; not exposed by the local Composer tool contract"
+      )
+    ),
   ])
 
 export function getCursorToolCallCapability(

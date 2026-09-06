@@ -1,3 +1,4 @@
+import { CursorCloudAttachmentError } from "./codec/cursor-attachment-reference"
 import { Logger } from "@nestjs/common"
 import { FastifyRequest, FastifyReply } from "fastify"
 import * as zlib from "zlib"
@@ -207,7 +208,10 @@ export class ConnectRPCHandler {
       if (error) {
         endStreamBody = {
           error: {
-            code: "internal",
+            code:
+              error instanceof CursorCloudAttachmentError
+                ? "failed_precondition"
+                : "internal",
             message: error.message,
           },
         }
@@ -272,7 +276,12 @@ export class ConnectRPCHandler {
       // Create a clean error with only the message to avoid circular references
       const errorMessage =
         error instanceof Error ? error.message : String(error)
-      this.endStream(res, new Error(errorMessage))
+      this.endStream(
+        res,
+        error instanceof CursorCloudAttachmentError
+          ? error
+          : new Error(errorMessage)
+      )
     }
   }
 

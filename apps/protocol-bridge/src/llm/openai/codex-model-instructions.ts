@@ -1,3 +1,4 @@
+import { getCodexModelProfile } from "./codex-model-catalog"
 import { parseModelRequest } from "../shared/model-request"
 import {
   CODEX_FALLBACK_BASE_INSTRUCTIONS,
@@ -101,6 +102,39 @@ export function resolveCodexModelInstructionEntry(modelId: string): {
   entry: GeneratedCodexModelInstructionEntry
 } {
   const normalizedModel = normalizeCodexModelId(modelId)
+  const profile = getCodexModelProfile(normalizedModel)
+  if (profile && typeof profile.base_instructions === "string") {
+    const messages = profile.model_messages as
+      | {
+          instructions_template?: string
+          instructions_variables?: Record<string, string>
+        }
+      | undefined
+    return {
+      normalizedModel,
+      source: "catalog",
+      entry: {
+        baseInstructions: profile.base_instructions,
+        includeSkillsUsageInstructions:
+          profile.include_skills_usage_instructions === true,
+        modelMessages: messages
+          ? {
+              instructionsTemplate: messages.instructions_template,
+              instructionsVariables: messages.instructions_variables
+                ? {
+                    personalityDefault:
+                      messages.instructions_variables.personality_default,
+                    personalityFriendly:
+                      messages.instructions_variables.personality_friendly,
+                    personalityPragmatic:
+                      messages.instructions_variables.personality_pragmatic,
+                  }
+                : undefined,
+            }
+          : undefined,
+      },
+    }
+  }
   const catalogEntry = GENERATED_CATALOG[normalizedModel]
   if (catalogEntry) {
     return {

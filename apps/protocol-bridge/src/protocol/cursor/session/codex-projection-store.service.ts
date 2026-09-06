@@ -332,6 +332,27 @@ export class CodexProjectionStore {
     this.states.delete(providerProjectionStorageKey(projection))
   }
 
+  /** Persist provider-only progress even when it has no rendered graph block. */
+  commitUnrenderedResponse(
+    scope: CodexProjectionScope,
+    items: readonly Record<string, unknown>[],
+    responseId?: string
+  ): void {
+    if (items.length === 0) return
+    const base = this.get(scope)
+    const expected = this.captureBase(scope, base)
+    const state = forkCodexProjectionState(base)
+    this.recordResponseItems(
+      state,
+      items.map((item) => ({
+        rolloutId: `response-item:${requireExactDurableIdentifier(item.id, "Codex native response item id")}`,
+        item,
+      }))
+    )
+    if (getCodexPendingRollout(state).length > 0)
+      this.commitDelta({ scope, expected, state, responseId })
+  }
+
   recordResponseItems(
     state: CodexProjectionState,
     items: Parameters<

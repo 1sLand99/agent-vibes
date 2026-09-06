@@ -1,3 +1,4 @@
+import type { CodexModelProfile } from "./codex-model-catalog"
 import type { ProviderMessageContent } from "../../shared/provider-content"
 import type { ThinkingIntent } from "../shared/thinking-types"
 import type { CodexProviderIdentity } from "./codex-provider-identity"
@@ -59,6 +60,8 @@ export interface CodexSystemTextBlock {
  * itself is sourced.
  */
 interface CodexExecutionRequestBase {
+  modelProfile?: CodexModelProfile
+  responseFormat?: "native"
   model: string
   system?: string | CodexSystemTextBlock[]
   tools?: CodexConversationTool[]
@@ -115,6 +118,8 @@ export interface CodexExecutionRequest extends CodexExecutionRequestBase {
  */
 export interface CodexNativeInputExecutionRequest extends CodexExecutionRequestBase {
   nativeInput: readonly CodexInputItem[]
+  /** Full native ingress payload; never projected through Anthropic messages. */
+  wireRequest?: CodexRequest
   messages?: never
   contextMessages?: never
   projectionState?: never
@@ -144,7 +149,8 @@ export type CodexRemoteCompactionV2Request = Omit<
   signal: AbortSignal
 }
 
-export interface CodexInputMessage {
+export interface CodexInputMessage extends Record<string, unknown> {
+  id?: string
   type: "message"
   role: string
   content: Array<Record<string, unknown>>
@@ -164,9 +170,11 @@ export interface CodexCustomToolCall {
   input: string
 }
 
-export interface CodexFunctionCallOutput {
+export interface CodexFunctionCallOutput extends Record<string, unknown> {
   type: "function_call_output"
-  call_id: string
+  call_id?: string
+  name?: string
+  namespace?: string
   output: string | Array<Record<string, unknown>>
 }
 
@@ -193,7 +201,8 @@ export interface CodexCompactionTriggerInputItem {
   type: "compaction_trigger"
 }
 
-export interface CodexAdditionalTools {
+export interface CodexAdditionalTools extends Record<string, unknown> {
+  id?: string
   type: "additional_tools"
   role: string
   tools: CodexTool[]
@@ -255,7 +264,13 @@ export interface CodexImageGenerationCallInputItem extends Record<
   result: string
 }
 
+export interface CodexConfigurationUpdate extends Record<string, unknown> {
+  type: "configuration_update"
+  reasoning: { effort: string }
+}
+
 export type CodexInputItem =
+  | CodexConfigurationUpdate
   | CodexInputMessage
   | CodexFunctionCall
   | CodexCustomToolCall
@@ -280,6 +295,8 @@ export interface CodexTool {
     | "tool_search"
     | "web_search"
     | "image_generation"
+    | "namespace"
+  tools?: CodexTool[]
   name?: string
   description?: string
   parameters?: Record<string, unknown>
@@ -301,7 +318,7 @@ export interface CodexRequest {
   stream: boolean
   store?: boolean
   parallel_tool_calls?: boolean
-  reasoning?: { effort: string; summary?: string; context?: "all_turns" }
+  reasoning?: { effort?: string; summary?: string; context?: "all_turns" }
   include?: string[]
   previous_response_id?: string
   client_metadata?: Record<string, string>

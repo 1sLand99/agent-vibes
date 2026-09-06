@@ -1,3 +1,4 @@
+import { assertLocalCursorAttachments } from "../codec/cursor-attachment-reference"
 import type { ContentBlock, ImageBlock } from "../../../context/types"
 import { requireExactDurableIdentifier } from "../../../context/durable-identifier"
 import type { UserMessage, UserMessageAction } from "../../../gen/agent/v1_pb"
@@ -233,6 +234,7 @@ function projectUserMessageActionMessage(
     )
   }
 
+  assertLocalCursorAttachments(userMessage)
   const textBlobId = userMessage.textBlobId
   const hasTextBlob = hasBytes(textBlobId)
   if (hasTextBlob && userMessage.text.length > 0) {
@@ -286,6 +288,15 @@ function projectUserMessageActionMessage(
       placement,
       ...(prependIndex !== undefined ? { prependIndex } : {}),
       ...(userMessage.messageId ? { messageId: userMessage.messageId } : {}),
+      ...(userMessage.turnSteer !== undefined
+        ? { turnSteer: userMessage.turnSteer }
+        : {}),
+      ...(userMessage.startedAtMs !== undefined
+        ? { startedAtMs: userMessage.startedAtMs.toString() }
+        : {}),
+      ...(userMessage.completedAtMs !== undefined
+        ? { completedAtMs: userMessage.completedAtMs.toString() }
+        : {}),
       hookAdditionalContexts: userMessage.hookAdditionalContexts.map(
         (context) => ({
           hookEventName: context.hookEventName,

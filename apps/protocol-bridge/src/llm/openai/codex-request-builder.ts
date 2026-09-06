@@ -1,3 +1,9 @@
+import { v5 as uuidv5 } from "uuid"
+import {
+  getCodexModelProfile,
+  codexCapabilitiesFromProfile,
+  resolveCodexWireEffort,
+} from "./codex-model-catalog"
 import { projectCodexNativeRequest } from "./codex-native-projector"
 import type {
   CodexInputItem,
@@ -54,7 +60,51 @@ export function buildCodexRequest(
     modelName
   )
 ): CodexRequest {
-  const effectiveCapabilities = capabilities ?? CODEX_UNKNOWN_MODEL_CAPABILITIES
+  const profile = request.modelProfile ?? getCodexModelProfile(modelName)
+  const effectiveCapabilities = request.modelProfile
+    ? codexCapabilitiesFromProfile(request.modelProfile)
+    : (capabilities ?? CODEX_UNKNOWN_MODEL_CAPABILITIES)
+  if (request.nativeInput !== undefined && request.wireRequest) {
+    const wire = structuredClone(request.wireRequest)
+    if (wire.model !== modelName)
+      throw new Error("Native Responses model does not match its dispatch")
+    wire.input = structuredClone([...request.nativeInput])
+    wire.stream = true
+    wire.store = false
+    wire.client_metadata = {
+      ...wire.client_metadata,
+      ...request.clientMetadata,
+    }
+    delete wire.previous_response_id
+    if (
+      effectiveCapabilities.useResponsesLite &&
+      (wire.instructions || wire.tools?.length)
+    ) {
+      const payload = buildResponsesPayloadForRequest(
+        wire.instructions ?? "",
+        wire.input,
+        wire.tools,
+        effectiveCapabilities,
+        request.upstreamIdentity.threadId
+      )
+      wire.input = payload.input
+      wire.instructions = payload.instructions
+      delete wire.tools
+      delete wire.tool_choice
+    }
+    // Lite requires an explicit false even when tools are already encoded in
+    // input, absent, or the native caller requested parallel execution.
+    if (effectiveCapabilities.useResponsesLite) wire.parallel_tool_calls = false
+    if (wire.reasoning || effectiveCapabilities.useResponsesLite)
+      wire.reasoning = resolveReasoningForRequest(
+        {
+          ...wire.reasoning,
+          effort: resolveCodexWireEffort(profile, wire.reasoning?.effort),
+        },
+        effectiveCapabilities
+      )
+    return wire
+  }
   const projection = projectCodexNativeRequest(request, modelName, {
     supportsOriginalImageDetail:
       effectiveCapabilities.supportsOriginalImageDetail === true,
@@ -62,14 +112,20 @@ export function buildCodexRequest(
   })
 
   const reasoning = resolveReasoningForRequest(
-    projection.reasoning,
+    projection.reasoning
+      ? {
+          ...projection.reasoning,
+          effort: resolveCodexWireEffort(profile, projection.reasoning.effort),
+        }
+      : undefined,
     effectiveCapabilities
   )
   const responsesPayload = buildResponsesPayloadForRequest(
     projection.instructions,
     projection.input,
     projection.tools,
-    effectiveCapabilities
+    effectiveCapabilities,
+    request.upstreamIdentity.threadId
   )
   const codexRequest: CodexRequest = {
     model: modelName,
@@ -77,6 +133,12 @@ export function buildCodexRequest(
     input: responsesPayload.input,
     stream: true,
     store: false,
+    // This is a request-level setting, not conditional on top-level tools.
+    // Responses Lite moves those tools into input but still requires false.
+    parallel_tool_calls: resolveParallelToolCallsForRequest(
+      request.parallelToolCalls,
+      effectiveCapabilities
+    ),
     include: reasoning ? ["reasoning.encrypted_content"] : [],
   }
 
@@ -103,10 +165,6 @@ export function buildCodexRequest(
   if (responsesPayload.tools && responsesPayload.tools.length > 0) {
     codexRequest.tools = responsesPayload.tools
     codexRequest.tool_choice = request.toolChoice ?? "auto"
-    codexRequest.parallel_tool_calls = resolveParallelToolCallsForRequest(
-      request.parallelToolCalls,
-      effectiveCapabilities
-    )
   }
 
   const clientMetadata = request.clientMetadata
@@ -125,15 +183,18 @@ function buildResponsesPayloadForRequest(
   instructions: string,
   input: CodexInputItem[],
   tools: CodexTool[] | undefined,
-  capabilities: CodexRequestCapabilities | null
+  capabilities: CodexRequestCapabilities | null,
+  threadId: string
 ): { instructions: string; input: CodexInputItem[]; tools?: CodexTool[] } {
   if (capabilities?.useResponsesLite !== true) {
     return { instructions, input, tools }
   }
 
+  const namespace = uuidv5(threadId, "6ba7b812-9dad-11d1-80b4-00c04fd430c8")
   const prefix: CodexInputItem[] = [
     {
       type: "additional_tools",
+      id: `at_${uuidv5(JSON.stringify(tools || []), namespace)}`,
       role: "developer",
       tools: tools || [],
     },
@@ -142,8 +203,12 @@ function buildResponsesPayloadForRequest(
   if (instructions.length > 0) {
     prefix.push({
       type: "message",
+      id: `msg_${uuidv5(instructions, namespace)}`,
       role: "developer",
       content: [{ type: "input_text", text: instructions }],
+      internal_chat_message_metadata_passthrough: {
+        content_item_kinds: ["model.base_instructions"],
+      },
     })
   }
 
@@ -221,11 +286,12 @@ function resolveReasoningForRequest(
   reasoning: CodexRequest["reasoning"],
   capabilities: CodexRequestCapabilities | null
 ): CodexRequest["reasoning"] {
-  if (capabilities?.supportsReasoningSummaries === false) {
-    return undefined
-  }
   if (!reasoning) {
     return undefined
+  }
+  if (capabilities?.supportsReasoningSummaryParameter === false) {
+    const { summary: _summary, ...rest } = reasoning
+    reasoning = rest
   }
   if (capabilities?.useResponsesLite === true) {
     return { ...reasoning, context: "all_turns" }

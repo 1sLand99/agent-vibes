@@ -54,6 +54,7 @@ export interface BackgroundWorkerHostDeps {
 export type BackgroundWorkerLlmTurnResult =
   | {
       readonly kind: "accepted"
+      readonly needsFollowUp: boolean
       readonly fullText: string
       /** The one accepted provider block sequence already committed to graph. */
       readonly assistantContent: readonly SubAgentAssistantContentBlock[]
@@ -178,6 +179,9 @@ export class SubagentBackgroundWorker {
           block.type === "tool_use" ? [block] : []
         )
 
+        if (acceptedToolCalls.length === 0 && llmResult.needsFollowUp) {
+          continue
+        }
         if (acceptedToolCalls.length === 0) {
           const finalText = llmResult.fullText.trim()
           if (!finalText) {

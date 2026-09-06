@@ -2,8 +2,6 @@ const MAX_REALTIME_SDP_LENGTH = 1_000_000
 const MAX_REALTIME_SESSION_LENGTH = 64_000
 
 export const DEFAULT_REALTIME_MODEL = "gpt-realtime"
-export const CHATGPT_WEB_RELAY_TRANSPORT =
-  "chatgpt-web-page-owned-relay-v1" as const
 
 export interface ChatGptWebRealtimeCallRequest {
   sdp: string
@@ -13,7 +11,7 @@ export interface ChatGptWebRealtimeCallRequest {
 export interface ChatGptWebRealtimeCallResult {
   callId: string
   sdp: string
-  transport: typeof CHATGPT_WEB_RELAY_TRANSPORT
+  transport: "chatgpt-web-voice"
 }
 
 export class ChatGptWebRealtimeRequestError extends Error {
@@ -212,18 +210,4 @@ export function parseChatGptWebRealtimeCallRequest(
   }
 
   return normalizeChatGptWebRealtimeCallRequest(body)
-}
-
-export function extractChatGptWebRealtimeCallId(location: string): string {
-  const path = location.trim().split("?", 1)[0] || ""
-  const candidate = path
-    .split("/")
-    .filter(Boolean)
-    .reverse()
-    .find((segment) => /^rtc_[A-Za-z0-9_-]+$/.test(segment))
-
-  if (!candidate) {
-    throw new Error("ChatGPT Web realtime response is missing a valid call id")
-  }
-  return candidate
 }

@@ -58,8 +58,20 @@ function loadCatalog(modelsJsonPath) {
 
     catalog[slug] = {
       baseInstructions,
+      profile: Object.fromEntries(
+        Object.entries(model).filter(
+          ([key]) => key !== "base_instructions" && key !== "model_messages"
+        )
+      ),
       modelMessages: modelMessages
         ? {
+            runtime: Object.fromEntries(
+              Object.entries(modelMessages).filter(
+                ([key]) =>
+                  key !== "instructions_template" &&
+                  key !== "instructions_variables"
+              )
+            ),
             instructionsTemplate:
               typeof modelMessages.instructions_template === "string"
                 ? modelMessages.instructions_template
@@ -117,11 +129,13 @@ export interface GeneratedCodexModelInstructionsVariables {
 }
 
 export interface GeneratedCodexModelMessages {
+  runtime?: Readonly<Record<string, unknown>>
   instructionsTemplate?: string
   instructionsVariables?: GeneratedCodexModelInstructionsVariables
 }
 
 export interface GeneratedCodexModelInstructionEntry {
+  profile?: Readonly<Record<string, unknown>>
   baseInstructions: string
   modelMessages?: GeneratedCodexModelMessages
   includeSkillsUsageInstructions?: boolean
@@ -139,7 +153,7 @@ export const CODEX_MODEL_INSTRUCTION_CATALOG = ${JSON.stringify(
 `
 }
 
-function main() {
+async function main() {
   const modelsJsonPath = resolveInputPath()
   assertFile(modelsJsonPath, "Codex models.json")
 
@@ -149,13 +163,32 @@ function main() {
   const outputPath = path.resolve(readArg("--out") || OUTPUT_PATH)
   const fallbackBaseInstructions = fs.readFileSync(promptPath, "utf8")
   const catalog = loadCatalog(modelsJsonPath)
-  const output = buildOutput({
+  const rawOutput = buildOutput({
     modelsJsonPath,
     promptPath,
     fallbackBaseInstructions,
     catalog,
   })
 
+  const prettier = await import("prettier")
+  const output = await prettier.format(rawOutput, {
+    ...(await prettier.resolveConfig(OUTPUT_PATH)),
+    parser: "typescript",
+  })
+  if (process.argv.includes("--check")) {
+    if (
+      !fs.existsSync(outputPath) ||
+      fs.readFileSync(outputPath, "utf8") !== output
+    ) {
+      throw new Error(
+        "Generated Codex catalog is out of date; run codex:instructions:sync"
+      )
+    }
+    process.stdout.write(
+      `Verified ${Object.keys(catalog).length} Codex model profiles and instructions\n`
+    )
+    return
+  }
   fs.mkdirSync(path.dirname(outputPath), { recursive: true })
   fs.writeFileSync(outputPath, output)
   process.stdout.write(
@@ -166,4 +199,7 @@ function main() {
   )
 }
 
-main()
+main().catch((error) => {
+  process.stderr.write(`${error.message}\n`)
+  process.exitCode = 1
+})

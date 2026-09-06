@@ -171,7 +171,14 @@ export interface CodexProjectionRolloutCursor {
   >
 }
 
+export interface CodexHistoryModelContext {
+  model: string
+  compHash?: string
+}
+
 export interface CodexProjectionWindow {
+  modelContext?: CodexHistoryModelContext
+  compactionModelHash?: string
   windowNumber: number
   firstWindowId: string
   previousWindowId?: string
@@ -262,6 +269,8 @@ export interface CodexSourceRecordLinkInput {
 }
 
 export interface CodexCompactionInstallInput {
+  nextModelContext?: CodexHistoryModelContext
+  compactionModelHash?: string
   rolloutId: string
   compactionId: string
   injectionMode: "pre_turn" | "mid_turn"
@@ -691,6 +700,17 @@ export function recordCodexRolloutMetadata(
   }
 ): void {
   assertNewRolloutId(state, input.rolloutId)
+  if (input.kind === "turn_context" && input.item.type === "model_context") {
+    const model = requireCodexIdentifier(input.item.model, "history model")
+    const compHash =
+      input.item.compHash === undefined
+        ? undefined
+        : requireCodexIdentifier(input.item.compHash, "compaction model hash")
+    state.activeWindow = {
+      ...state.activeWindow,
+      modelContext: { model, ...(compHash ? { compHash } : {}) },
+    }
+  }
   appendPendingRollout(state, {
     kind: input.kind,
     rolloutId: requireRolloutId(input.rolloutId),
@@ -865,6 +885,12 @@ export function installCodexCompaction(
   const windowNumber = currentWindow.windowNumber + 1
   const window: CodexProjectionWindow = {
     windowNumber,
+    modelContext: input.nextModelContext
+      ? cloneJson(input.nextModelContext)
+      : currentWindow.modelContext,
+    ...(input.compactionModelHash
+      ? { compactionModelHash: input.compactionModelHash }
+      : {}),
     firstWindowId: currentWindow.firstWindowId,
     previousWindowId: currentWindow.windowId,
     windowId: buildCodexProjectionWindowId(nativeThreadId, windowNumber),
@@ -2320,6 +2346,12 @@ function hashCodexCompactionInstallInput(
           "compaction id"
         ),
         injectionMode: input.injectionMode,
+        ...(input.nextModelContext
+          ? { nextModelContext: input.nextModelContext }
+          : {}),
+        ...(input.compactionModelHash
+          ? { compactionModelHash: input.compactionModelHash }
+          : {}),
         rawHistory: input.rawHistory,
         preTriggerInput: input.preTriggerInput,
         requestInput: input.requestInput,
@@ -2429,6 +2461,14 @@ function getCodexPromptOutputType(
   const type = getCodexItemType(item)
   switch (type) {
     case "function_call_output":
+      if (!getCodexPromptCallId(item)) {
+        requireCodexIdentifier(
+          (item as Record<string, unknown>).name,
+          "named tool output name"
+        )
+        return undefined
+      }
+      return type
     case "custom_tool_call_output":
       return type
     case "tool_search_output":

@@ -113,6 +113,7 @@ const interactionUpdates = [
   "feedbackRequest",
   "responseComparison",
   "contextInjectionState",
+  "routedModel",
 ] as const
 
 const conversationActions = [
@@ -174,6 +175,7 @@ const execPairs = [
   ["conversationSearchArgs", "conversationSearchResult"],
   ["miniSweAgentBashArgs", "miniSweAgentBashResult"],
   ["agentStoreConflictArgs", "agentStoreConflictResult"],
+  ["adoptArgs", "adoptResult"],
 ] as const
 
 const execControl = {

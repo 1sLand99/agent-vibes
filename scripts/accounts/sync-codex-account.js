@@ -162,7 +162,14 @@ function writeAccountsFile(destPath, account) {
       (a.accountId || "") === (account.accountId || "")
   )
   if (idx >= 0) {
-    existing.accounts[idx] = account
+    const current = existing.accounts[idx]
+    existing.accounts[idx] = {
+      ...account,
+      ...(current.label ? { label: current.label } : {}),
+      ...(current.baseUrl ? { baseUrl: current.baseUrl } : {}),
+      ...(current.proxyUrl ? { proxyUrl: current.proxyUrl } : {}),
+      ...(current.deviceId ? { deviceId: current.deviceId } : {}),
+    }
   } else {
     existing.accounts.push(account)
   }

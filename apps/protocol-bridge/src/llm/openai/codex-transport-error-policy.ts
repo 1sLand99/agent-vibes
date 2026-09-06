@@ -14,7 +14,8 @@ export function shouldRetryCodexSessionWebSocketError(error: unknown): boolean {
     message.includes("websocket is not open") ||
     message.includes("readystate") ||
     message.includes("socket has been closed") ||
-    message.includes("websocket closed before response.completed")
+    message.includes("websocket closed before response.completed") ||
+    message.includes("codex websocket idle timeout")
   )
 }
 

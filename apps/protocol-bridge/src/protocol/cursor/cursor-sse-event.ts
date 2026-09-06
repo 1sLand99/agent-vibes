@@ -34,6 +34,8 @@ export interface CursorSseEventData {
   }
   item?: Record<string, unknown>
   status?: "completed" | "incomplete" | "failed"
+  endTurn?: boolean
+  usageMetadata?: Record<string, unknown>
   responseId?: string
   incompleteReason?: string
   errorCode?: string

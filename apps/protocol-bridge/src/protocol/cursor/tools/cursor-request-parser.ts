@@ -1,4 +1,13 @@
+import {
+  normalizeCursorSystemPromptSpec,
+  readCursorProtocolSessionState,
+  type CursorProtocolSessionState,
+} from "../session/cursor-protocol-state"
 import { create, toBinary } from "@bufbuild/protobuf"
+import {
+  assertLocalCursorAttachments,
+  CursorCloudAttachmentError,
+} from "../codec/cursor-attachment-reference"
 import { Logger } from "@nestjs/common"
 import type { ContentBlock } from "../../../context/types"
 import type { SubagentTerminalDeliveryCommit } from "../subagents/subagent-terminal-delivery"
@@ -13,6 +22,7 @@ import {
 import {
   AgentClientMessage,
   AgentRunRequest,
+  type McpToolDefinition,
   BackgroundTaskCompletionReason,
   BackgroundTaskStatus,
   type ConversationAction,
@@ -310,6 +320,8 @@ export interface McpToolDef {
   description: string
   /** JSON Schema 形式的 input_schema */
   inputSchema?: Record<string, unknown>
+  outputSchema?: Record<string, unknown>
+  annotations?: Record<string, unknown>
   /**
    * IDE-side MCP server registry key — the value the Cursor IDE actually
    * uses to look up the server when bridge forwards `serverName` /
@@ -593,6 +605,7 @@ export interface ParsedCursorRequest {
   goalState?: BridgeGoalState
   /** ConversationStateStructure.is_root_project_conversation when present. */
   isRootProjectConversation?: boolean
+  cursorProtocolState?: CursorProtocolSessionState
 
   /** Exact optional response-comparison request identity from UserMessage. */
   bestOfNGroupId?: string
@@ -686,6 +699,10 @@ export interface ParsedCursorRequest {
     outputPath?: string
     threadId?: string
     reason?: number
+    /** Record-only notifications persist on the wire without waking the model. */
+    recordOnly?: boolean
+    /** Decimal uint64 string, safe for durable JSON without precision loss. */
+    completedAtMs?: string
     /** Official BackgroundTaskCompletion.subagent_id. */
     subagentId?: string
     /** Official BackgroundTaskCompletion.tool_call_id. */
@@ -745,56 +762,16 @@ export interface ParsedCursorRequest {
  * 把 oneof case 的 camelCase 还原回 snake_case 标签，保持下游分支
  * 与 proto 字段一一对应。
  *
- * 当 cursor 协议新增 ExecClientMessage 的 oneof case 时，需要在这里
- * 同步加一项（即使 bridge 自己永远不会主动触发该工具的执行流，
- * 客户端 IDE 仍可能主动发起这些 precheck/diagnostics 请求）。
+ * Names come from the generated descriptor, including newly added result cases.
+ * Recognition does not advertise a tool or authorize a new executor.
  */
-const EXEC_RESULT_CASE_MAP: Record<string, string> = {
-  shellResult: "shell_result",
-  writeResult: "write_result",
-  deleteResult: "delete_result",
-  grepResult: "grep_result",
-  readResult: "read_result",
-  lsResult: "ls_result",
-  diagnosticsResult: "diagnostics_result",
-  requestContextResult: "request_context_result",
-  mcpResult: "mcp_result",
-  shellStream: "shell_stream",
-  backgroundShellSpawnResult: "background_shell_spawn_result",
-  listMcpResourcesExecResult: "list_mcp_resources_exec_result",
-  readMcpResourceExecResult: "read_mcp_resource_exec_result",
-  fetchResult: "fetch_result",
-  recordScreenResult: "record_screen_result",
-  computerUseResult: "computer_use_result",
-  writeShellStdinResult: "write_shell_stdin_result",
-  executeHookResult: "execute_hook_result",
-  // ExecClientMessage 补齐
-  subagentResult: "subagent_result",
-  redactedReadResult: "redacted_read_result",
-  forceBackgroundShellResult: "force_background_shell_result",
-  forceBackgroundSubagentResult: "force_background_subagent_result",
-  mcpStateExecResult: "mcp_state_exec_result",
-  subagentAwaitResult: "subagent_await_result",
-  // 与最新 cursor agent.v1 ExecClientMessage 对齐：客户端在 IDE 端做
-  // smart-mode 分类、canvas diagnostics、shell/mcp/web_fetch 准入
-  // 检查（allowlist precheck）后会通过 BiDi 上行带这五种结果。
-  // bridge 自身不发起这些工具，但仍需识别字段，避免下游把 camelCase
-  // 字符串当作未知 case 走兜底路径而丢失上下文。
-  smartModeClassifierResult: "smart_mode_classifier_result",
-  canvasDiagnosticsResult: "canvas_diagnostics_result",
-  shellAllowlistPrecheckResult: "shell_allowlist_precheck_result",
-  mcpAllowlistPrecheckResult: "mcp_allowlist_precheck_result",
-  webFetchAllowlistPrecheckResult: "web_fetch_allowlist_precheck_result",
-  gitDiffResponse: "git_diff_response",
-  piReadResult: "pi_read_result",
-  piBashResult: "pi_bash_result",
-  piEditResult: "pi_edit_result",
-  piWriteResult: "pi_write_result",
-  piGrepResult: "pi_grep_result",
-  piFindResult: "pi_find_result",
-  piLsResult: "pi_ls_result",
-  conversationSearchResult: "conversation_search_result",
-}
+const EXEC_RESULT_CASE_MAP: Readonly<Record<string, string>> = Object.freeze(
+  Object.fromEntries(
+    ExecClientMessageSchema.fields
+      .filter((field) => field.oneof?.name === "message")
+      .map((field) => [field.localName, field.name])
+  )
+)
 
 export type ParsedBackgroundTaskCompletion = NonNullable<
   ParsedCursorRequest["agentControlBackgroundTaskCompletions"]
@@ -808,7 +785,12 @@ export type ParsedBackgroundTaskCompletion = NonNullable<
 export function isTerminalBackgroundTaskCompletion(
   completion: ParsedBackgroundTaskCompletion
 ): boolean {
-  if (completion.reason === BackgroundTaskCompletionReason.TASK_PROGRESS) {
+  if (completion.recordOnly === true) return false
+  if (
+    completion.reason !== undefined &&
+    completion.reason !== Number(BackgroundTaskCompletionReason.UNSPECIFIED) &&
+    completion.reason !== Number(BackgroundTaskCompletionReason.TASK_FINISHED)
+  ) {
     return false
   }
   return (
@@ -816,6 +798,19 @@ export function isTerminalBackgroundTaskCompletion(
     completion.status === BackgroundTaskStatus.SUCCESS ||
     completion.status === BackgroundTaskStatus.ERROR ||
     completion.status === BackgroundTaskStatus.ABORTED
+  )
+}
+
+/** Worker messages change context, not the owning task's terminal state. */
+export function isBackgroundWorkerNotification(
+  completion: ParsedBackgroundTaskCompletion
+): boolean {
+  return (
+    completion.recordOnly !== true &&
+    (completion.reason === BackgroundTaskCompletionReason.WORKER_REPARENTED ||
+      completion.reason === BackgroundTaskCompletionReason.WORKER_MESSAGE ||
+      completion.reason ===
+        BackgroundTaskCompletionReason.WORKER_NEEDS_ATTENTION)
   )
 }
 
@@ -848,6 +843,14 @@ export function normalizeBackgroundTaskCompletions(
       outputPath: maybeString(record.outputPath),
       threadId: maybeString(record.threadId),
       reason: maybeNumber(record.reason),
+      recordOnly: record.recordOnly === true,
+      completedAtMs:
+        typeof record.completedAtMs === "bigint"
+          ? record.completedAtMs.toString()
+          : typeof record.completedAtMs === "string" &&
+              /^\d+$/.test(record.completedAtMs)
+            ? record.completedAtMs
+            : undefined,
       subagentId: maybeString(record.subagentId),
       toolCallId: maybeString(record.toolCallId),
       notificationContext: maybeNumber(record.notificationContext),
@@ -1161,6 +1164,7 @@ export class CursorRequestParser {
     userMsg: UserMessage | undefined,
     resolver?: CursorProtocolReferenceResolver
   ): AttachedImage[] {
+    assertLocalCursorAttachments(userMsg)
     const attachedImages: AttachedImage[] = []
     if (!userMsg?.selectedContext?.selectedImages?.length) {
       return attachedImages
@@ -1613,7 +1617,8 @@ export class CursorRequestParser {
       }
     } catch (error) {
       if (
-        error instanceof CursorInterruptedPendingToolCallResolutionCodecError
+        error instanceof CursorInterruptedPendingToolCallResolutionCodecError ||
+        error instanceof CursorCloudAttachmentError
       ) {
         throw error
       }
@@ -2120,6 +2125,9 @@ export class CursorRequestParser {
     }
 
     const requestContext = action.requestContext
+    const mcpToolDefs = this.parseMcpToolDefinitions(
+      requestContext?.tools || []
+    )
     const workspaceContext = this.parseWorkspaceContext(requestContext)
 
     const builtInToolCapabilityOptions = {
@@ -2132,6 +2140,14 @@ export class CursorRequestParser {
     )
     if (requestContext?.searchConversationsEnabled === true) {
       supportedTools.push("search_conversations")
+    }
+    for (const tool of mcpToolDefs) {
+      if (
+        isCursorBuiltInToolAllowed(tool.name, builtInToolCapabilityOptions) &&
+        !supportedTools.includes(tool.name)
+      ) {
+        supportedTools.push(tool.name)
+      }
     }
     const useWeb =
       requestContext?.webSearchEnabled === true ||
@@ -2151,12 +2167,20 @@ export class CursorRequestParser {
       unifiedMode: "AGENT",
       isAgentic: true,
       supportedTools,
+      mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
       useWeb,
       ...workspaceContext,
       hookConfiguredSteps: selectCursorAgentHookSteps(
         requestContext?.hooksConfig?.configuredSteps
       ),
       hooksAdditionalContext: requestContext?.hooksAdditionalContext,
+      cursorProtocolState: requestContext?.systemPromptOverride
+        ? {
+            systemPrompt: normalizeCursorSystemPromptSpec(
+              requestContext.systemPromptOverride
+            ),
+          }
+        : undefined,
       bestOfNGroupId: action.userMessage?.bestOfNGroupId,
       tryUseBestOfNPromotion: action.userMessage?.tryUseBestOfNPromotion,
       requestContextEnv: this.parseRequestContextEnv(requestContext?.env),
@@ -2208,6 +2232,76 @@ export class CursorRequestParser {
   /**
    * 解析 AgentRunRequest → 提取 prompt、model、conversationId
    */
+  private parseMcpToolDefinitions(
+    primary: readonly McpToolDefinition[],
+    fallback: readonly McpToolDefinition[] = []
+  ): McpToolDef[] {
+    const mcpToolDefsByName = new Map<string, McpToolDef>()
+    const appendMcpToolDef = (tool: {
+      name?: string
+      toolName?: string
+      providerIdentifier?: string
+      description?: string
+      inputSchema?: unknown
+      inputSchemaJson?: string
+      outputSchemaJson?: string
+      annotationsJson?: string
+    }) => {
+      const name = tool.name || tool.toolName
+      if (!name || mcpToolDefsByName.has(name)) return
+      const def: McpToolDef = {
+        name,
+        toolName: tool.toolName || name,
+        providerIdentifier: tool.providerIdentifier || "",
+        description: tool.description || "",
+        ideRegistryKey: computeMcpIdeRegistryKey({
+          name,
+          toolName: tool.toolName || name,
+          providerIdentifier: tool.providerIdentifier || "",
+        }),
+      }
+      if (tool.inputSchema) {
+        try {
+          const parsed = this.protoValueToJs(tool.inputSchema)
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            def.inputSchema = parsed as Record<string, unknown>
+          }
+        } catch {
+          // inputSchema 解析失败则跳过
+        }
+      }
+      if (!def.inputSchema && tool.inputSchemaJson?.trim()) {
+        try {
+          const parsed = JSON.parse(tool.inputSchemaJson) as unknown
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            def.inputSchema = parsed as Record<string, unknown>
+          }
+        } catch {
+          this.logger.warn(`Invalid MCP input_schema_json for ${name}`)
+        }
+      }
+      for (const [wireKey, key] of [
+        ["outputSchemaJson", "outputSchema"],
+        ["annotationsJson", "annotations"],
+      ] as const) {
+        const json = tool[wireKey]
+        if (!json?.trim()) continue
+        try {
+          const parsed: unknown = JSON.parse(json)
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            def[key] = parsed as Record<string, unknown>
+          }
+        } catch {
+          this.logger.warn(`Invalid MCP ${wireKey} for ${name}`)
+        }
+      }
+      mcpToolDefsByName.set(name, def)
+    }
+
+    for (const tool of [...primary, ...fallback]) appendMcpToolDef(tool)
+    return Array.from(mcpToolDefsByName.values())
+  }
+
   private parseRunRequest(req: AgentRunRequest): ParsedCursorRequest | null {
     // 提取 prompt
     let prompt = ""
@@ -2689,65 +2783,10 @@ export class CursorRequestParser {
 
     const supportedTools = Array.from(supportedToolsSet)
 
-    // 提取 MCP 工具完整定义（含 input_schema）
-    const mcpToolDefsByName = new Map<string, McpToolDef>()
-    const appendMcpToolDef = (tool: {
-      name?: string
-      toolName?: string
-      providerIdentifier?: string
-      description?: string
-      inputSchema?: unknown
-      inputSchemaJson?: string
-    }) => {
-      const name = tool.name || tool.toolName
-      if (!name || mcpToolDefsByName.has(name)) return
-      const def: McpToolDef = {
-        name,
-        toolName: tool.toolName || name,
-        providerIdentifier: tool.providerIdentifier || "",
-        description: tool.description || "",
-        ideRegistryKey: computeMcpIdeRegistryKey({
-          name,
-          toolName: tool.toolName || name,
-          providerIdentifier: tool.providerIdentifier || "",
-        }),
-      }
-      if (tool.inputSchema) {
-        try {
-          const parsed = this.protoValueToJs(tool.inputSchema)
-          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            def.inputSchema = parsed as Record<string, unknown>
-          }
-        } catch {
-          // inputSchema 解析失败则跳过
-        }
-      }
-      if (!def.inputSchema && tool.inputSchemaJson?.trim()) {
-        try {
-          const parsed = JSON.parse(tool.inputSchemaJson) as unknown
-          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            def.inputSchema = parsed as Record<string, unknown>
-          }
-        } catch {
-          this.logger.warn(`Invalid MCP input_schema_json for ${name}`)
-        }
-      }
-      mcpToolDefsByName.set(name, def)
-    }
-
-    // Primary source: RequestContext.tools (Cursor Agent turn payload)
-    if (requestContext?.tools?.length) {
-      for (const tool of requestContext.tools) {
-        appendMcpToolDef(tool)
-      }
-    }
-    // Fallback source: top-level mcp_tools (some protocol variants)
-    if (req.mcpTools?.mcpTools?.length) {
-      for (const tool of req.mcpTools.mcpTools) {
-        appendMcpToolDef(tool)
-      }
-    }
-    const mcpToolDefs = Array.from(mcpToolDefsByName.values())
+    const mcpToolDefs = this.parseMcpToolDefinitions(
+      requestContext?.tools || [],
+      req.mcpTools?.mcpTools || []
+    )
     if (mcpToolDefs.length > 0) {
       this.logger.log(
         `Extracted ${mcpToolDefs.length} MCP tool definitions: ${mcpToolDefs.map((d) => d.name).join(", ")}`
@@ -2761,6 +2800,10 @@ export class CursorRequestParser {
       requestContext?.hooksConfig?.configuredSteps
     )
     const hooksAdditionalContext = requestContext?.hooksAdditionalContext
+    const cursorProtocolState = readCursorProtocolSessionState(
+      req,
+      requestContext
+    )
     const goalState = req.conversationState?.goalState
       ? fromProtoGoalState(req.conversationState.goalState)
       : undefined
@@ -2898,6 +2941,7 @@ export class CursorRequestParser {
           requestedModelParameters,
           hookConfiguredSteps,
           hooksAdditionalContext,
+          cursorProtocolState,
           goalState,
           isRootProjectConversation,
           requestContextEnv,
@@ -3108,6 +3152,7 @@ export class CursorRequestParser {
           requestedModelParameters,
           hookConfiguredSteps,
           hooksAdditionalContext,
+          cursorProtocolState,
           goalState,
           isRootProjectConversation,
           requestContextEnv,
@@ -3161,6 +3206,7 @@ export class CursorRequestParser {
           requestedModelParameters,
           hookConfiguredSteps,
           hooksAdditionalContext,
+          cursorProtocolState,
           goalState,
           isRootProjectConversation,
           requestContextEnv,
@@ -3209,6 +3255,7 @@ export class CursorRequestParser {
       requestedModelParameters,
       hookConfiguredSteps,
       hooksAdditionalContext,
+      cursorProtocolState,
       goalState,
       isRootProjectConversation,
       bestOfNGroupId: userMessage?.bestOfNGroupId,

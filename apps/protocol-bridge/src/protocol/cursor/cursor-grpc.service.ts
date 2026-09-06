@@ -1,3 +1,4 @@
+import type { CursorProtocolSessionState } from "./session/cursor-protocol-state"
 import {
   create,
   fromJson,
@@ -457,6 +458,7 @@ import {
   SubagentTypeCustomSchema,
   SubagentTypeSchema,
   SummaryCompletedUpdateSchema,
+  RoutedModelUpdateSchema,
   SummaryStartedUpdateSchema,
   SummaryUpdateSchema,
   SwitchModeArgsSchema,
@@ -1775,6 +1777,13 @@ export class CursorGrpcService {
     return this.wrapInteractionUpdate(
       "textDelta",
       create(TextDeltaUpdateSchema, { text })
+    )
+  }
+
+  createRoutedModelResponse(displayName: string): Buffer {
+    return this.wrapInteractionUpdate(
+      "routedModel",
+      create(RoutedModelUpdateSchema, { displayName })
     )
   }
 
@@ -5396,7 +5405,7 @@ export class CursorGrpcService {
   ): SandboxPolicy_ReadBoundaryMode {
     const numeric = this.parseOptionalNonNegativeInt(value)
     const min = Number(SandboxPolicy_ReadBoundaryMode.UNSPECIFIED)
-    const max = Number(SandboxPolicy_ReadBoundaryMode.CUSTOM)
+    const max = Number(SandboxPolicy_ReadBoundaryMode.WORKSPACE)
     if (numeric !== undefined && numeric >= min && numeric <= max) {
       return numeric as SandboxPolicy_ReadBoundaryMode
     }
@@ -5410,8 +5419,15 @@ export class CursorGrpcService {
         return SandboxPolicy_ReadBoundaryMode.WORKSPACE
       case "custom":
       case "read_boundary_mode_custom":
-        return SandboxPolicy_ReadBoundaryMode.CUSTOM
+        throw new Error(
+          "Cursor no longer supports the custom sandbox read boundary"
+        )
       default:
+        if (numeric !== undefined) {
+          throw new Error(
+            `Unsupported Cursor sandbox read boundary: ${numeric}`
+          )
+        }
         return SandboxPolicy_ReadBoundaryMode.UNSPECIFIED
     }
   }
@@ -11911,6 +11927,7 @@ export class CursorGrpcService {
       goalState?: BridgeGoalState
       /** Durable ConversationStateStructure.is_root_project_conversation. */
       isRootProjectConversation?: boolean
+      cursorProtocolState?: CursorProtocolSessionState
     }
   ): Buffer {
     // 构建 file_states_v2 (map<string, FileStateStructure>)
@@ -11969,6 +11986,7 @@ export class CursorGrpcService {
 
     // 构建 ConversationStateStructure 并正确填充字段
     const stateStructure = create(ConversationStateStructureSchema, {
+      ...checkpoint.cursorProtocolState?.conversation,
       // Token 统计
       tokenDetails: this.buildConversationTokenDetails(checkpoint.tokenDetails),
       // 待处理工具调用 ID

@@ -384,6 +384,30 @@ codex --login
 agent-vibes sync --codex
 ```
 
+The same Codex OAuth pool powers ChatGPT Web Live at
+`POST /v1/realtime/calls`. A synchronized OAuth account already contains the
+required access/refresh tokens. Optional Web Live account metadata belongs in
+the same `codex-accounts.json` entry:
+
+```json
+{
+  "accounts": [
+    {
+      "label": "chatgpt-plus",
+      "accessToken": "...",
+      "refreshToken": "...",
+      "accountId": "...",
+      "proxyUrl": "http://127.0.0.1:7897",
+      "deviceId": "58c4f084-baa7-43ed-897e-92497a1d26f0"
+    }
+  ]
+}
+```
+
+`deviceId` is optional; Agent Vibes derives a stable per-account value when it
+is absent. Web Live follows the Codex pool's token refresh, round-robin,
+per-account proxy, cooldown, disablement, hot reload, and persistence rules.
+
 - OpenAI-compatible file: `~/.agent-vibes/data/openai-compat-accounts.json`
 
 ```json
@@ -748,8 +772,9 @@ agent-vibes/
 
 `/v1/realtime/calls` exchanges a browser WebRTC SDP offer for an SDP answer
 using a configured ChatGPT OAuth account. It never uses a Platform API key and
-requires `PROXY_API_KEY`. The upstream capability is experimental; accounts
-without access receive `503` with error code `realtime_not_available`.
+requires `PROXY_API_KEY`. The WebRTC audio and ChatGPT Web Live events flow
+directly between the browser and ChatGPT after signaling. Accounts without Web
+Live availability receive a standard OpenAI error envelope.
 
 ## Tech Stack
 

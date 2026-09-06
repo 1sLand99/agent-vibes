@@ -1,7 +1,15 @@
 syntax = "proto3";
 package agent.v1;
 
+import "google/protobuf/timestamp.proto";
 import "google/protobuf/value.proto";
+
+enum AdoptOutcome {
+  ADOPT_OUTCOME_UNSPECIFIED = 0;
+  ADOPT_OUTCOME_ALREADY_PARENTED = 1;
+  ADOPT_OUTCOME_EDGE_ONLY = 2;
+  ADOPT_OUTCOME_STORE_IMPORT_COMPLETED = 3;
+}
 
 enum AgentHostBackgroundWorkKind {
   AGENT_HOST_BACKGROUND_WORK_KIND_UNSPECIFIED = 0;
@@ -48,10 +56,22 @@ enum AgentMode {
   AGENT_MODE_CUSTOM = 8;
 }
 
+enum AgentStoreClaimMountKind {
+  AGENT_STORE_CLAIM_MOUNT_KIND_UNSPECIFIED = 0;
+  AGENT_STORE_CLAIM_MOUNT_KIND_SELF = 1;
+  AGENT_STORE_CLAIM_MOUNT_KIND_USER = 2;
+  AGENT_STORE_CLAIM_MOUNT_KIND_TEAM = 3;
+  AGENT_STORE_CLAIM_MOUNT_KIND_AUTOMATION = 4;
+  AGENT_STORE_CLAIM_MOUNT_KIND_CLOUD_PEER = 5;
+}
+
 enum BackgroundTaskCompletionReason {
   BACKGROUND_TASK_COMPLETION_REASON_UNSPECIFIED = 0;
   BACKGROUND_TASK_COMPLETION_REASON_TASK_FINISHED = 1;
   BACKGROUND_TASK_COMPLETION_REASON_TASK_PROGRESS = 2;
+  BACKGROUND_TASK_COMPLETION_REASON_WORKER_REPARENTED = 3;
+  BACKGROUND_TASK_COMPLETION_REASON_WORKER_MESSAGE = 4;
+  BACKGROUND_TASK_COMPLETION_REASON_WORKER_NEEDS_ATTENTION = 5;
 }
 
 enum BackgroundTaskKind {
@@ -133,6 +153,12 @@ enum CustomSubagentPermissionMode {
   CUSTOM_SUBAGENT_PERMISSION_MODE_AGENT_ONLY = 3;
 }
 
+enum DesktopControlMode {
+  DESKTOP_CONTROL_MODE_UNSPECIFIED = 0;
+  DESKTOP_CONTROL_MODE_VIEW_ONLY = 1;
+  DESKTOP_CONTROL_MODE_CONTROL = 2;
+}
+
 enum DiagnosticSeverity {
   DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;
   DIAGNOSTIC_SEVERITY_ERROR = 1;
@@ -174,6 +200,13 @@ enum KeystrokeEventType {
   KEYSTROKE_EVENT_TYPE_KEY_COMBO = 1;
   KEYSTROKE_EVENT_TYPE_KEY_SINGLE = 2;
   KEYSTROKE_EVENT_TYPE_TEXT_TYPED = 3;
+}
+
+enum LocalAgentMailboxEndedReason {
+  LOCAL_AGENT_MAILBOX_ENDED_REASON_UNSPECIFIED = 0;
+  LOCAL_AGENT_MAILBOX_ENDED_REASON_NO_ACTIVE_SUBSCRIPTIONS = 1;
+  LOCAL_AGENT_MAILBOX_ENDED_REASON_STORE_DELETED = 2;
+  LOCAL_AGENT_MAILBOX_ENDED_REASON_MIGRATED_TO_CLOUD = 3;
 }
 
 enum LocalPromptQualityInvocationStatus {
@@ -315,6 +348,8 @@ enum SimulatedMsgReason {
   SIMULATED_MSG_REASON_AGENT_STORE_CONFLICT = 30;
   SIMULATED_MSG_REASON_GOAL_CONTINUATION = 31;
   SIMULATED_MSG_REASON_PROJECT_KICKOFF = 32;
+  SIMULATED_MSG_REASON_MARKDOWN_PROMPT_BUTTON = 33;
+  SIMULATED_MSG_REASON_USER_QUICK_ACTION = 34;
 }
 
 enum SmartModeClassifierDecision {
@@ -328,6 +363,13 @@ enum SubagentBackgroundReason {
   SUBAGENT_BACKGROUND_REASON_AGENT_REQUEST = 1;
   SUBAGENT_BACKGROUND_REASON_USER_REQUEST = 2;
   SUBAGENT_BACKGROUND_REASON_QUEUED_FOLLOW_UP = 3;
+}
+
+enum SubagentDispatchTool {
+  SUBAGENT_DISPATCH_TOOL_UNSPECIFIED = 0;
+  SUBAGENT_DISPATCH_TOOL_TASK = 1;
+  SUBAGENT_DISPATCH_TOOL_CREATE_AGENT = 2;
+  SUBAGENT_DISPATCH_TOOL_SEND_TO_AGENT = 3;
 }
 
 enum SubagentExecutionEnvironment {
@@ -357,6 +399,7 @@ enum SubscriptionSource {
   SUBSCRIPTION_SOURCE_SLACK = 1;
   SUBSCRIPTION_SOURCE_GITHUB = 2;
   SUBSCRIPTION_SOURCE_LINEAR = 3;
+  SUBSCRIPTION_SOURCE_ORIGIN = 4;
 }
 
 enum TaskMode {
@@ -384,6 +427,14 @@ enum TodoStatus {
   TODO_STATUS_IN_PROGRESS = 2;
   TODO_STATUS_COMPLETED = 3;
   TODO_STATUS_CANCELLED = 4;
+}
+
+enum UpdatePrCodeTourExecutionMode {
+  UPDATE_PR_CODE_TOUR_EXECUTION_MODE_UNSPECIFIED = 0;
+  UPDATE_PR_CODE_TOUR_EXECUTION_MODE_SERVER_SCHEDULED = 1;
+  UPDATE_PR_CODE_TOUR_EXECUTION_MODE_CLIENT_REQUIRED = 2;
+  UPDATE_PR_CODE_TOUR_EXECUTION_MODE_SKIPPED = 3;
+  UPDATE_PR_CODE_TOUR_EXECUTION_MODE_EDITED = 4;
 }
 
 message AbortAgentHostBackgroundWorkRequest {
@@ -415,6 +466,25 @@ message AbortResult {
 message ActiveBranchChange {
   string path = 1;
   string branch_name = 2;
+}
+
+message AdoptArgs {
+  string source_agent_id = 1;
+}
+
+message AdoptResult {
+  oneof result {
+    AdoptOutcome success = 4;
+    string error = 5;
+  }
+  string source_agent_id = 1;
+  string target_agent_id = 2;
+  string project_root_id = 3;
+}
+
+message AdoptToolCall {
+  AdoptArgs args = 1;
+  AdoptResult result = 2;
 }
 
 message AfterAgentResponseRequestQuery {
@@ -472,6 +542,12 @@ message AgentConversationTurnStructure {
   optional string encrypted_model = 4;
   optional uint32 dynamic_tool_count = 5;
   repeated uint32 send_message_step_indices = 6;
+  optional string routed_model_display_name = 7;
+  repeated SubagentDispatchStep subagent_dispatch_steps = 8;
+}
+
+message AgentHostBackgroundTaskCompleted {
+  BackgroundTaskCompletion completion = 1;
 }
 
 message AgentHostBackgroundWork {
@@ -481,6 +557,29 @@ message AgentHostBackgroundWork {
   optional string owner_id = 4;
   bool has_abort = 5;
   map<string, string> metadata = 6;
+}
+
+message AgentHostConnected {
+}
+
+message AgentHostConnectionStateChanged {
+  oneof state {
+    AgentHostConnected connected = 1;
+    AgentHostReconnecting reconnecting = 2;
+  }
+}
+
+message AgentHostFirstMessage {
+  double elapsed_ms = 1;
+}
+
+message AgentHostFirstMessageNetwork {
+  double elapsed_ms = 1;
+}
+
+message AgentHostFirstNonHeartbeatResponse {
+  double handshake_ms = 1;
+  uint32 attempt = 2;
 }
 
 message AgentHostInteractionCancelled {
@@ -501,10 +600,41 @@ message AgentHostInteractionResolved {
   string interaction_id = 2;
 }
 
+message AgentHostNetworkPhaseStarted {
+}
+
+message AgentHostOwningProject {
+  string project_agent_id = 1;
+  optional string project_name = 2;
+}
+
 message AgentHostPendingInteraction {
   string interaction_id = 1;
   string turn_id = 2;
   InteractionQuery query = 3;
+}
+
+message AgentHostReconnecting {
+  uint32 attempt = 1;
+  optional AgentHostReconnectTrigger trigger = 2;
+}
+
+message AgentHostReconnectTrigger {
+  optional string error_class = 1;
+  optional uint32 connect_code = 2;
+  optional string connect_code_name = 3;
+  optional uint32 error_code = 4;
+  optional bool count_as_server_error = 5;
+  optional bool count_as_transport_error = 6;
+  optional bool stall_aborted = 7;
+  optional string originating_request_id = 8;
+  optional string attempt_request_id = 9;
+  optional string endpoint_url = 10;
+}
+
+message AgentHostResponseMetadata {
+  optional string server_region = 1;
+  optional string transport_mode = 2;
 }
 
 message AgentHostSession {
@@ -513,6 +643,11 @@ message AgentHostSession {
   uint64 last_event_id = 3;
   optional string forked_from_session_id = 4;
   optional SessionParent parent = 5;
+  optional string title = 6;
+  optional google.protobuf.Timestamp updated_at = 7;
+  optional string model_id = 8;
+  repeated string workspace_paths = 9;
+  optional string worktree_main_path = 10;
 }
 
 message AgentHostSessionAdded {
@@ -525,6 +660,11 @@ message AgentHostSessionBackgroundWorkSnapshot {
 
 message AgentHostSessionBackgroundWorkState {
   repeated AgentHostBackgroundWork work = 1;
+}
+
+message AgentHostSessionBlob {
+  bytes blob_id = 1;
+  bytes data = 2;
 }
 
 message AgentHostSessionDeleted {
@@ -540,8 +680,11 @@ message AgentHostSessionEvent {
     AgentHostTurnSettled turn_settled = 9;
     AgentHostInteractionResolved interaction_resolved = 10;
     AgentHostSubagentStarted subagent_started = 11;
+    AgentHostBackgroundTaskCompleted background_task_completed = 12;
+    AgentHostTurnInteractionsSuperseded turn_interactions_superseded = 13;
   }
   uint64 event_id = 1;
+  optional bool keepalive = 14;
 }
 
 message AgentHostSessionInteractionsSnapshot {
@@ -557,6 +700,7 @@ message AgentHostSessionOptions {
   optional string worktree_main_path = 2;
   optional bool is_glass_root = 3;
   optional SubagentInteractionPolicy interaction_policy = 4;
+  optional AgentHostOwningProject owning_project = 5;
 }
 
 message AgentHostSessionsSnapshot {
@@ -574,11 +718,59 @@ message AgentHostSubagentStarted {
   string root_session_id = 4;
 }
 
+message AgentHostTtftBreakdown {
+  double server_first_token_ms = 1;
+  double pre_stream_setup_ms = 2;
+  double wait_for_first_event_ms = 3;
+  optional double provider_ttft_ms = 4;
+  double slow_pool_wait_ms = 5;
+  uint32 attempt = 6;
+}
+
 message AgentHostTurnAwaitingInput {
   string turn_id = 1;
   string request_id = 2;
   string interaction_id = 3;
   InteractionQuery query = 4;
+}
+
+message AgentHostTurnError {
+  optional string kind = 1;
+  optional string title = 2;
+  optional string detail = 3;
+  optional bool is_retryable = 4;
+  optional uint32 connect_code = 5;
+  optional string inference_request_error_type = 6;
+  optional string request_id = 7;
+  optional PH_aiserver_v1_ErrorDetails error_details = 8;
+}
+
+message AgentHostTurnInteractionsSuperseded {
+  oneof continuation {
+    ConversationStateStructure replay_action_from_state = 2;
+    ConversationStateStructure resume_from_checkpoint = 3;
+  }
+  string turn_id = 1;
+}
+
+message AgentHostTurnLifecycle {
+  oneof event {
+    AgentHostNetworkPhaseStarted network_phase_started = 2;
+    AgentHostResponseMetadata response_metadata = 3;
+    AgentHostConnectionStateChanged connection_state_changed = 4;
+    AgentHostFirstMessage first_message = 5;
+    AgentHostFirstMessageNetwork first_message_network = 6;
+    AgentHostFirstNonHeartbeatResponse first_non_heartbeat_response = 7;
+    AgentHostTtftBreakdown ttft_breakdown = 8;
+    AgentHostTurnLifecycleFinished finished = 9;
+  }
+  string turn_id = 1;
+}
+
+message AgentHostTurnLifecycleFinished {
+}
+
+message AgentHostTurnLifecycleWatchReady {
 }
 
 message AgentHostTurnOptions {
@@ -589,12 +781,18 @@ message AgentHostTurnOptions {
   optional uint32 fixed_retry_delay_ms = 5;
   optional bool endless_retries = 6;
   optional string agent_session_id = 7;
+  optional bool is_running_in_test = 8;
+  optional uint32 stall_advisory_timeout_ms = 9;
+  optional uint32 stall_fail_timeout_ms = 10;
+  repeated RequestedModel selected_subagent_models = 11;
+  repeated SubagentModelOverride subagent_model_overrides = 12;
 }
 
 message AgentHostTurnSettled {
   string turn_id = 1;
   AgentHostTurnOutcome outcome = 2;
   optional string detail = 3;
+  optional AgentHostTurnError error = 4;
 }
 
 message AgentHostTurnStarted {
@@ -629,6 +827,11 @@ message AgentRunRequest {
   optional string run_id = 25;
   optional string agent_session_id = 26;
   optional bool client_supports_prompt_context_usage_rpc = 27;
+  optional bool client_supports_routed_model_update = 28;
+  optional SystemPromptSpec system_prompt_spec = 29;
+  optional ClientLlmGatewayCredential client_llm_gateway_credential = 30;
+  optional bool client_supports_preview_card = 31;
+  optional bool started_as_new_project = 32;
 }
 
 message AgentServerMessage {
@@ -676,9 +879,21 @@ message AgentSkillMetadata {
   repeated string scoped_to = 13;
 }
 
+message AgentStoreClaimConfig {
+  AgentStoreSelfClaimConfig self = 1;
+  repeated AgentStoreClaimMount mounts = 2;
+  optional bool store_backed_artifacts_enabled = 3;
+}
+
+message AgentStoreClaimMount {
+  AgentStoreClaimMountKind kind = 1;
+  string source_id = 2;
+}
+
 message AgentStoreConflictArgs {
   optional AgentStoreConflictCursor cursor = 1;
   optional bool advance = 2;
+  optional bool include_quota_notices = 3;
 }
 
 message AgentStoreConflictCursor {
@@ -704,6 +919,9 @@ message AgentStoreConflictEvent {
   optional string original_abs_path = 10;
   optional string conflict_abs_path = 11;
   optional uint64 preserved_bytes = 12;
+  optional string scope_kind = 13;
+  optional uint64 limit_bytes = 14;
+  optional uint64 usage_bytes = 15;
 }
 
 message AgentStoreConflictResult {
@@ -717,6 +935,9 @@ message AgentStoreConflictSuccess {
   repeated AgentStoreConflictEvent events = 1;
   AgentStoreConflictCursor next_cursor = 2;
   bool gap = 3;
+}
+
+message AgentStoreSelfClaimConfig {
 }
 
 message AiAttributionArgs {
@@ -861,6 +1082,8 @@ message AskQuestionToolCall {
 
 message AssistantMessage {
   string text = 1;
+  optional uint64 started_at_ms = 2;
+  optional uint64 completed_at_ms = 3;
 }
 
 message AsyncAskQuestionCompletionAction {
@@ -872,6 +1095,7 @@ message AsyncAskQuestionCompletionAction {
 message AttachAgentHostSessionRequest {
   string session_id = 1;
   optional uint64 last_event_id = 2;
+  optional bool background_task_completions_only = 3;
 }
 
 message AwaitArgs {
@@ -951,6 +1175,7 @@ message BackgroundShellSpawnArgs {
   bool skip_approval = 12;
   optional string conversation_id = 13;
   repeated string admin_command_denylist = 14;
+  optional string request_id = 15;
 }
 
 message BackgroundShellSpawnError {
@@ -992,6 +1217,8 @@ message BackgroundTaskCompletion {
   optional string subagent_id = 9;
   optional string tool_call_id = 10;
   BackgroundTaskNotificationContext notification_context = 11;
+  optional uint64 completed_at_ms = 12;
+  bool record_only = 13;
 }
 
 message BackgroundTaskCompletionAction {
@@ -1073,6 +1300,18 @@ message CallFrame {
   optional int32 column_number = 4;
 }
 
+message CallLocalSubscriptionToolRequest {
+  string conversation_id = 1;
+  string tool_name = 2;
+  string tool_args_json = 3;
+}
+
+message CallLocalSubscriptionToolResponse {
+  string result_json = 1;
+  bool is_error = 2;
+  optional int64 watch_expires_at_unix_ms = 3;
+}
+
 message CancelAction {
   string reason = 1;
   optional InterruptedPendingToolCallResolutions interrupted_pending_tool_call_resolutions = 3;
@@ -1107,11 +1346,31 @@ message CanvasDiagnosticsResult {
     CanvasDiagnosticsSuccess success = 1;
     CanvasDiagnosticsError error = 2;
   }
+  optional string canvas_id = 3;
+  optional string title = 4;
+  optional string save_state = 5;
+  optional string save_detail = 6;
 }
 
 message CanvasDiagnosticsSuccess {
   string path = 1;
   repeated Diagnostic diagnostics = 2;
+}
+
+message ClaimWorkerRepo {
+  string repo_url = 1;
+  string ref = 2;
+  bool primary = 3;
+}
+
+message ClaimWorkerRequest {
+  string http_mcp_config_json = 1;
+  string mcp_config_json = 2;
+  string bc_id = 3;
+  AgentStoreClaimConfig agent_store_claim_config = 4;
+  string user_email = 5;
+  repeated string repo_urls = 6;
+  repeated ClaimWorkerRepo repos = 7;
 }
 
 message ClickAction {
@@ -1141,6 +1400,17 @@ message ClientContinuationConfig {
 }
 
 message ClientHeartbeat {
+}
+
+message ClientLlmGatewayCredential {
+  string bearer_token = 1;
+}
+
+message CloudSubagentInheritedContext {
+  optional string automation_run_bc_id = 1;
+  optional string inline_mcp_config_json = 3;
+  bool resolved = 4;
+  bytes inline_mcp_config_blob_id = 5;
 }
 
 message CloudSubagentReference {
@@ -1226,6 +1496,7 @@ message ComputerUseArgs {
   string tool_call_id = 1;
   repeated ComputerUseAction actions = 2;
   optional string description = 3;
+  optional bool bind_unmapped_characters = 4;
 }
 
 message ComputerUseError {
@@ -1542,6 +1813,10 @@ message ConversationStateStructure {
   map<string, bytes> subagent_state_refs = 31;
   optional GoalState goal_state = 32;
   optional bool is_root_project_conversation = 33;
+  repeated string completed_ask_question_tool_call_ids = 34;
+  repeated string durable_skill_blocks = 35;
+  optional string durable_custom_mode_id = 36;
+  optional uint32 message_count_at_last_compaction = 37;
 }
 
 message ConversationStep {
@@ -1590,6 +1865,23 @@ message Coordinate {
   int32 y = 2;
 }
 
+message CreateAgentArgs {
+  string tool_call_id = 1;
+  string prompt = 2;
+  optional string name = 3;
+  optional string model = 4;
+  optional string base_branch = 5;
+  optional string machine_type = 6;
+  optional string worker_id = 7;
+  optional string pool = 8;
+  map<string, string> labels = 9;
+  optional string environment_build_id = 10;
+}
+
+message CreateAgentError {
+  string error = 1;
+}
+
 message CreateAgentHostSessionRequest {
   string session_id = 1;
   optional ConversationStateStructure initial_history = 2;
@@ -1597,6 +1889,23 @@ message CreateAgentHostSessionRequest {
 }
 
 message CreateAgentHostSessionResponse {
+}
+
+message CreateAgentResult {
+  oneof result {
+    CreateAgentSuccess success = 1;
+    CreateAgentError error = 2;
+  }
+}
+
+message CreateAgentSuccess {
+  string agent_id = 1;
+  string message = 2;
+}
+
+message CreateAgentToolCall {
+  CreateAgentArgs args = 1;
+  CreateAgentResult result = 2;
 }
 
 message CreateGoalArgs {
@@ -1886,6 +2195,40 @@ message DeleteToolCall {
   DeleteResult result = 2;
 }
 
+message DesktopChunk {
+  bytes data = 1;
+}
+
+message DesktopClose {
+  string reason = 1;
+}
+
+message DesktopPing {
+  uint64 nonce = 1;
+}
+
+message DesktopStreamClientMessage {
+  oneof message {
+    DesktopStreamStart start = 1;
+    DesktopChunk chunk = 2;
+    DesktopPing ping = 3;
+    DesktopClose close = 4;
+  }
+}
+
+message DesktopStreamServerMessage {
+  oneof message {
+    DesktopChunk chunk = 1;
+    DesktopPing ping = 2;
+    DesktopClose close = 3;
+  }
+}
+
+message DesktopStreamStart {
+  string session_id = 1;
+  string worker_session_secret = 2;
+}
+
 message Diagnostic {
   DiagnosticSeverity severity = 1;
   Range range = 2;
@@ -2043,6 +2386,9 @@ message EditWritePermissionDenied {
   bool is_readonly = 3;
 }
 
+message Empty {
+}
+
 message Error {
   string message = 1;
 }
@@ -2101,6 +2447,7 @@ message ExecClientMessage {
     ConversationSearchResult conversation_search_result = 53;
     AgentStoreConflictResult agent_store_conflict_result = 54;
     ShellResult mini_swe_agent_bash_result = 55;
+    AdoptResult adopt_result = 56;
   }
   uint32 id = 1;
   string exec_id = 15;
@@ -2171,11 +2518,13 @@ message ExecServerMessage {
     ShellArgs mini_swe_agent_bash_args = 52;
     ConversationSearchArgs conversation_search_args = 53;
     AgentStoreConflictArgs agent_store_conflict_args = 54;
+    AdoptArgs adopt_args = 56;
   }
   uint32 id = 1;
   string exec_id = 15;
   optional SpanContext span_context = 19;
   optional bool accept_hook_additional_contexts = 55;
+  optional string machine_id = 57;
 }
 
 message ExecuteHookArgs {
@@ -2366,6 +2715,21 @@ message ForkAgentHostSessionResponse {
   string session_id = 1;
 }
 
+message Frame {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_REQUEST = 1;
+    KIND_RESPONSE = 2;
+    KIND_ERROR = 3;
+  }
+
+  string id = 1;
+  string method = 2;
+  bytes data = 3;
+  Frame.Kind kind = 4;
+  string error = 5;
+}
+
 message GenerateImageArgs {
   string description = 1;
   optional string file_path = 2;
@@ -2412,6 +2776,55 @@ message GenerateImageSuccess {
 message GenerateImageToolCall {
   GenerateImageArgs args = 1;
   GenerateImageResult result = 2;
+}
+
+message GetAgentHostSessionBlobsRequest {
+  string session_id = 1;
+  repeated bytes blob_ids = 2;
+  optional uint64 max_response_bytes = 3;
+}
+
+message GetAgentHostSessionBlobsResponse {
+  repeated AgentHostSessionBlob blobs = 1;
+  repeated bytes missing_blob_ids = 2;
+  repeated bytes remaining_blob_ids = 3;
+  repeated bytes oversize_blob_ids = 4;
+}
+
+message GetAgentStatusArgs {
+  string tool_call_id = 1;
+  repeated string agent_ids = 2;
+}
+
+message GetAgentStatusError {
+  string error = 1;
+}
+
+message GetAgentStatusResult {
+  oneof result {
+    GetAgentStatusSuccess success = 1;
+    GetAgentStatusError error = 2;
+  }
+}
+
+message GetAgentStatusSuccess {
+  repeated GetAgentStatusWorker workers = 1;
+  string message = 2;
+}
+
+message GetAgentStatusToolCall {
+  GetAgentStatusArgs args = 1;
+  GetAgentStatusResult result = 2;
+}
+
+message GetAgentStatusWorker {
+  string bc_id = 1;
+  string name = 2;
+  string lifecycle = 3;
+  bool turn_in_flight = 4;
+  string last_terminal_turn_status = 5;
+  string pr_url = 6;
+  uint64 last_activity_at_ms = 7;
 }
 
 message GetAllowedModelIntentsRequest {
@@ -2482,10 +2895,36 @@ message GetNewChatNudgeLegacyModelPickerResponse {
 
 message GetNewChatNudgeParameterizedModelPickerRequest {
   RequestedModel current_model = 1;
+  optional bool model_nudges_enabled = 2;
 }
 
 message GetNewChatNudgeParameterizedModelPickerResponse {
   optional NewChatNudgeV2 nudge = 1;
+}
+
+message GetPrCodeTourArgs {
+  string tool_call_id = 1;
+  optional string revision_id = 2;
+}
+
+message GetPrCodeTourError {
+  string error = 1;
+}
+
+message GetPrCodeTourResult {
+  oneof result {
+    GetPrCodeTourSuccess success = 1;
+    GetPrCodeTourError error = 2;
+  }
+}
+
+message GetPrCodeTourSuccess {
+  repeated PrCodeTourRevisionSnapshot revisions = 1;
+}
+
+message GetPrCodeTourToolCall {
+  GetPrCodeTourArgs args = 1;
+  GetPrCodeTourResult result = 2;
 }
 
 message GetPromptContextUsageRequest {
@@ -2807,13 +3246,16 @@ message InteractionUpdate {
     FeedbackRequestUpdate feedback_request = 21;
     ResponseComparisonUpdate response_comparison = 22;
     ContextInjectionStateUpdate context_injection_state = 23;
+    RoutedModelUpdate routed_model = 24;
   }
+  optional uint64 message_started_at_ms = 25;
 }
 
 message InterruptAgentHostTurnRequest {
   string session_id = 1;
   string turn_id = 2;
   optional string reason = 3;
+  optional bool session_tree = 4;
 }
 
 message InterruptAgentHostTurnResponse {
@@ -2929,10 +3371,18 @@ message KvServerMessage {
 message ListAgentHostSessionsRequest {
   optional bool include_children = 1;
   optional string parent_session_id = 2;
+  optional uint32 limit = 3;
 }
 
 message ListAgentHostSessionsResponse {
   repeated AgentHostSession sessions = 1;
+}
+
+message ListLocalSubscriptionToolsRequest {
+}
+
+message ListLocalSubscriptionToolsResponse {
+  repeated LocalSubscriptionToolDefinition tools = 1;
 }
 
 message ListMcpResourcesError {
@@ -2973,6 +3423,35 @@ message ListMcpResourcesToolCall {
   ListMcpResourcesExecResult result = 2;
 }
 
+message LocalAgentMailboxDelivery {
+  string conversation_id = 1;
+  string offset = 2;
+  LocalAgentMailboxEntry entry = 3;
+}
+
+message LocalAgentMailboxEnded {
+  string conversation_id = 1;
+  LocalAgentMailboxEndedReason reason = 2;
+}
+
+message LocalAgentMailboxEntry {
+  oneof payload {
+    SubscriptionDeliveryEntry subscription_delivery = 2;
+  }
+  string local_agent_mailbox_entry_id = 1;
+}
+
+message LocalAgentMailboxGap {
+  string conversation_id = 1;
+  string after_offset = 2;
+  string resume_offset = 3;
+}
+
+message LocalAgentMailboxWatch {
+  string conversation_id = 1;
+  int64 watch_expires_at_unix_ms = 2;
+}
+
 message LocalPromptQualityInvocation {
   string invocation_id = 1;
   string attempt_request_id = 2;
@@ -2990,6 +3469,14 @@ message LocalPromptQualityInvocation {
   int64 total_tokens = 14;
   optional int64 token_limit = 15;
   optional string error_message = 16;
+  optional string prompt_tag = 17;
+  optional string feature_type = 18;
+}
+
+message LocalSubscriptionToolDefinition {
+  string tool_name = 1;
+  string description = 2;
+  string input_schema_json = 3;
 }
 
 message LsArgs {
@@ -3062,6 +3549,7 @@ message McpAllowlistPrecheckArgs {
   string provider_identifier = 1;
   string tool_name = 2;
   optional string tool_call_id = 3;
+  optional string annotations_json = 4;
 }
 
 message McpAllowlistPrecheckResult {
@@ -3225,6 +3713,7 @@ message McpStateServer {
   repeated McpToolDefinition tools = 5;
   repeated McpInstructions instructions = 6;
   optional string status = 7;
+  optional string error_message = 8;
 }
 
 message McpStateSuccess {
@@ -3255,6 +3744,8 @@ message McpToolDefinition {
   string provider_identifier = 4;
   string tool_name = 5;
   optional string input_schema_json = 6;
+  optional string output_schema_json = 7;
+  optional string annotations_json = 8;
 }
 
 message McpToolDescriptor {
@@ -3400,9 +3891,21 @@ message NudgeAskVariant {
 
 message NudgeBumpVariant {
   string banner_message = 1;
+  optional string banner_description = 2;
 }
 
 message NudgeSilentSwitchVariant {
+}
+
+message OpenDesktopSessionRequest {
+  string session_id = 1;
+  string worker_session_secret = 2;
+  DesktopControlMode control_mode = 3;
+}
+
+message OpenDesktopSessionResponse {
+  bool accepted = 1;
+  optional string unavailable_reason = 2;
 }
 
 message OutputLocation {
@@ -3891,6 +4394,16 @@ message PostToolUseRequestResponse {
   optional string additional_context = 1;
 }
 
+message PrCodeTourRevisionSnapshot {
+  string revision_id = 1;
+  string status = 2;
+  string head_sha = 3;
+  string feedback = 4;
+  int64 updated_at_ms = 5;
+  bool is_current = 6;
+  string markdown = 7;
+}
+
 message PreCompactRequestQuery {
   string trigger = 1;
   double context_usage_percent = 2;
@@ -3966,6 +4479,8 @@ message PreparedTaskSubagent {
   optional string subagent_source = 33;
   optional string cloud_subagent_bc_id = 34;
   optional string provider_tool_name = 35;
+  optional CloudSubagentInheritedContext inherited_context = 36;
+  optional string usage_uuid = 37;
 }
 
 message PreToolUseRequestQuery {
@@ -4014,6 +4529,10 @@ message PrewarmRequest {
   optional string computer_use_coordinate_mode = 23;
   optional string agent_session_id = 24;
   optional bool client_supports_prompt_context_usage_rpc = 25;
+  optional bool client_supports_routed_model_update = 26;
+  optional ClientLlmGatewayCredential client_llm_gateway_credential = 27;
+  optional bool client_supports_preview_card = 28;
+  optional bool started_as_new_project = 29;
 }
 
 message PrManagementArgs {
@@ -4147,6 +4666,34 @@ message PromptUploadRef {
 message Range {
   Position start = 1;
   Position end = 2;
+}
+
+message ReadAgentTranscriptArgs {
+  string tool_call_id = 1;
+  string agent_id = 2;
+  string mode = 3;
+  uint32 max_turns = 4;
+}
+
+message ReadAgentTranscriptError {
+  string error = 1;
+}
+
+message ReadAgentTranscriptResult {
+  oneof result {
+    ReadAgentTranscriptSuccess success = 1;
+    ReadAgentTranscriptError error = 2;
+  }
+}
+
+message ReadAgentTranscriptSuccess {
+  string transcript = 1;
+  bool truncated = 2;
+}
+
+message ReadAgentTranscriptToolCall {
+  ReadAgentTranscriptArgs args = 1;
+  ReadAgentTranscriptResult result = 2;
 }
 
 message ReadArgs {
@@ -4378,6 +4925,14 @@ message RecentlyAddedPlugin {
   repeated string mcp_servers = 8;
 }
 
+message ReconcileLocalAgentMailboxWatchesRequest {
+  repeated string conversation_ids = 1;
+}
+
+message ReconcileLocalAgentMailboxWatchesResponse {
+  repeated LocalAgentMailboxWatch watches = 1;
+}
+
 message RecordCiInvestigationFinding {
   string check_name = 1;
   optional string details_url = 2;
@@ -4513,6 +5068,9 @@ message ReflectSuccess {
 message ReflectToolCall {
   ReflectArgs args = 1;
   ReflectResult result = 2;
+}
+
+message ReleaseWorkerRequest {
 }
 
 message ReplaceEnvArgs {
@@ -4674,6 +5232,7 @@ message RequestContext {
   optional bool search_conversations_enabled = 50;
   optional bool send_message_enabled = 51;
   repeated string admin_command_denylist = 52;
+  optional SystemPromptSpec system_prompt_override = 53;
 }
 
 message RequestContextArgs {
@@ -4682,6 +5241,11 @@ message RequestContextArgs {
   optional string read_only_pinned_tree_sha = 4;
   optional string read_only_plugin_cache_root = 5;
   optional bool use_cached = 7;
+  optional bool wait_for_workspace_cache = 8;
+}
+
+message RequestContextDecoration {
+  optional bool smart_mode_classifier_auto_mode_enabled = 1;
 }
 
 message RequestContextEnv {
@@ -4707,6 +5271,8 @@ message RequestContextEnv {
   optional string dev_force_next_smart_mode_classifier_block_token = 23;
   optional string dev_delay_next_smart_mode_classifier_token = 24;
   repeated MountedAgentStore mounted_agent_stores = 25;
+  optional UserAgentStoreWebContext user_agent_store_web_context = 26;
+  optional google.protobuf.Timestamp dev_mock_prompt_time = 27;
 }
 
 message RequestContextError {
@@ -4834,6 +5400,10 @@ message ResumeAction {
   RequestContext request_context = 2;
 }
 
+message RoutedModelUpdate {
+  string display_name = 1;
+}
+
 message SameMachineTarget {
 }
 
@@ -4842,7 +5412,6 @@ message SandboxPolicy {
     READ_BOUNDARY_MODE_UNSPECIFIED = 0;
     READ_BOUNDARY_MODE_SYSTEM = 1;
     READ_BOUNDARY_MODE_WORKSPACE = 2;
-    READ_BOUNDARY_MODE_CUSTOM = 3;
   }
 
   enum Type {
@@ -5106,6 +5675,7 @@ message SelectedImage {
     bytes blob_id = 1;
     bytes data = 8;
     SelectedImage.BlobIdWithData blob_id_with_data = 9;
+    PromptUploadRef prompt_upload_ref = 10;
   }
   string uuid = 2;
   string path = 3;
@@ -5239,6 +5809,7 @@ message SendAgentHostActionRequest {
   optional AgentHostTurnOptions turn_options = 5;
   optional RequestedModel requested_model = 6;
   optional ConversationStateStructure base_history = 7;
+  optional RequestContextDecoration request_context_decoration = 8;
 }
 
 message SendAgentHostActionResponse {
@@ -5252,6 +5823,7 @@ message SendAgentHostMessageRequest {
   optional ModelDetails model_details = 4;
   optional AgentHostTurnOptions turn_options = 5;
   optional RequestedModel requested_model = 6;
+  optional string message_id = 7;
 }
 
 message SendAgentHostMessageResponse {
@@ -5317,6 +5889,36 @@ message SendMessageText {
 message SendMessageToolCall {
   SendMessageArgs args = 1;
   SendMessageResult result = 2;
+}
+
+message SendToAgentArgs {
+  string tool_call_id = 1;
+  string agent_id = 2;
+  string message = 3;
+  string delivery = 4;
+  string title = 5;
+}
+
+message SendToAgentError {
+  string error = 1;
+}
+
+message SendToAgentResult {
+  oneof result {
+    SendToAgentSuccess success = 1;
+    SendToAgentError error = 2;
+  }
+}
+
+message SendToAgentSuccess {
+  string worker_bc_id = 1;
+  string delivered_as = 2;
+  string message = 3;
+}
+
+message SendToAgentToolCall {
+  SendToAgentArgs args = 1;
+  SendToAgentResult result = 2;
 }
 
 message SendToUserArgs {
@@ -5443,6 +6045,7 @@ message ShellArgs {
   optional ShellHookApprovalRequirement hook_approval_requirement = 20;
   optional string conversation_id = 21;
   repeated string admin_command_denylist = 22;
+  optional string request_id = 23;
 }
 
 message ShellCommand {
@@ -5729,6 +6332,7 @@ message SmartModeClassifierResult {
 message SmartModeClassifierSuccess {
   SmartModeClassifierDecision decision = 1;
   optional string block_reason = 2;
+  optional string proposed_allow_rule = 3;
 }
 
 message SmartModeRiskTarget {
@@ -5821,6 +6425,32 @@ message StepTiming {
   uint64 timestamp_ms = 2;
 }
 
+message StopAgentArgs {
+  string tool_call_id = 1;
+  string agent_id = 2;
+}
+
+message StopAgentError {
+  string error = 1;
+}
+
+message StopAgentResult {
+  oneof result {
+    StopAgentSuccess success = 1;
+    StopAgentError error = 2;
+  }
+}
+
+message StopAgentSuccess {
+  string worker_bc_id = 1;
+  string message = 2;
+}
+
+message StopAgentToolCall {
+  StopAgentArgs args = 1;
+  StopAgentResult result = 2;
+}
+
 message StopRequestQuery {
   string status = 1;
   int32 loop_count = 2;
@@ -5837,6 +6467,27 @@ message StopRequestQuery {
 
 message StopRequestResponse {
   optional string followup_message = 1;
+}
+
+message StreamLocalAgentMailboxHeartbeat {
+}
+
+message StreamLocalAgentMailboxRequest {
+  message ConversationCursor {
+    string conversation_id = 1;
+    string after_offset = 2;
+  }
+
+  repeated StreamLocalAgentMailboxRequest.ConversationCursor conversations = 1;
+}
+
+message StreamLocalAgentMailboxResponse {
+  oneof message {
+    LocalAgentMailboxDelivery delivery = 1;
+    StreamLocalAgentMailboxHeartbeat heartbeat = 2;
+    LocalAgentMailboxGap gap = 3;
+    LocalAgentMailboxEnded ended = 4;
+  }
 }
 
 message SubagentArgs {
@@ -5862,6 +6513,7 @@ message SubagentArgs {
   optional bool direct_meta_parent_child_subagent = 18;
   SubagentExecutionEnvironment environment = 19;
   optional string cloud_base_branch = 20;
+  repeated RequestedModel.ModelParameterValue model_parameters = 21;
 }
 
 message SubagentAwaitArgs {
@@ -5905,6 +6557,13 @@ message SubagentCredentials {
     AzureCredentials azure_credentials = 2;
     BedrockCredentials bedrock_credentials = 3;
   }
+}
+
+message SubagentDispatchStep {
+  uint32 step_index = 1;
+  string tool_call_id = 2;
+  SubagentDispatchTool tool = 3;
+  bool backgrounded = 4;
 }
 
 message SubagentError {
@@ -6081,6 +6740,12 @@ message SubmittedExitedCustomMode {
   string label = 2;
 }
 
+message SubscriptionDeliveryEntry {
+  string subscription_id = 1;
+  string event_id = 2;
+  string inbox_rel_path = 3;
+}
+
 message SubscriptionEventDisplay {
   optional string display_label = 1;
   optional string resource_url = 2;
@@ -6098,6 +6763,7 @@ message SummarizeAction {
 
 message SummaryCompletedUpdate {
   optional string hook_message = 1;
+  optional bool failed = 2;
 }
 
 message SummaryStartedUpdate {
@@ -6160,6 +6826,13 @@ message SwitchModeToolCall {
 message SystemContextInjection {
   string producer = 1;
   string content = 2;
+}
+
+message SystemPromptSpec {
+  oneof spec {
+    string replace = 1;
+    string append = 2;
+  }
 }
 
 message TargetMachine {
@@ -6225,6 +6898,7 @@ message TaskToolCallArgsProto {
   optional string cloud_base_branch = 10;
   optional string cloud_requested_environment_build_id = 11;
   optional TargetMachine machine = 12;
+  optional bool interrupt = 13;
 }
 
 message TaskToolCallDelta {
@@ -6265,6 +6939,8 @@ message ThinkingDetails {
 message ThinkingMessage {
   string text = 1;
   uint32 duration_ms = 2;
+  optional uint64 started_at_ms = 3;
+  optional uint64 completed_at_ms = 4;
 }
 
 message TodoItem {
@@ -6342,6 +7018,13 @@ message ToolCall {
     SearchConversationsToolCall search_conversations_tool_call = 69;
     CreateGoalToolCall create_goal_tool_call = 70;
     UpdateGoalToolCall update_goal_tool_call = 71;
+    AdoptToolCall adopt_tool_call = 72;
+    GetAgentStatusToolCall get_agent_status_tool_call = 73;
+    SendToAgentToolCall send_to_agent_tool_call = 74;
+    ReadAgentTranscriptToolCall read_agent_transcript_tool_call = 75;
+    CreateAgentToolCall create_agent_tool_call = 76;
+    StopAgentToolCall stop_agent_tool_call = 77;
+    GetPrCodeTourToolCall get_pr_code_tour_tool_call = 78;
   }
   repeated HookAdditionalContext hook_additional_contexts = 54;
   optional string tool_call_id = 57;
@@ -6476,6 +7159,16 @@ message UpdatePrAction {
 message UpdatePrCodeTourArgs {
   string feedback = 1;
   string tool_call_id = 2;
+  optional string base_sha = 3;
+  optional string head_sha = 4;
+  optional string source_revision_id = 5;
+  optional string revision_id = 6;
+  optional string markdown = 7;
+  optional string heading = 8;
+  optional string artifact_path = 9;
+  optional string artifact_alt = 10;
+  repeated string scope_commit_hashes = 11;
+  optional string explicit_user_prompt = 12;
 }
 
 message UpdatePrCodeTourError {
@@ -6492,6 +7185,7 @@ message UpdatePrCodeTourResult {
 message UpdatePrCodeTourSuccess {
   string revision_id = 1;
   string message = 2;
+  UpdatePrCodeTourExecutionMode execution_mode = 3;
 }
 
 message UpdatePrCodeTourToolCall {
@@ -6551,6 +7245,11 @@ message UploadLocalAgentRunToPromptQualityResponse {
   string primary_invocation_id = 2;
 }
 
+message UserAgentStoreWebContext {
+  string store_id = 1;
+  string portal_base_url = 2;
+}
+
 message UserContextInjection {
   UserMessage user_message = 1;
   RequestContext request_context = 2;
@@ -6599,6 +7298,9 @@ message UserMessage {
   repeated HookAdditionalContext hook_additional_contexts = 21;
   optional CustomModeIntent custom_mode_intent = 22;
   optional ProjectDetails project_details = 23;
+  optional bool turn_steer = 24;
+  optional uint64 started_at_ms = 25;
+  optional uint64 completed_at_ms = 26;
 }
 
 message UserMessageAction {
@@ -6656,9 +7358,21 @@ message WatchAgentHostSessionsEvent {
     AgentHostSessionUpdated updated = 3;
     AgentHostSessionDeleted deleted = 4;
   }
+  optional bool keepalive = 5;
 }
 
 message WatchAgentHostSessionsRequest {
+}
+
+message WatchAgentHostSessionTurnLifecycleEvent {
+  oneof event {
+    AgentHostTurnLifecycleWatchReady ready = 1;
+    AgentHostTurnLifecycle lifecycle = 2;
+  }
+}
+
+message WatchAgentHostSessionTurnLifecycleRequest {
+  string session_id = 1;
 }
 
 message WebFetchAllowlistPrecheckArgs {
@@ -6871,8 +7585,10 @@ message ZoomSelection {
 }
 
 // ============================
-// Placeholder types (3 direct + 13 recursive-shell + 0 opaque)
+// Placeholder types (4 direct + 27 recursive-shell + 0 opaque)
 // ============================
+
+message PH_aiserver_v1_ClientAction {} // placeholder for aiserver.v1.ClientAction (recursive)
 
 message PH_aiserver_v1_CodeBlock {} // placeholder for aiserver.v1.CodeBlock (recursive)
 
@@ -6883,11 +7599,89 @@ message PH_aiserver_v1_CodeResult { // placeholder for aiserver.v1.CodeResult
   float score = 2;
 }
 
+message PH_aiserver_v1_ConfigureSpendLimitAction {} // placeholder for aiserver.v1.ConfigureSpendLimitAction (recursive)
+
 message PH_aiserver_v1_CursorPosition {} // placeholder for aiserver.v1.CursorPosition (recursive)
 
 message PH_aiserver_v1_CursorRange {} // placeholder for aiserver.v1.CursorRange (recursive)
 
+message PH_aiserver_v1_CustomErrorDetails {} // placeholder for aiserver.v1.CustomErrorDetails (recursive)
+
+message PH_aiserver_v1_DashboardAction {} // placeholder for aiserver.v1.DashboardAction (recursive)
+
 message PH_aiserver_v1_DetailedLine {} // placeholder for aiserver.v1.DetailedLine (recursive)
+
+message PH_aiserver_v1_ErrorAnalyticsMetadata {} // placeholder for aiserver.v1.ErrorAnalyticsMetadata (recursive)
+
+message PH_aiserver_v1_ErrorButton {} // placeholder for aiserver.v1.ErrorButton (recursive)
+
+message PH_aiserver_v1_ErrorDetails { // placeholder for aiserver.v1.ErrorDetails
+  PH_aiserver_v1_ErrorDetails_Error error = 1;
+  PH_aiserver_v1_CustomErrorDetails details = 2;
+  optional bool is_expected = 3;
+}
+
+// placeholder for aiserver.v1.ErrorDetails.Error (recursive)
+enum PH_aiserver_v1_ErrorDetails_Error {
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_UNSPECIFIED = 0;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_BAD_API_KEY = 1;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_NOT_LOGGED_IN = 2;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_INVALID_AUTH_ID = 3;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_NOT_HIGH_ENOUGH_PERMISSIONS = 4;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_BAD_MODEL_NAME = 5;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_USER_NOT_FOUND = 6;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_FREE_USER_RATE_LIMIT_EXCEEDED = 7;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_PRO_USER_RATE_LIMIT_EXCEEDED = 8;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_FREE_USER_USAGE_LIMIT = 9;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_PRO_USER_USAGE_LIMIT = 10;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_AUTH_TOKEN_NOT_FOUND = 11;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_AUTH_TOKEN_EXPIRED = 12;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_OPENAI = 13;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_OPENAI_RATE_LIMIT_EXCEEDED = 14;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_AGENT_REQUIRES_LOGIN = 18;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_MAX_TOKENS = 20;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_USER_ABORTED_REQUEST = 21;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_GENERIC_RATE_LIMIT_EXCEEDED = 22;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_PRO_USER_ONLY = 23;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_TIMEOUT = 25;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_GPT_4_VISION_PREVIEW_RATE_LIMIT = 28;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_CUSTOM_MESSAGE = 29;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_OUTDATED_CLIENT = 30;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_CLAUDE_IMAGE_TOO_LARGE = 31;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_FILE_NOT_FOUND = 33;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_API_KEY_RATE_LIMIT = 34;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_DEBOUNCED = 35;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_BAD_REQUEST = 36;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_REPOSITORY_SERVICE_REPOSITORY_IS_NOT_INITIALIZED = 37;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_UNAUTHORIZED = 38;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_NOT_FOUND = 39;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_DEPRECATED = 40;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_RESOURCE_EXHAUSTED = 41;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_BAD_USER_API_KEY = 42;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_CONVERSATION_TOO_LONG = 43;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_USAGE_PRICING_REQUIRED = 44;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_USAGE_PRICING_REQUIRED_CHANGEABLE = 45;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_GITHUB_NO_USER_CREDENTIALS = 46;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_GITHUB_USER_NO_ACCESS = 47;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_GITHUB_APP_NO_ACCESS = 48;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_GITHUB_MULTIPLE_OWNERS = 49;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_RATE_LIMITED = 50;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_RATE_LIMITED_CHANGEABLE = 51;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_CUSTOM = 52;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_HOOKS_BLOCKED = 53;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_SUSPICIOUS_USAGE_BLOCKED = 54;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_EXTENSION_HOST_TIMEOUT = 55;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_NETWORK_ERROR = 56;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_PROVIDER_ERROR = 57;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_MODEL_BLOCKED = 58;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_INTERNAL = 59;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_MAX_MODE_REQUIRED = 60;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_MODEL_NO_LONGER_SUPPORTED = 61;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_PRICING_WARNING = 62;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_SLOW_POOL = 63;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_UNSUPPORTED_REGION = 64;
+  PH_AISERVER_V1_ERRORDETAILS_ERROR_ERROR_ACCOUNT_CLOSED = 65;
+}
 
 message PH_aiserver_v1_FileDiff {} // placeholder for aiserver.v1.FileDiff (recursive)
 
@@ -6941,3 +7735,17 @@ enum PH_aiserver_v1_GitDiff_DiffType {
   PH_AISERVER_V1_GITDIFF_DIFFTYPE_DIFF_TYPE_DIFF_TO_HEAD = 1;
   PH_AISERVER_V1_GITDIFF_DIFFTYPE_DIFF_TYPE_DIFF_FROM_BRANCH_TO_MAIN = 2;
 }
+
+message PH_aiserver_v1_PlanChoice {} // placeholder for aiserver.v1.PlanChoice (recursive)
+
+message PH_aiserver_v1_ReloadWindowAction {} // placeholder for aiserver.v1.ReloadWindowAction (recursive)
+
+message PH_aiserver_v1_SwitchModelAction {} // placeholder for aiserver.v1.SwitchModelAction (recursive)
+
+message PH_aiserver_v1_SwitchModelAction_ModelParameterValue {} // placeholder for aiserver.v1.SwitchModelAction.ModelParameterValue (recursive)
+
+message PH_aiserver_v1_UpgradeAction {} // placeholder for aiserver.v1.UpgradeAction (recursive)
+
+message PH_aiserver_v1_UpgradeChoice {} // placeholder for aiserver.v1.UpgradeChoice (recursive)
+
+message PH_aiserver_v1_UrlAction {} // placeholder for aiserver.v1.UrlAction (recursive)

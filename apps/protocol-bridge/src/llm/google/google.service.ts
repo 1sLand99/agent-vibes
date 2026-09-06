@@ -1627,6 +1627,7 @@ export class GoogleService implements ProviderAdapter {
     model?: string
     conversationId?: string
     outputFormat?: string
+    aspectRatio?: string
     referenceImages?: ImageGenerationReference[]
   }): Promise<{
     imageData: string
@@ -1654,6 +1655,7 @@ export class GoogleService implements ProviderAdapter {
       model: resolvedModel,
       conversationId,
       referenceImages: input.referenceImages || [],
+      aspectRatio: input.aspectRatio,
     })
     try {
       const data = (await this.processPool.generate(
@@ -1848,6 +1850,7 @@ export class GoogleService implements ProviderAdapter {
     model: string
     conversationId?: string
     referenceImages: ImageGenerationReference[]
+    aspectRatio?: string
   }): Record<string, unknown> {
     const parts: Array<Record<string, unknown>> = [{ text: input.prompt }]
     for (const image of input.referenceImages.slice(0, 3)) {
@@ -1875,6 +1878,9 @@ export class GoogleService implements ProviderAdapter {
         generationConfig: {
           candidateCount: 1,
           responseModalities: ["TEXT", "IMAGE"],
+          ...(input.aspectRatio
+            ? { imageConfig: { aspectRatio: input.aspectRatio } }
+            : {}),
         },
       },
       userAgent: "antigravity",

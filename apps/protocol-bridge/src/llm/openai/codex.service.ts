@@ -1,3 +1,10 @@
+import { readCodexResponseEvents } from "./codex-sse-reader"
+import { CodexModelCatalogCache } from "./codex-model-catalog-cache"
+import {
+  getCodexModelProfile,
+  hasRemoteCodexModelCatalog,
+} from "./codex-model-catalog"
+import { readCodexResponseOutcome } from "./codex-response-outcome"
 /**
  * CodexService — Core executor for Codex (OpenAI Responses API) reverse proxy.
  *
@@ -52,6 +59,7 @@ import {
   type CooldownableAccount,
   clearAccountDisablement,
   disableAccount,
+  isAccountAvailableForModel,
   isAccountDisabled,
   markAccountCooldown,
   markAccountSuccess,
@@ -79,7 +87,6 @@ import {
   getPublicModelMetadata,
   isChatGptCodexModelSupported,
   normalizeCodexModelTier,
-  resolveCodexRequestCapabilities,
   supportsCodexModelForTier,
 } from "../shared/model-registry"
 import { CodexAuthService, type CodexTokenData } from "./codex-auth.service"
@@ -197,6 +204,11 @@ import {
 } from "./codex-turn-metadata"
 import { isCodexRefreshTokenInvalidationMessage } from "./codex-token-refresh-policy"
 import {
+  CHATGPT_WEB_REALTIME_POOL_MODEL,
+  type CodexRealtimeAccountLease,
+  resolveChatGptWebDeviceId,
+} from "./codex-realtime-account"
+import {
   isCodexStaleResponseIdError,
   resolveCodexWebSocketFailure,
 } from "./codex-transport-error-policy"
@@ -260,6 +272,7 @@ interface CodexAccountSlot extends CooldownableAccount {
   planType?: CodexModelTier
   baseUrl: string
   proxyUrl?: string
+  deviceId?: string
   configPath?: string
   source: "env" | "file"
   /** 持久化 disabled 状态的唯一标识 key */
@@ -354,6 +367,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   private useWebSocket: boolean = false
   private readonly sessionWarmupPromises = new Map<string, Promise<void>>()
 
+  private readonly modelCatalogCache = new CodexModelCatalogCache()
   private readonly runtimeCache = new CodexRuntimeCacheStore()
   /** Stable only for this bridge process; native request identity is typed. */
   private readonly nativeInstallationId = crypto.randomUUID()
@@ -414,7 +428,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     )
   }
 
-  onModuleInit() {
+  async onModuleInit() {
     const envApiKey = this.configService.get<string>("CODEX_API_KEY", "").trim()
     const envAccessToken = this.configService
       .get<string>("CODEX_ACCESS_TOKEN", "")
@@ -437,6 +451,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         .trim() || DEFAULT_BASE_URL
     const envProxyUrl = this.configService
       .get<string>("CODEX_PROXY_URL", "")
+      .trim()
+    const envDeviceId = this.configService
+      .get<string>("CODEX_DEVICE_ID", "")
       .trim()
 
     // WebSocket transport preference.
@@ -462,6 +479,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         accessToken: envAccessToken || undefined,
         baseUrl: envBaseUrl,
         proxyUrl: envProxyUrl || undefined,
+        deviceId: envDeviceId || undefined,
         source: "env",
         stateKey: this.buildCodexSlotStateKey({
           apiKey: envApiKey,
@@ -539,6 +557,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
 
     // 5. 恢复持久化的 disabled 状态，避免重启后再次用失效账号做 warmup 导致无意义 401
     this.restorePersistedAccountStates()
+    await this.refreshModelCatalogs()
   }
 
   /**
@@ -546,6 +565,92 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
    */
   isAvailable(): boolean {
     return this.accounts.length > 0
+  }
+
+  getChatGptWebRealtimeAccountCount(): number {
+    return this.accounts.filter((slot) => this.hasChatGptWebCredential(slot))
+      .length
+  }
+
+  /**
+   * Lease one OAuth account for a ChatGPT Web SDP handshake. The lease uses
+   * the same round-robin cursor, refresh serialization, proxy metadata and
+   * cooldown state as ordinary Codex traffic.
+   */
+  async acquireChatGptWebRealtimeAccount(
+    excludedAccountKeys: ReadonlySet<string> = new Set()
+  ): Promise<CodexRealtimeAccountLease | null> {
+    const attempted = new Set(excludedAccountKeys)
+    let inspected = 0
+
+    while (inspected < this.accounts.length) {
+      const now = Date.now()
+      const slot = this.slotRouter.pickFromCurrentIndex({
+        candidates: this.accounts,
+        isSlotUsable: (candidate) => {
+          const key = this.getSlotStickyKey(candidate)
+          return (
+            !attempted.has(key) &&
+            this.hasChatGptWebCredential(candidate) &&
+            isAccountAvailableForModel(
+              candidate,
+              CHATGPT_WEB_REALTIME_POOL_MODEL,
+              now
+            )
+          )
+        },
+      })
+      if (!slot) return null
+
+      inspected++
+      const accountKey = this.getSlotStickyKey(slot)
+      attempted.add(accountKey)
+      const accessToken = await this.getChatGptWebAccessToken(slot)
+      if (!accessToken) {
+        markAccountCooldown(
+          slot,
+          401,
+          CHATGPT_WEB_REALTIME_POOL_MODEL,
+          undefined,
+          this.getAccountLabel(slot)
+        )
+        continue
+      }
+
+      let settled = false
+      return {
+        accountKey,
+        label: this.getAccountLabel(slot),
+        accessToken,
+        deviceId: resolveChatGptWebDeviceId(slot.deviceId, accountKey),
+        proxyUrl: slot.proxyUrl?.trim() || undefined,
+        refreshAccessToken: (reason) =>
+          this.tryRefreshSlotToken(slot, reason, {
+            allowOAuthOnApiKeySlot: true,
+          }),
+        accept: () => {
+          if (settled) return
+          settled = true
+          markAccountSuccess(slot, CHATGPT_WEB_REALTIME_POOL_MODEL)
+        },
+        reject: (statusCode, detail, retryAfterSeconds) => {
+          if (settled) return
+          settled = true
+          markAccountCooldown(
+            slot,
+            statusCode,
+            CHATGPT_WEB_REALTIME_POOL_MODEL,
+            retryAfterSeconds?.toString(),
+            this.getAccountLabel(slot)
+          )
+          this.logger.warn(
+            `[Codex] ChatGPT Web Realtime rejected ${this.getAccountLabel(slot)}: HTTP ${statusCode}${detail ? ` ${detail.slice(0, 300)}` : ""}`
+          )
+        },
+      }
+    }
+
+    return null
   }
 
   /**
@@ -624,6 +729,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       )
     }
 
+    for (const slot of removedSlots)
+      this.modelCatalogCache.remove(this.modelCatalogScope(slot))
     this.accounts = nextAccounts
     this.slotRouter.normalizeAccountIndex(this.accounts.length)
     this.configuredModelTier = this.resolveConfiguredModelTier()
@@ -898,9 +1005,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
    * physical-attempt coordinator snapshots it. Transport code may consume
    * this metadata but can never invent a new turn/window identity.
    */
-  prepareBridgeNativeExecutionRequest(
-    request: CodexExecutionRequest
-  ): CodexExecutionRequest {
+  prepareBridgeNativeExecutionRequest<T extends CodexProviderExecutionRequest>(
+    request: T
+  ): T {
     this.getLocalProjectionKey(request)
     const identity = this.getUpstreamIdentity(request)
     if (request.clientMetadata !== undefined) {
@@ -932,8 +1039,78 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     return extractCodexTurnKey(codexRequest)
   }
 
-  private usesResponsesLite(modelName: string): boolean {
-    return resolveCodexRequestCapabilities(modelName)?.useResponsesLite === true
+  private modelCatalogScope(slot: CodexAccountSlot): string {
+    return `${this.getSlotStickyKey(slot)}:${slot.workspaceId ?? ""}:${this.identity.version()}`
+  }
+
+  /** Refresh before history budgeting so a new comp_hash is checked before dispatch. */
+  async refreshModelCatalogs(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
+    const refresh = Promise.all(
+      this.accounts
+        .filter((slot) => !isAccountDisabled(slot) && !this.isApiKeyMode(slot))
+        .map((slot) =>
+          this.modelCatalogCache.refresh({
+            scope: this.modelCatalogScope(slot),
+            directory: path.join(
+              path.dirname(this.accountsFilePath),
+              "codex-model-catalogs"
+            ),
+            clientVersion: this.identity.version(),
+            fetchCatalog: async (etag) => {
+              const token = await this.getBearerToken(slot)
+              if (!token)
+                throw new Error(
+                  "Codex model catalog requires the configured account token"
+                )
+              const headers = buildCodexNonTurnHttpHeaders({
+                token,
+                isApiKey: false,
+                accept: "application/json",
+                identity: {
+                  version: this.identity.version(),
+                  userAgent: this.identity.userAgent(),
+                  originator: this.identity.originator(),
+                },
+                accountId: this.getSlotAccountId(slot),
+                workspaceId: slot.workspaceId,
+              })
+              if (etag) headers["If-None-Match"] = etag
+              const url = new URL(this.buildUrl(slot, "models"))
+              url.searchParams.set("client_version", this.identity.version())
+              const init: RequestInit & { dispatcher?: unknown } = {
+                headers,
+                signal: AbortSignal.timeout(10_000),
+              }
+              const dispatcher = this.buildProxyDispatcher(slot)
+              if (dispatcher) init.dispatcher = dispatcher
+              return fetch(url, init)
+            },
+            onError: (error) =>
+              this.logger.warn(
+                `Codex model catalog refresh failed: ${error instanceof Error ? error.message : String(error)}`
+              ),
+          })
+        )
+    )
+    const abort = createAbortPromise(signal, "Codex catalog wait aborted")
+    try {
+      await Promise.race([refresh, ...(abort.promise ? [abort.promise] : [])])
+    } finally {
+      abort.cleanup()
+    }
+  }
+
+  private usesResponsesLite(
+    modelName: string,
+    slot?: CodexAccountSlot
+  ): boolean {
+    return (
+      getCodexModelProfile(
+        modelName,
+        slot ? this.modelCatalogScope(slot) : undefined
+      )?.use_responses_lite === true
+    )
   }
 
   private applyCodexTurnStateHeader(
@@ -1540,6 +1717,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       return true
     }
 
+    const scope = this.modelCatalogScope(slot)
+    if (hasRemoteCodexModelCatalog(scope))
+      return getCodexModelProfile(modelName, scope) !== undefined
     const tier = this.getSlotPlanType(slot) || this.getModelTier() || "pro"
     return (
       isChatGptCodexModelSupported(modelName) &&
@@ -1949,6 +2129,25 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     return slot.accessToken || ""
   }
 
+  private hasChatGptWebCredential(slot: CodexAccountSlot): boolean {
+    return !!(
+      slot.tokenData?.accessToken ||
+      slot.tokenData?.refreshToken ||
+      slot.accessToken ||
+      slot.refreshToken
+    )
+  }
+
+  private async getChatGptWebAccessToken(
+    slot: CodexAccountSlot
+  ): Promise<string> {
+    if (slot.tokenData) {
+      const tokenData = await this.ensureFreshTokenData(slot)
+      if (tokenData?.accessToken) return tokenData.accessToken
+    }
+    return slot.accessToken || ""
+  }
+
   /**
    * Refresh an OAuth slot once, sharing the in-flight refresh per slot.
    */
@@ -2003,9 +2202,13 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
    */
   private async tryRefreshSlotToken(
     slot: CodexAccountSlot,
-    reason: string
+    reason: string,
+    options?: { allowOAuthOnApiKeySlot?: boolean }
   ): Promise<string | null> {
-    if (this.isApiKeyMode(slot) || !slot.tokenData?.refreshToken) {
+    if (
+      (this.isApiKeyMode(slot) && !options?.allowOAuthOnApiKeySlot) ||
+      !slot.tokenData?.refreshToken
+    ) {
       return null
     }
 
@@ -2295,75 +2498,22 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   private formatCodexResponseCompletedEvent(
     payload: Record<string, unknown> | null
   ): string | undefined {
-    if (payload?.type !== "response.completed") {
-      return undefined
-    }
-    const response =
-      payload.response &&
-      typeof payload.response === "object" &&
-      !Array.isArray(payload.response)
-        ? (payload.response as Record<string, unknown>)
-        : {}
-    const usage =
-      response.usage &&
-      typeof response.usage === "object" &&
-      !Array.isArray(response.usage)
-        ? response.usage
-        : undefined
-    return `event: ${CODEX_RESPONSE_COMPLETED_EVENT}\ndata: ${JSON.stringify({
-      type: CODEX_RESPONSE_COMPLETED_EVENT,
-      responseId: typeof response.id === "string" ? response.id : "",
-      ...(usage ? { usage } : {}),
-    })}\n\n`
+    if (payload?.type !== "response.completed") return undefined
+    const outcome = readCodexResponseOutcome(payload)
+    if (!outcome) return undefined
+    const { status: _status, ...completion } = outcome
+    return `event: ${CODEX_RESPONSE_COMPLETED_EVENT}\ndata: ${JSON.stringify({ type: CODEX_RESPONSE_COMPLETED_EVENT, ...completion })}\n\n`
   }
 
   private formatCodexResponseTerminalEvent(
     payload: Record<string, unknown> | null
   ): string | undefined {
     if (!payload) return undefined
-    const type = payload?.type
-    if (
-      type !== "response.completed" &&
-      type !== "response.incomplete" &&
-      type !== "response.failed"
-    ) {
-      return undefined
-    }
-    const response =
-      payload.response &&
-      typeof payload.response === "object" &&
-      !Array.isArray(payload.response)
-        ? (payload.response as Record<string, unknown>)
-        : {}
-    const incompleteDetails =
-      response.incomplete_details &&
-      typeof response.incomplete_details === "object" &&
-      !Array.isArray(response.incomplete_details)
-        ? (response.incomplete_details as Record<string, unknown>)
-        : undefined
-    const error =
-      response.error &&
-      typeof response.error === "object" &&
-      !Array.isArray(response.error)
-        ? (response.error as Record<string, unknown>)
-        : undefined
-    return `event: ${CODEX_RESPONSE_TERMINAL_EVENT}\ndata: ${JSON.stringify({
-      type: CODEX_RESPONSE_TERMINAL_EVENT,
-      status:
-        type === "response.completed"
-          ? "completed"
-          : type === "response.incomplete"
-            ? "incomplete"
-            : "failed",
-      responseId: typeof response.id === "string" ? response.id : "",
-      ...(typeof incompleteDetails?.reason === "string"
-        ? { incompleteReason: incompleteDetails.reason }
-        : {}),
-      ...(typeof error?.code === "string" ? { errorCode: error.code } : {}),
-      ...(typeof error?.message === "string"
-        ? { errorMessage: error.message }
-        : {}),
-    })}\n\n`
+    const outcome = readCodexResponseOutcome(payload, {
+      allowMaxOutputIncomplete: true,
+    })
+    if (!outcome) return undefined
+    return `event: ${CODEX_RESPONSE_TERMINAL_EVENT}\ndata: ${JSON.stringify({ type: CODEX_RESPONSE_TERMINAL_EVENT, ...outcome })}\n\n`
   }
 
   /**
@@ -2992,7 +3142,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       const { codexRequest: assembledCodexRequest, clientMetadata } =
         this.attachBridgeNativeClientMetadata(
           request,
-          buildCodexRequest(request, modelName) as Record<string, unknown>
+          buildCodexRequest(
+            {
+              ...request,
+              modelProfile: getCodexModelProfile(
+                modelName,
+                this.modelCatalogScope(slot)
+              ),
+            },
+            modelName
+          ) as Record<string, unknown>
         )
       const codexRequest = this.cacheService.injectSessionCacheKey(
         assembledCodexRequest,
@@ -3003,7 +3162,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         localProjectionKey: this.getLocalProjectionKey(request),
         upstreamIdentity: this.getUpstreamIdentity(request),
         clientMetadata,
-        useResponsesLite: this.usesResponsesLite(modelName),
+        useResponsesLite: this.usesResponsesLite(modelName, slot),
       })
       const timeoutSignal = AbortSignal.timeout(options.timeoutMs)
       const fetchOptions: RequestInit & { dispatcher?: unknown } = {
@@ -3144,6 +3303,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     forwardHeaders?: CodexForwardHeaders
   ): Promise<AnthropicResponse> {
     const request = dispatch.request
+    await this.refreshModelCatalogs()
     const modelName = request.model
     let slot: CodexAccountSlot
     try {
@@ -3169,10 +3329,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     this.bindConversationToSlot(this.getLocalProjectionKey(request), slot)
 
     const reverseToolMap = buildReverseMapFromClaudeTools(request.tools)
-    let codexRequest = buildCodexRequest(request, modelName) as Record<
-      string,
-      unknown
-    >
+    let codexRequest = buildCodexRequest(
+      {
+        ...request,
+        modelProfile: getCodexModelProfile(
+          modelName,
+          this.modelCatalogScope(slot)
+        ),
+      },
+      modelName
+    ) as Record<string, unknown>
     codexRequest = this.attachBridgeNativeClientMetadata(
       request,
       codexRequest
@@ -3359,7 +3525,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       omitAccountId,
       forwardHeaders,
       clientMetadata: this.requireCodexRequestClientMetadata(codexRequest),
-      useResponsesLite: this.usesResponsesLite(modelName),
+      useResponsesLite: this.usesResponsesLite(modelName, slot),
     })
     this.applyCodexTurnStateHeader(headers, turnContext)
 
@@ -3440,7 +3606,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         case "throw_codex_api_error":
           throw createCodexApiErrorFromBody(
             failureAction.statusCode,
-            failureAction.body
+            failureAction.body,
+            { retryAfterHeader: response.headers.get("retry-after") }
           )
       }
     }
@@ -3452,68 +3619,49 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       modelName,
       "request"
     )
+    this.modelCatalogCache.invalidate(
+      this.modelCatalogScope(slot),
+      response.headers.get("x-models-etag")
+    )
     this.captureCodexTurnStateFromHttpHeaders(turnContext, response.headers)
-    const fullBody = await response.text()
-    const lines = fullBody.split("\n")
-
-    // Aggregate output items the same way the WebSocket path does: the codex
-    // backend may emit message/reasoning/tool content only on intermediate
-    // `response.output_item.done` events and leave `response.completed.response
-    // .output` empty. Collect them so the completed frame can be backfilled,
-    // otherwise non-stream responses would drop all content.
-    const collectedItems: Array<Record<string, unknown>> = []
-
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (!trimmed.startsWith("data:")) continue
-
-      const jsonStr = trimmed.slice(5).trim()
-      if (!jsonStr || jsonStr === "[DONE]") continue
-
-      try {
-        const event = JSON.parse(jsonStr) as Record<string, unknown>
-        this.captureCodexTurnStateFromSsePayload(turnContext, event)
-        if (event.type === "response.output_item.done") {
-          const item = event.item as Record<string, unknown> | undefined
-          if (item && typeof item === "object") {
-            collectedItems.push(item)
-          }
-          continue
-        }
-        if (event.type === "response.completed") {
-          this.logCodexUsage(
-            "http",
-            modelName,
-            cacheId,
-            slot,
-            event,
-            requestStartedAt
-          )
-          const completedResponse =
-            (event.response as Record<string, unknown>) || {}
-          const existingOutput = completedResponse.output
-          const hasUsableOutput =
-            Array.isArray(existingOutput) && existingOutput.length > 0
-          const completedEvent =
-            !hasUsableOutput && collectedItems.length > 0
-              ? {
-                  ...event,
-                  response: { ...completedResponse, output: collectedItems },
-                }
-              : event
-          const result = translateCodexToClaudeNonStream(
-            completedEvent,
-            reverseToolMap
-          )
-          if (result) {
-            this.logger.log(
-              `[Codex] Non-stream response: model=${result.model}, stop=${result.stop_reason}`
-            )
-            return result
-          }
-        }
-      } catch {
-        // Skip unparseable lines
+    if (!response.body)
+      throw new CodexApiError(502, "Codex response has no body")
+    const collectedItems: Record<string, unknown>[] = []
+    for await (const event of readCodexResponseEvents(
+      response.body,
+      fetchOptions.signal ?? undefined
+    )) {
+      readCodexResponseOutcome(event)
+      this.captureCodexTurnStateFromSsePayload(turnContext, event)
+      if (
+        event.type === "response.output_item.done" &&
+        event.item &&
+        typeof event.item === "object"
+      )
+        collectedItems.push(event.item as Record<string, unknown>)
+      if (event.type === "response.completed") {
+        this.logCodexUsage(
+          "http",
+          modelName,
+          cacheId,
+          slot,
+          event,
+          requestStartedAt
+        )
+        const completedResponse = event.response as Record<string, unknown>
+        const output = completedResponse.output
+        const completedEvent =
+          Array.isArray(output) && output.length
+            ? event
+            : {
+                ...event,
+                response: { ...completedResponse, output: collectedItems },
+              }
+        const result = translateCodexToClaudeNonStream(
+          completedEvent,
+          reverseToolMap
+        )
+        if (result) return result
       }
     }
 
@@ -3537,6 +3685,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       | "upstreamIdentity"
       | "clientMetadata"
       | "continuationPolicy"
+      | "responseFormat"
     >,
     forwardHeaders?: CodexForwardHeaders,
     turnContextOverride?: CodexTurnContext,
@@ -3568,7 +3717,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       slot.workspaceId,
       forwardHeaders,
       false,
-      this.usesResponsesLite(modelName)
+      this.usesResponsesLite(modelName, slot)
     )
     this.applyCodexTurnStateHeader(wsHeaders, turnContext)
     const sessionId =
@@ -3581,7 +3730,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       this.wsService.buildWebSocketRequestBody(
         prepareCodexRequestForSend(requestForSend),
         {
-          useResponsesLite: this.usesResponsesLite(modelName),
+          useResponsesLite: this.usesResponsesLite(modelName, slot),
           forwardHeaders,
           streamRequestStartMs: Date.now(),
           turnState: turnContext?.turnState,
@@ -3705,6 +3854,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           wsHeaders,
           slot.proxyUrl || undefined
         )
+        this.modelCatalogCache.invalidate(
+          this.modelCatalogScope(slot),
+          this.wsService.getConnectionMetadata(ws)?.modelsEtag
+        )
         this.captureCodexTurnStateFromConnection(turnContext, ws)
         try {
           const prepared = planWebSocketRequest(codexRequest)
@@ -3728,6 +3881,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           wsUrl,
           wsHeaders,
           slot.proxyUrl || undefined
+        )
+        this.modelCatalogCache.invalidate(
+          this.modelCatalogScope(slot),
+          this.wsService.getConnectionMetadata(ws)?.modelsEtag
         )
         this.captureCodexTurnStateFromConnection(turnContext, ws)
 
@@ -3829,7 +3986,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   async prewarmExactNativeRequest(input: {
     request: Pick<
       CodexExecutionRequest,
-      "model" | "localProjectionKey" | "upstreamIdentity" | "clientMetadata"
+      | "model"
+      | "localProjectionKey"
+      | "upstreamIdentity"
+      | "clientMetadata"
+      | "responseFormat"
     >
     /** Exact request emitted by the native Codex request assembler. */
     nativeRequest: Record<string, unknown>
@@ -3915,7 +4076,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
   private async runSessionWarmup(
     request: Pick<
       CodexExecutionRequest,
-      "model" | "localProjectionKey" | "upstreamIdentity" | "clientMetadata"
+      | "model"
+      | "localProjectionKey"
+      | "upstreamIdentity"
+      | "clientMetadata"
+      | "responseFormat"
     >,
     slot: CodexAccountSlot,
     wsUrl: string,
@@ -3947,7 +4112,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       slot.workspaceId,
       forwardHeaders,
       false,
-      this.usesResponsesLite(modelName)
+      this.usesResponsesLite(modelName, slot)
     )
 
     const { release } = await this.wsService.acquireSession(sessionId)
@@ -3992,7 +4157,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         )
         warmupBody = prepareCodexRequestForSend(warmupBody)
         const wsBody = this.wsService.buildWarmupRequestBody(warmupBody, {
-          useResponsesLite: this.usesResponsesLite(modelName),
+          useResponsesLite: this.usesResponsesLite(modelName, slot),
           forwardHeaders,
           streamRequestStartMs: Date.now(),
         })
@@ -4043,6 +4208,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     lifecycle?: Pick<ProviderPhysicalDispatch<object>["lifecycle"], "state">,
     attemptReceipt: CodexPhysicalAttemptReceipt = {}
   ): AsyncGenerator<string, void, unknown> {
+    // Cursor refreshes before building its native history candidate. Refreshing
+    // here would change compaction compatibility after that check has passed.
+    if (!request.projectionState) await this.refreshModelCatalogs(abortSignal)
     const modelName = request.model
     let slot: CodexAccountSlot
     try {
@@ -4068,10 +4236,16 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     this.bindConversationToSlot(this.getLocalProjectionKey(request), slot)
 
     const reverseToolMap = buildReverseMapFromClaudeTools(request.tools)
-    let codexRequest = buildCodexRequest(request, modelName) as Record<
-      string,
-      unknown
-    >
+    let codexRequest = buildCodexRequest(
+      {
+        ...request,
+        modelProfile: getCodexModelProfile(
+          modelName,
+          this.modelCatalogScope(slot)
+        ),
+      },
+      modelName
+    ) as Record<string, unknown>
     codexRequest = this.attachBridgeNativeClientMetadata(
       request,
       codexRequest
@@ -4216,6 +4390,24 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       }
       markAccountSuccess(slot, modelName)
     } catch (e) {
+      if (
+        request.responseFormat === "native" &&
+        e instanceof CodexApiError &&
+        e.providerDetails?.event
+      ) {
+        if (e.getStatus() === 429)
+          markAccountCooldown(
+            slot,
+            429,
+            modelName,
+            e.retryAfterSeconds?.toString(),
+            this.getAccountLabel(slot)
+          )
+        const event = e.providerDetails.event as Record<string, unknown>
+        yield `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`
+        return
+      }
+      if (lifecycle?.state === "accepted") throw e
       const abortedError = toUpstreamRequestAbortedError(
         e,
         abortSignal,
@@ -4263,7 +4455,11 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     cacheId: string,
     request: Pick<
       CodexExecutionRequest,
-      "model" | "localProjectionKey" | "upstreamIdentity" | "clientMetadata"
+      | "model"
+      | "localProjectionKey"
+      | "upstreamIdentity"
+      | "clientMetadata"
+      | "responseFormat"
     >,
     omitAccountId: boolean = false,
     forwardHeaders?: CodexForwardHeaders,
@@ -4286,7 +4482,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       omitAccountId,
       forwardHeaders,
       clientMetadata: this.requireCodexRequestClientMetadata(codexRequest),
-      useResponsesLite: this.usesResponsesLite(modelName),
+      useResponsesLite: this.usesResponsesLite(modelName, slot),
     })
     this.applyCodexTurnStateHeader(headers, turnContext)
 
@@ -4371,7 +4567,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           case "throw_codex_api_error":
             throw createCodexApiErrorFromBody(
               failureAction.statusCode,
-              failureAction.body
+              failureAction.body,
+              { retryAfterHeader: response.headers.get("retry-after") }
             )
         }
       }
@@ -4387,165 +4584,58 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         modelName,
         "request"
       )
+      this.modelCatalogCache.invalidate(
+        this.modelCatalogScope(slot),
+        response.headers.get("x-models-etag")
+      )
       this.captureCodexTurnStateFromHttpHeaders(turnContext, response.headers)
 
-      // Stream SSE events
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ""
-
-      try {
-        while (true) {
-          const externalAbort = createAbortPromise(
-            abortSignal,
-            "Codex HTTP stream aborted"
-          )
-          try {
-            const { done, value } = await Promise.race([
-              reader.read(),
-              ...(externalAbort.promise ? [externalAbort.promise] : []),
-            ])
-            if (done) break
-
-            buffer += decoder.decode(value, { stream: true })
-
-            const lines = buffer.split("\n")
-            buffer = lines.pop() || ""
-
-            for (const line of lines) {
-              const trimmed = line.trim()
-              if (!trimmed) continue
-              const payload = parseCodexSsePayload(trimmed)
-              this.captureCodexTurnStateFromSsePayload(turnContext, payload)
-
-              if (
-                firstUpstreamMs === undefined &&
-                typeof payload?.type === "string"
-              ) {
-                firstUpstreamMs = Date.now() - requestStartedAt
-                this.logger.debug(
-                  `[Codex] First upstream HTTP event after ${firstUpstreamMs}ms: type=${payload.type}`
-                )
-              }
-              if (
-                firstContentMs === undefined &&
-                (payload?.type === "response.output_text.delta" ||
-                  payload?.type === "response.reasoning_summary_text.delta" ||
-                  payload?.type === "response.function_call_arguments.delta")
-              ) {
-                firstContentMs = Date.now() - requestStartedAt
-                firstContentType = String(payload.type)
-                this.logger.debug(
-                  `[Codex] First content HTTP event after ${firstContentMs}ms: type=${firstContentType}`
-                )
-              }
-
-              this.logCodexUsage(
-                "http",
-                modelName,
-                cacheId,
-                slot,
-                payload,
-                requestStartedAt
-              )
-
-              if (
-                payload?.type === "response.output_item.done" &&
-                payload.item &&
-                typeof payload.item === "object"
-              ) {
-                yield `event: codex_response_item\ndata: ${JSON.stringify({
-                  type: "codex_response_item",
-                  item: payload.item,
-                })}\n\n`
-              }
-              const completedEvent =
-                this.formatCodexResponseCompletedEvent(payload)
-              if (completedEvent) {
-                yield completedEvent
-              }
-              const terminalEvent =
-                this.formatCodexResponseTerminalEvent(payload)
-              if (terminalEvent) {
-                yield terminalEvent
-              }
-
-              const claudeEvents = translateCodexSseEvent(
-                trimmed,
-                state,
-                reverseToolMap
-              )
-              for (const event of claudeEvents) {
-                yield event
-              }
-            }
-          } finally {
-            externalAbort.cleanup()
-          }
+      for await (const payload of readCodexResponseEvents(
+        response.body,
+        requestSignal.signal
+      )) {
+        this.captureCodexTurnStateFromSsePayload(turnContext, payload)
+        if (firstUpstreamMs === undefined)
+          firstUpstreamMs = Date.now() - requestStartedAt
+        if (
+          firstContentMs === undefined &&
+          [
+            "response.output_text.delta",
+            "response.reasoning_summary_text.delta",
+            "response.function_call_arguments.delta",
+          ].includes(String(payload.type))
+        ) {
+          firstContentMs = Date.now() - requestStartedAt
+          firstContentType = String(payload.type)
         }
-
-        // Process remaining buffer
-        if (buffer.trim()) {
-          const payload = parseCodexSsePayload(buffer.trim())
-          this.captureCodexTurnStateFromSsePayload(turnContext, payload)
-          if (
-            firstUpstreamMs === undefined &&
-            typeof payload?.type === "string"
-          ) {
-            firstUpstreamMs = Date.now() - requestStartedAt
-            this.logger.debug(
-              `[Codex] First upstream HTTP event after ${firstUpstreamMs}ms: type=${payload.type}`
-            )
-          }
-          if (
-            firstContentMs === undefined &&
-            (payload?.type === "response.output_text.delta" ||
-              payload?.type === "response.reasoning_summary_text.delta" ||
-              payload?.type === "response.function_call_arguments.delta")
-          ) {
-            firstContentMs = Date.now() - requestStartedAt
-            firstContentType = String(payload.type)
-            this.logger.debug(
-              `[Codex] First content HTTP event after ${firstContentMs}ms: type=${firstContentType}`
-            )
-          }
-          this.logCodexUsage(
-            "http",
-            modelName,
-            cacheId,
-            slot,
-            payload,
-            requestStartedAt
-          )
-          if (
-            payload?.type === "response.output_item.done" &&
-            payload.item &&
-            typeof payload.item === "object"
-          ) {
-            yield `event: codex_response_item\ndata: ${JSON.stringify({
-              type: "codex_response_item",
-              item: payload.item,
-            })}\n\n`
-          }
-          const completedEvent = this.formatCodexResponseCompletedEvent(payload)
-          if (completedEvent) {
-            yield completedEvent
-          }
-          const terminalEvent = this.formatCodexResponseTerminalEvent(payload)
-          if (terminalEvent) {
-            yield terminalEvent
-          }
-          const claudeEvents = translateCodexSseEvent(
-            buffer.trim(),
-            state,
-            reverseToolMap
-          )
-          for (const event of claudeEvents) {
-            yield event
-          }
+        this.logCodexUsage(
+          "http",
+          modelName,
+          cacheId,
+          slot,
+          payload,
+          requestStartedAt
+        )
+        if (request.responseFormat === "native") {
+          yield `event: ${String(payload.type)}\ndata: ${JSON.stringify(payload)}\n\n`
+          continue
         }
-      } finally {
-        reader.releaseLock()
+        if (
+          payload.type === "response.output_item.done" &&
+          payload.item &&
+          typeof payload.item === "object"
+        ) {
+          yield `event: codex_response_item\ndata: ${JSON.stringify({ type: "codex_response_item", item: payload.item })}\n\n`
+        }
+        const completedEvent = this.formatCodexResponseCompletedEvent(payload)
+        if (completedEvent) yield completedEvent
+        const terminalEvent = this.formatCodexResponseTerminalEvent(payload)
+        if (terminalEvent) yield terminalEvent
+        yield* translateCodexSseEvent(
+          `data: ${JSON.stringify(payload)}`,
+          state,
+          reverseToolMap
+        )
       }
     } catch (error) {
       if (requestSignal.didTimeout()) {
@@ -4601,6 +4691,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       | "upstreamIdentity"
       | "clientMetadata"
       | "continuationPolicy"
+      | "responseFormat"
     >,
     forwardHeaders?: CodexForwardHeaders,
     abortSignal?: AbortSignal,
@@ -4633,7 +4724,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       slot.workspaceId,
       forwardHeaders,
       false,
-      this.usesResponsesLite(modelName)
+      this.usesResponsesLite(modelName, slot)
     )
     this.applyCodexTurnStateHeader(wsHeaders, turnContext)
     const sessionId = turnContext?.wsSessionId || ""
@@ -4642,6 +4733,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         wsUrl,
         wsHeaders,
         slot.proxyUrl || undefined
+      )
+      this.modelCatalogCache.invalidate(
+        this.modelCatalogScope(slot),
+        this.wsService.getConnectionMetadata(ws)?.modelsEtag
       )
       this.captureCodexTurnStateFromConnection(turnContext, ws)
       const prepared =
@@ -4668,7 +4763,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         forwardHeaders,
         turnContext,
         capturePreparedWireInput,
-        prepared.continuation
+        prepared.continuation,
+        request.responseFormat
       )
       return
     }
@@ -4687,6 +4783,10 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
         wsUrl,
         wsHeaders,
         slot.proxyUrl || undefined
+      )
+      this.modelCatalogCache.invalidate(
+        this.modelCatalogScope(slot),
+        this.wsService.getConnectionMetadata(ws)?.modelsEtag
       )
       this.captureCodexTurnStateFromConnection(turnContext, ws)
 
@@ -4733,7 +4833,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             this.wsService.buildWebSocketRequestBody(
               prepareCodexRequestForSend(codexRequest),
               {
-                useResponsesLite: this.usesResponsesLite(modelName),
+                useResponsesLite: this.usesResponsesLite(modelName, slot),
                 forwardHeaders,
                 turnState: turnContext?.turnState,
               }
@@ -4755,7 +4855,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           forwardHeaders,
           turnContext,
           capturePreparedWireInput,
-          prepared.continuation
+          prepared.continuation,
+          request.responseFormat
         )
         return
       } catch (error) {
@@ -4799,7 +4900,8 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
     forwardHeaders?: CodexForwardHeaders,
     turnContext?: CodexTurnContext,
     capturePreparedWireInput?: (input: readonly CodexInputItem[]) => void,
-    pendingContinuationAttempt?: CodexPendingContinuationAttempt
+    pendingContinuationAttempt?: CodexPendingContinuationAttempt,
+    responseFormat?: "native"
   ): AsyncGenerator<string, void, unknown> {
     const state = createStreamState()
     const itemsAdded: CodexInputItem[] = []
@@ -4848,7 +4950,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
       const wsBody = this.wsService.buildWebSocketRequestBody(
         preparedCodexRequest,
         {
-          useResponsesLite: this.usesResponsesLite(modelName),
+          useResponsesLite: this.usesResponsesLite(modelName, slot),
           forwardHeaders,
           streamRequestStartMs: Date.now(),
           turnState: turnContext?.turnState,
@@ -4866,7 +4968,7 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
             | Record<string, unknown>
             | undefined
           appendCodexResponseOutputItemToLedger(itemsAdded, item)
-          if (item && typeof item === "object") {
+          if (responseFormat !== "native" && item && typeof item === "object") {
             yield `event: codex_response_item\ndata: ${JSON.stringify({
               type: "codex_response_item",
               item,
@@ -4894,6 +4996,18 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
               )
             }
           }
+        }
+        if (responseFormat === "native") {
+          this.logCodexUsage(
+            "websocket",
+            modelName,
+            cacheId,
+            slot,
+            msg as Record<string, unknown>,
+            requestStartedAt
+          )
+          yield `event: ${msg.type}\ndata: ${JSON.stringify(msg)}\n\n`
+          continue
         }
         const completedEvent = this.formatCodexResponseCompletedEvent(
           msg as Record<string, unknown>

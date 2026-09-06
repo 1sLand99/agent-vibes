@@ -1,3 +1,4 @@
+import { getCodexModelProfile } from "../llm/openai/codex-model-catalog"
 import { Injectable, Logger } from "@nestjs/common"
 import { createHash } from "crypto"
 import {
@@ -76,6 +77,7 @@ export type CodexGraphDeltaProjectionOptions = Omit<
 
 /** Exact immutable state captured before a Remote Compaction V2 request. */
 export interface CodexRemoteCompactRequest {
+  model?: string
   rawHistory: readonly CodexInputItem[]
   preTriggerInput: readonly CodexInputItem[]
   expectedHistoryVersion: number
@@ -368,7 +370,31 @@ export class CodexContextEngineService {
     // A manual compact is an explicit user action and a reactive compact is
     // backed by a provider context-full signal.  Automatic compaction alone
     // is gated by the exact native prompt token count.
+    const currentModel = options.referenceContextItem.model
+    const currentProfile = currentModel
+      ? getCodexModelProfile(currentModel)
+      : undefined
+    const previousContext = projectionState.activeWindow.modelContext
+    const previousProfile = previousContext
+      ? getCodexModelProfile(previousContext.model)
+      : undefined
+    const hashChanged = !!(
+      previousContext?.compHash &&
+      currentProfile?.comp_hash &&
+      previousContext.compHash !== currentProfile.comp_hash
+    )
+    const shrunkWindow = !!(
+      previousProfile?.context_window !== undefined &&
+      currentProfile?.context_window !== undefined &&
+      previousProfile.context_window > currentProfile.context_window &&
+      nativePressureTokens > effectiveMaxTokens
+    )
+    const compactModel =
+      (hashChanged || shrunkWindow) && previousContext
+        ? previousContext.model
+        : currentModel
     const requiresCompaction =
+      hashChanged ||
       options.strategy === "manual" ||
       options.strategy === "reactive" ||
       nativePressureTokens > effectiveMaxTokens
@@ -442,6 +468,7 @@ export class CodexContextEngineService {
     const expectedWindowId = projectionState.activeWindow.windowId
 
     const compactResult = await options.remoteCompactProvider({
+      model: compactModel,
       rawHistory,
       preTriggerInput: compactionInput.input,
       expectedHistoryVersion,
@@ -468,6 +495,17 @@ export class CodexContextEngineService {
     )
 
     installCodexCompaction(projectionState, {
+      nextModelContext: currentModel
+        ? {
+            model: currentModel,
+            ...(currentProfile?.comp_hash
+              ? { compHash: currentProfile.comp_hash }
+              : {}),
+          }
+        : undefined,
+      compactionModelHash: compactModel
+        ? (getCodexModelProfile(compactModel)?.comp_hash ?? undefined)
+        : undefined,
       rolloutId: `compaction:${candidate.commitId}`,
       nativeThreadId,
       compactionId: candidate.commitId,

@@ -215,6 +215,7 @@ export class ContextRequestPlannerService {
       this.normalizePositiveInteger(input.maxOutputTokens) ?? 0
     const autoCompactTokenLimit = resolveAutoCompactTokenLimit({
       backend: input.backend,
+      model: input.model,
       maxTokens,
       maxOutputTokens,
       requestedServiceTier: input.requestedServiceTier,

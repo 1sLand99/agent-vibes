@@ -20,6 +20,7 @@ import { ForwardProxyServer } from "./forward-proxy"
 import { ModelRouterService } from "./llm/shared/model-router.service"
 import { registerCursorOfficialPassthroughHook } from "./protocol/cursor/cursor-official-passthrough"
 import { rotateActiveLogFileIfNeeded } from "./shared/active-log-rotation"
+import { createBridgeLogStream } from "./shared/bridge-log-file"
 import { registerContentTypeParsers } from "./shared/content-type-parsers"
 import { registerRequestHooks } from "./shared/request-hooks"
 
@@ -100,39 +101,27 @@ if (!process.env.NODE_EXTRA_CA_CERTS) {
 
 async function bootstrap() {
   // ── Debug Mode ─────────────────────────────────────────────────────
-  // npm run start       → quiet (warn + error only, no file tee)
+  // npm run start       → quiet (warnings/errors captured in the log)
   // npm run start:debug → verbose (all levels + full file logging)
   const isDebug = process.env.LOG_DEBUG === "true"
   const nestLogLevels: LogLevel[] = isDebug
     ? ["verbose", "debug", "log", "warn", "error"]
     : ["warn", "error"]
 
-  // ── File Logging (debug mode only) ─────────────────────────────────
-  const logDir = path.join(os.tmpdir(), "agent-vibes-logs")
-  fs.mkdirSync(logDir, { recursive: true })
-
-  const timestampForFilename = () =>
-    new Date().toISOString().replace(/[:.]/g, "-")
-  const logFileName = `protocol-bridge-${timestampForFilename()}.log`
-  const logFilePath = path.join(logDir, logFileName)
-  const latestLogPath = path.join(logDir, "protocol-bridge.log")
-
-  const logStream = fs.createWriteStream(logFilePath, { flags: "a" })
-  try {
-    if (fs.existsSync(latestLogPath)) {
-      fs.unlinkSync(latestLogPath)
-    }
-    fs.symlinkSync(logFileName, latestLogPath)
-  } catch {
-    fs.copyFileSync(logFilePath, latestLogPath)
-  }
+  // ── File Logging ──────────────────────────────────────────────────
+  const logDir =
+    process.env.AGENT_VIBES_LOG_DIR?.trim() ||
+    path.join(os.tmpdir(), "agent-vibes-logs")
+  const origStdoutWrite = process.stdout.write.bind(process.stdout)
+  const origStderrWrite = process.stderr.write.bind(process.stderr)
+  const logStream = createBridgeLogStream(logDir, (error) => {
+    // Bypass the tee: reporting a log write error through it would recurse.
+    origStderrWrite(`Bridge file logging error: ${String(error)}\n`)
+  })
 
   logStream.write(
     `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Agent Vibes server starting (debug=${isDebug})\n${"=".repeat(60)}\n`
   )
-
-  const origStdoutWrite = process.stdout.write.bind(process.stdout)
-  const origStderrWrite = process.stderr.write.bind(process.stderr)
 
   if (isDebug) {
     // Debug: tee ALL stdout to log file
@@ -447,7 +436,7 @@ ${line(`${c.orange}${c.bold}API Endpoints${c.reset}`)}
 ${line(`  ${c.purple}POST${c.reset} /v1/messages ${c.dim}·· Anthropic API${c.reset}`)}
 ${line(`  ${c.purple}POST${c.reset} /v1/chat/completions ${c.dim}·· OpenAI Chat API${c.reset}`)}
 ${line(`  ${c.purple}POST${c.reset} /v1/responses ${c.dim}·· OpenAI Responses API${c.reset}`)}
-${line(`  ${c.purple}POST${c.reset} /v1/realtime/calls ${c.dim}·· ChatGPT OAuth WebRTC${c.reset}`)}
+${line(`  ${c.purple}POST${c.reset} /v1/realtime/calls ${c.dim}·· ChatGPT Web Live${c.reset}`)}
 ${line(`  ${c.purple}GET ${c.reset} /v1/models   ${c.dim}·· List available models${c.reset}`)}
 ${line(`  ${c.purple}POST${c.reset} /agent.v1.*  ${c.dim}·· Cursor gRPC endpoints${c.reset}`)}
 ${line(`  ${c.purple}GET ${c.reset} /health      ${c.dim}·· Health check${c.reset}`)}

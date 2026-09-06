@@ -1,5 +1,7 @@
+import { ModelModule } from "../../llm/shared/model.module"
+import { CodexResponsesService } from "./codex-responses.service"
 import { Module } from "@nestjs/common"
-import { ChatGptRealtimeCompanionService } from "../../llm/openai/chatgpt-realtime-companion.service"
+import { CodexModule } from "../../llm/openai/codex.module"
 import { RequiredApiKeyGuard } from "../../shared/required-api-key.guard"
 import { AnthropicModule } from "../anthropic/anthropic.module"
 import { ChatCompletionsController } from "./chat-completions.controller"
@@ -15,11 +17,11 @@ import { RealtimeController } from "./realtime.controller"
  * translation lives here.
  */
 @Module({
-  imports: [AnthropicModule],
+  imports: [AnthropicModule, CodexModule, ModelModule],
   controllers: [ChatCompletionsController, RealtimeController],
   providers: [
     ChatCompletionsService,
-    ChatGptRealtimeCompanionService,
+    CodexResponsesService,
     RequiredApiKeyGuard,
   ],
 })

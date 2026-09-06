@@ -1,3 +1,4 @@
+import { once } from "node:events"
 import {
   Body,
   Controller,
@@ -5,10 +6,11 @@ import {
   HttpException,
   Post,
   Res,
+  Req,
   UseGuards,
 } from "@nestjs/common"
 import { ApiOperation, ApiSecurity, ApiTags } from "@nestjs/swagger"
-import type { FastifyReply } from "fastify"
+import type { FastifyReply, FastifyRequest } from "fastify"
 import { ApiKeyGuard } from "../../shared/api-key.guard"
 import { ChatCompletionsService } from "./chat-completions.service"
 import { renderOpenAiError } from "./openai-error"
@@ -99,7 +101,8 @@ export class ChatCompletionsController {
   @ApiOperation({ summary: "Create a response (OpenAI Responses API)" })
   async createResponse(
     @Body() body: Record<string, unknown>,
-    @Res({ passthrough: true }) res?: FastifyReply
+    @Res({ passthrough: true }) res?: FastifyReply,
+    @Req() httpRequest?: FastifyRequest
   ) {
     const req = body as unknown as OpenAiResponsesRequest
     if (typeof req?.model !== "string" || req.model.trim() === "") {
@@ -119,22 +122,42 @@ export class ChatCompletionsController {
       )
     }
 
+    const controller = new AbortController()
+    const onClose = () => {
+      if (!res?.raw.writableEnded) controller.abort()
+    }
+    res?.raw.once("close", onClose)
+    const headers = httpRequest?.headers
+    const credential =
+      headers?.["x-api-key"] ??
+      headers?.authorization?.replace(/^Bearer\s+/i, "") ??
+      headers?.["x-goog-api-key"] ??
+      "local"
+    const context = {
+      owner: Array.isArray(credential) ? credential[0]! : credential,
+      signal: controller.signal,
+    }
     if (req.stream && res) {
       await this.streamResponse(
         res,
-        this.chatCompletionsService.createResponseStream(req)
+        this.chatCompletionsService.createResponseStream(req, context),
+        controller,
+        "responses"
       )
+      res.raw.off("close", onClose)
       return
     }
 
     try {
-      return await this.chatCompletionsService.createResponse(req)
+      return await this.chatCompletionsService.createResponse(req, context)
     } catch (error) {
       const rendered = renderOpenAiError(error)
       if (res && rendered.retryAfterSeconds != null) {
         res.header("Retry-After", String(rendered.retryAfterSeconds))
       }
       throw new HttpException(rendered.body, rendered.status)
+    } finally {
+      res?.raw.off("close", onClose)
     }
   }
 
@@ -189,7 +212,9 @@ export class ChatCompletionsController {
    */
   private async streamResponse(
     res: FastifyReply,
-    stream: AsyncGenerator<string, void, unknown>
+    stream: AsyncGenerator<string, void, unknown>,
+    abortController?: AbortController,
+    protocol?: "responses"
   ): Promise<void> {
     let headersWritten = false
     const ensureHeaders = () => {
@@ -197,27 +222,41 @@ export class ChatCompletionsController {
       res.header("Content-Type", "text/event-stream")
       res.header("Cache-Control", "no-cache")
       res.header("Connection", "keep-alive")
+      for (const [name, value] of Object.entries(res.getHeaders())) {
+        if (value !== undefined) res.raw.setHeader(name, value)
+      }
+      res.raw.writeHead(res.statusCode)
+      res.hijack()
       headersWritten = true
     }
 
     try {
       for await (const chunk of stream) {
         ensureHeaders()
-        res.raw.write(chunk)
+        if (res.raw.destroyed) break
+        if (!res.raw.write(chunk))
+          await once(res.raw, "drain", { signal: abortController?.signal })
       }
     } catch (error) {
+      if (abortController?.signal.aborted || res.raw.destroyed) return
       const rendered = renderOpenAiError(error)
       if (!headersWritten) {
         res.status(rendered.status)
+        if (rendered.retryAfterSeconds != null)
+          res.header("Retry-After", String(rendered.retryAfterSeconds))
+        res.send(rendered.body)
+        return
       }
-      if (rendered.retryAfterSeconds != null) {
-        res.header("Retry-After", String(rendered.retryAfterSeconds))
-      }
-      ensureHeaders()
-      res.raw.write(`data: ${JSON.stringify(rendered.body)}\n\n`)
+      res.raw.write(
+        protocol === "responses"
+          ? `event: error\ndata: ${JSON.stringify({ ...rendered.body.error, type: "error" })}\n\n`
+          : `data: ${JSON.stringify(rendered.body)}\n\n`
+      )
     } finally {
-      ensureHeaders()
-      res.raw.end()
+      if (!res.raw.destroyed && (headersWritten || !res.sent)) {
+        ensureHeaders()
+        res.raw.end()
+      }
     }
   }
 }

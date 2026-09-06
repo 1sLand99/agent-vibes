@@ -7,6 +7,7 @@ import type {
 import { requireExactDurableIdentifier } from "../../context/durable-identifier"
 
 const CODEX_API_VISIBLE_INPUT_ITEM_TYPES = new Set([
+  "configuration_update",
   "additional_tools",
   "message",
   "agent_message",

@@ -1,3 +1,4 @@
+import { readCodexResponseOutcome } from "./codex-response-outcome"
 /**
  * Codex Response Translator
  *
@@ -27,9 +28,15 @@ import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
 // ── Streaming state ────────────────────────────────────────────────────
 
 export interface CodexStreamState {
+  activeNativeItem?: string
+  pendingNativeItems: string[]
+  bufferedNativeEvents: Map<string, Record<string, unknown>[]>
+  bufferedNativeBytes: number
   hasToolCall: boolean
   blockIndex: number
   hasReceivedArgumentsDelta: boolean
+  currentTextPart: number
+  completedTextParts: Set<number>
   hasTextDelta: boolean
   textBlockOpen: boolean
   thinkingBlockOpen: boolean
@@ -42,9 +49,14 @@ export interface CodexStreamState {
 
 export function createStreamState(): CodexStreamState {
   return {
+    pendingNativeItems: [],
+    bufferedNativeEvents: new Map(),
+    bufferedNativeBytes: 0,
     hasToolCall: false,
     blockIndex: 0,
     hasReceivedArgumentsDelta: false,
+    currentTextPart: 0,
+    completedTextParts: new Set(),
     hasTextDelta: false,
     textBlockOpen: false,
     thinkingBlockOpen: false,
@@ -218,11 +230,71 @@ export function translateCodexSseEvent(
     return []
   }
 
+  readCodexResponseOutcome(event, { allowMaxOutputIncomplete: true })
   const eventType = event.type as string
   if (!eventType) {
     return []
   }
 
+  const item = event.item as Record<string, unknown> | undefined
+  const itemId =
+    typeof event.item_id === "string"
+      ? event.item_id
+      : typeof item?.id === "string"
+        ? item.id
+        : undefined
+  if (
+    itemId &&
+    eventType === "response.output_item.added" &&
+    state.activeNativeItem === undefined
+  )
+    state.activeNativeItem = itemId
+  if (itemId && state.activeNativeItem && itemId !== state.activeNativeItem) {
+    if (!state.bufferedNativeEvents.has(itemId)) {
+      state.pendingNativeItems.push(itemId)
+      state.bufferedNativeEvents.set(itemId, [])
+    }
+    state.bufferedNativeEvents.get(itemId)!.push(event)
+    state.bufferedNativeBytes += Buffer.byteLength(JSON.stringify(event))
+    if (state.bufferedNativeBytes > 16 * 1024 * 1024)
+      throw new Error("Codex interleaved output buffer exceeded 16 MiB")
+    return []
+  }
+  const translated = translateOrderedCodexEvent(event, state, reverseToolMap)
+  if (
+    eventType === "response.output_item.done" &&
+    itemId === state.activeNativeItem
+  ) {
+    state.activeNativeItem = undefined
+    while (
+      state.pendingNativeItems.length > 0 &&
+      state.activeNativeItem === undefined
+    ) {
+      const nextId = state.pendingNativeItems.shift()!
+      const pending = state.bufferedNativeEvents.get(nextId)!
+      state.bufferedNativeEvents.delete(nextId)
+      state.activeNativeItem = nextId
+      for (const queued of pending) {
+        state.bufferedNativeBytes -= Buffer.byteLength(JSON.stringify(queued))
+        translated.push(
+          ...translateOrderedCodexEvent(queued, state, reverseToolMap)
+        )
+        if (queued.type === "response.output_item.done")
+          state.activeNativeItem = undefined
+      }
+    }
+  }
+  if (eventType === "response.completed" && state.pendingNativeItems.length > 0)
+    throw new Error("Codex completed with unfinished interleaved output items")
+  return translated
+}
+
+function translateOrderedCodexEvent(
+  event: Record<string, unknown>,
+  state: CodexStreamState,
+  reverseToolMap: Map<string, string>
+): string[] {
+  const eventType = event.type as string
   const results: string[] = []
   if (state.thinkingBlockOpen && state.thinkingStopPending) {
     switch (eventType) {
@@ -296,6 +368,9 @@ export function translateCodexSseEvent(
 
     // ── Text content blocks ──────────────────────────────────────
     case "response.content_part.added": {
+      state.currentTextPart =
+        typeof event.content_index === "number" ? event.content_index : 0
+      state.hasTextDelta = false
       results.push(...finalizeThinkingBlock(state))
       state.textBlockOpen = true
       results.push(
@@ -327,6 +402,17 @@ export function translateCodexSseEvent(
     }
 
     case "response.content_part.done": {
+      if (!state.textBlockOpen) break
+      const part = event.part as Record<string, unknown> | undefined
+      if (!state.hasTextDelta && typeof part?.text === "string" && part.text)
+        results.push(
+          formatSseEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: state.blockIndex,
+            delta: { type: "text_delta", text: part.text },
+          })
+        )
+      state.completedTextParts.add(state.currentTextPart)
       results.push(
         formatSseEvent("content_block_stop", {
           type: "content_block_stop",
@@ -345,6 +431,11 @@ export function translateCodexSseEvent(
         break
       }
 
+      if (item.type === "message") {
+        state.completedTextParts.clear()
+        state.hasTextDelta = false
+        break
+      }
       if (item.type === "reasoning") {
         state.thinkingSummarySeen = false
         state.thinkingSignature =
@@ -421,6 +512,7 @@ export function translateCodexSseEvent(
       if (!state.hasReceivedArgumentsDelta) {
         const args = event.arguments as string
         if (args) {
+          state.hasReceivedArgumentsDelta = true
           results.push(
             formatSseEvent("content_block_delta", {
               type: "content_block_delta",
@@ -456,52 +548,42 @@ export function translateCodexSseEvent(
       }
 
       if (item.type === "message") {
-        if (state.hasTextDelta) {
-          break
-        }
-        const content = item.content as Array<Record<string, unknown>> | string
-        let text = ""
-        if (Array.isArray(content)) {
-          for (const part of content) {
-            if (part.type === "output_text" && typeof part.text === "string") {
-              text += part.text
-            }
-          }
-        } else if (typeof content === "string") {
-          text = content
-        }
-        if (!text) {
-          break
-        }
-
-        results.push(...finalizeThinkingBlock(state))
-        if (!state.textBlockOpen) {
-          state.textBlockOpen = true
+        const content =
+          typeof item.content === "string"
+            ? [{ type: "output_text", text: item.content }]
+            : (item.content as Record<string, unknown>[] | undefined)
+        for (const [index, part] of (content ?? []).entries()) {
+          if (
+            part.type !== "output_text" ||
+            state.completedTextParts.has(index)
+          )
+            continue
+          if (!state.textBlockOpen)
+            results.push(
+              ...translateOrderedCodexEvent(
+                {
+                  type: "response.content_part.added",
+                  item_id: item.id,
+                  content_index: index,
+                  part,
+                },
+                state,
+                reverseToolMap
+              )
+            )
           results.push(
-            formatSseEvent("content_block_start", {
-              type: "content_block_start",
-              index: state.blockIndex,
-              ...(typeof item.id === "string" ? { item_id: item.id } : {}),
-              content_block: { type: "text", text: "" },
-            })
+            ...translateOrderedCodexEvent(
+              {
+                type: "response.content_part.done",
+                item_id: item.id,
+                content_index: index,
+                part,
+              },
+              state,
+              reverseToolMap
+            )
           )
         }
-        results.push(
-          formatSseEvent("content_block_delta", {
-            type: "content_block_delta",
-            index: state.blockIndex,
-            delta: { type: "text_delta", text },
-          })
-        )
-        results.push(
-          formatSseEvent("content_block_stop", {
-            type: "content_block_stop",
-            index: state.blockIndex,
-          })
-        )
-        state.textBlockOpen = false
-        state.blockIndex++
-        state.hasTextDelta = true
         break
       }
 
@@ -512,7 +594,7 @@ export function translateCodexSseEvent(
         ) {
           state.thinkingSignature = item.encrypted_content
         }
-        if (state.thinkingSummarySeen) {
+        if (state.thinkingBlockOpen) {
           results.push(...finalizeThinkingBlock(state))
         } else {
           results.push(
@@ -596,9 +678,26 @@ export function translateCodexSseEvent(
         }
       }
 
+      if (
+        item.type === "function_call" &&
+        !state.hasReceivedArgumentsDelta &&
+        typeof item.arguments === "string"
+      ) {
+        results.push(
+          formatSseEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: state.blockIndex,
+            delta: { type: "input_json_delta", partial_json: item.arguments },
+          })
+        )
+      }
+
       // custom_tool_call：透传原始 input，不做 patch 包装。
       // 如果上游需要特定包装（如 Cursor 的 apply_agent_diff），在消费侧处理。
-      if (item.type === "custom_tool_call") {
+      if (
+        item.type === "custom_tool_call" &&
+        !state.hasReceivedArgumentsDelta
+      ) {
         const rawInput =
           typeof item.input === "string"
             ? item.input
@@ -627,7 +726,8 @@ export function translateCodexSseEvent(
       break
     }
 
-    // ── response.completed → message_delta + message_stop ────────
+    // ── Accepted terminal response → message_delta + message_stop ──
+    case "response.incomplete":
     case "response.completed": {
       const response = event.response as Record<string, unknown>
       const usage = extractResponsesUsage(
@@ -636,7 +736,21 @@ export function translateCodexSseEvent(
 
       let stopReason: string
       const upstreamStopReason = response?.stop_reason as string
-      if (state.hasToolCall) {
+      if (eventType === "response.incomplete") {
+        // Truncation may arrive before the final text/reasoning part.done.
+        results.push(...finalizeThinkingBlock(state))
+        if (state.textBlockOpen) {
+          results.push(
+            formatSseEvent("content_block_stop", {
+              type: "content_block_stop",
+              index: state.blockIndex,
+            })
+          )
+          state.textBlockOpen = false
+          state.blockIndex++
+        }
+        stopReason = "max_tokens"
+      } else if (state.hasToolCall) {
         stopReason = "tool_use"
       } else if (
         upstreamStopReason === "max_tokens" ||
@@ -644,12 +758,18 @@ export function translateCodexSseEvent(
       ) {
         stopReason = upstreamStopReason
       } else {
-        stopReason = "end_turn"
+        stopReason = response?.end_turn === false ? "continue" : "end_turn"
       }
 
       const messageDelta: Record<string, unknown> = {
         type: "message_delta",
-        delta: { stop_reason: stopReason, stop_sequence: null },
+        delta: {
+          stop_reason: stopReason,
+          stop_sequence: null,
+          ...(eventType === "response.incomplete"
+            ? { incomplete_reason: "max_output_tokens" }
+            : {}),
+        },
         usage: {
           input_tokens: usage.inputTokens,
           output_tokens: usage.outputTokens,
@@ -662,55 +782,6 @@ export function translateCodexSseEvent(
       }
 
       results.push(formatSseEvent("message_delta", messageDelta))
-      results.push(formatSseEvent("message_stop", { type: "message_stop" }))
-      break
-    }
-
-    // ── response.failed → 错误终止 — 对齐 Codex 官方 response.failed 事件 ──
-    case "response.failed": {
-      const response = event.response as Record<string, unknown>
-      const errorObj = response?.error as Record<string, unknown>
-      const errorMessage = (errorObj?.message as string) || "Response failed"
-      const errorCode = (errorObj?.code as string) || "unknown_error"
-
-      results.push(
-        formatSseEvent("message_delta", {
-          type: "message_delta",
-          delta: {
-            stop_reason: "error",
-            stop_sequence: null,
-            error: { type: errorCode, message: errorMessage },
-          },
-          usage: { input_tokens: 0, output_tokens: 0 },
-        })
-      )
-      results.push(formatSseEvent("message_stop", { type: "message_stop" }))
-      break
-    }
-
-    // ── response.incomplete → 不完整响应 — 对齐 Codex 官方 response.incomplete 事件 ──
-    case "response.incomplete": {
-      const response = event.response as Record<string, unknown>
-      const incompleteDetails = response?.incomplete_details as Record<
-        string,
-        unknown
-      >
-      const reason = (incompleteDetails?.reason as string) || "unknown"
-
-      const stopReason =
-        reason === "max_output_tokens" ? "max_tokens" : "incomplete"
-
-      results.push(
-        formatSseEvent("message_delta", {
-          type: "message_delta",
-          delta: {
-            stop_reason: stopReason,
-            stop_sequence: null,
-            incomplete_reason: reason,
-          },
-          usage: { input_tokens: 0, output_tokens: 0 },
-        })
-      )
       results.push(formatSseEvent("message_stop", { type: "message_stop" }))
       break
     }
@@ -906,7 +977,7 @@ export function translateCodexToClaudeNonStream(
   } else if (hasToolCall) {
     stopReason = "tool_use"
   } else {
-    stopReason = "end_turn"
+    stopReason = response?.end_turn === false ? "continue" : "end_turn"
   }
 
   return {

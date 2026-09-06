@@ -11,6 +11,18 @@ enum BlobStorageFormat {
   BLOB_STORAGE_FORMAT_V2_LAYERED = 4;
   BLOB_STORAGE_FORMAT_V3 = 5;
   BLOB_STORAGE_FORMAT_VM_SNAPSHOT_V2 = 6;
+  BLOB_STORAGE_FORMAT_V4 = 7;
+}
+
+enum CaptureErrorTag {
+  CAPTURE_ERROR_TAG_UNSPECIFIED = 0;
+  CAPTURE_ERROR_TAG_INVALID_IMAGE_USER = 1;
+}
+
+enum CaptureErrorType {
+  CAPTURE_ERROR_TYPE_UNSPECIFIED = 0;
+  CAPTURE_ERROR_TYPE_SYSTEM = 1;
+  CAPTURE_ERROR_TYPE_USER = 2;
 }
 
 enum ClonePurpose {
@@ -32,6 +44,7 @@ enum DrainingReason {
   DRAINING_REASON_MANUAL = 3;
   DRAINING_REASON_HEALTH = 4;
   DRAINING_REASON_RETIREMENT = 5;
+  DRAINING_REASON_COMPACTION = 6;
 }
 
 enum EntryType {
@@ -39,6 +52,13 @@ enum EntryType {
   ENTRY_TYPE_FILE = 1;
   ENTRY_TYPE_DIRECTORY = 2;
   ENTRY_TYPE_SYMLINK = 3;
+}
+
+enum EnvironmentBuildResolution {
+  ENVIRONMENT_BUILD_RESOLUTION_UNSPECIFIED = 0;
+  ENVIRONMENT_BUILD_RESOLUTION_RESOLVED = 1;
+  ENVIRONMENT_BUILD_RESOLUTION_NO_FINISHED_BUILDS = 2;
+  ENVIRONMENT_BUILD_RESOLUTION_NO_HEALTHY_BUILDS = 3;
 }
 
 enum FirecrackerVersion {
@@ -68,6 +88,13 @@ enum ImagePullFailureCategory {
   IMAGE_PULL_FAILURE_CATEGORY_UPSTREAM = 5;
 }
 
+enum IoTelemetryAvailability {
+  IO_TELEMETRY_AVAILABILITY_UNSPECIFIED = 0;
+  IO_TELEMETRY_AVAILABILITY_AVAILABLE = 1;
+  IO_TELEMETRY_AVAILABILITY_UNSUPPORTED = 2;
+  IO_TELEMETRY_AVAILABILITY_READ_ERROR = 3;
+}
+
 enum IsoEnvExtraDrivePurpose {
   ISO_ENV_EXTRA_DRIVE_PURPOSE_UNSPECIFIED = 0;
   ISO_ENV_EXTRA_DRIVE_PURPOSE_CHECKPOINT_SCRATCH = 1;
@@ -80,12 +107,14 @@ enum PodCreatingPhase {
   POD_CREATING_PHASE_POST_CREATE = 3;
   POD_CREATING_PHASE_UPDATE_CONTENT = 4;
   POD_CREATING_PHASE_POST_START = 5;
+  POD_CREATING_PHASE_QUEUED = 6;
 }
 
 enum PodStartCacheSource {
   POD_START_CACHE_SOURCE_UNSPECIFIED = 0;
   POD_START_CACHE_SOURCE_NODE_LOCAL_FIRECRACKER_SNAPSHOT = 1;
   POD_START_CACHE_SOURCE_REMOTE_ROOTAR_CHECKPOINT = 2;
+  POD_START_CACHE_SOURCE_NODE_LOCAL_CLOUD_HYPERVISOR_SNAPSHOT = 3;
 }
 
 enum PrivateWorkerWaitReason {
@@ -108,6 +137,23 @@ enum RestartReason {
   RESTART_REASON_UNSPECIFIED = 0;
   RESTART_REASON_PROCESS_EXITED = 1;
   RESTART_REASON_HEALTH_CHECK_FAILED = 2;
+}
+
+enum RootArchiveCompressionAlgorithm {
+  ROOT_ARCHIVE_COMPRESSION_ALGORITHM_NONE = 0;
+  ROOT_ARCHIVE_COMPRESSION_ALGORITHM_ZSTD = 1;
+}
+
+enum RootArchiveFormat {
+  ROOT_ARCHIVE_FORMAT_UNSPECIFIED = 0;
+  ROOT_ARCHIVE_FORMAT_EXT4 = 1;
+  ROOT_ARCHIVE_FORMAT_SQUASHFS = 2;
+  ROOT_ARCHIVE_FORMAT_EROFS = 3;
+}
+
+enum SnapshotCategory {
+  SNAPSHOT_CATEGORY_EXPLICIT_FORMAT = 0;
+  SNAPSHOT_CATEGORY_FULL_VM = 1;
 }
 
 enum SnapshotMemoryHashAlgorithm {
@@ -144,6 +190,12 @@ enum WorkspaceGitSetupMode {
   WORKSPACE_GIT_SETUP_MODE_UNSPECIFIED = 0;
   WORKSPACE_GIT_SETUP_MODE_REUSE = 1;
   WORKSPACE_GIT_SETUP_MODE_REUSE_THEN_CHECKOUT = 2;
+  WORKSPACE_GIT_SETUP_MODE_NO_REPO = 3;
+}
+
+enum WritableFilesystem {
+  WRITABLE_FILESYSTEM_UNSPECIFIED = 0;
+  WRITABLE_FILESYSTEM_EXT4 = 1;
 }
 
 message AllowedDomain {
@@ -201,6 +253,15 @@ message BuildStepStarted {
   string command = 4;
 }
 
+message CaptureFailureDetails {
+  oneof details {
+    InvalidImageUserFailure invalid_image_user = 3;
+  }
+  CaptureErrorType error_type = 1;
+  CaptureErrorTag error_tag = 2;
+  bool is_client_error = 4;
+}
+
 message CloneCompleted {
   ClonePurpose purpose = 1;
 }
@@ -221,6 +282,7 @@ message CreateProcessRequest {
   map<string, string> env = 4;
   optional string idempotency_key = 5;
   optional ProcessSupervision supervision = 6;
+  optional ProcessSupervision durable_supervision = 7;
 }
 
 message CreateProcessResponse {
@@ -327,6 +389,7 @@ message DevContainerExecCommand {
   bool depends_on_git_checkout = 8;
   optional ProcessSupervision supervision = 9;
   bool ignore_failure_for_install_health = 10;
+  optional ProcessSupervision durable_supervision = 11;
 }
 
 message DevContainerSpec {
@@ -354,6 +417,10 @@ message DevContainerSpec {
   optional AnygressPerPodDenyRules anygress_per_pod_deny_rules = 28;
   optional AntiAffinityTags anti_affinity_tags = 32;
   optional bool enable_lazy_v3_squashfs_snapshot_load = 34;
+  optional V4RootArchiveOptions v4_root_archive_options = 35;
+  optional bool enable_lazy_v4_load = 36;
+  optional bool enable_writable_ublk_load = 37;
+  optional bool enable_writable_ublk_eager_hydrate = 38;
 }
 
 message DirectoryEntry {
@@ -424,6 +491,7 @@ message DockerDevContainerPersistentState {
   WorkspaceConfig workspace = 9;
   bool v2_hydrated = 10;
   optional string pod_daemon_auth_token = 11;
+  bool primary_docker_builder = 12;
 }
 
 message DockerImageBuildEvent {
@@ -460,11 +528,13 @@ message EgressRestricted {
 }
 
 message EnvironmentBuildBootInfo {
-  string build_id = 1;
+  optional string build_id = 1;
   string snapshot_id = 2;
   WorkspaceGitSetupMode workspace_git_setup_mode = 3;
   WarmForkMode warm_fork_mode = 4;
   bool fast_forward_default_branch = 5;
+  EnvironmentBuildResolution resolution = 6;
+  bool default_image_fallback = 7;
 }
 
 message ExternalSnapshot {
@@ -475,6 +545,7 @@ message ExternalSnapshot {
   optional string node_machine_type = 5;
   optional string cpu_baseline_id = 6;
   optional SnapshotUsageStats usage_stats = 7;
+  optional V4RootArchiveOptions v4_root_archive_options = 8;
 }
 
 message FeatureExitCode {
@@ -524,6 +595,29 @@ message GitRepoSourceReference {
   string http_proxy = 5;
   optional string mtls_cert_pem = 6;
   optional string mtls_key_pem = 7;
+}
+
+message GuestBlockDeviceCounters {
+  string device = 1;
+  uint32 major = 2;
+  uint32 minor = 3;
+  uint64 reads_completed = 4;
+  uint64 reads_merged = 5;
+  uint64 sectors_read = 6;
+  uint64 read_time_milliseconds = 7;
+  uint64 writes_completed = 8;
+  uint64 writes_merged = 9;
+  uint64 sectors_written = 10;
+  uint64 write_time_milliseconds = 11;
+  uint64 io_in_progress = 12;
+  uint64 io_time_milliseconds = 13;
+  uint64 weighted_io_time_milliseconds = 14;
+  uint64 discards_completed = 15;
+  uint64 discards_merged = 16;
+  uint64 sectors_discarded = 17;
+  uint64 discard_time_milliseconds = 18;
+  uint64 flushes_completed = 19;
+  uint64 flush_time_milliseconds = 20;
 }
 
 message HttpHealthCheck {
@@ -608,6 +702,16 @@ message InstallCommandFailure {
 message InternalBuildMessage {
   uint32 stream_id = 1;
   string content = 2;
+}
+
+message InvalidImageUserFailure {
+  string user = 1;
+}
+
+message IoPressureSample {
+  IoTelemetryAvailability availability = 1;
+  PressureStallLine some = 2;
+  PressureStallLine full = 3;
 }
 
 message IsoDevContainerMetadata {
@@ -742,12 +846,16 @@ message PersistedDevContainerConfig {
   ContainerRuntime container_runtime = 27;
   FirecrackerVersion firecracker_version = 28;
   optional bool enable_lazy_v3_squashfs_snapshot_load = 29;
+  optional bool enable_lazy_v4_load = 30;
+  optional bool enable_writable_ublk_load = 31;
+  optional bool enable_writable_ublk_eager_hydrate = 32;
 }
 
 message PersistedDriveDescriptor {
   oneof descriptor {
     PersistedFileDriveDescriptor file_v1 = 1;
     PersistedLazySquashfsDriveDescriptor lazy_squashfs_v1 = 2;
+    PersistedWritableUblkDriveDescriptor writable_ublk_v1 = 3;
   }
 }
 
@@ -792,6 +900,8 @@ message PersistedLazySquashfsDriveDescriptor {
   string drive_id = 1;
   string guest_path = 2;
   uint64 chunk_size = 4;
+  optional BlobStorageFormat blob_storage_format = 6;
+  optional V4RootArchiveOptions v4_root_archive_options = 7;
 }
 
 message PersistedLocalRepoSource {
@@ -822,6 +932,22 @@ message PersistedTarGzipUrlSource {
 
 message PersistedTarRepoSource {
   string name = 1;
+}
+
+message PersistedWritableUblkDriveDescriptor {
+  oneof source {
+    PersistedLazySnapshotSource snapshot = 3;
+    PersistedLazyCheckpointSource checkpoint = 4;
+    PersistedZeroBlockSource zero = 8;
+  }
+  string drive_id = 1;
+  string guest_path = 2;
+  WritableFilesystem filesystem = 5;
+  string overlay_artifact_reference = 6;
+  uint64 device_size_bytes = 7;
+}
+
+message PersistedZeroBlockSource {
 }
 
 message Pod {
@@ -856,7 +982,8 @@ message Pod {
   optional string started_from_checkpoint_id = 30;
   optional AntiAffinityTags anti_affinity_tags = 31;
   optional bool collect_metrics = 32;
-  repeated string mesh_link_target_pod_ids = 33;
+  repeated PodMeshLink mesh_links = 34;
+  ContainerRuntime container_runtime = 35;
 }
 
 message PodCollection {
@@ -966,12 +1093,25 @@ message PodIdentity {
   string pod_id = 2;
 }
 
+message PodIoExperience {
+  uint64 sampled_at_monotonic_nanoseconds = 1;
+  IoPressureSample vm_io_pressure = 2;
+  IoPressureSample cgroup_io_pressure = 3;
+  IoTelemetryAvailability block_stats_availability = 4;
+  repeated GuestBlockDeviceCounters block_devices = 5;
+}
+
 message PodMemoryBreakdown {
   uint64 all_process_rss_bytes = 1;
   uint64 process_rss_count = 2;
   optional uint64 cgroup_anon_bytes = 3;
   optional uint64 cgroup_file_bytes = 4;
   optional uint64 cgroup_kernel_bytes = 5;
+}
+
+message PodMeshLink {
+  string target_pod_id = 1;
+  string virtual_ip = 2;
 }
 
 message PodMetricsSample {
@@ -998,6 +1138,7 @@ message PodMetricsSample {
   uint64 event_stream_subscribers_fell_behind_total = 22;
   double cpu_psi_some_avg10 = 23;
   PodMemoryBreakdown memory_breakdown = 24;
+  PodIoExperience io_experience = 25;
 }
 
 message PodPorts {
@@ -1060,6 +1201,13 @@ message PortState {
   uint32 host_port = 3;
 }
 
+message PressureStallLine {
+  double avg10 = 1;
+  double avg60 = 2;
+  double avg300 = 3;
+  uint64 total_stall_microseconds = 4;
+}
+
 message ProcessEvent {
   oneof data {
     StdoutData stdout = 2;
@@ -1084,6 +1232,7 @@ message ProcessSupervision {
   RestartPolicy restart_policy = 1;
   optional RestartBackoff backoff = 2;
   optional HttpHealthCheck health_check = 3;
+  optional string exclusive_group = 4;
 }
 
 message ProgressDetail {
@@ -1134,6 +1283,12 @@ message RestartBackoff {
   uint32 reset_after_healthy_ms = 4;
 }
 
+message RootArchivePayloadSummary {
+  uint64 logical_payload_length = 1;
+  RootArchiveCompressionAlgorithm compression_algorithm = 2;
+  uint64 compression_block_size = 3;
+}
+
 message RuntimeStatePersistentState {
   map<string, DaemonCommandHandlerPersistentState> command_handlers = 1;
 }
@@ -1173,11 +1328,20 @@ message Snapshot {
   optional string cpu_baseline_id = 19;
   optional SnapshotUsageStats usage_stats = 20;
   optional uint64 object_size_bytes = 21;
+  optional V4RootArchiveOptions v4_root_archive_options = 22;
+  optional string failure_reason = 23;
+  optional CaptureFailureDetails failure_details = 24;
 }
 
 message SnapshotCollection {
   repeated Snapshot items = 1;
   optional string next_cursor = 2;
+}
+
+message SnapshotDriveArtifactFile {
+  string artifact_reference = 1;
+  repeated SnapshotFileChunk file_chunks = 2;
+  uint64 file_size = 3;
 }
 
 message SnapshotExtraDriveFile {
@@ -1226,6 +1390,7 @@ message SnapshotVmSnapshotV1Metadata {
   SnapshotFileChunk kernel_file_chunk = 5;
   IsoDevContainerMetadata dev_container_metadata = 6;
   repeated SnapshotExtraDriveFile extra_drive_files = 7;
+  repeated SnapshotDriveArtifactFile drive_artifact_files = 8;
 }
 
 message SnapshotVmSnapshotV2Metadata {
@@ -1241,6 +1406,7 @@ message SnapshotVmSnapshotV2Metadata {
   optional SnapshotMemoryPrefetchHint memory_prefetch_hint = 10;
   SnapshotMemoryHashAlgorithm memory_hash_algorithm = 11;
   repeated SnapshotMemoryCellAttributes memory_cell_attrs = 12;
+  repeated SnapshotDriveArtifactFile drive_artifact_files = 13;
 }
 
 message SpanEnded {
@@ -1284,6 +1450,11 @@ message TopProcess {
   uint64 threads = 6;
   uint64 num_fds = 7;
   uint64 cpu_ticks_delta = 8;
+}
+
+message V4RootArchiveOptions {
+  RootArchiveFormat format = 1;
+  optional RootArchivePayloadSummary payload_summary = 2;
 }
 
 message WaitingForWorkerStatus {

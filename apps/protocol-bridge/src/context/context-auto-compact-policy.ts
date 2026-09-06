@@ -1,5 +1,7 @@
+import { getCodexModelProfile } from "../llm/openai/codex-model-catalog"
 export interface ContextAutoCompactInput {
   backend: string
+  model?: string
   maxTokens: number
   maxOutputTokens?: number
   requestedServiceTier?: string
@@ -37,7 +39,12 @@ export function resolveAutoCompactTokenLimit(
   }
 
   if (input.backend === "codex") {
-    return Math.floor(maxTokens * 0.9)
+    const configured = input.model
+      ? normalizePositiveInteger(
+          getCodexModelProfile(input.model)?.auto_compact_token_limit
+        )
+      : undefined
+    return Math.min(configured ?? Infinity, Math.floor(maxTokens * 0.9))
   }
 
   const outputReserve = Math.min(

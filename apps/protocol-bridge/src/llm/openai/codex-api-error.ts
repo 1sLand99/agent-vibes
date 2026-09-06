@@ -9,7 +9,8 @@ export class CodexApiError extends HttpException {
     message: string,
     public readonly retryAfterSeconds?: number,
     /** Stable provider error code decoded from the Codex response body. */
-    public readonly providerCode?: string
+    public readonly providerCode?: string,
+    public readonly providerDetails?: Record<string, unknown>
   ) {
     super(
       {
@@ -18,6 +19,7 @@ export class CodexApiError extends HttpException {
           type: "api_error",
           message,
           ...(providerCode ? { code: providerCode } : {}),
+          ...(providerDetails ? { details: providerDetails } : {}),
         },
         message,
         ...(retryAfterSeconds != null

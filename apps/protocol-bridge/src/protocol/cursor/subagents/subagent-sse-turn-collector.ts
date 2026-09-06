@@ -39,6 +39,7 @@ export interface SubAgentSseTurnResult {
   /** Exact native Codex item that rendered each accepted graph fragment. */
   assistantNativeSources: SubAgentAssistantNativeSource[]
   rawResponseItems: Record<string, unknown>[]
+  needsFollowUp: boolean
   providerResponseId?: string
 }
 
@@ -64,6 +65,8 @@ export interface SubAgentSseEvent {
     item_id?: string
     status?: string
     responseId?: string
+    endTurn?: boolean
+    usageMetadata?: Record<string, unknown>
     incompleteReason?: string
     errorCode?: string
     errorMessage?: string
@@ -102,7 +105,7 @@ type OpenBlock =
 type ClosedBlock = Exclude<OpenBlock, { kind: "other" }>
 
 type NativeTerminal =
-  | { status: "completed"; responseId?: string }
+  | { status: "completed"; responseId?: string; endTurn?: boolean }
   | { status: "incomplete"; reason: string; responseId?: string }
   | {
       status: "failed"
@@ -194,7 +197,11 @@ export class SubAgentSseTurnCollector {
             )
       switch (event.data.status) {
         case "completed":
-          this.nativeTerminal = { status: "completed", responseId }
+          this.nativeTerminal = {
+            status: "completed",
+            responseId,
+            endTurn: event.data.endTurn,
+          }
           break
         case "incomplete":
           this.nativeTerminal = {
@@ -448,6 +455,9 @@ export class SubAgentSseTurnCollector {
       assistantNativeSources,
       rawResponseItems: this.rawResponseItems.map((item) => ({ ...item })),
       providerResponseId: this.nativeTerminal?.responseId ?? this.messageId,
+      needsFollowUp:
+        this.nativeTerminal?.status === "completed" &&
+        this.nativeTerminal.endTurn === false,
     }
   }
 }

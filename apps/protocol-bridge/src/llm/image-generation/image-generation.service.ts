@@ -3,6 +3,7 @@ import * as fs from "fs/promises"
 import * as path from "path"
 import { GoogleService } from "../google/google.service"
 import { CodexService } from "../openai/codex.service"
+import { normalizeImageAspectRatio } from "./image-aspect-ratio"
 
 export type ImageGenerationProvider = "codex" | "gemini"
 
@@ -17,6 +18,7 @@ export interface ImageGenerationInput {
   model?: string
   conversationId?: string
   outputFormat?: string
+  aspectRatio?: string
   referenceImagePaths?: string[]
   referenceImages?: ImageGenerationReference[]
 }
@@ -45,13 +47,18 @@ export class ImageGenerationService {
     if (!prompt) {
       throw new Error("Image generation prompt is required")
     }
+    const request = {
+      ...input,
+      prompt,
+      aspectRatio: normalizeImageAspectRatio(input.aspectRatio),
+    }
 
     const errors: string[] = []
-    for (const provider of this.resolveProviderOrder(input)) {
+    for (const provider of this.resolveProviderOrder(request)) {
       try {
         return provider === "gemini"
-          ? await this.generateWithGemini({ ...input, prompt })
-          : await this.generateWithCodex({ ...input, prompt })
+          ? await this.generateWithGemini(request)
+          : await this.generateWithCodex(request)
       } catch (error) {
         const normalized = this.toError(error)
         errors.push(`${provider}: ${normalized.message}`)
@@ -72,7 +79,8 @@ export class ImageGenerationService {
     const hasReferenceImages =
       (input.referenceImages?.length || 0) > 0 ||
       (input.referenceImagePaths?.length || 0) > 0
-    if (hasReferenceImages) {
+    // Do not silently drop an exact aspect ratio during provider fallback.
+    if (hasReferenceImages || input.aspectRatio) {
       return ["gemini"]
     }
 
@@ -115,6 +123,7 @@ export class ImageGenerationService {
       conversationId: input.conversationId,
       outputFormat: input.outputFormat,
       referenceImages: references,
+      aspectRatio: input.aspectRatio,
     })
     return {
       ...result,

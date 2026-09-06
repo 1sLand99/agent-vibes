@@ -7,6 +7,11 @@
  */
 
 import { parseModelRequest } from "./model-request"
+import {
+  getCodexModelProfile,
+  listCodexModelProfiles,
+  codexCapabilitiesFromProfile,
+} from "../openai/codex-model-catalog"
 
 // ---------------------------------------------------------------------------
 // Model Families
@@ -28,6 +33,9 @@ export interface CodexRequestCapabilities {
   defaultVerbosity?: string
   supportsParallelToolCalls: boolean
   useResponsesLite: boolean
+  supportsReasoningSummaryParameter?: boolean
+  compactionModelHash?: string
+  autoCompactTokenLimit?: number
   supportsReasoningSummaries: boolean
   supportsOriginalImageDetail: boolean
   supportsImages: boolean
@@ -81,50 +89,6 @@ function createLevelThinkingCapability(
         ? "high"
         : levels[levels.length - 1] || undefined),
   }
-}
-
-const CODEX_PRIORITY_SERVICE_TIERS = ["priority"] as const
-const CODEX_STANDARD_CONTEXT_TOKEN_LIMIT = 272_000
-const CODEX_SPARK_CONTEXT_TOKEN_LIMIT = 120_000
-const CODEX_MAX_CONTEXT_TOKEN_LIMIT = 1_000_000
-const CODEX_GPT56_CONTEXT_TOKEN_LIMIT = 372_000
-const CODEX_TRUNCATION_POLICY_TOKENS_10K = {
-  mode: "tokens",
-  limit: 10_000,
-} as const satisfies CodexTruncationPolicyConfig
-const CODEX_TRUNCATION_POLICY_BYTES_10K = {
-  mode: "bytes",
-  limit: 10_000,
-} as const satisfies CodexTruncationPolicyConfig
-
-function createCodexRequestCapabilities(
-  overrides: Partial<CodexRequestCapabilities> = {}
-): CodexRequestCapabilities {
-  return {
-    supportsVerbosity: true,
-    defaultVerbosity: "low",
-    supportsParallelToolCalls: true,
-    useResponsesLite: false,
-    supportsReasoningSummaries: true,
-    supportsOriginalImageDetail: true,
-    supportsImages: true,
-    supportedServiceTiers: [],
-    ...overrides,
-    truncationPolicy: overrides.truncationPolicy
-      ? { ...overrides.truncationPolicy }
-      : undefined,
-  }
-}
-
-function createCodexCatalogCapabilities(
-  overrides: Partial<CodexRequestCapabilities> = {}
-): CodexRequestCapabilities {
-  return createCodexRequestCapabilities({
-    contextTokenLimit: CODEX_STANDARD_CONTEXT_TOKEN_LIMIT,
-    contextTokenLimitForMaxMode: CODEX_MAX_CONTEXT_TOKEN_LIMIT,
-    truncationPolicy: CODEX_TRUNCATION_POLICY_TOKENS_10K,
-    ...overrides,
-  })
 }
 
 function inferPassthroughGptThinkingCapability(
@@ -473,208 +437,6 @@ const CODEX_MODELS: Record<
   Omit<ModelEntry, "family" | "isClaudeThroughGoogle">
 > = {
   // --- GPT-5 ---
-  "gpt-5": {
-    cloudCodeId: "gpt-5",
-    displayName: "GPT-5",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["minimal", "low", "medium", "high"],
-      "medium"
-    ),
-    codex: createCodexRequestCapabilities({
-      supportsOriginalImageDetail: false,
-    }),
-  },
-  "gpt-5-codex": {
-    cloudCodeId: "gpt-5-codex",
-    displayName: "GPT-5 Codex",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high"],
-      "medium"
-    ),
-    codex: createCodexRequestCapabilities(),
-  },
-  "gpt-5-codex-mini": {
-    cloudCodeId: "gpt-5-codex-mini",
-    displayName: "GPT-5 Codex Mini",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high"],
-      "medium"
-    ),
-    codex: createCodexRequestCapabilities(),
-  },
-  "gpt-5.1": {
-    cloudCodeId: "gpt-5.1",
-    displayName: "GPT-5.1",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["none", "low", "medium", "high"],
-      "medium"
-    ),
-    codex: createCodexRequestCapabilities({
-      supportsOriginalImageDetail: false,
-    }),
-  },
-  "gpt-5.1-codex": {
-    cloudCodeId: "gpt-5.1-codex",
-    displayName: "GPT-5.1 Codex",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high"],
-      "medium"
-    ),
-    codex: createCodexRequestCapabilities(),
-  },
-  "gpt-5.1-codex-mini": {
-    cloudCodeId: "gpt-5.1-codex-mini",
-    displayName: "GPT-5.1 Codex Mini",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high"],
-      "medium"
-    ),
-    codex: createCodexRequestCapabilities(),
-  },
-  "gpt-5.1-codex-max": {
-    cloudCodeId: "gpt-5.1-codex-max",
-    displayName: "GPT-5.1 Codex Max",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high", "xhigh"],
-      "medium"
-    ),
-    codex: createCodexRequestCapabilities(),
-  },
-  "gpt-5.2": {
-    cloudCodeId: "gpt-5.2",
-    displayName: "GPT-5.2",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["none", "low", "medium", "high", "xhigh"],
-      "medium"
-    ),
-    codex: createCodexCatalogCapabilities({
-      supportsOriginalImageDetail: false,
-      truncationPolicy: CODEX_TRUNCATION_POLICY_BYTES_10K,
-    }),
-  },
-  "gpt-5.2-codex": {
-    cloudCodeId: "gpt-5.2-codex",
-    displayName: "GPT-5.2 Codex",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high", "xhigh"],
-      "medium"
-    ),
-    codex: createCodexRequestCapabilities(),
-  },
-  "gpt-5.3-codex": {
-    cloudCodeId: "gpt-5.3-codex",
-    displayName: "GPT-5.3 Codex",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high", "xhigh"],
-      "medium"
-    ),
-    codex: createCodexCatalogCapabilities(),
-  },
-  "gpt-5.3-codex-spark": {
-    cloudCodeId: "gpt-5.3-codex-spark",
-    displayName: "GPT-5.3 Codex Spark",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high", "xhigh"],
-      "medium"
-    ),
-    codex: createCodexRequestCapabilities({
-      supportsImages: false,
-      contextTokenLimit: CODEX_SPARK_CONTEXT_TOKEN_LIMIT,
-      contextTokenLimitForMaxMode: CODEX_SPARK_CONTEXT_TOKEN_LIMIT,
-      truncationPolicy: CODEX_TRUNCATION_POLICY_TOKENS_10K,
-    }),
-  },
-  "gpt-5.6-sol": {
-    cloudCodeId: "gpt-5.6-sol",
-    displayName: "GPT-5.6 Sol",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high", "xhigh", "max", "ultra"],
-      "medium"
-    ),
-    codex: createCodexCatalogCapabilities({
-      contextTokenLimit: CODEX_GPT56_CONTEXT_TOKEN_LIMIT,
-      contextTokenLimitForMaxMode: CODEX_GPT56_CONTEXT_TOKEN_LIMIT,
-      supportedServiceTiers: CODEX_PRIORITY_SERVICE_TIERS,
-    }),
-  },
-  "gpt-5.6-terra": {
-    cloudCodeId: "gpt-5.6-terra",
-    displayName: "GPT-5.6 Terra",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high", "xhigh", "max", "ultra"],
-      "medium"
-    ),
-    codex: createCodexCatalogCapabilities({
-      contextTokenLimit: CODEX_GPT56_CONTEXT_TOKEN_LIMIT,
-      contextTokenLimitForMaxMode: CODEX_GPT56_CONTEXT_TOKEN_LIMIT,
-      supportedServiceTiers: CODEX_PRIORITY_SERVICE_TIERS,
-    }),
-  },
-  "gpt-5.6-luna": {
-    cloudCodeId: "gpt-5.6-luna",
-    displayName: "GPT-5.6 Luna",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high", "xhigh", "max", "ultra"],
-      "medium"
-    ),
-    codex: createCodexCatalogCapabilities({
-      contextTokenLimit: CODEX_GPT56_CONTEXT_TOKEN_LIMIT,
-      contextTokenLimitForMaxMode: CODEX_GPT56_CONTEXT_TOKEN_LIMIT,
-      supportedServiceTiers: CODEX_PRIORITY_SERVICE_TIERS,
-    }),
-  },
-  "gpt-5.5": {
-    cloudCodeId: "gpt-5.5",
-    displayName: "GPT-5.5",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high", "xhigh"],
-      "medium"
-    ),
-    codex: createCodexCatalogCapabilities({
-      supportedServiceTiers: CODEX_PRIORITY_SERVICE_TIERS,
-    }),
-  },
-  "gpt-5.4": {
-    cloudCodeId: "gpt-5.4",
-    displayName: "GPT-5.4",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high", "xhigh"],
-      "medium"
-    ),
-    codex: createCodexCatalogCapabilities({
-      contextTokenLimitForMaxMode: CODEX_MAX_CONTEXT_TOKEN_LIMIT,
-      supportedServiceTiers: CODEX_PRIORITY_SERVICE_TIERS,
-    }),
-  },
-  "gpt-5.4-mini": {
-    cloudCodeId: "gpt-5.4-mini",
-    displayName: "GPT-5.4 Mini",
-    isThinking: true,
-    thinking: createLevelThinkingCapability(
-      ["low", "medium", "high", "xhigh"],
-      "medium"
-    ),
-    codex: createCodexCatalogCapabilities({
-      defaultVerbosity: "medium",
-    }),
-  },
-
   // --- GPT-4.1 ---
   "gpt-4.1": {
     cloudCodeId: "gpt-4.1",
@@ -730,100 +492,14 @@ const CODEX_MODELS: Record<
     displayName: "Codex Mini",
     isThinking: true,
     thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
-    codex: createCodexRequestCapabilities(),
   },
   "codex-mini-latest": {
     cloudCodeId: "codex-mini-latest",
     displayName: "Codex Mini Latest",
     isThinking: true,
     thinking: createLevelThinkingCapability(["low", "medium", "high", "xhigh"]),
-    codex: createCodexRequestCapabilities(),
   },
 }
-
-const CODEX_GPT5_MODEL_IDS_BY_TIER: Record<CodexModelTier, readonly string[]> =
-  {
-    free: [
-      "gpt-5",
-      "gpt-5-codex",
-      "gpt-5-codex-mini",
-      "gpt-5.1",
-      "gpt-5.1-codex",
-      "gpt-5.1-codex-mini",
-      "gpt-5.1-codex-max",
-      "gpt-5.2",
-      "gpt-5.2-codex",
-      "gpt-5.3-codex",
-      "gpt-5.6-sol",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
-      "gpt-5.5",
-      "gpt-5.4",
-      "gpt-5.4-mini",
-    ],
-    team: [
-      "gpt-5",
-      "gpt-5-codex",
-      "gpt-5-codex-mini",
-      "gpt-5.1",
-      "gpt-5.1-codex",
-      "gpt-5.1-codex-mini",
-      "gpt-5.1-codex-max",
-      "gpt-5.2",
-      "gpt-5.2-codex",
-      "gpt-5.3-codex",
-      "gpt-5.6-sol",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
-      "gpt-5.5",
-      "gpt-5.4",
-      "gpt-5.4-mini",
-    ],
-    plus: [
-      "gpt-5",
-      "gpt-5-codex",
-      "gpt-5-codex-mini",
-      "gpt-5.1",
-      "gpt-5.1-codex",
-      "gpt-5.1-codex-mini",
-      "gpt-5.1-codex-max",
-      "gpt-5.2",
-      "gpt-5.2-codex",
-      "gpt-5.3-codex",
-      "gpt-5.3-codex-spark",
-      "gpt-5.6-sol",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
-      "gpt-5.5",
-      "gpt-5.4",
-      "gpt-5.4-mini",
-    ],
-    pro: [
-      "gpt-5",
-      "gpt-5-codex",
-      "gpt-5-codex-mini",
-      "gpt-5.1",
-      "gpt-5.1-codex",
-      "gpt-5.1-codex-mini",
-      "gpt-5.1-codex-max",
-      "gpt-5.2",
-      "gpt-5.2-codex",
-      "gpt-5.3-codex",
-      "gpt-5.3-codex-spark",
-      "gpt-5.6-sol",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
-      "gpt-5.5",
-      "gpt-5.4",
-      "gpt-5.4-mini",
-    ],
-  }
-
-const CODEX_OFFICIAL_MODEL_IDS = Array.from(
-  new Set(Object.values(CODEX_GPT5_MODEL_IDS_BY_TIER).flat())
-)
-
-const CHATGPT_CODEX_MODEL_IDS = new Set(CODEX_OFFICIAL_MODEL_IDS)
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -836,7 +512,7 @@ export const DEFAULT_GEMINI_MODEL = "gemini-3.1-pro-high"
 export const DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-5"
 
 /** Default Codex model when no mapping found */
-export const DEFAULT_CODEX_MODEL = "gpt-5-codex-mini"
+export const DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 
 const PUBLIC_MODEL_METADATA: Record<string, PublicModelMetadata> = {
   "claude-sonnet-4-5-20250929": {
@@ -1057,6 +733,21 @@ export function resolveCloudCodeModel(alias: string): ModelEntry | null {
   }
 
   // Check Codex (OpenAI) models
+  const profile = getCodexModelProfile(normalized)
+  if (profile) {
+    return {
+      cloudCodeId: profile.slug,
+      displayName: profile.display_name,
+      family: "gpt",
+      isThinking: profile.supported_reasoning_levels.length > 0,
+      thinking: createLevelThinkingCapability(
+        profile.supported_reasoning_levels.map((x) => x.effort),
+        profile.default_reasoning_level
+      ),
+      codex: codexCapabilitiesFromProfile(profile),
+      isClaudeThroughGoogle: false,
+    }
+  }
   const codex = CODEX_MODELS[normalized]
   if (codex) {
     return {
@@ -1095,12 +786,8 @@ export function resolveCodexRequestCapabilities(
     return null
   }
 
-  const resolved = resolveCloudCodeModel(normalized)
-  if (!resolved || resolved.family !== "gpt") {
-    return null
-  }
-
-  return resolved.codex || null
+  const profile = getCodexModelProfile(normalized)
+  return profile ? codexCapabilitiesFromProfile(profile) : null
 }
 
 export function resolveModelThinkingCapability(
@@ -1420,173 +1107,24 @@ export const CLAUDE_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
   },
 ]
 
-const DEFAULT_VISIBLE_CODEX_CURSOR_MODEL_IDS = new Set([
-  "gpt-5.6-sol",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-  "gpt-5.5",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5.3-codex",
-  "gpt-5.3-codex-spark",
-  "gpt-5.2",
-])
-
-function withCodexCursorDisplayCapabilities(
-  model: CursorDisplayModel
+function codexDisplayModel(
+  profile: ReturnType<typeof listCodexModelProfiles>[number]
 ): CursorDisplayModel {
-  const capabilities = CODEX_MODELS[model.name]?.codex
-  if (!capabilities) {
-    return model
-  }
-
   return {
-    ...model,
-    supportsImages: capabilities.supportsImages,
-    contextTokenLimit:
-      capabilities.contextTokenLimit ?? model.contextTokenLimit,
-    contextTokenLimitForMaxMode:
-      capabilities.contextTokenLimitForMaxMode ??
-      capabilities.contextTokenLimit ??
-      model.contextTokenLimitForMaxMode,
+    name: profile.slug,
+    displayName: profile.display_name,
+    shortName: profile.display_name,
+    family: "gpt",
+    isThinking: profile.supported_reasoning_levels.length > 0,
+    isHidden: profile.visibility !== "list",
+    supportsImages: profile.input_modalities.includes("image"),
+    contextTokenLimit: profile.context_window,
+    contextTokenLimitForMaxMode: profile.max_context_window,
   }
 }
-
-const RAW_BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
-  {
-    name: "gpt-5.6-sol",
-    displayName: "GPT-5.6 Sol",
-    shortName: "GPT-5.6 Sol",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.6-terra",
-    displayName: "GPT-5.6 Terra",
-    shortName: "GPT-5.6 Terra",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.6-luna",
-    displayName: "GPT-5.6 Luna",
-    shortName: "GPT-5.6 Luna",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.5",
-    displayName: "GPT-5.5",
-    shortName: "GPT-5.5",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.4",
-    displayName: "GPT-5.4",
-    shortName: "GPT-5.4",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.4-mini",
-    displayName: "GPT-5.4 Mini",
-    shortName: "GPT-5.4 Mini",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.3-codex",
-    displayName: "GPT-5.3 Codex",
-    shortName: "GPT-5.3 Codex",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.2",
-    displayName: "GPT-5.2",
-    shortName: "GPT-5.2",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5",
-    displayName: "GPT-5",
-    shortName: "GPT-5",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5-codex",
-    displayName: "GPT-5 Codex",
-    shortName: "GPT-5 Codex",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5-codex-mini",
-    displayName: "GPT-5 Codex Mini",
-    shortName: "GPT-5 Mini",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.1",
-    displayName: "GPT-5.1",
-    shortName: "GPT-5.1",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.1-codex",
-    displayName: "GPT-5.1 Codex",
-    shortName: "GPT-5.1 Codex",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.1-codex-mini",
-    displayName: "GPT-5.1 Codex Mini",
-    shortName: "GPT-5.1 Mini",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.1-codex-max",
-    displayName: "GPT-5.1 Codex Max",
-    shortName: "GPT-5.1 Max",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.2-codex",
-    displayName: "GPT-5.2 Codex",
-    shortName: "GPT-5.2 Codex",
-    family: "gpt",
-    isThinking: true,
-  },
-  {
-    name: "gpt-5.3-codex-spark",
-    displayName: "GPT-5.3 Codex Spark",
-    shortName: "GPT-5.3 Spark",
-    family: "gpt",
-    isThinking: true,
-  },
-]
-
 export const BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] =
-  RAW_BASE_CODEX_CURSOR_DISPLAY_MODELS.map(withCodexCursorDisplayCapabilities)
-
-export const CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] =
-  BASE_CODEX_CURSOR_DISPLAY_MODELS.map(
-    (model): CursorDisplayModel =>
-      DEFAULT_VISIBLE_CODEX_CURSOR_MODEL_IDS.has(model.name)
-        ? model
-        : {
-            ...model,
-            isHidden: true,
-          }
-  )
+  listCodexModelProfiles().map(codexDisplayModel)
+export const CODEX_CURSOR_DISPLAY_MODELS = BASE_CODEX_CURSOR_DISPLAY_MODELS
 
 const ALL_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
   ...CLAUDE_CURSOR_DISPLAY_MODELS,
@@ -1603,6 +1141,10 @@ const CURSOR_DISPLAY_MODEL_BY_NAME = new Map(
 export function getCursorDisplayModel(
   modelId: string
 ): CursorDisplayModel | null {
+  const profile = getCodexModelProfile(
+    parseModelRequest(modelId).normalizedBaseModel
+  )
+  if (profile) return codexDisplayModel(profile)
   return (
     CURSOR_DISPLAY_MODEL_BY_NAME.get(
       parseModelRequest(modelId).normalizedBaseModel
@@ -1717,14 +1259,13 @@ export function getCodexCursorDisplayModels(
   const excludeMaxNamedModels = options.excludeMaxNamedModels ?? false
   const normalizedTier = normalizeCodexModelTier(options.codexModelTier)
 
-  const allowedModelIds = new Set<string>(
-    normalizedTier
-      ? CODEX_GPT5_MODEL_IDS_BY_TIER[normalizedTier]
-      : CODEX_OFFICIAL_MODEL_IDS
-  )
-  let models = CODEX_CURSOR_DISPLAY_MODELS.filter((model) =>
-    allowedModelIds.has(model.name)
-  )
+  let models = listCodexModelProfiles()
+    .filter(
+      (profile) =>
+        !normalizedTier ||
+        supportsCodexModelForTier(profile.slug, normalizedTier)
+    )
+    .map(codexDisplayModel)
 
   if (excludeMaxNamedModels) {
     models = models.filter((model) => !model.name.includes("max"))
@@ -1737,9 +1278,16 @@ export function getCodexModelIdsForTier(
   tier?: string | null
 ): readonly string[] {
   const normalizedTier = normalizeCodexModelTier(tier)
-  return normalizedTier
-    ? CODEX_GPT5_MODEL_IDS_BY_TIER[normalizedTier]
-    : CODEX_OFFICIAL_MODEL_IDS
+  return listCodexModelProfiles()
+    .filter(
+      (p) =>
+        !normalizedTier ||
+        p.available_in_plans.length === 0 ||
+        p.available_in_plans.some(
+          (plan) => normalizeCodexModelTier(plan) === normalizedTier
+        )
+    )
+    .map((p) => p.slug)
 }
 
 export function supportsCodexModelForTier(
@@ -1765,7 +1313,7 @@ export function isChatGptCodexModelSupported(modelId: string): boolean {
     return false
   }
 
-  return CHATGPT_CODEX_MODEL_IDS.has(normalized)
+  return getCodexModelProfile(normalized) !== undefined
 }
 
 export function getCursorDisplayModels(

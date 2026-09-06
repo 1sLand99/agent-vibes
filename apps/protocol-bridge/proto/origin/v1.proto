@@ -4,9 +4,27 @@ package origin.v1;
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/value.proto";
 
+enum AppInstallRequestOutcome {
+  APP_INSTALL_REQUEST_OUTCOME_UNSPECIFIED = 0;
+  APP_INSTALL_REQUEST_OUTCOME_CREATED = 1;
+  APP_INSTALL_REQUEST_OUTCOME_ALREADY_PENDING = 2;
+  APP_INSTALL_REQUEST_OUTCOME_DENIED_COOLDOWN = 3;
+  APP_INSTALL_REQUEST_OUTCOME_ALREADY_INSTALLED = 4;
+}
+
+enum AtlasFreshness {
+  ATLAS_FRESHNESS_UNSPECIFIED = 0;
+  ATLAS_FRESHNESS_EAGER = 1;
+  ATLAS_FRESHNESS_BALANCED = 2;
+  ATLAS_FRESHNESS_RELAXED = 3;
+  ATLAS_FRESHNESS_MANUAL = 4;
+}
+
 enum AuthorizedNamespaceAccessReason {
   AUTHORIZED_NAMESPACE_ACCESS_REASON_UNSPECIFIED = 0;
   AUTHORIZED_NAMESPACE_ACCESS_REASON_TEAM_OWNERSHIP = 1;
+  AUTHORIZED_NAMESPACE_ACCESS_REASON_USER_OWNERSHIP = 2;
+  AUTHORIZED_NAMESPACE_ACCESS_REASON_EXPLICIT_GRANT = 3;
 }
 
 enum AuthPolicyAppliesTo {
@@ -36,6 +54,13 @@ enum ChangeStatus {
   CHANGE_STATUS_CLOSED = 4;
 }
 
+enum CheckRunAnnotationLevel {
+  CHECK_RUN_ANNOTATION_LEVEL_UNSPECIFIED = 0;
+  CHECK_RUN_ANNOTATION_LEVEL_NOTICE = 1;
+  CHECK_RUN_ANNOTATION_LEVEL_WARNING = 2;
+  CHECK_RUN_ANNOTATION_LEVEL_FAILURE = 3;
+}
+
 enum CheckRunConclusion {
   CHECK_RUN_CONCLUSION_UNSPECIFIED = 0;
   success = 1;
@@ -53,6 +78,13 @@ enum CheckRunLifecycleStatus {
   queued = 1;
   in_progress = 2;
   completed = 3;
+}
+
+enum CodeIntelligenceProvenance {
+  CODE_INTELLIGENCE_PROVENANCE_UNSPECIFIED = 0;
+  CODE_INTELLIGENCE_PROVENANCE_EXACT_SCIP = 1;
+  CODE_INTELLIGENCE_PROVENANCE_HYBRID = 2;
+  CODE_INTELLIGENCE_PROVENANCE_SEARCH = 3;
 }
 
 enum CommentSide {
@@ -109,6 +141,8 @@ enum RepoKind {
   REPO_KIND_UNSPECIFIED = 0;
   REPO_KIND_STANDARD = 1;
   REPO_KIND_CURSOR_MARKETPLACE = 2;
+  REPO_KIND_ORIGIN_NATIVE_CURSOR_MARKETPLACE = 3;
+  REPO_KIND_AGENT_TEMP = 4;
 }
 
 enum RepoMirrorTransition {
@@ -129,6 +163,10 @@ enum RepoMirrorTransitionJobPhase {
   REPO_MIRROR_TRANSITION_JOB_PHASE_ROLLING_BACK = 7;
   REPO_MIRROR_TRANSITION_JOB_PHASE_COMPLETED = 8;
   REPO_MIRROR_TRANSITION_JOB_PHASE_INITIALIZING_MIRROR_FETCH = 9;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_ENABLING_GITHUB_FENCE = 10;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_VERIFYING_INTEGRITY = 11;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_REOPENING_INBOUND_MIRROR = 12;
+  REPO_MIRROR_TRANSITION_JOB_PHASE_SNAPSHOTTING_REFS = 13;
 }
 
 enum RepoMirrorTransitionJobStatus {
@@ -138,6 +176,7 @@ enum RepoMirrorTransitionJobStatus {
   REPO_MIRROR_TRANSITION_JOB_STATUS_SUCCEEDED = 3;
   REPO_MIRROR_TRANSITION_JOB_STATUS_FAILED_ROLLED_BACK = 4;
   REPO_MIRROR_TRANSITION_JOB_STATUS_REQUIRES_ATTENTION = 5;
+  REPO_MIRROR_TRANSITION_JOB_STATUS_SUPERSEDED = 6;
 }
 
 enum RepoSelectionMode {
@@ -170,8 +209,7 @@ enum RulesetBypassActorKind {
   RULESET_BYPASS_ACTOR_KIND_USER = 1;
   RULESET_BYPASS_ACTOR_KIND_TEAM = 2;
   RULESET_BYPASS_ACTOR_KIND_APP = 3;
-  RULESET_BYPASS_ACTOR_KIND_ORGANIZATION_ADMIN = 4;
-  RULESET_BYPASS_ACTOR_KIND_REPOSITORY_ROLE = 5;
+  RULESET_BYPASS_ACTOR_KIND_ORIGIN_ROLE = 6;
 }
 
 enum RulesetBypassMode {
@@ -240,6 +278,17 @@ enum UpdateChangeBranchMethod {
   UPDATE_CHANGE_BRANCH_METHOD_MERGE_COMMIT = 1;
 }
 
+message AcceptShareInviteRequest {
+  oneof locator {
+    string token = 1;
+    string invite_id = 2;
+  }
+}
+
+message AcceptShareInviteResponse {
+  ClientRepoIdentifier repository = 1;
+}
+
 message ActorWithDisplay {
   string id = 1;
   string kind = 2;
@@ -247,10 +296,22 @@ message ActorWithDisplay {
   string avatar_url = 4;
 }
 
+message AddAppSigningKeyRequest {
+  string app_id = 1;
+  string public_key = 2;
+}
+
+message AddAppSigningKeyResponse {
+  AppSigningKey key = 1;
+}
+
 message AddAssigneeRequest {
   oneof target {
     string auth_id = 2;
     string group_id = 3;
+    int64 cursor_user_id = 4;
+    int64 cursor_group_id = 5;
+    string user_id = 6;
   }
   ChangeIdentifier change = 1;
 }
@@ -263,6 +324,7 @@ message AddCommentToThreadRequest {
   ChangeIdentifier change = 1;
   string thread_id = 2;
   string body = 3;
+  string review_id = 4;
 }
 
 message AddCommentToThreadResponse {
@@ -291,26 +353,28 @@ message App {
   string slug = 2;
   string display_name = 3;
   string webhook_url = 4;
-  string public_key = 5;
   bool is_public = 6;
   string namespace_slug = 7;
   repeated string events = 8;
-  repeated AppAuthPolicyStatement auth_policy_statements = 9;
   string created_at = 10;
   string updated_at = 11;
   repeated string installation_redirect_uris = 12;
   string icon_url = 13;
   string description = 14;
   string website_url = 15;
+  repeated string default_scopes = 16;
 }
 
-message AppAuthPolicyStatement {
-  string resource_kind = 1;
-  string action = 2;
+message AppDefaultScopesReplace {
+  repeated string scopes = 1;
 }
 
-message AppAuthPolicyStatementsReplace {
-  repeated AppAuthPolicyStatement statements = 1;
+message AppDisplayMetadata {
+  string id = 1;
+  string slug = 2;
+  string display_name = 3;
+  optional string icon_url = 4;
+  optional string description = 5;
 }
 
 message AppEventsReplace {
@@ -319,6 +383,18 @@ message AppEventsReplace {
 
 message AppInstallationRedirectUrisReplace {
   repeated string installation_redirect_uris = 1;
+}
+
+message AppInstallRequest {
+  string id = 1;
+  ActorWithDisplay requester = 2;
+  optional string note = 3;
+  string created_at = 4;
+}
+
+message AppInstallRequestGroup {
+  AppDisplayMetadata app = 1;
+  repeated AppInstallRequest requests = 2;
 }
 
 message ApplyReviewRequestChangesRequest {
@@ -338,6 +414,54 @@ message AppMetadata {
   string icon_url = 5;
   string description = 6;
   string website_url = 7;
+  repeated string default_scopes = 8;
+  string install_redirect_uri = 9;
+}
+
+message AppSigningKey {
+  string kid = 1;
+  string created_at = 2;
+}
+
+message AppStats {
+  uint32 installation_count = 1;
+}
+
+message AppWorkloadIdentityClaimMatcher {
+  string path = 1;
+  optional string exact = 2;
+  optional string regex = 3;
+}
+
+message AppWorkloadIdentityPoliciesReplace {
+  repeated AppWorkloadIdentityPolicy policies = 1;
+}
+
+message AppWorkloadIdentityPolicy {
+  string issuer_family = 1;
+  string issuer = 2;
+  optional string subject_exact = 3;
+  optional string subject_regex = 4;
+  repeated AppWorkloadIdentityClaimMatcher claims = 5;
+  optional bool enabled = 6;
+}
+
+message AtlasLayerStatus {
+  string layer = 1;
+  string label = 2;
+  bool enabled = 3;
+  int32 generated_nodes = 4;
+  int32 pending_nodes = 5;
+  string last_gen_at = 6;
+}
+
+message AtlasNodeLayerContent {
+  string layer = 1;
+  string label = 2;
+  string content_markdown = 3;
+  string digest_json = 4;
+  string status = 5;
+  string last_gen_at = 6;
 }
 
 message AuthorizedNamespace {
@@ -385,6 +509,15 @@ message BuildkiteTrigger {
   repeated string branch_filters = 7;
 }
 
+message CancelMyAppInstallRequestRequest {
+  string namespace_id = 1;
+  string app_id = 2;
+}
+
+message CancelMyAppInstallRequestResponse {
+  bool canceled = 1;
+}
+
 message CanMergeClientRequest {
   ClientRepoIdentifier identifier = 1;
   string ours = 2;
@@ -399,7 +532,6 @@ message Change {
   string description = 5;
   string head_ref = 6;
   string base_ref = 7;
-  string author_id = 8;
   ChangeStatus status = 9;
   google.protobuf.Timestamp created_at = 10;
   google.protobuf.Timestamp updated_at = 11;
@@ -408,11 +540,6 @@ message Change {
   optional string parent_change_id = 14;
   optional string stack_id = 15;
   optional string merge_commit_sha = 16;
-  string author_kind = 17;
-  string author_display_name = 18;
-  string author_avatar_url = 19;
-  optional string merged_by_id = 20;
-  optional string merged_by_kind = 21;
   ActorWithDisplay author = 22;
   ActorWithDisplay merged_by = 23;
 }
@@ -421,12 +548,15 @@ message ChangeAssignment {
   string id = 1;
   string change_id = 2;
   ChangeAssignmentKind kind = 3;
-  string assigned_auth_id = 4;
   string assigned_group_id = 5;
   ChangeAssignmentCreatedVia created_via = 6;
-  string created_by_auth_id = 7;
   google.protobuf.Timestamp created_at = 8;
   google.protobuf.Timestamp updated_at = 9;
+  int64 cursor_user_id = 10;
+  int64 cursor_group_id = 11;
+  OriginReviewerCandidateUser assigned_user = 12;
+  OriginReviewerCandidateGroup assigned_group = 13;
+  ActorWithDisplay created_by = 14;
 }
 
 message ChangeIdentifier {
@@ -446,7 +576,6 @@ message ChangeMergeWhenReady {
   string change_id = 2;
   string repo_uuid = 3;
   uint64 change_number = 4;
-  string enabling_user_id = 5;
   string status = 6;
   string source = 7;
   string trunk_branch = 8;
@@ -455,6 +584,23 @@ message ChangeMergeWhenReady {
   bool dev = 11;
   optional string repo_org = 12;
   optional string repo_name = 13;
+  ActorWithDisplay enabled_by = 14;
+}
+
+message ChangeMergeWhenReadySummary {
+  string id = 1;
+  string change_id = 2;
+  string repo_uuid = 3;
+  uint64 change_number = 4;
+  string status = 6;
+  string source = 7;
+  string trunk_branch = 8;
+  optional google.protobuf.Timestamp lock_expires_at = 9;
+  int32 consecutive_failed_attempts = 10;
+  bool dev = 11;
+  optional string repo_org = 12;
+  optional string repo_name = 13;
+  ActorWithDisplay enabled_by = 14;
 }
 
 message ChangesetMergeability {
@@ -544,6 +690,41 @@ message ChangeSyncTarget {
   uint64 change_number = 2;
 }
 
+message ChangeTimelineEvent {
+  string id = 1;
+  string event_type = 2;
+  google.protobuf.Timestamp created_at = 3;
+  string actor_id = 4;
+  string actor_kind = 5;
+  string actor_display_name = 6;
+  string actor_avatar_url = 7;
+  string subject_user_id = 8;
+  string subject_user_display_name = 9;
+  string subject_user_avatar_url = 10;
+  string subject_group_id = 11;
+  string label_name = 12;
+  string label_color = 13;
+  string previous_base_ref = 14;
+  string new_base_ref = 15;
+  string previous_title = 16;
+  string new_title = 17;
+  string previous_head_sha = 18;
+  string new_head_sha = 19;
+  string head_ref_name = 20;
+  string review_id = 21;
+  string dismissal_message = 22;
+  uint64 related_change_number = 23;
+}
+
+message ChangeViewerCapabilities {
+  optional bool can_write_pull_requests = 1;
+  optional bool can_write_contents = 2;
+  optional bool can_write_reviews = 3;
+  optional bool can_merge = 4;
+  optional bool can_enable_merge_when_ready = 5;
+  optional bool can_disable_merge_when_ready = 6;
+}
+
 message ChangeWithLatestVersion {
   Change change = 1;
   optional Version latest_version = 2;
@@ -562,6 +743,38 @@ message CheckRunActor {
   string display_name = 3;
   string slug = 4;
   string icon_url = 5;
+}
+
+message CheckRunAnnotation {
+  string id = 1;
+  string check_run_id = 2;
+  CheckRunAnnotationLevel annotation_level = 3;
+  string message = 4;
+  optional string title = 5;
+  optional string raw_details = 6;
+  int64 created_at_unix_ms = 7;
+  int64 updated_at_unix_ms = 8;
+  CheckRunAnnotationLocation location = 9;
+}
+
+message CheckRunAnnotationColumnRange {
+  int32 start_column = 1;
+  int32 end_column = 2;
+}
+
+message CheckRunAnnotationInput {
+  CheckRunAnnotationLevel annotation_level = 4;
+  string message = 5;
+  optional string title = 8;
+  optional string raw_details = 9;
+  CheckRunAnnotationLocation location = 11;
+}
+
+message CheckRunAnnotationLocation {
+  string path = 1;
+  int32 start_line = 2;
+  int32 end_line = 3;
+  CheckRunAnnotationColumnRange columns = 4;
 }
 
 message CheckRunGroup {
@@ -592,6 +805,7 @@ message CheckRunInput {
   optional int64 completed_at_unix_ms = 8;
   optional string details_url = 10;
   optional CheckRunOutput output = 11;
+  optional int64 deadline_at_unix_ms = 12;
 }
 
 message CheckRunOutput {
@@ -611,21 +825,11 @@ message CheckRunStatus {
   string external_id = 9;
   optional bool required = 10;
   optional CheckRunOutput output = 11;
+  optional int64 deadline_at_unix_ms = 12;
 }
 
 message CiState {
   repeated CheckRunGroup check_run_groups = 1;
-}
-
-message ClaimInboundConvergenceIntentRequest {
-  ClientRepoIdentifier identifier = 1;
-  uint64 top_change_number = 2;
-  string intent_token = 3;
-  repeated string authorized_author_ids = 4;
-  repeated string authorized_change_ids = 5;
-}
-
-message ClaimInboundConvergenceIntentResponse {
 }
 
 message ClaimInboundMirrorGithubMergeOperationRequest {
@@ -652,11 +856,36 @@ message CloseReviewRequestRequest {
   oneof target {
     string auth_id = 2;
     string group_id = 3;
+    int64 cursor_user_id = 4;
+    int64 cursor_group_id = 5;
+    string user_id = 6;
   }
   ChangeIdentifier change = 1;
 }
 
 message CloseReviewRequestResponse {
+}
+
+message CodeIntelligenceIndex {
+  string indexed_commit_sha = 1;
+  CodeIntelligenceProvenance provenance = 2;
+}
+
+message CodeIntelligenceLocation {
+  string path = 1;
+  CodeIntelligenceRange range = 2;
+}
+
+message CodeIntelligencePosition {
+  uint32 line = 1;
+  uint32 utf16_column = 2;
+}
+
+message CodeIntelligenceRange {
+  uint32 start_line = 1;
+  uint32 start_utf16_column = 2;
+  uint32 end_line = 3;
+  uint32 end_utf16_column = 4;
 }
 
 message CodeownersOwners {
@@ -679,24 +908,17 @@ message Comment {
   string change_id = 2;
   string version_id = 3;
   uint64 version_number = 4;
-  string author_id = 5;
   string body = 6;
   google.protobuf.Timestamp created_at = 7;
   google.protobuf.Timestamp updated_at = 8;
   string thread_id = 9;
-  string author_kind = 10;
-  string author_display_name = 11;
-  string author_avatar_url = 12;
   repeated CommentReactionGroup reaction_groups = 13;
   ActorWithDisplay author = 14;
+  string review_id = 15;
 }
 
 message CommentReaction {
   string emoji = 1;
-  string reactor_id = 2;
-  string reactor_kind = 3;
-  string reactor_display_name = 4;
-  string reactor_avatar_url = 5;
   bool viewer_is_reactor = 6;
   ActorWithDisplay reactor = 7;
 }
@@ -714,7 +936,6 @@ message CommentThread {
   uint64 version_number = 4;
   string review_id = 5;
   google.protobuf.Timestamp resolved_at = 6;
-  string resolved_by_id = 7;
   string path = 8;
   CommentSide side = 9;
   uint32 start_line = 10;
@@ -723,15 +944,25 @@ message CommentThread {
   google.protobuf.Timestamp created_at = 13;
   google.protobuf.Timestamp updated_at = 14;
   repeated Comment comments = 15;
-  string resolved_by_kind = 16;
-  string resolved_by_display_name = 17;
-  string resolved_by_avatar_url = 18;
   ActorWithDisplay resolved_by = 19;
   uint64 ported_to_version_number = 20;
   CommentThreadPortingStatus porting_status = 21;
   string ported_path = 22;
   uint32 ported_start_line = 23;
   uint32 ported_end_line = 24;
+  string version_head_sha = 25;
+  string version_base_sha = 26;
+  google.protobuf.Timestamp version_created_at = 27;
+}
+
+message CommitActorDisplay {
+  string display_name = 1;
+  string avatar_url = 2;
+}
+
+message CommitActorDisplays {
+  CommitActorDisplay author = 1;
+  CommitActorDisplay committer = 2;
 }
 
 message CompareCommitsClientRequest {
@@ -744,14 +975,14 @@ message CreateAppRequest {
   string slug = 1;
   string display_name = 2;
   string webhook_url = 3;
-  bool is_public = 5;
   string namespace_slug = 6;
   string public_key = 7;
   repeated string events = 8;
-  repeated AppAuthPolicyStatement auth_policy_statements = 9;
   repeated string installation_redirect_uris = 10;
   string description = 11;
   string website_url = 12;
+  repeated string default_scopes = 13;
+  repeated AppWorkloadIdentityPolicy workload_identity_policies = 14;
 }
 
 message CreateAppResponse {
@@ -771,6 +1002,16 @@ message CreateChangeRequest {
 message CreateChangeResponse {
   Change change = 1;
   Version initial_version = 2;
+}
+
+message CreateCheckRunAnnotationsRequest {
+  ClientRepoIdentifier identifier = 1;
+  string check_run_id = 2;
+  repeated CheckRunAnnotationInput annotations = 3;
+}
+
+message CreateCheckRunAnnotationsResponse {
+  repeated CheckRunAnnotation annotations = 1;
 }
 
 message CreateCommentRequest {
@@ -833,10 +1074,12 @@ message CreateInstallationRequest {
   string namespace_slug = 2;
   repeated string repo_ids = 3;
   repeated string requested_scopes = 4;
+  optional string state = 5;
 }
 
 message CreateInstallationResponse {
   Installation installation = 1;
+  string installation_receipt = 2;
 }
 
 message CreateLabelRequest {
@@ -873,6 +1116,7 @@ message CreateMirroredRepoRequest {
   string target_namespace = 2;
   optional string forge_environment = 3;
   optional RepoKind repo_kind = 4;
+  optional int64 github_installation_id = 6;
 }
 
 message CreateOriginNamespaceRequest {
@@ -883,6 +1127,15 @@ message CreateOriginNamespaceRequest {
 
 message CreateOriginNamespaceResponse {
   OriginNamespace origin_namespace = 1;
+}
+
+message CreateRepoMirrorDeployKeyRequest {
+  ClientRepoIdentifier identifier = 1;
+  bool rotate = 2;
+}
+
+message CreateRepoMirrorDeployKeyResponse {
+  RepoMirrorDeployKeyInfo deploy_key = 1;
 }
 
 message CreateRepoRequest {
@@ -897,6 +1150,16 @@ message CreateRepoResponse {
   Repo repository = 3;
 }
 
+message CreateRepoShareInviteRequest {
+  ClientRepoIdentifier identifier = 1;
+  string invitee_email = 2;
+  string policy_name = 3;
+}
+
+message CreateRepoShareInviteResponse {
+  RepoShareInvite invite = 1;
+}
+
 message CreateReviewRequest {
   ChangeIdentifier change = 1;
   ReviewVerdict verdict = 2;
@@ -908,6 +1171,16 @@ message CreateReviewResponse {
   Review review = 1;
 }
 
+message DeclineShareInviteRequest {
+  oneof locator {
+    string token = 1;
+    string invite_id = 2;
+  }
+}
+
+message DeclineShareInviteResponse {
+}
+
 message DeleteBuildkiteTriggerRequest {
   ClientRepoIdentifier repo = 1;
   string trigger_id = 2;
@@ -915,6 +1188,14 @@ message DeleteBuildkiteTriggerRequest {
 
 message DeleteBuildkiteTriggerResponse {
   string trigger_id = 1;
+}
+
+message DeleteChangeHeadBranchRequest {
+  ChangeIdentifier change = 1;
+}
+
+message DeleteChangeHeadBranchResponse {
+  bool already_deleted = 1;
 }
 
 message DeleteCommentRequest {
@@ -955,6 +1236,14 @@ message DeleteRepoClientResponse {
   string repo_uuid = 1;
 }
 
+message DeleteRepoMirrorDeployKeyRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message DeleteRepoMirrorDeployKeyResponse {
+  bool deleted = 1;
+}
+
 message DeleteRulesetRequest {
   ClientRepoIdentifier repo = 1;
   string ruleset_id = 2;
@@ -964,6 +1253,13 @@ message DeleteRulesetResponse {
   string ruleset_id = 1;
 }
 
+message DeleteSshPublicKeyRequest {
+  string id = 1;
+}
+
+message DeleteSshPublicKeyResponse {
+}
+
 message DeleteVercelTriggerRequest {
   ClientRepoIdentifier repo = 1;
   string trigger_id = 2;
@@ -971,6 +1267,15 @@ message DeleteVercelTriggerRequest {
 
 message DeleteVercelTriggerResponse {
   string trigger_id = 1;
+}
+
+message DenyAppInstallRequestsRequest {
+  string namespace_id = 1;
+  string app_id = 2;
+}
+
+message DenyAppInstallRequestsResponse {
+  uint32 denied_count = 1;
 }
 
 message DetachRepoMirrorRequest {
@@ -1052,10 +1357,47 @@ message FileViewedState {
 
 message FilterMirrorableGithubReposRequest {
   repeated GithubRepoIdentifier repos = 1;
+  optional bool org_admin_only = 2;
 }
 
 message FilterMirrorableGithubReposResponse {
   repeated GithubRepoIdentifier mirrorable_repos = 1;
+}
+
+message FindCodeIntelligenceReferencesAtPositionHeader {
+  CodeIntelligenceIndex index = 1;
+  optional ResolvedCodeIntelligenceSymbol symbol = 2;
+}
+
+message FindCodeIntelligenceReferencesAtPositionRequest {
+  ClientRepoIdentifier repo = 1;
+  string commit_sha = 2;
+  string path = 3;
+  CodeIntelligencePosition position = 4;
+}
+
+message FindCodeIntelligenceReferencesAtPositionResponse {
+  oneof chunk {
+    FindCodeIntelligenceReferencesAtPositionHeader header = 1;
+    FindCodeIntelligenceReferencesAtPositionResult result = 2;
+    FindCodeIntelligenceReferencesAtPositionTrailer trailer = 3;
+  }
+}
+
+message FindCodeIntelligenceReferencesAtPositionResult {
+  CodeIntelligenceLocation location = 1;
+  bool is_definition = 2;
+}
+
+message FindCodeIntelligenceReferencesAtPositionTrailer {
+  uint32 total_count = 1;
+}
+
+message FoldChangeRequest {
+  ChangeIdentifier change = 1;
+}
+
+message FoldChangeResponse {
 }
 
 message GeneratedCodeTour {
@@ -1064,6 +1406,10 @@ message GeneratedCodeTour {
   string result = 3;
   optional string agentic_markdown = 4;
   optional string agentic_error_message = 5;
+  optional uint32 format_version = 6;
+  optional uint32 prompt_revision = 7;
+  bool machine_generated = 8;
+  int64 updated_at_ms = 9;
 }
 
 message GetActiveMirrorTransitionJobRequest {
@@ -1081,6 +1427,7 @@ message GetAppMetadataRequest {
 
 message GetAppMetadataResponse {
   AppMetadata app = 1;
+  AppStats stats = 2;
 }
 
 message GetAppRequest {
@@ -1089,13 +1436,41 @@ message GetAppRequest {
 
 message GetAppResponse {
   App app = 1;
+  AppStats stats = 2;
+  repeated AppSigningKey signing_keys = 3;
+}
+
+message GetAtlasNodeRequest {
+  ClientRepoIdentifier repo = 1;
+  string path = 2;
+}
+
+message GetAtlasNodeResponse {
+  string last_commit = 1;
+  repeated AtlasNodeLayerContent layers = 2;
+}
+
+message GetAtlasRepoStatusRequest {
+  ClientRepoIdentifier repo = 1;
+}
+
+message GetAtlasRepoStatusResponse {
+  bool configured = 1;
+  bool enabled = 2;
+  string model = 3;
+  int32 node_count = 4;
+  repeated AtlasLayerStatus layers = 5;
+  bool refreshing = 6;
+  AtlasFreshness freshness = 7;
 }
 
 message GetAuthorizedNamespacesRequest {
+  bool include_explicit_grant_namespaces = 1;
 }
 
 message GetAuthorizedNamespacesResponse {
   repeated AuthorizedNamespace namespaces = 1;
+  bool origin_disabled_for_team = 2;
 }
 
 message GetBlameClientRequest {
@@ -1120,6 +1495,10 @@ message GetChangeMergeWhenReadyResponse {
 
 message GetChangeRequest {
   ChangeIdentifier change = 1;
+  optional bool include_head_ref_exists = 2;
+  optional bool include_merge_when_ready = 3;
+  optional bool include_commits_behind_base = 4;
+  optional bool include_viewer_capabilities = 5;
 }
 
 message GetChangeResponse {
@@ -1129,6 +1508,10 @@ message GetChangeResponse {
   repeated ChangeLabel labels = 4;
   optional google.protobuf.Timestamp viewer_last_viewed_at = 5;
   optional google.protobuf.Timestamp viewer_timeline_viewed_at = 6;
+  optional bool head_ref_exists = 7;
+  optional ChangeMergeWhenReadySummary merge_when_ready = 8;
+  optional int32 commits_behind_base = 9;
+  optional ChangeViewerCapabilities viewer_capabilities = 10;
 }
 
 message GetChangesetMergeabilityRequest {
@@ -1172,6 +1555,15 @@ message GetChangeStackResponse {
   optional string stack_id = 6;
 }
 
+message GetChangeSyncSnapshotRequest {
+  ClientRepoIdentifier identifier = 1;
+  uint64 change_number = 2;
+}
+
+message GetChangeSyncSnapshotResponse {
+  string snapshot_json = 1;
+}
+
 message GetCheckRunRequest {
   ClientRepoIdentifier identifier = 1;
   string check_run_id = 2;
@@ -1185,11 +1577,14 @@ message GetCiStateRequest {
   ClientRepoIdentifier identifier = 1;
   string sha = 2;
   optional uint64 change_number = 3;
+  optional uint64 version_number = 4;
+  optional bool use_latest_version = 5;
 }
 
 message GetCiStateResponse {
   repeated CheckRunGroup check_run_groups = 1;
   repeated MissingRequiredCheck missing_required_checks = 2;
+  optional string resolved_head_sha = 3;
 }
 
 message GetCollectedPullRequestDiffRequest {
@@ -1200,17 +1595,36 @@ message GetCollectedPullRequestDiffRequest {
   optional bool include_file_stats = 5;
   optional uint32 page_size = 6;
   optional string page_cursor = 7;
+  optional uint64 change_number = 8;
+  optional uint64 version_number = 9;
 }
 
 message GetCollectedPullRequestDiffResponse {
   string merge_base_sha = 1;
   repeated CollectedFileDiff files = 2;
   optional string next_page_cursor = 4;
+  optional string resolved_head_sha = 5;
+  optional string resolved_base_sha = 6;
+  optional uint64 resolved_version_number = 7;
+}
+
+message GetCommitChangedPathsClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string commit_sha = 2;
+  optional string base_commit_sha = 3;
 }
 
 message GetCommitClientRequest {
   ClientRepoIdentifier identifier = 1;
   string commit_sha = 2;
+}
+
+message GetCommitDiff2ClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string commit_sha = 2;
+  optional string base_commit_sha = 3;
+  bool include_patches = 4;
+  repeated string paths = 5;
 }
 
 message GetCommitDiffClientRequest {
@@ -1221,6 +1635,12 @@ message GetCommitDiffClientRequest {
   repeated string paths = 5;
   optional uint32 page_size = 6;
   optional string page_cursor = 7;
+}
+
+message GetCommitDiffStatsClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  string commit_sha = 2;
+  optional string base_commit_sha = 3;
 }
 
 message GetFileHistoryClientRequest {
@@ -1295,6 +1715,15 @@ message GetMirrorTransitionJobResponse {
   Repo repository = 2;
 }
 
+message GetMyAppInstallRequestRequest {
+  string namespace_id = 1;
+  string app_id = 2;
+}
+
+message GetMyAppInstallRequestResponse {
+  bool has_pending_request = 1;
+}
+
 message GetNamespaceTeamAccessRequest {
   string namespace_slug = 1;
 }
@@ -1351,6 +1780,7 @@ message GetRepoCodeownersResponse {
 message GetRepoContentAtShaClientRequest {
   ClientRepoIdentifier identifier = 1;
   PH_git_forge_v1_PathIdentifier path_identifier = 2;
+  optional uint64 max_file_size = 3;
 }
 
 message GetRepoContentClientRequest {
@@ -1361,6 +1791,14 @@ message GetRepoContentClientRequest {
 message GetRepoContentDetailsAtShaClientRequest {
   ClientRepoIdentifier identifier = 1;
   PH_git_forge_v1_PathIdentifier path_identifier = 2;
+}
+
+message GetRepoMirrorDeployKeyRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message GetRepoMirrorDeployKeyResponse {
+  optional RepoMirrorDeployKeyInfo deploy_key = 1;
 }
 
 message GetRepoNamespaceRequest {
@@ -1378,6 +1816,7 @@ message GetRepoRequest {
 
 message GetRepoResponse {
   Repo repository = 1;
+  optional RepoGithubMirrorInfo github_mirror_info = 2;
 }
 
 message GetRepoTeamAccessRequest {
@@ -1413,12 +1852,21 @@ message GetSectionOfChangesRequest {
   SectionOfChangesSortField sort_field = 5;
   bool sort_is_asc = 6;
   bool skip_total_count = 7;
+  repeated string change_ids = 8;
 }
 
 message GetSectionOfChangesResponse {
   repeated SectionOfChanges changes = 1;
   bool has_more = 2;
   int32 total_count = 3;
+}
+
+message GetShareInviteByTokenRequest {
+  string token = 1;
+}
+
+message GetShareInviteByTokenResponse {
+  RepoShareInviteDetails invite = 1;
 }
 
 message GetTagClientRequest {
@@ -1520,6 +1968,7 @@ message Installation {
 message InstallationReference {
   string id = 1;
   string app_id = 2;
+  AppDisplayMetadata app_metadata = 3;
 }
 
 message Label {
@@ -1530,6 +1979,35 @@ message Label {
   optional string description = 5;
   google.protobuf.Timestamp created_at = 6;
   google.protobuf.Timestamp updated_at = 7;
+}
+
+message LeaveMyExternalRepositoryRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message LeaveMyExternalRepositoryResponse {
+}
+
+message ListAppInstallRequestsRequest {
+  string namespace_id = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListAppInstallRequestsResponse {
+  repeated AppInstallRequestGroup groups = 1;
+  string next_page_token = 2;
+}
+
+message ListAtlasNodePathsRequest {
+  ClientRepoIdentifier repo = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListAtlasNodePathsResponse {
+  repeated string paths = 1;
+  string next_page_token = 2;
 }
 
 message ListBuildkiteTriggersRequest {
@@ -1550,6 +2028,7 @@ message ListChangeCommitsResponse {
   repeated PH_git_forge_v1_Commit commits = 1;
   string merge_base_sha = 2;
   bool truncated = 3;
+  map<string, CommitActorDisplays> actor_displays_by_sha = 4;
 }
 
 message ListChangesByHeadRefRequest {
@@ -1570,11 +2049,32 @@ message ListChangesRequest {
   optional string author_id = 5;
   optional string base_ref = 6;
   optional string head_ref = 7;
+  repeated string file = 8;
 }
 
 message ListChangesResponse {
   repeated ChangeWithLatestVersion changes = 1;
   optional uint64 next_cursor = 2;
+}
+
+message ListChangeTimelineEventsRequest {
+  ChangeIdentifier change = 1;
+}
+
+message ListChangeTimelineEventsResponse {
+  repeated ChangeTimelineEvent events = 1;
+}
+
+message ListCheckRunAnnotationsRequest {
+  ClientRepoIdentifier identifier = 1;
+  string check_run_id = 2;
+  int32 page_size = 3;
+  string page_token = 4;
+}
+
+message ListCheckRunAnnotationsResponse {
+  repeated CheckRunAnnotation annotations = 1;
+  string next_page_token = 2;
 }
 
 message ListCommentReactionsRequest {
@@ -1619,6 +2119,7 @@ message ListCommitsInRangeClientRequest {
 
 message ListFileViewedStatesRequest {
   ChangeIdentifier change = 1;
+  string head_commit_sha = 2;
 }
 
 message ListFileViewedStatesResponse {
@@ -1632,6 +2133,9 @@ message ListHostedReposRequest {
   string search = 3;
   ListHostedReposOrderBy order_by = 4;
   string namespace = 5;
+  bool include_github_mirror_info = 6;
+  bool apply_repository_picker_policy = 7;
+  bool include_external_collaborator_repos = 8;
 }
 
 message ListHostedReposResponse {
@@ -1652,6 +2156,20 @@ message ListLabelsResponse {
   optional string next_cursor = 2;
 }
 
+message ListMyExternalRepositoriesRequest {
+}
+
+message ListMyExternalRepositoriesResponse {
+  repeated MyExternalRepository repositories = 1;
+}
+
+message ListMyShareInvitesRequest {
+}
+
+message ListMyShareInvitesResponse {
+  repeated MyShareInvite invites = 1;
+}
+
 message ListNamespaceAppsRequest {
   string namespace_slug = 1;
   uint32 page_size = 2;
@@ -1659,8 +2177,8 @@ message ListNamespaceAppsRequest {
 }
 
 message ListNamespaceAppsResponse {
-  repeated App apps = 1;
   string next_page_token = 2;
+  repeated AppDisplayMetadata app_metadata = 3;
 }
 
 message ListNamespaceAssignablePoliciesRequest {
@@ -1705,11 +2223,23 @@ message ListOriginRepoReviewerCandidatesResponse {
   repeated OriginReviewerCandidateGroup groups = 2;
 }
 
+message ListPublicAppsRequest {
+  uint32 page_size = 1;
+  string page_token = 2;
+}
+
+message ListPublicAppsResponse {
+  repeated AppDisplayMetadata apps = 1;
+  string next_page_token = 2;
+}
+
 message ListRefsClientRequest {
   ClientRepoIdentifier identifier = 1;
   PH_git_forge_v1_ListRefsFilter filter = 2;
   bool names_only = 3;
   string prefix = 4;
+  optional uint32 limit = 5;
+  optional string page_token = 7;
 }
 
 message ListRepoAssignablePoliciesRequest {
@@ -1718,6 +2248,22 @@ message ListRepoAssignablePoliciesRequest {
 
 message ListRepoAssignablePoliciesResponse {
   repeated AuthPolicySummary policies = 1;
+}
+
+message ListRepoCheckSourcesRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message ListRepoCheckSourcesResponse {
+  repeated RepoCheckSource sources = 1;
+}
+
+message ListRepoExternalCollaboratorsRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message ListRepoExternalCollaboratorsResponse {
+  repeated RepoExternalCollaboratorRow rows = 1;
 }
 
 message ListRepoGrantsRequest {
@@ -1733,12 +2279,38 @@ message ListRepoGrantsResponse {
   bool list_truncated = 3;
 }
 
+message ListRepoInstallationsRequest {
+  string repo_id = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListRepoInstallationsResponse {
+  repeated InstallationReference installations = 1;
+  string next_page_token = 2;
+}
+
 message ListRepoPathsClientRequest {
   ClientRepoIdentifier identifier = 1;
   string revision = 2;
   repeated string includes = 3;
   repeated string excludes = 4;
   uint32 limit = 5;
+}
+
+message ListReposForAppInstallRequest {
+  string namespace = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+  string search = 4;
+}
+
+message ListRepoShareInvitesRequest {
+  ClientRepoIdentifier identifier = 1;
+}
+
+message ListRepoShareInvitesResponse {
+  repeated RepoShareInvite invites = 1;
 }
 
 message ListReviewRequestEventsRequest {
@@ -1763,6 +2335,13 @@ message ListRulesetsRequest {
 
 message ListRulesetsResponse {
   repeated Ruleset rulesets = 1;
+}
+
+message ListSshPublicKeysRequest {
+}
+
+message ListSshPublicKeysResponse {
+  repeated SshPublicKey ssh_public_keys = 1;
 }
 
 message ListVercelTriggersRequest {
@@ -1825,6 +2404,7 @@ message MergeStackRequest {
   ClientRepoIdentifier identifier = 1;
   uint64 top_change_number = 2;
   PH_git_forge_v1_MergeMode mode = 3;
+  string expected_target_head_sha = 4;
 }
 
 message MergeStackResponse {
@@ -1843,9 +2423,30 @@ message MintRawRepoFileLinkClientResponse {
   string raw_origin = 3;
 }
 
+message MirrorFetchProgress {
+  string subphase = 1;
+  optional uint64 bytes_received = 2;
+  optional google.protobuf.Timestamp heartbeat_at = 3;
+}
+
 message MissingRequiredCheck {
   string display_name = 1;
   string identity_path = 2;
+}
+
+message MyExternalRepository {
+  ClientRepoIdentifier repository = 1;
+  GrantPolicyRef policy = 2;
+  google.protobuf.Timestamp added_at = 3;
+}
+
+message MyShareInvite {
+  string invite_id = 1;
+  ClientRepoIdentifier repository = 2;
+  string inviter_display_name = 3;
+  string policy_name = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  google.protobuf.Timestamp created_at = 6;
 }
 
 message NamespaceGrantRow {
@@ -1869,15 +2470,17 @@ message OriginReviewerCandidateGroup {
   string organization_slug = 2;
   string group_slug = 3;
   string name = 4;
-  repeated string member_auth_ids = 5;
+  int64 cursor_group_id = 6;
+  repeated string member_user_ids = 7;
 }
 
 message OriginReviewerCandidateUser {
-  string auth_id = 1;
   string first_name = 3;
   string last_name = 4;
   string email = 5;
   string avatar_url = 6;
+  int64 cursor_user_id = 7;
+  string user_id = 8;
 }
 
 message PostCheckRunRequest {
@@ -1944,6 +2547,17 @@ message ProjectedLatestVersionEntry {
   Version projected_latest_version = 2;
 }
 
+message PublishAgentTempRepoRequest {
+  ClientRepoIdentifier identifier = 1;
+  optional string new_name = 2;
+  optional RepoVisibility visibility = 3;
+}
+
+message PublishAgentTempRepoResponse {
+  bool published = 1;
+  Repo repository = 2;
+}
+
 message RebuildBuildkiteCheckRunRequest {
   ChangeIdentifier change = 1;
   string check_run_id = 2;
@@ -1998,10 +2612,21 @@ message RecordInboundMirrorGithubMergeGithubResultResponse {
   InboundMirrorGithubMergeOperation operation = 1;
 }
 
+message RefreshAtlasRepoRequest {
+  ClientRepoIdentifier repo = 1;
+}
+
+message RefreshAtlasRepoResponse {
+  string head_sha = 1;
+}
+
 message RemoveAssigneeRequest {
   oneof target {
     string auth_id = 2;
     string group_id = 3;
+    int64 cursor_user_id = 4;
+    int64 cursor_group_id = 5;
+    string user_id = 6;
   }
   ChangeIdentifier change = 1;
 }
@@ -2046,6 +2671,28 @@ message Repo {
   bool allow_squash_merge = 18;
   RepoVisibility visibility = 19;
   bool delete_branch_on_merge = 20;
+  optional google.protobuf.Timestamp deleted_at = 21;
+}
+
+message RepoCheckSource {
+  CheckRunActor actor = 1;
+  string group_key = 2;
+  string suite_name = 3;
+  repeated RepoCheckSourceRun runs = 4;
+  int64 last_seen_at_unix_ms = 5;
+}
+
+message RepoCheckSourceRun {
+  string run_key = 1;
+  string name = 2;
+}
+
+message RepoExternalCollaboratorRow {
+  string user_id = 1;
+  string display_name = 2;
+  string email = 3;
+  GrantPolicyRef policy = 4;
+  google.protobuf.Timestamp added_at = 5;
 }
 
 message RepoGithubMirrorInfo {
@@ -2060,6 +2707,13 @@ message RepoGrantRow {
   GrantPolicyRef repo_policy = 3;
   GrantPolicyRef effective_policy = 4;
   bool is_namespace_owned = 5;
+}
+
+message RepoMirrorDeployKeyInfo {
+  string public_key_openssh = 1;
+  string fingerprint_sha256 = 2;
+  google.protobuf.Timestamp created_at = 3;
+  google.protobuf.Timestamp updated_at = 4;
 }
 
 message RepoMirrorTransitionJob {
@@ -2077,6 +2731,28 @@ message RepoMirrorTransitionJob {
   optional string completed_at = 16;
   string created_at = 17;
   string updated_at = 18;
+  optional MirrorFetchProgress fetch_progress = 19;
+}
+
+message RepoShareInvite {
+  string id = 1;
+  string invitee_email = 2;
+  string policy_name = 3;
+  google.protobuf.Timestamp expires_at = 4;
+  google.protobuf.Timestamp accepted_at = 5;
+  google.protobuf.Timestamp declined_at = 6;
+  google.protobuf.Timestamp revoked_at = 7;
+  google.protobuf.Timestamp created_at = 8;
+  string invited_by_principal_kind = 9;
+  string invited_by_principal_id = 10;
+}
+
+message RepoShareInviteDetails {
+  string invitee_email = 1;
+  ClientRepoIdentifier repository = 2;
+  string inviter_display_name = 3;
+  string policy_name = 4;
+  google.protobuf.Timestamp expires_at = 5;
 }
 
 message RepoSummary {
@@ -2094,12 +2770,30 @@ message RepoSummary {
   bool allow_merge_commit = 13;
   bool allow_squash_merge = 14;
   RepoVisibility visibility = 15;
+  optional RepoGithubMirrorInfo github_mirror_info = 16;
+  optional google.protobuf.Timestamp deleted_at = 17;
+  RepoKind repo_kind = 18;
+  optional string owner_type = 19;
+}
+
+message RequestAppInstallRequest {
+  string namespace_id = 1;
+  string app_id = 2;
+  optional string note = 3;
+}
+
+message RequestAppInstallResponse {
+  AppInstallRequestOutcome outcome = 1;
+  optional string cool_down_expires_at = 2;
 }
 
 message RequestReviewRequest {
   oneof target {
     string auth_id = 2;
     string group_id = 3;
+    int64 cursor_user_id = 4;
+    int64 cursor_group_id = 5;
+    string user_id = 6;
   }
   ChangeIdentifier change = 1;
 }
@@ -2117,6 +2811,18 @@ message RequestReviewsResponse {
   repeated ChangeAssignment assignments = 1;
 }
 
+message ResolveCodeIntelligenceSymbolAtPositionRequest {
+  ClientRepoIdentifier repo = 1;
+  string commit_sha = 2;
+  string path = 3;
+  CodeIntelligencePosition position = 4;
+}
+
+message ResolveCodeIntelligenceSymbolAtPositionResponse {
+  CodeIntelligenceIndex index = 1;
+  optional ResolvedCodeIntelligenceSymbol symbol = 2;
+}
+
 message ResolveCommentThreadRequest {
   ChangeIdentifier change = 1;
   string thread_id = 2;
@@ -2124,6 +2830,16 @@ message ResolveCommentThreadRequest {
 
 message ResolveCommentThreadResponse {
   CommentThread thread = 1;
+}
+
+message ResolvedCodeIntelligenceSymbol {
+  string opaque_id = 1;
+  CodeIntelligenceRange occurrence_range = 2;
+  optional CodeIntelligenceLocation definition = 3;
+  optional string signature = 4;
+  optional string documentation = 5;
+  repeated CodeIntelligenceLocation definitions = 6;
+  optional string kind = 7;
 }
 
 message ResolveOriginPullRequestRedirectRequest {
@@ -2149,6 +2865,14 @@ message RestackStackResponse {
   repeated uint64 restacked_change_numbers = 1;
 }
 
+message RestorePullRequestBranchRequest {
+  ChangeIdentifier change = 1;
+}
+
+message RestorePullRequestBranchResponse {
+  bool already_restored = 1;
+}
+
 message RetargetChangeRequest {
   ChangeIdentifier change = 1;
   string base_ref = 2;
@@ -2160,18 +2884,28 @@ message RetargetChangeResponse {
   bool unchanged = 3;
 }
 
+message RevertPullRequestRequest {
+  ChangeIdentifier change = 1;
+  optional string title = 2;
+  optional string description = 3;
+  bool draft = 4;
+  bool allow_stack_landing_revert = 5;
+}
+
+message RevertPullRequestResponse {
+  Change change = 1;
+  bool reverse_mirror_push_failed = 2;
+  repeated uint64 reverted_change_numbers = 5;
+}
+
 message Review {
   string id = 1;
   string change_id = 2;
   string version_id = 3;
   uint64 version_number = 4;
-  string author_id = 5;
   ReviewVerdict verdict = 6;
   string body = 7;
   google.protobuf.Timestamp created_at = 8;
-  string author_kind = 9;
-  string author_display_name = 10;
-  string author_avatar_url = 11;
   optional google.protobuf.Timestamp submitted_at = 12;
   optional ReviewDismissal dismissal = 13;
   ActorWithDisplay author = 14;
@@ -2179,9 +2913,8 @@ message Review {
 
 message ReviewDismissal {
   google.protobuf.Timestamp dismissed_at = 1;
-  string dismissed_by_id = 2;
-  string dismissed_by_kind = 3;
   string dismissal_message = 4;
+  ActorWithDisplay dismissed_by = 5;
 }
 
 message ReviewRequestEvent {
@@ -2192,16 +2925,37 @@ message ReviewRequestEvent {
   string assigned_auth_id = 5;
   string assigned_group_id = 6;
   ChangeAssignmentCreatedVia created_via = 7;
-  string actor_auth_id = 8;
   google.protobuf.Timestamp created_at = 9;
   ActorWithDisplay actor = 10;
+  OriginReviewerCandidateUser assigned_user = 11;
+  OriginReviewerCandidateGroup assigned_group = 12;
 }
 
 message ReviewRequestTarget {
   oneof target {
     string auth_id = 1;
     string group_id = 2;
+    int64 cursor_user_id = 3;
+    int64 cursor_group_id = 4;
+    string user_id = 5;
   }
+}
+
+message RevokeAppSigningKeyRequest {
+  string app_id = 1;
+  string kid = 2;
+}
+
+message RevokeAppSigningKeyResponse {
+}
+
+message RevokeRepoShareInviteRequest {
+  ClientRepoIdentifier identifier = 1;
+  string invite_id = 2;
+}
+
+message RevokeRepoShareInviteResponse {
+  RepoShareInvite invite = 1;
 }
 
 message Ruleset {
@@ -2222,14 +2976,12 @@ message RulesetBypassActor {
   RulesetBypassMode bypass_mode = 2;
   RulesetBypassActorKind actor_kind = 3;
   google.protobuf.Struct actor_payload = 4;
-  optional string actor_app_id = 5;
 }
 
 message RulesetBypassActorInput {
   RulesetBypassMode bypass_mode = 1;
   RulesetBypassActorKind actor_kind = 2;
   google.protobuf.Struct actor_payload = 3;
-  optional string actor_app_id = 4;
 }
 
 message RulesetRule {
@@ -2243,6 +2995,13 @@ message RulesetRuleInput {
   google.protobuf.Struct parameters = 2;
 }
 
+message SearchRefsClientRequest {
+  ClientRepoIdentifier identifier = 1;
+  PH_git_forge_v1_ListRefsFilter filter = 2;
+  string query = 3;
+  optional uint32 limit = 4;
+}
+
 message SectionOfChanges {
   string id = 1;
   int32 number = 2;
@@ -2251,7 +3010,6 @@ message SectionOfChanges {
   string description = 5;
   string head_ref = 6;
   string base_ref = 7;
-  string author_id = 8;
   SectionOfChangesStatus status = 9;
   google.protobuf.Timestamp created_at = 10;
   google.protobuf.Timestamp updated_at = 11;
@@ -2271,9 +3029,6 @@ message SectionOfChanges {
   optional string stack_id = 25;
   string repo_namespace = 26;
   string repo_name = 27;
-  string author_kind = 28;
-  string author_display_name = 29;
-  string author_avatar_url = 30;
   ActorWithDisplay author = 31;
   optional google.protobuf.Timestamp viewer_last_viewed_at = 32;
 }
@@ -2314,14 +3069,17 @@ message SectionOfChangesFilterAnd {
 
 message SectionOfChangesFilterApprovedBy {
   string auth_id = 1;
+  int64 cursor_user_id = 2;
 }
 
 message SectionOfChangesFilterAuthorIs {
   string auth_id = 1;
+  int64 cursor_user_id = 2;
 }
 
 message SectionOfChangesFilterClosedReviewRequestFrom {
   string auth_id = 1;
+  int64 cursor_user_id = 2;
 }
 
 message SectionOfChangesFilterConsolidatedStatus {
@@ -2338,10 +3096,12 @@ message SectionOfChangesFilterHasLabel {
 
 message SectionOfChangesFilterIncludesAssignee {
   string auth_id = 1;
+  int64 cursor_user_id = 2;
 }
 
 message SectionOfChangesFilterIncludesDirectReviewer {
   string auth_id = 1;
+  int64 cursor_user_id = 2;
 }
 
 message SectionOfChangesFilterIncludesDirectTeamReviewer {
@@ -2350,11 +3110,13 @@ message SectionOfChangesFilterIncludesDirectTeamReviewer {
 
 message SectionOfChangesFilterIncludesPastReviewer {
   string auth_id = 1;
+  int64 cursor_user_id = 2;
 }
 
 message SectionOfChangesFilterIncludesReviewer {
   string auth_id = 1;
   repeated string group_public_ids = 2;
+  int64 cursor_user_id = 3;
 }
 
 message SectionOfChangesFilterLastUpdated {
@@ -2383,6 +3145,7 @@ message SectionOfChangesFilterNumLinesChanged {
 
 message SectionOfChangesFilterOpenReviewRequestFor {
   string auth_id = 1;
+  int64 cursor_user_id = 2;
 }
 
 message SectionOfChangesFilterOr {
@@ -2391,6 +3154,7 @@ message SectionOfChangesFilterOr {
 
 message SectionOfChangesFilterReopenedReviewRequestFor {
   string auth_id = 1;
+  int64 cursor_user_id = 2;
 }
 
 message SectionOfChangesFilterReviewStatus {
@@ -2410,12 +3174,8 @@ message SectionOfChangesFilterUnsupported {
 }
 
 message SectionOfChangesReviewer {
-  string author_id = 1;
   SectionOfChangesVerdict verdict = 2;
   google.protobuf.Timestamp reviewed_at = 3;
-  string author_kind = 4;
-  string author_display_name = 5;
-  string author_avatar_url = 6;
   ActorWithDisplay author = 7;
 }
 
@@ -2426,6 +3186,17 @@ message SetAppIconRequest {
 
 message SetAppIconResponse {
   App app = 1;
+}
+
+message SetAtlasRepoConfigRequest {
+  ClientRepoIdentifier repo = 1;
+  bool enabled = 2;
+  repeated string enabled_layers = 3;
+  AtlasFreshness freshness = 4;
+}
+
+message SetAtlasRepoConfigResponse {
+  GetAtlasRepoStatusResponse status = 1;
 }
 
 message SetBuildkiteTriggerEnabledRequest {
@@ -2447,6 +3218,77 @@ message SetCommentReactionRequest {
 message SetCommentReactionResponse {
 }
 
+message SetNamespaceGroupAccessRequest {
+  oneof policy_update {
+    string policy_name = 3;
+    bool clear_access = 4;
+  }
+  string namespace_slug = 1;
+  repeated string group_ids = 2;
+  bool retain_self_admin = 5;
+}
+
+message SetNamespaceGroupAccessResponse {
+  OriginNamespace namespace = 1;
+  bool self_admin_granted = 2;
+}
+
+message SetNamespaceTeamAccessRequest {
+  oneof policy_update {
+    string policy_name = 3;
+    bool clear_access = 4;
+  }
+  string namespace_slug = 1;
+  TeamGroupKind group = 2;
+  bool retain_self_admin = 5;
+}
+
+message SetNamespaceTeamAccessResponse {
+  OriginNamespace namespace = 1;
+  NamespaceTeamGroupAccess team_admins = 2;
+  NamespaceTeamGroupAccess team_members = 3;
+  bool self_admin_granted = 4;
+}
+
+message SetNamespaceUserAccessRequest {
+  oneof policy_update {
+    string policy_name = 3;
+    bool clear_access = 4;
+  }
+  string namespace_slug = 1;
+  repeated string user_ids = 2;
+  bool retain_self_admin = 5;
+}
+
+message SetNamespaceUserAccessResponse {
+  OriginNamespace namespace = 1;
+  bool self_admin_granted = 2;
+}
+
+message SetRepoExternalCollaboratorAccessRequest {
+  oneof policy_update {
+    GrantPolicyRef policy = 3;
+    bool remove = 4;
+  }
+  ClientRepoIdentifier identifier = 1;
+  string user_id = 2;
+}
+
+message SetRepoExternalCollaboratorAccessResponse {
+}
+
+message SetRepoGroupAccessRequest {
+  oneof policy_update {
+    string policy_name = 3;
+    bool clear_access = 4;
+  }
+  ClientRepoIdentifier identifier = 1;
+  string group_id = 2;
+}
+
+message SetRepoGroupAccessResponse {
+}
+
 message SetRepoTeamAccessRequest {
   oneof policy_update {
     string policy_name = 3;
@@ -2462,6 +3304,18 @@ message SetRepoTeamAccessResponse {
   TeamGroupAccess team_members = 3;
 }
 
+message SetRepoUserAccessRequest {
+  oneof policy_update {
+    string policy_name = 3;
+    bool clear_access = 4;
+  }
+  ClientRepoIdentifier identifier = 1;
+  string user_id = 2;
+}
+
+message SetRepoUserAccessResponse {
+}
+
 message SetupTeamNamespaceRequest {
   OriginNamespaceOwnerType owner_type = 1;
   int64 owner_entity_id = 2;
@@ -2469,6 +3323,16 @@ message SetupTeamNamespaceRequest {
 }
 
 message SetupTeamNamespaceResponse {
+  OriginNamespace origin_namespace = 1;
+  bool namespace_created = 2;
+  bool grants_changed = 3;
+}
+
+message SetupUserNamespaceRequest {
+  string namespace = 1;
+}
+
+message SetupUserNamespaceResponse {
   OriginNamespace origin_namespace = 1;
   bool namespace_created = 2;
   bool grants_changed = 3;
@@ -2482,6 +3346,22 @@ message SetVercelTriggerEnabledRequest {
 
 message SetVercelTriggerEnabledResponse {
   VercelTrigger trigger = 1;
+}
+
+message SplitChangeIntoStackRequest {
+  ChangeIdentifier change = 1;
+  string expected_head_sha = 2;
+  string expected_base_sha = 3;
+  repeated SplitChangeStackGroup groups = 4;
+}
+
+message SplitChangeIntoStackResponse {
+  repeated Change changes = 1;
+}
+
+message SplitChangeStackGroup {
+  string title = 1;
+  repeated string paths = 2;
 }
 
 message SshPublicKey {
@@ -2530,6 +3410,17 @@ message SubmitReviewRequest {
 
 message SubmitReviewResponse {
   Review review = 1;
+}
+
+message SuggestOriginNamespaceRequest {
+  string preferred_slug = 1;
+}
+
+message SuggestOriginNamespaceResponse {
+  bool available = 1;
+  string normalized_slug = 2;
+  string suggested_slug = 3;
+  string message = 4;
 }
 
 message SuspendInstallationRequest {
@@ -2596,10 +3487,11 @@ message UpdateAppRequest {
   optional string webhook_url = 3;
   optional AppEventsReplace events = 5;
   optional bool is_public = 6;
-  optional AppAuthPolicyStatementsReplace auth_policy_statements = 7;
   optional AppInstallationRedirectUrisReplace installation_redirect_uris = 8;
   optional string description = 9;
   optional string website_url = 10;
+  optional AppDefaultScopesReplace default_scopes = 11;
+  optional AppWorkloadIdentityPoliciesReplace workload_identity_policies = 12;
 }
 
 message UpdateAppResponse {
@@ -2682,6 +3574,16 @@ message UpdateRepoBranchDeletionSettingResponse {
   Repo repository = 1;
 }
 
+message UpdateRepoDefaultBranchRequest {
+  ClientRepoIdentifier identifier = 1;
+  string default_branch = 2;
+}
+
+message UpdateRepoDefaultBranchResponse {
+  string default_branch = 1;
+  bool changed = 2;
+}
+
 message UpdateRepoMergeSettingsRequest {
   ClientRepoIdentifier identifier = 1;
   bool allow_merge_commit = 2;
@@ -2689,6 +3591,26 @@ message UpdateRepoMergeSettingsRequest {
 }
 
 message UpdateRepoMergeSettingsResponse {
+  Repo repository = 1;
+}
+
+message UpdateRepoShareInviteRequest {
+  ClientRepoIdentifier identifier = 1;
+  string invite_id = 2;
+  optional string policy_name = 3;
+  bool rotate_token = 4;
+}
+
+message UpdateRepoShareInviteResponse {
+  RepoShareInvite invite = 1;
+}
+
+message UpdateRepoVisibilityRequest {
+  ClientRepoIdentifier identifier = 1;
+  optional RepoVisibility visibility = 2;
+}
+
+message UpdateRepoVisibilityResponse {
   Repo repository = 1;
 }
 

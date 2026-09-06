@@ -1,3 +1,4 @@
+import { CodexApiError } from "../../llm/openai/codex-api-error"
 /**
  * OpenAI-compatible error envelope mapper.
  *
@@ -82,7 +83,10 @@ export function renderOpenAiError(error: unknown): OpenAiErrorRendering {
         message: anthropic.body.error.message,
         type: openAiErrorTypeFromStatus(status),
         param: null,
-        code: openAiErrorCodeFromStatus(status),
+        code:
+          error instanceof CodexApiError
+            ? (error.providerCode ?? openAiErrorCodeFromStatus(status))
+            : openAiErrorCodeFromStatus(status),
       },
     },
     retryAfterSeconds: anthropic.retryAfterSeconds,
