@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - "apps/protocol-bridge/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/deploy-proxy.yml"
   workflow_dispatch:
 
 jobs:
@@ -57,6 +60,9 @@ jobs:
         working-directory: apps/protocol-bridge
         run: npm run build
 
+      - name: Install locked production dependencies
+        run: npm ci --workspace=apps/protocol-bridge --omit=dev --ignore-scripts
+
       - name: Prepare production bundle
         run: |
           node <<'NODE'
@@ -80,6 +86,30 @@ jobs:
           fs.cpSync(path.join(sourceDir, "dist"), path.join(bundleDir, "dist"), {
             recursive: true,
           })
+
+          // Keep the dependency tree installed from the repository lockfile.
+          // Workspace links point outside this standalone deployment bundle.
+          const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"))
+          const workspaceLinks = new Set(
+            Object.entries(lock.packages)
+              .filter(([, entry]) => entry.link)
+              .map(([location]) => path.normalize(location))
+          )
+          fs.cpSync("node_modules", path.join(bundleDir, "node_modules"), {
+            recursive: true,
+            verbatimSymlinks: true,
+            filter: (source) => !workspaceLinks.has(source),
+          })
+          // App-local versions must take precedence for dist imports without
+          // replacing the hoisted versions required by other dependencies.
+          const localModules = path.join(sourceDir, "node_modules")
+          if (fs.existsSync(localModules)) {
+            fs.cpSync(localModules, path.join(bundleDir, "dist", "node_modules"), {
+              recursive: true,
+              verbatimSymlinks: true,
+            })
+          }
+
           const dataDir = path.join(sourceDir, "data")
           if (fs.existsSync(dataDir)) {
             fs.cpSync(dataDir, path.join(bundleDir, "data"), {
@@ -100,6 +130,7 @@ jobs:
           const envExample = [
             ".env.production.example",
             ".env.example",
+            ".env.local.example",
           ]
             .map((name) => path.join(sourceDir, name))
             .find((filePath) => fs.existsSync(filePath))
@@ -110,8 +141,6 @@ jobs:
             )
           }
           NODE
-          cd .deploy-bundle
-          npm install --omit=dev --ignore-scripts
 
       - name: Deploy to server
         uses: appleboy/scp-action@v0.1.7
