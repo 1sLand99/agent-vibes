@@ -759,16 +759,19 @@ agent-vibes/
 
 ## API Endpoints
 
-| Path                         | Method | Protocol                 | Description             |
-| ---------------------------- | ------ | ------------------------ | ----------------------- |
-| `/v1/messages`               | POST   | Anthropic API (SSE)      | Claude Code CLI         |
-| `/v1/messages/count_tokens`  | POST   | Anthropic API            | Count request tokens    |
-| `/v1/realtime/calls`         | POST   | WebRTC SDP               | ChatGPT OAuth voice     |
-| `/agent.v1.AgentService/Run` | POST   | ConnectRPC (HTTP/2 BiDi) | Cursor IDE (Agent mode) |
-| `/v1/models`                 | GET    | REST JSON                | Anthropic model list    |
-| `/v1/anthropic/models`       | GET    | REST JSON                | List available models   |
-| `/health`                    | GET    | REST JSON                | Health check            |
-| `/docs`                      | GET    | Swagger UI               | API documentation       |
+| Path                           | Method | Protocol                 | Description              |
+| ------------------------------ | ------ | ------------------------ | ------------------------ |
+| `/v1/messages`                 | POST   | Anthropic API (SSE)      | Claude Code CLI          |
+| `/v1/messages/count_tokens`    | POST   | Anthropic API            | Count request tokens     |
+| `/v1/web-gpt/chat/completions` | POST   | OpenAI Chat API          | ChatGPT web quota (text) |
+| `/v1/web-gpt/responses`        | POST   | OpenAI Responses API     | ChatGPT web quota (text) |
+| `/v1/web-gpt/models`           | GET    | REST JSON                | Web model list           |
+| `/v1/realtime/calls`           | POST   | WebRTC SDP               | ChatGPT OAuth voice      |
+| `/agent.v1.AgentService/Run`   | POST   | ConnectRPC (HTTP/2 BiDi) | Cursor IDE (Agent mode)  |
+| `/v1/models`                   | GET    | REST JSON                | Anthropic model list     |
+| `/v1/anthropic/models`         | GET    | REST JSON                | List available models    |
+| `/health`                      | GET    | REST JSON                | Health check             |
+| `/docs`                        | GET    | Swagger UI               | API documentation        |
 
 `/v1/realtime/calls` exchanges a browser WebRTC SDP offer for an SDP answer
 using a configured ChatGPT OAuth account. It never uses a Platform API key and
