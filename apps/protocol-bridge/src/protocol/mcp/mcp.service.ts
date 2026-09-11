@@ -155,6 +155,9 @@ export class McpService {
     for (const provider of this.providers.values()) {
       const offered = await provider.listTools()
       if (!offered.some((tool) => tool.name === params.name)) continue
+      // Logged because a tool call is the one MCP operation with an outside
+      // effect; the arguments are not, since they carry workspace content.
+      this.logger.log(`MCP tools/call ${params.name} via ${provider.id}`)
       const result: McpToolResult = await provider.callTool(
         params.name,
         (args as Record<string, unknown>) ?? {}
