@@ -28,6 +28,27 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The Go worker binary committed alongside its source is built for the
+      # maintainer's macOS machine. `nest build` copies the whole go-worker
+      # directory into dist as an asset, so without this step the bundle ships
+      # a Mach-O binary to a Linux host, the worker dies with "exec format
+      # error", and the bridge exits on "Worker ready timeout" before it ever
+      # listens. Rebuild it for the deployment target instead.
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: apps/protocol-bridge/src/llm/google/go-worker/go.sum
+
+      - name: Cross-compile the Go worker for the server
+        working-directory: apps/protocol-bridge/src/llm/google/go-worker
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w" -o agent-vibes-google-go-worker .
+          # Fail loudly rather than shipping an unrunnable binary again.
+          head -c 4 agent-vibes-google-go-worker | od -An -tx1 | grep -q '7f 45 4c 46'
+          echo "Go worker rebuilt as ELF for linux/amd64"
+
       - name: Restore credentials from secrets
         working-directory: apps/protocol-bridge
         run: |
