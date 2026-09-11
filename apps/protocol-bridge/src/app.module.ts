@@ -12,6 +12,7 @@ import { PersistenceModule } from "./persistence"
 import { AnthropicModule } from "./protocol/anthropic/anthropic.module"
 import { CursorModule } from "./protocol/cursor/cursor.module"
 import { GoogleProtocolModule } from "./protocol/google/google.module"
+import { McpModule } from "./protocol/mcp/mcp.module"
 import { OpenaiModule } from "./protocol/openai/openai.module"
 import { validateEnv } from "./shared/env.validation"
 import { UsageStatsModule } from "./usage"
@@ -41,6 +42,7 @@ const ENV_FILE_CANDIDATES = [
     AnthropicModule,
     CursorModule,
     GoogleProtocolModule,
+    McpModule,
     OpenaiModule,
     ContextModule,
     ModelModule,
