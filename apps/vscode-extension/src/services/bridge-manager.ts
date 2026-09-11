@@ -156,6 +156,23 @@ export class BridgeManager extends EventEmitter {
         env.PROXY_API_KEY = this.config.proxyApiKey
       }
 
+      // MCP workspace agent. Only wired up when a relay is configured, and
+      // only with a root to expose — the bridge itself refuses to start the
+      // agent without one, so passing a blank root would just log an error.
+      if (this.config.mcpRelayUrl && this.config.mcpWorkspaceRoot) {
+        env.MCP_RELAY_URL = this.config.mcpRelayUrl
+        env.MCP_WORKSPACE_ROOT = this.config.mcpWorkspaceRoot
+        if (this.config.mcpApiKey) {
+          env.MCP_API_KEY = this.config.mcpApiKey
+        }
+        if (this.config.mcpWorkspaceWritable) {
+          env.MCP_WORKSPACE_WRITABLE = "1"
+        }
+        if (this.config.mcpWorkspaceExec) {
+          env.MCP_WORKSPACE_EXEC = "1"
+        }
+      }
+
       // Stability first: Kiro warmup sends one request per account on every
       // bridge start. On account pools this can trigger 429 cooldowns and a
       // memory spike before the first real turn.
