@@ -45,10 +45,11 @@ export class McpAuthGuard implements CanActivate {
 
     const request = context.switchToHttp().getRequest<{
       headers: Record<string, string | string[] | undefined>
+      params?: Record<string, string | undefined>
       ip?: string
     }>()
 
-    if (!presentedSecret(request.headers, expected)) {
+    if (!presentedSecret(request.headers, request.params?.token, expected)) {
       // Log that a rejection happened, never what was presented.
       this.logger.warn(`MCP auth rejected (${request.ip || "unknown peer"})`)
       throw new UnauthorizedException("Invalid MCP credential")
@@ -57,9 +58,20 @@ export class McpAuthGuard implements CanActivate {
   }
 }
 
-/** True when any accepted header carries exactly the expected secret. */
+/**
+ * True when an accepted header — or the URL path segment — carries exactly
+ * the expected secret.
+ *
+ * The path form exists because ChatGPT's MCP connectors can only register an
+ * endpoint as unauthenticated or behind an OAuth flow; they cannot be told to
+ * send a fixed header. A secret path segment is the usual way such endpoints
+ * stay private. It is weaker than a header — URLs are the kind of thing that
+ * ends up in intermediary logs — so it is a second way in, never a
+ * replacement, and the secret is rotated by changing MCP_API_KEY.
+ */
 function presentedSecret(
   headers: Record<string, string | string[] | undefined>,
+  pathToken: string | undefined,
   expected: string
 ): boolean {
   const read = (name: string): string => {
@@ -70,6 +82,7 @@ function presentedSecret(
   const candidates = [
     read("authorization").replace(/^Bearer\s+/i, ""),
     read("x-api-key"),
+    pathToken || "",
   ]
   // Evaluate every candidate rather than short-circuiting: the comparison is
   // constant-time, and returning early on the first match would leak which

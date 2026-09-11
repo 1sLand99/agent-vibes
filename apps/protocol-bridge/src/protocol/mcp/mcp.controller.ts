@@ -38,6 +38,21 @@ const MAX_BATCH = 20
 export class McpController {
   constructor(private readonly mcp: McpService) {}
 
+  /**
+   * Same entry point, with the credential carried as a path segment.
+   *
+   * Declared before the bare route so Fastify matches the more specific form
+   * first. See McpAuthGuard for why this alternative exists.
+   */
+  @Post(":token")
+  @HttpCode(200)
+  @ApiOperation({ summary: "JSON-RPC entry point, credential in the path" })
+  async rpcWithPathToken(
+    @Body() body: unknown
+  ): Promise<JsonRpcResponse | JsonRpcResponse[] | undefined> {
+    return this.rpc(body)
+  }
+
   @Post()
   @HttpCode(200)
   @ApiOperation({ summary: "JSON-RPC entry point for MCP clients" })
