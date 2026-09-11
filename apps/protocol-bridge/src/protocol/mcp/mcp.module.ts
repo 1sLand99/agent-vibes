@@ -2,6 +2,8 @@ import { Module } from "@nestjs/common"
 import { McpAuthGuard } from "./mcp-auth.guard"
 import { McpController } from "./mcp.controller"
 import { McpDiagnosticProvider } from "./mcp-diagnostic.provider"
+import { McpRelayGateway } from "./mcp-relay.gateway"
+import { McpWorkspaceAgent } from "./mcp-workspace.agent"
 import { McpService } from "./mcp.service"
 
 /**
@@ -12,7 +14,13 @@ import { McpService } from "./mcp.service"
  */
 @Module({
   controllers: [McpController],
-  providers: [McpService, McpAuthGuard, McpDiagnosticProvider],
+  providers: [
+    McpService,
+    McpAuthGuard,
+    McpDiagnosticProvider,
+    McpRelayGateway,
+    McpWorkspaceAgent,
+  ],
   exports: [McpService],
 })
 export class McpModule {}
