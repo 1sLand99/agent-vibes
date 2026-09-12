@@ -1208,6 +1208,9 @@ const WEB_GPT_THINKING_EFFORTS: Record<string, readonly string[]> = {
  */
 const CURSOR_LEVELS_LOW_TO_HIGH = ["low", "medium", "high", "xhigh"] as const
 
+/** ChatGPT's own words, accepted from a caller who speaks them. */
+const WEB_GPT_EFFORT_NAMES = new Set(["min", "standard", "extended", "max"])
+
 const WEB_GPT_EFFORT_BY_CURSOR_LEVEL: Record<string, string> = {
   low: "min",
   medium: "standard",
@@ -1242,7 +1245,14 @@ export function webGptCursorEffortLevels(modelId: string): string[] {
 }
 
 /**
- * The `thinking_effort` to send for a model, given what Cursor asked for.
+ * The `thinking_effort` to send for a model, given the depth that was asked
+ * for.
+ *
+ * The request may say it in either vocabulary: Cursor's ladder
+ * (low/medium/high/xhigh, which is also what OpenAI's `reasoning_effort`
+ * uses), or ChatGPT's own word for it (min/standard/extended/max) for a caller
+ * who knows the web app. Either way the answer is checked against what this
+ * model actually publishes.
  *
  * Null means "say nothing", which leaves the web app's own default in place —
  * the right answer both for a model with no depths to choose from and for a
@@ -1250,12 +1260,15 @@ export function webGptCursorEffortLevels(modelId: string): string[] {
  */
 export function webGptThinkingEffort(
   modelId: string,
-  cursorLevel: string | undefined
+  requestedDepth: string | undefined
 ): string | null {
   const slug = readWebGptModel(modelId) ?? modelId.trim()
   const efforts = WEB_GPT_THINKING_EFFORTS[slug.toLowerCase()]
-  if (!efforts?.length || !cursorLevel) return null
-  const wanted = WEB_GPT_EFFORT_BY_CURSOR_LEVEL[cursorLevel.toLowerCase()]
+  if (!efforts?.length || !requestedDepth) return null
+  const normalized = requestedDepth.trim().toLowerCase()
+  const wanted =
+    WEB_GPT_EFFORT_BY_CURSOR_LEVEL[normalized] ??
+    (WEB_GPT_EFFORT_NAMES.has(normalized) ? normalized : undefined)
   if (!wanted) return null
   if (efforts.includes(wanted)) return wanted
   // Asked for more than this model offers: give it the deepest it has rather

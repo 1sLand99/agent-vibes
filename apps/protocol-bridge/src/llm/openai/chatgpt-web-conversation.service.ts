@@ -53,6 +53,11 @@ export interface ChatGptWebMessage {
 export interface ChatGptWebRequest {
   readonly model: string
   readonly messages: readonly ChatGptWebMessage[]
+  /**
+   * ChatGPT's own depth for this turn — `min`, `standard`, `extended` or
+   * `max`. Left out, upstream applies the model's default.
+   */
+  readonly thinkingEffort?: string | null
   readonly signal?: AbortSignal
 }
 
@@ -243,7 +248,7 @@ export class ChatGptWebConversationService {
     }
 
     const lease = await this.lease()
-    const body = this.buildPayload(slug, req.messages)
+    const body = this.buildPayload(slug, req.messages, req.thinkingEffort)
 
     let response: Response
     try {
@@ -285,7 +290,8 @@ export class ChatGptWebConversationService {
 
   private buildPayload(
     slug: string,
-    messages: readonly ChatGptWebMessage[]
+    messages: readonly ChatGptWebMessage[],
+    thinkingEffort?: string | null
   ): Record<string, unknown> {
     const now = Date.now() / 1_000
     return {
@@ -306,6 +312,9 @@ export class ChatGptWebConversationService {
       force_paragen: false,
       force_rate_limit: false,
       websocket_request_id: crypto.randomUUID(),
+      // Sent only when asked for. The field is optional upstream, and leaving
+      // it out is how you say "whatever this model normally does".
+      ...(thinkingEffort ? { thinking_effort: thinkingEffort } : {}),
     }
   }
 

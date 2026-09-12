@@ -1,6 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import { ChatGptWebBrowserService } from "../../llm/openai/chatgpt-web-browser.service"
+import { parseModelRequest } from "../../llm/shared/model-request"
 import { ChatGptWebV1Decoder } from "../../llm/openai/chatgpt-web-v1-stream"
 import {
   ChatGptWebError,
@@ -49,9 +50,15 @@ export class ChatGptWebTransportSelector {
     return configured === "browser" ? "browser" : "http"
   }
 
-  /** Strip a transport prefix, leaving the model id upstream expects. */
+  /**
+   * The slug upstream expects: no transport prefix, no depth suffix.
+   *
+   * `browser/gpt-5-6-thinking(high)` names a transport, a model and a depth in
+   * one string. Only the middle part is a model chatgpt.com knows.
+   */
   static stripPrefix(model: string): string {
-    return model.trim().replace(/^browser[/:]/i, "")
+    return parseModelRequest(model.trim().replace(/^browser[/:]/i, ""))
+      .baseModel
   }
 
   private connectorId(): string {
@@ -76,6 +83,7 @@ export class ChatGptWebTransportSelector {
   async *stream(
     model: string,
     messages: readonly ChatGptWebMessage[],
+    thinkingEffort?: string | null,
     signal?: AbortSignal
   ): AsyncGenerator<ChatGptWebEvent> {
     const connectorId = this.connectorId()
@@ -87,8 +95,7 @@ export class ChatGptWebTransportSelector {
       prompt: flatten(messages),
       connectorId,
       model: slug,
-      // This surface has no depth of its own to express — an OpenAI-shaped
-      // request carries no Cursor effort — so the model's own default stands.
+      thinkingEffort: thinkingEffort ?? undefined,
       signal,
     })) {
       for (const event of decoder.push(chunk)) {

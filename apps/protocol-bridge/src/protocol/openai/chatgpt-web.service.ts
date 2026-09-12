@@ -1,11 +1,13 @@
 import { Injectable, Logger } from "@nestjs/common"
 import * as crypto from "node:crypto"
+import { parseModelRequest } from "../../llm/shared/model-request"
 import {
   ChatGptWebConversationService,
   ChatGptWebError,
   type ChatGptWebEvent,
   type ChatGptWebMessage,
 } from "../../llm/openai/chatgpt-web-conversation.service"
+import { webGptThinkingEffort } from "../../llm/shared/model-registry"
 import { ChatGptWebTransportSelector } from "./chatgpt-web-transport.selector"
 import type {
   OpenAiChatCompletionRequest,
@@ -46,15 +48,19 @@ export class ChatGptWebProtocolService {
     model: string,
     messages: readonly ChatGptWebMessage[],
     hasTools: boolean,
+    requestedDepth?: string,
     signal?: AbortSignal
   ): AsyncGenerator<ChatGptWebEvent> {
+    const slug = ChatGptWebTransportSelector.stripPrefix(model)
+    const thinkingEffort = webGptThinkingEffort(slug, requestedDepth)
     if (this.transports.resolve(model) === "browser") {
-      return this.transports.stream(model, messages, signal)
+      return this.transports.stream(model, messages, thinkingEffort, signal)
     }
     this.rejectToolUse(hasTools)
     return this.conversation.stream({
-      model: ChatGptWebTransportSelector.stripPrefix(model),
+      model: slug,
       messages,
+      thinkingEffort,
       signal,
     })
   }
@@ -86,7 +92,8 @@ export class ChatGptWebProtocolService {
     for await (const event of this.run(
       req.model,
       messages,
-      (req.tools?.length ?? 0) > 0
+      (req.tools?.length ?? 0) > 0,
+      requestedDepth(req.model, req.reasoning_effort)
     )) {
       if (event.kind === "text") text += event.delta
       else if (event.kind === "reasoning") reasoning += event.delta
@@ -137,7 +144,8 @@ export class ChatGptWebProtocolService {
     for await (const event of this.run(
       req.model,
       messages,
-      (req.tools?.length ?? 0) > 0
+      (req.tools?.length ?? 0) > 0,
+      requestedDepth(req.model, req.reasoning_effort)
     )) {
       if (event.kind === "text") yield frame({ content: event.delta }, null)
       else if (event.kind === "reasoning")
@@ -158,7 +166,8 @@ export class ChatGptWebProtocolService {
     for await (const event of this.run(
       req.model,
       messages,
-      (req.tools?.length ?? 0) > 0
+      (req.tools?.length ?? 0) > 0,
+      requestedDepth(req.model, undefined, req.reasoning)
     )) {
       if (event.kind === "text") text += event.delta
     }
@@ -243,6 +252,7 @@ export class ChatGptWebProtocolService {
       req.model,
       messages,
       (req.tools?.length ?? 0) > 0,
+      requestedDepth(req.model, undefined, req.reasoning),
       signal
     )) {
       if (event.kind !== "text") continue
@@ -282,6 +292,28 @@ export class ChatGptWebProtocolService {
 }
 
 // ── request normalisation ───────────────────────────────────────────────
+
+/**
+ * The depth a request asked for, wherever it chose to say it.
+ *
+ * Three spellings reach this surface and they all mean the same thing:
+ * `reasoning_effort` on a chat completion, `reasoning.effort` on a response,
+ * and the `model(level)` suffix this bridge accepts everywhere else. The
+ * vocabulary may be OpenAI's, Cursor's or ChatGPT's own — `webGptThinkingEffort`
+ * is what settles that, and what checks the answer against the model.
+ */
+function requestedDepth(
+  model: string,
+  explicit?: string,
+  fromReasoning?: { effort?: string }
+): string | undefined {
+  const suffix = parseModelRequest(model)
+  const fromSuffix =
+    suffix.hasSuffix && suffix.suffix?.kind === "level"
+      ? suffix.suffix.level
+      : undefined
+  return explicit || fromReasoning?.effort || fromSuffix
+}
 
 /** Flatten OpenAI content parts down to the plain text upstream accepts. */
 function flattenContent(
