@@ -24,6 +24,7 @@ import {
   getCodexPublicModelIds,
   getPublicModelMetadata,
   resolveCloudCodeModel,
+  WEB_GPT_CURSOR_DISPLAY_MODELS,
 } from "../../llm/shared/model-registry"
 import {
   type BackendType,
@@ -1345,6 +1346,22 @@ export class MessagesService implements OnModuleInit {
           addModel(modelId, "openai")
         }
       }
+    }
+
+    // ChatGPT Web models are advertised unconditionally, and deliberately not
+    // through isModelAdvertisable: that gate asks whether Codex serves the id,
+    // and the interesting ones here (the *-pro tier) have no Codex equivalent
+    // at all. The route is opt-in by name, and an unconfigured deployment
+    // already answers with a specific error rather than a silent failure.
+    for (const model of WEB_GPT_CURSOR_DISPLAY_MODELS) {
+      modelMap.set(model.name, {
+        id: model.name,
+        object: "model",
+        created_at: now,
+        owned_by: "openai",
+        type: "model",
+        display_name: model.displayName,
+      })
     }
 
     const data = Array.from(modelMap.values()).sort((left, right) => {

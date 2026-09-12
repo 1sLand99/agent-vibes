@@ -1126,10 +1126,48 @@ export const BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] =
   listCodexModelProfiles().map(codexDisplayModel)
 export const CODEX_CURSOR_DISPLAY_MODELS = BASE_CODEX_CURSOR_DISPLAY_MODELS
 
+/**
+ * Models served by chatgpt.com's web app rather than the Codex backend.
+ *
+ * They are listed so the editor's picker offers them like any other model —
+ * the route exists either way, but a model nobody can select from a list is a
+ * model nobody uses.
+ *
+ * The `web-gpt/` prefix is part of the name, not a vendor tag to be stripped:
+ * it is what tells the router to spend the web quota and drive a browser, and
+ * that has to be a deliberate choice rather than something inferred from a
+ * model id that also exists on Codex.
+ *
+ * Names match the slugs chatgpt.com's own catalogue returns; `*-pro` and
+ * `research` have no Codex equivalent at all.
+ */
+export const WEB_GPT_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = (
+  [
+    ["gpt-5-6-thinking", "GPT-5.6 Thinking", true],
+    ["gpt-5-6", "GPT-5.6", false],
+    ["gpt-5-5-thinking", "GPT-5.5 Thinking", true],
+    ["gpt-5-5", "GPT-5.5", false],
+    ["gpt-6-pro", "GPT-6 Pro", true],
+    ["gpt-5-6-pro", "GPT-5.6 Pro", true],
+    ["gpt-5-5-pro", "GPT-5.5 Pro", true],
+    ["o3-pro", "o3-pro", true],
+    ["gpt-5-6-mini", "GPT-5.6 Mini", false],
+    ["gpt-5-5-mini", "GPT-5.5 Mini", false],
+  ] as const
+).map(([slug, label, isThinking]) => ({
+  name: `web-gpt/${slug}`,
+  displayName: `${label} (Web)`,
+  shortName: `${label} Web`,
+  family: "gpt" as const,
+  isThinking,
+  supportsAgent: true,
+}))
+
 const ALL_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
   ...CLAUDE_CURSOR_DISPLAY_MODELS,
   ...GEMINI_CURSOR_DISPLAY_MODELS,
   ...CODEX_CURSOR_DISPLAY_MODELS,
+  ...WEB_GPT_CURSOR_DISPLAY_MODELS,
 ]
 
 const CURSOR_DISPLAY_MODEL_BY_NAME = new Map(
