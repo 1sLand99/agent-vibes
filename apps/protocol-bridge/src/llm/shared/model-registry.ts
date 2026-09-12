@@ -1161,7 +1161,30 @@ export const WEB_GPT_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = (
   family: "gpt" as const,
   isThinking,
   supportsAgent: true,
+  // The transport flattens a turn down to the text chatgpt.com's composer
+  // accepts, so an attached image would be dropped without a word. Saying so
+  // here means the editor never offers to attach one.
+  supportsImages: false,
 }))
+
+/** The chatgpt.com model behind a `web-gpt/` (or `web-gpt:`) prefix, if any. */
+export function readWebGptModel(modelId: string): string | null {
+  const match = /^web-gpt[/:](.+)$/i.exec(modelId.trim())
+  return match ? match[1]!.trim() : null
+}
+
+/**
+ * Whether an id asks for the ChatGPT Web route.
+ *
+ * Nothing else in this registry resolves one: the slug behind the prefix
+ * belongs to chatgpt.com's catalogue, not to any local backend, so
+ * `resolveCloudCodeModel` returns null for it and every caller asking "who
+ * serves this model" has to settle this question before consulting the
+ * registry at all.
+ */
+export function isWebGptModel(modelId: string): boolean {
+  return readWebGptModel(modelId) !== null
+}
 
 const ALL_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
   ...CLAUDE_CURSOR_DISPLAY_MODELS,
@@ -1368,6 +1391,11 @@ export function getCursorDisplayModels(
           excludeMaxNamedModels: options.excludeMaxNamedModels,
         })
       : []),
+    // Listed regardless of `includeCodex`: these are served by chatgpt.com's
+    // web app, so the Codex backend being absent says nothing about them.
+    // Whether one can actually run is the caller's routability check, which is
+    // where the ChatGPT credential is known.
+    ...WEB_GPT_CURSOR_DISPLAY_MODELS,
     ...(options.extraModels || []),
   ]
 

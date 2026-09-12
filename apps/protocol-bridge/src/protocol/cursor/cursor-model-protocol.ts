@@ -23,6 +23,7 @@ import {
 } from "../../gen/aiserver/v1_pb"
 import {
   getCursorDisplayModel,
+  isWebGptModel,
   resolveCloudCodeModel,
   resolveModelThinkingCapability,
   type CursorDisplayModel,
@@ -401,7 +402,11 @@ function parseBracketCursorVariantString(modelId: string): {
 }
 
 function supportsCursorFastMode(model: CursorDisplayModel): boolean {
-  return model.family === "gpt"
+  // Fast mode is the Codex priority service tier. A ChatGPT Web model is in
+  // the gpt family but never touches Codex, so offering the toggle would
+  // promise a tier that cannot exist — and, on the legacy picker path, mint
+  // `-fast` model ids that chatgpt.com's catalogue has never heard of.
+  return model.family === "gpt" && !isWebGptModel(model.name)
 }
 
 function parseLegacyCursorVariantModelName(modelId: string): {

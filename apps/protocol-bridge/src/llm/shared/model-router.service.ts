@@ -7,6 +7,7 @@ import {
   detectModelFamily,
   doesModelSupportThinking,
   isOpusModel,
+  readWebGptModel,
   resolveCloudCodeModel,
 } from "./model-registry"
 
@@ -475,7 +476,7 @@ export class ModelRouterService {
     // path. It is never inferred from a model name: that transport spends a
     // different quota and needs a signed-in browser, so asking for it has to
     // be deliberate.
-    const webGptModel = readWebGptPrefix(cursorModel)
+    const webGptModel = readWebGptModel(cursorModel)
     if (webGptModel) {
       this.logger.log(`[ROUTE] ${cursorModel} -> chatgpt-web | ${webGptModel}`)
       return {
@@ -617,10 +618,4 @@ export class ModelRouterService {
       `Unknown model ${cursorModel}. Supported families: gemini, claude, gpt/o-series.`
     )
   }
-}
-
-/** The model behind a `web-gpt/` (or `web-gpt:`) prefix, if there is one. */
-function readWebGptPrefix(cursorModel: string): string | null {
-  const match = /^web-gpt[/:](.+)$/i.exec(cursorModel.trim())
-  return match ? match[1]!.trim() : null
 }
