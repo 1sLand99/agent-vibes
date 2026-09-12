@@ -198,6 +198,30 @@ export class ConfigManager {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? ""
   }
 
+  /**
+   * ChatGPT connector whose tools a Cursor turn is offered.
+   *
+   * Only needed for `web-gpt/<model>`: that route runs the turn on ChatGPT
+   * Web, and a connector is the only channel the web model will call tools
+   * through.
+   */
+  get chatGptWebConnectorId(): string {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<string>("chatGptWeb.connectorId") ?? ""
+    ).trim()
+  }
+
+  /** Chrome profile the ChatGPT tab runs in; empty means the default path. */
+  get chatGptWebBrowserProfile(): string {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<string>("chatGptWeb.browserProfile") ?? ""
+    ).trim()
+  }
+
   get mcpWorkspaceWritable(): boolean {
     return (
       vscode.workspace

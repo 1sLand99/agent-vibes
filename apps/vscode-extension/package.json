@@ -401,6 +401,16 @@
           "type": "boolean",
           "default": false,
           "description": "Allow the MCP client to run programs in the workspace. Off by default; while off, no command tool is advertised at all. Commands run without a shell."
+        },
+        "agentVibes.chatGptWeb.connectorId": {
+          "type": "string",
+          "default": "",
+          "description": "ChatGPT connector that carries Cursor's tools, e.g. asdk_app_… Required to use a web-gpt/<model> in Cursor; that route runs the turn on ChatGPT Web, where a connector is the only channel the model will call tools through."
+        },
+        "agentVibes.chatGptWeb.browserProfile": {
+          "type": "string",
+          "default": "",
+          "description": "Chrome profile directory the ChatGPT tab runs in. Empty uses ~/.agent-vibes/chatgpt-browser-profile. Sign in there once; the session persists."
         }
       }
     }
