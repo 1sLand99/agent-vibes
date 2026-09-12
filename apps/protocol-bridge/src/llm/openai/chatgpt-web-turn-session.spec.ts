@@ -187,3 +187,39 @@ describe("ChatGptWebTurnSession", () => {
     stream.close()
   })
 })
+
+describe("a source that arrives in bursts", () => {
+  /**
+   * The shape that wedged a real turn: chunks a few hundred milliseconds
+   * apart, then the source ends. Each gap starts a fresh wait, and a timer
+   * left over from the previous one used to clear the new wait's wake — after
+   * which nothing could resolve it, and the segment stopped with the end
+   * marker still queued.
+   */
+  const textFrame = (text: string) =>
+    `data: {"p":"","o":"add","c":0,"v":{"message":{"author":{"role":"assistant"},` +
+    `"metadata":{"recipient":"all"},"content":{"content_type":"text","parts":[${JSON.stringify(
+      text
+    )}]}}}}\n`
+
+  async function* bursts(): AsyncGenerator<string> {
+    const pause = () => new Promise((resolve) => setTimeout(resolve, 300))
+    await pause()
+    yield textFrame("hello")
+    await pause()
+    yield 'data: {"p":"/message/content/parts/0","o":"append","c":0,"v":" world"}\n'
+    await pause()
+    yield "data: [DONE]\n"
+  }
+
+  it("ends the segment instead of stopping with segments queued", async () => {
+    const session = new ChatGptWebTurnSession({ source: bursts() })
+    const events: string[] = []
+    for await (const frame of session.segment()) {
+      events.push(/^event: (\S+)/.exec(frame)?.[1] ?? "?")
+    }
+    expect(events.at(-1)).toBe("message_stop")
+    expect(events).toContain("content_block_delta")
+    expect(session.finished).toBe(true)
+  }, 15_000)
+})

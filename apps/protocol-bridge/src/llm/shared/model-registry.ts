@@ -1254,9 +1254,13 @@ export function webGptCursorEffortLevels(modelId: string): string[] {
  * who knows the web app. Either way the answer is checked against what this
  * model actually publishes.
  *
- * Null means "say nothing", which leaves the web app's own default in place —
- * the right answer both for a model with no depths to choose from and for a
- * request that expressed no preference.
+ * A request that names no depth gets the deepest the model publishes. The web
+ * quota is the reason to be here at all, and the model that answers a turn
+ * from an editor should be thinking as hard as it can unless told otherwise;
+ * naming a shallower depth still wins.
+ *
+ * Null means "say nothing", which leaves the web app's own default in place.
+ * It is what a model with no depths to choose from gets.
  */
 export function webGptThinkingEffort(
   modelId: string,
@@ -1264,7 +1268,8 @@ export function webGptThinkingEffort(
 ): string | null {
   const slug = readWebGptModel(modelId) ?? modelId.trim()
   const efforts = WEB_GPT_THINKING_EFFORTS[slug.toLowerCase()]
-  if (!efforts?.length || !requestedDepth) return null
+  if (!efforts?.length) return null
+  if (!requestedDepth) return efforts[efforts.length - 1] ?? null
   const normalized = requestedDepth.trim().toLowerCase()
   const wanted =
     WEB_GPT_EFFORT_BY_CURSOR_LEVEL[normalized] ??

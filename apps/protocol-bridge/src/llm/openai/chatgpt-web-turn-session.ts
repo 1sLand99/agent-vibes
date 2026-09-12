@@ -281,19 +281,27 @@ export class ChatGptWebTurnSession {
         this.ended = true
         return null
       }
+      // Wait for the next push, with a short timer in case one raced the
+      // assignment below.
+      //
+      // Both halves have to belong to *this* iteration. An earlier version let
+      // a timer from a previous one fire late, find whatever `wake` was
+      // current, and clear it — leaving the promise it belonged to with no way
+      // to be resolved: no wake to call, and its own timer already spent
+      // looking at someone else's. The reader stopped there with segments
+      // still queued, which is a turn that never ends.
       await new Promise<void>((resolve) => {
-        this.wake = () => {
-          this.wake = null
+        let settled = false
+        const finish = (): void => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          if (this.wake === wake) this.wake = null
           resolve()
         }
-        // The browser stream can be quiet for a while between frames; a short
-        // wake keeps this from blocking forever if a push races the assignment.
-        setTimeout(() => {
-          if (this.wake) {
-            this.wake = null
-            resolve()
-          }
-        }, IDLE_SEGMENT_END_MS)
+        const wake = (): void => finish()
+        const timer = setTimeout(finish, IDLE_SEGMENT_END_MS)
+        this.wake = wake
       })
     }
   }

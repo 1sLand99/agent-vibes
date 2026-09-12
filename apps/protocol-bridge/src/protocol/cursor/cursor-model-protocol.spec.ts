@@ -150,13 +150,21 @@ describe("thinking depth on a ChatGPT Web model", () => {
     expect(webGptThinkingEffort("web-gpt/gpt-6-pro", "xhigh")).toBe("standard")
   })
 
-  it("says nothing when there is nothing to say", () => {
-    // A null leaves the web app's own default in place, which is what a model
-    // with no depths and a turn with no preference both want.
+  it("thinks as hard as it can when the turn named no depth", () => {
+    // The web quota is the reason to be here; a turn that expressed no
+    // preference should not quietly get the shallow default.
+    expect(webGptThinkingEffort("web-gpt/gpt-5-6-thinking", undefined)).toBe(
+      "max"
+    )
+    expect(webGptThinkingEffort("web-gpt/gpt-5-5-pro", undefined)).toBe(
+      "extended"
+    )
+  })
+
+  it("says nothing for a model with no depths to choose from", () => {
+    // A null leaves the web app's own default in place.
     expect(webGptThinkingEffort("web-gpt/gpt-5-6", "high")).toBeNull()
-    expect(
-      webGptThinkingEffort("web-gpt/gpt-5-6-thinking", undefined)
-    ).toBeNull()
+    expect(webGptThinkingEffort("web-gpt/o3-pro", undefined)).toBeNull()
   })
 
   it("offers no Max toggle, which would be wired to nothing", () => {

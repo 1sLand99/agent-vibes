@@ -100,10 +100,12 @@ describe("depth on the /v1/web-gpt surface", () => {
     expect(seen[0]!.thinkingEffort).toBe("extended")
   })
 
-  it("says nothing when the caller asked for nothing", async () => {
+  it("goes as deep as the model allows when the caller asked for nothing", async () => {
+    // The web quota is the reason to be on this surface at all; naming a
+    // shallower depth is how you spend less of it.
     const { service, seen } = harness()
     await service.createChatCompletion(ask("gpt-5-6-thinking"))
-    expect(seen[0]!.thinkingEffort).toBeNull()
+    expect(seen[0]!.thinkingEffort).toBe("max")
   })
 
   it("says nothing for a model with no depths to choose from", async () => {
