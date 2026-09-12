@@ -12,7 +12,7 @@ import type { McpTool, McpToolProvider, McpToolResult } from "./mcp-types"
 /**
  * Public half of the workspace relay.
  *
- * A workspace agent dials in over WebSocket, proves it holds MCP_API_KEY, and
+ * An editor agent dials in over WebSocket, proves it holds MCP_API_KEY, and
  * advertises the tools it can run. Only then does the MCP endpoint offer any
  * tools at all; when the socket drops, the endpoint goes back to being inert.
  *
@@ -56,7 +56,7 @@ export class McpRelayGateway implements OnModuleInit {
     if (!secret) {
       this.logger.error(
         "MCP_RELAY_SERVER is set but MCP_API_KEY is not — refusing to accept " +
-          "workspace agents rather than accepting them unauthenticated"
+          "editor agents rather than accepting them unauthenticated"
       )
       return
     }
@@ -108,7 +108,7 @@ export class McpRelayGateway implements OnModuleInit {
       providerId = null
       for (const call of pending.values()) {
         clearTimeout(call.timer)
-        call.reject(new Error("Workspace session disconnected"))
+        call.reject(new Error("Editor session disconnected"))
       }
       pending.clear()
     }
@@ -123,7 +123,7 @@ export class McpRelayGateway implements OnModuleInit {
 
       if (frame.type === "register") {
         tools = [...frame.tools]
-        providerId = `workspace:${frame.sessionId}`
+        providerId = `editor:${frame.sessionId}`
         const provider: McpToolProvider = {
           id: providerId,
           listTools: () => tools,
@@ -131,7 +131,7 @@ export class McpRelayGateway implements OnModuleInit {
         }
         this.mcp.registerProvider(provider)
         this.logger.warn(
-          `Workspace session attached: ${frame.label} (${tools.length} tools)`
+          `Editor session attached: ${frame.label} (${tools.length} tools)`
         )
         return
       }
@@ -142,8 +142,8 @@ export class McpRelayGateway implements OnModuleInit {
         pending.delete(frame.callId)
         clearTimeout(call.timer)
         if (frame.error) {
-          // A refusal authored by the workspace ("path escapes the root",
-          // "command execution is disabled") is information the model should
+          // A refusal authored by the editor ("no editor session is attached",
+          // "that file is outside the workspace") is information the model should
           // act on, and it carries nothing internal — so surface it as a tool
           // error rather than collapsing it into a generic internal failure.
           call.resolve({
@@ -151,7 +151,7 @@ export class McpRelayGateway implements OnModuleInit {
             isError: true,
           })
         } else if (frame.result) call.resolve(frame.result)
-        else call.reject(new Error("Workspace returned no result"))
+        else call.reject(new Error("Editor returned no result"))
         return
       }
 
@@ -161,7 +161,7 @@ export class McpRelayGateway implements OnModuleInit {
     ws.on("close", () => {
       clearInterval(heartbeat)
       detach()
-      this.logger.warn("Workspace session detached")
+      this.logger.warn("Editor session detached")
     })
     ws.on("error", (error) => {
       this.logger.warn(`Workspace socket error: ${error.message}`)
@@ -176,7 +176,7 @@ export class McpRelayGateway implements OnModuleInit {
     args: Record<string, unknown>
   ): Promise<McpToolResult> {
     if (ws.readyState !== ws.OPEN) {
-      return Promise.reject(new Error("Workspace session is not connected"))
+      return Promise.reject(new Error("Editor session is not connected"))
     }
     const callId = crypto.randomUUID()
     return new Promise<McpToolResult>((resolve, reject) => {

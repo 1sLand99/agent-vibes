@@ -83,7 +83,7 @@ export class McpController {
   }
 
   /**
-   * Liveness for the connector, and a way to see whether a workspace session
+   * Liveness for the connector, and a way to see whether an editor session
    * is attached without disclosing anything about it.
    */
   @Get()

@@ -13,7 +13,7 @@ import type { McpTool, McpToolProvider, McpToolResult } from "./mcp-types"
  * publicly reachable endpoint.
  *
  * Off unless MCP_DIAGNOSTIC_TOOL is set, so a normal deployment keeps the
- * property that an endpoint with no workspace session attached is inert.
+ * property that an endpoint with no editor session attached is inert.
  */
 @Injectable()
 export class McpDiagnosticProvider implements McpToolProvider, OnModuleInit {

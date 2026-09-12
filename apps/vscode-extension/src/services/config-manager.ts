@@ -160,12 +160,12 @@ export class ConfigManager {
     ).trim()
   }
 
-  // ── MCP workspace agent ───────────────────────────────────────────────
+  // ── MCP relay ─────────────────────────────────────────────────────────
   //
-  // When a relay URL is set the bridge dials out to it and offers the tools
-  // below to whatever MCP client is registered against that relay (in
-  // practice, a ChatGPT connector). Every capability is off by default: the
-  // relay is reachable from the internet, so opting in has to be deliberate.
+  // When a relay URL is set the bridge dials out to it and carries Cursor's
+  // own tools to whatever MCP client is registered against that relay (in
+  // practice, a ChatGPT connector). Nothing runs on the relay host: a call
+  // travels back to this editor, or it is refused.
 
   get mcpRelayUrl(): string {
     return (
@@ -181,21 +181,6 @@ export class ConfigManager {
         .getConfiguration("agentVibes")
         .get<string>("mcp.apiKey") ?? ""
     ).trim()
-  }
-
-  /**
-   * Directory the agent exposes. Defaults to the folder currently open in the
-   * editor, which is almost always what someone means by "my workspace"; an
-   * explicit setting wins so a multi-root or unusual layout can pin one.
-   */
-  get mcpWorkspaceRoot(): string {
-    const configured = (
-      vscode.workspace
-        .getConfiguration("agentVibes")
-        .get<string>("mcp.workspaceRoot") ?? ""
-    ).trim()
-    if (configured) return configured
-    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? ""
   }
 
   /**
@@ -220,22 +205,6 @@ export class ConfigManager {
         .getConfiguration("agentVibes")
         .get<string>("chatGptWeb.browserProfile") ?? ""
     ).trim()
-  }
-
-  get mcpWorkspaceWritable(): boolean {
-    return (
-      vscode.workspace
-        .getConfiguration("agentVibes")
-        .get<boolean>("mcp.workspaceWritable") ?? false
-    )
-  }
-
-  get mcpWorkspaceExec(): boolean {
-    return (
-      vscode.workspace
-        .getConfiguration("agentVibes")
-        .get<boolean>("mcp.workspaceExec") ?? false
-    )
   }
 
   get antigravitySystemPrompt(): boolean {

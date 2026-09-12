@@ -380,27 +380,12 @@
         "agentVibes.mcp.relayUrl": {
           "type": "string",
           "default": "",
-          "description": "MCP relay to attach this workspace to, e.g. wss://host/mcp/agent. Leave empty to keep the workspace agent off."
+          "description": "MCP relay to carry Cursor's tools to, e.g. wss://host/mcp/agent. Leave empty to keep the relay off."
         },
         "agentVibes.mcp.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Credential presented to the MCP relay. Must match the relay's MCP_API_KEY."
-        },
-        "agentVibes.mcp.workspaceRoot": {
-          "type": "string",
-          "default": "",
-          "description": "Directory the MCP tools may touch. Empty means the folder currently open in the editor. Nothing outside this directory is reachable."
-        },
-        "agentVibes.mcp.workspaceWritable": {
-          "type": "boolean",
-          "default": false,
-          "description": "Allow the MCP client to write files in the workspace. Off by default; while off, no write tool is advertised at all."
-        },
-        "agentVibes.mcp.workspaceExec": {
-          "type": "boolean",
-          "default": false,
-          "description": "Allow the MCP client to run programs in the workspace. Off by default; while off, no command tool is advertised at all. Commands run without a shell."
+          "description": "Credential presented to the MCP relay, and required of any MCP client calling in. Must match the relay's MCP_API_KEY."
         },
         "agentVibes.chatGptWeb.connectorId": {
           "type": "string",

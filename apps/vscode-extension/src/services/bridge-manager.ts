@@ -156,32 +156,22 @@ export class BridgeManager extends EventEmitter {
         env.PROXY_API_KEY = this.config.proxyApiKey
       }
 
-      // MCP workspace agent. Only wired up when a relay is configured, and
-      // only with a root to expose — the bridge itself refuses to start the
-      // agent without one, so passing a blank root would just log an error.
-      if (this.config.mcpRelayUrl && this.config.mcpWorkspaceRoot) {
+      // The relay carries Cursor's own tools out to a public MCP endpoint, so
+      // there is nothing to scope: what a caller can reach is whatever the
+      // editor implements, executed by the editor.
+      if (this.config.mcpRelayUrl) {
         env.MCP_RELAY_URL = this.config.mcpRelayUrl
-        env.MCP_WORKSPACE_ROOT = this.config.mcpWorkspaceRoot
-        if (this.config.mcpApiKey) {
-          env.MCP_API_KEY = this.config.mcpApiKey
-        }
-        if (this.config.mcpWorkspaceWritable) {
-          env.MCP_WORKSPACE_WRITABLE = "1"
-        }
-        if (this.config.mcpWorkspaceExec) {
-          env.MCP_WORKSPACE_EXEC = "1"
-        }
       }
 
-      // ChatGPT Web as a Cursor backend. MCP_API_KEY is shared with the
-      // workspace agent above: the relay requires the same secret of the agent
-      // attaching and of any MCP client calling in, so one value avoids a
-      // deployment where the agent connects but the connector is turned away.
+      // ChatGPT Web as a Cursor backend. MCP_API_KEY is shared with the relay
+      // above: the relay requires the same secret of the agent attaching and
+      // of any MCP client calling in, so one value avoids a deployment where
+      // the agent connects but the connector is turned away.
       if (this.config.chatGptWebConnectorId) {
         env.CHATGPT_WEB_CONNECTOR_ID = this.config.chatGptWebConnectorId
-        if (this.config.mcpApiKey) {
-          env.MCP_API_KEY = this.config.mcpApiKey
-        }
+      }
+      if (this.config.mcpApiKey) {
+        env.MCP_API_KEY = this.config.mcpApiKey
       }
       if (this.config.chatGptWebBrowserProfile) {
         env.CHATGPT_WEB_BROWSER_PROFILE = this.config.chatGptWebBrowserProfile

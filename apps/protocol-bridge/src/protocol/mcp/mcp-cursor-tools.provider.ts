@@ -21,11 +21,16 @@ import type { McpTool, McpToolProvider, McpToolResult } from "./mcp-types"
  * which is exactly an MCP tool, so nothing is translated — they are passed
  * through.
  *
- * Execution belongs to whoever attaches a sink, and the tools are advertised
- * only while one is. Registering them permanently would mean the endpoint
- * offered 53 editor tools that always fail whenever no Cursor turn is running
- * — and it would bury the workspace agent's own tools, which is what serves
- * the browser-driven flow.
+ * Two things read this provider, and they ask different questions:
+ *
+ *   - `listTools` is the manifest, and it does not depend on a sink. The relay
+ *     agent sends it once per connection because a ChatGPT connector discovers
+ *     tools when it is registered and can never refresh them.
+ *   - Registration with McpService is scoped to an attached sink, so the local
+ *     endpoint advertises a tool only while something can actually run it.
+ *     A deployment with no editor — the public relay host runs this same
+ *     binary — therefore offers nothing of its own and serves only what an
+ *     attached editor session brought.
  */
 
 export interface CursorToolSink {

@@ -1,11 +1,10 @@
 import type { McpTool, McpToolResult } from "./mcp-types"
 
 /**
- * Frames exchanged between a workspace agent and the public MCP relay.
+ * Frames exchanged between an editor agent and the public MCP relay.
  *
- * The agent dials out to the relay, so the machine holding the workspace
- * never needs an inbound port and the relay never needs to know how to reach
- * it. The relay is the passive half: it forwards calls it receives from an
+ * The agent dials out to the relay, so the machine running the editor never
+ * needs an inbound port and the relay never needs to know how to reach it. The relay is the passive half: it forwards calls it receives from an
  * MCP client and waits for the agent to answer.
  */
 

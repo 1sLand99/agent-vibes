@@ -154,7 +154,7 @@ export class McpService {
       return rpcFailure(
         id,
         RPC_NO_SESSION,
-        "No workspace session is attached to this MCP endpoint"
+        "No editor session is attached to this MCP endpoint"
       )
     }
 
