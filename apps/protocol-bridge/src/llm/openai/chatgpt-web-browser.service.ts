@@ -222,18 +222,51 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
 
   // ── turns ─────────────────────────────────────────────────────────────
 
-  /** Run one turn, returning the raw SSE the app received. */
-  runTurn(request: BrowserTurnRequest): Promise<string> {
-    const run = this.queue.then(
-      () => this.runTurnExclusive(request),
-      () => this.runTurnExclusive(request)
-    )
-    // Keep the chain alive regardless of this turn's outcome.
-    this.queue = run.catch(() => undefined)
-    return run
+  /**
+   * Run one turn, yielding raw SSE as the page receives it.
+   *
+   * Turns are queued: one tab carries one conversation, and interleaving two
+   * would mix their frames. A caller that abandons the iterator still releases
+   * the queue, so one dropped request cannot wedge the rest.
+   */
+  async *streamTurn(
+    request: BrowserTurnRequest
+  ): AsyncGenerator<string, void, unknown> {
+    const release = await this.acquire()
+    try {
+      yield* this.runTurnExclusive(request)
+    } finally {
+      release()
+    }
   }
 
-  private async runTurnExclusive(request: BrowserTurnRequest): Promise<string> {
+  /** Convenience for callers that only want the finished stream. */
+  async runTurn(request: BrowserTurnRequest): Promise<string> {
+    const parts: string[] = []
+    for await (const chunk of this.streamTurn(request)) parts.push(chunk)
+    return parts.join("")
+  }
+
+  /** Take the turn lock, resolving to the function that gives it back. */
+  private acquire(): Promise<() => void> {
+    let release!: () => void
+    const next = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const waited = this.queue.then(
+      () => release,
+      () => release
+    )
+    this.queue = this.queue.then(
+      () => next,
+      () => next
+    )
+    return waited
+  }
+
+  private async *runTurnExclusive(
+    request: BrowserTurnRequest
+  ): AsyncGenerator<string, void, unknown> {
     const session = await this.ensurePage()
     await session.send("Page.bringToFront")
 
@@ -250,54 +283,48 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
 
     await this.clickSend(session)
 
-    const chunks: string[] = []
     const deadline = Date.now() + TURN_TIMEOUT_MS
-    for (;;) {
-      if (request.signal?.aborted) {
-        await session
-          .evaluate(`window.${HOOK_FLAG}.release()`)
-          .catch(() => null)
-        throw new ChatGptWebBrowserError(
-          499,
-          "chatgpt_web_aborted",
-          "The caller went away"
-        )
-      }
-      const progress = JSON.parse(
-        await session.evaluate<string>(`window.${HOOK_FLAG}.progress()`)
-      ) as { done: boolean; chunks: number; failed: string | null }
+    try {
+      for (;;) {
+        if (request.signal?.aborted) {
+          throw new ChatGptWebBrowserError(
+            499,
+            "chatgpt_web_aborted",
+            "The caller went away"
+          )
+        }
+        const progress = JSON.parse(
+          await session.evaluate<string>(`window.${HOOK_FLAG}.progress()`)
+        ) as { done: boolean; chunks: number; failed: string | null }
 
-      if (progress.chunks > 0) {
-        chunks.push(
-          await session.evaluate<string>(`window.${HOOK_FLAG}.drain()`)
-        )
+        if (progress.chunks > 0) {
+          const drained = await session.evaluate<string>(
+            `window.${HOOK_FLAG}.drain()`
+          )
+          if (drained) yield drained
+        }
+        if (progress.failed) {
+          throw new ChatGptWebBrowserError(
+            502,
+            "chatgpt_web_turn_failed",
+            `The page reported: ${progress.failed.slice(0, 200)}`
+          )
+        }
+        if (progress.done) return
+        if (Date.now() > deadline) {
+          throw new ChatGptWebBrowserError(
+            504,
+            "chatgpt_web_turn_timeout",
+            "The turn did not finish in time"
+          )
+        }
+        await delay(POLL_MS)
       }
-      if (progress.failed) {
-        await session
-          .evaluate(`window.${HOOK_FLAG}.release()`)
-          .catch(() => null)
-        throw new ChatGptWebBrowserError(
-          502,
-          "chatgpt_web_turn_failed",
-          `The page reported: ${progress.failed.slice(0, 200)}`
-        )
-      }
-      if (progress.done) break
-      if (Date.now() > deadline) {
-        await session
-          .evaluate(`window.${HOOK_FLAG}.release()`)
-          .catch(() => null)
-        throw new ChatGptWebBrowserError(
-          504,
-          "chatgpt_web_turn_timeout",
-          "The turn did not finish in time"
-        )
-      }
-      await delay(POLL_MS)
+    } finally {
+      // Runs on a thrown error and on an abandoned iterator alike, so the page
+      // never stays armed for a turn nobody is reading.
+      await session.evaluate(`window.${HOOK_FLAG}.release()`).catch(() => null)
     }
-
-    await session.evaluate(`window.${HOOK_FLAG}.release()`).catch(() => null)
-    return chunks.join("")
   }
 
   /**

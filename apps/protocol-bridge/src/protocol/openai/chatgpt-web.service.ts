@@ -3,8 +3,10 @@ import * as crypto from "node:crypto"
 import {
   ChatGptWebConversationService,
   ChatGptWebError,
+  type ChatGptWebEvent,
   type ChatGptWebMessage,
 } from "../../llm/openai/chatgpt-web-conversation.service"
+import { ChatGptWebTransportSelector } from "./chatgpt-web-transport.selector"
 import type {
   OpenAiChatCompletionRequest,
   OpenAiChatCompletionResponse,
@@ -28,7 +30,34 @@ import type {
 export class ChatGptWebProtocolService {
   private readonly logger = new Logger(ChatGptWebProtocolService.name)
 
-  constructor(private readonly conversation: ChatGptWebConversationService) {}
+  constructor(
+    private readonly conversation: ChatGptWebConversationService,
+    private readonly transports: ChatGptWebTransportSelector
+  ) {}
+
+  /**
+   * Route a turn to whichever transport the request asks for.
+   *
+   * Only the browser transport can offer the model any tools, so tool use is
+   * refused on the HTTP one rather than answered without them — an agent left
+   * waiting for a call that can never arrive is worse than a clear error.
+   */
+  private run(
+    model: string,
+    messages: readonly ChatGptWebMessage[],
+    hasTools: boolean,
+    signal?: AbortSignal
+  ): AsyncGenerator<ChatGptWebEvent> {
+    if (this.transports.resolve(model) === "browser") {
+      return this.transports.stream(messages, signal)
+    }
+    this.rejectToolUse(hasTools)
+    return this.conversation.stream({
+      model: ChatGptWebTransportSelector.stripPrefix(model),
+      messages,
+      signal,
+    })
+  }
 
   listModelSlugs(): Promise<string[]> {
     return this.conversation.listModelSlugs()
@@ -50,15 +79,15 @@ export class ChatGptWebProtocolService {
   async createChatCompletion(
     req: OpenAiChatCompletionRequest
   ): Promise<OpenAiChatCompletionResponse> {
-    this.rejectToolUse((req.tools?.length ?? 0) > 0)
     const messages = normalizeChatMessages(req.messages)
 
     let text = ""
     let reasoning = ""
-    for await (const event of this.conversation.stream({
-      model: req.model,
+    for await (const event of this.run(
+      req.model,
       messages,
-    })) {
+      (req.tools?.length ?? 0) > 0
+    )) {
       if (event.kind === "text") text += event.delta
       else if (event.kind === "reasoning") reasoning += event.delta
     }
@@ -91,7 +120,6 @@ export class ChatGptWebProtocolService {
   async *createChatCompletionStream(
     req: OpenAiChatCompletionRequest
   ): AsyncGenerator<string, void, unknown> {
-    this.rejectToolUse((req.tools?.length ?? 0) > 0)
     const messages = normalizeChatMessages(req.messages)
     const id = `chatcmpl-${randomId()}`
     const created = Math.floor(Date.now() / 1_000)
@@ -106,10 +134,11 @@ export class ChatGptWebProtocolService {
       })}\n\n`
 
     yield frame({ role: "assistant", content: "" }, null)
-    for await (const event of this.conversation.stream({
-      model: req.model,
+    for await (const event of this.run(
+      req.model,
       messages,
-    })) {
+      (req.tools?.length ?? 0) > 0
+    )) {
       if (event.kind === "text") yield frame({ content: event.delta }, null)
       else if (event.kind === "reasoning")
         yield frame({ reasoning_content: event.delta }, null)
@@ -123,14 +152,14 @@ export class ChatGptWebProtocolService {
   async createResponse(
     req: OpenAiResponsesRequest
   ): Promise<Record<string, unknown>> {
-    this.rejectToolUse((req.tools?.length ?? 0) > 0)
     const messages = normalizeResponsesInput(req)
 
     let text = ""
-    for await (const event of this.conversation.stream({
-      model: req.model,
+    for await (const event of this.run(
+      req.model,
       messages,
-    })) {
+      (req.tools?.length ?? 0) > 0
+    )) {
       if (event.kind === "text") text += event.delta
     }
 
@@ -157,7 +186,6 @@ export class ChatGptWebProtocolService {
     req: OpenAiResponsesRequest,
     signal?: AbortSignal
   ): AsyncGenerator<string, void, unknown> {
-    this.rejectToolUse((req.tools?.length ?? 0) > 0)
     const messages = normalizeResponsesInput(req)
     const responseId = `resp_${randomId()}`
     const itemId = `msg_${randomId()}`
@@ -211,11 +239,12 @@ export class ChatGptWebProtocolService {
     })
 
     let text = ""
-    for await (const event of this.conversation.stream({
-      model: req.model,
+    for await (const event of this.run(
+      req.model,
       messages,
-      signal,
-    })) {
+      (req.tools?.length ?? 0) > 0,
+      signal
+    )) {
       if (event.kind !== "text") continue
       text += event.delta
       yield emit("response.output_text.delta", {
