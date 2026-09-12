@@ -56,23 +56,37 @@ export function solveChatGptWebProofOfWork(input: ChatGptWebPowInput): string {
   const { seed, difficulty, userAgent } = input
   if (!seed || !difficulty) return fallbackToken(seed)
 
+  // Shape taken from a real browser payload rather than guessed: 25 slots,
+  // with the counter at index 3. Upstream has accepted a shorter array so
+  // far, but matching what the sentinel SDK actually sends is the difference
+  // between working by luck and working by construction.
+  const now = Date.now()
   const config: unknown[] = [
-    2560,
-    browserTimestamp(new Date()),
-    4_294_705_152,
+    3000,
+    browserTimestamp(new Date(now)),
+    4_395_630_592,
     0,
     userAgent,
-    "",
-    "",
+    "https://chatgpt.com/backend-api/sentinel/sdk.js",
+    "prod-e19e9dde1dc2f8240984b529c2e64925ead474f6",
     "en-US",
     "en-US,en",
-    0,
-    "webkitTemporaryStorage",
-    "location",
+    Math.random(),
+    "appCodeName\u2212Mozilla",
+    `_reactListening${crypto.randomBytes(6).toString("hex")}`,
+    "webkitRequestFileSystem",
+    1_000_000 + Math.floor(Math.random() * 1_000_000),
     crypto.randomUUID(),
     "",
-    12,
-    Date.now() / 1_000,
+    8,
+    now,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
   ]
 
   const width = difficulty.length
