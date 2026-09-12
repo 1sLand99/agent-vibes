@@ -36,7 +36,7 @@ function installHook(): {
     fetch: (input: unknown, init: unknown) => Promise<unknown>
   } & Record<string, unknown>
 
-  // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval
   const run = new Function(
     "window",
     "document",

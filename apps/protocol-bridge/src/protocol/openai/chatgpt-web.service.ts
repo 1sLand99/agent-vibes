@@ -28,9 +28,25 @@ import type {
  * arrive. Text and reasoning stream through unchanged.
  */
 
+interface ThreadRef {
+  conversationId?: string
+  messageId?: string
+}
+
+/** How many answered turns keep their place in the thread map. */
+const REMEMBERED_RESPONSES = 500
+
 @Injectable()
 export class ChatGptWebProtocolService {
   private readonly logger = new Logger(ChatGptWebProtocolService.name)
+  /**
+   * Where each answer left its conversation.
+   *
+   * A caller continues by naming one — `conversation` for the thread itself,
+   * or `previous_response_id` for the turn that produced it — and gets back a
+   * thread that is a real conversation on the account, openable in the web UI.
+   */
+  private readonly threads = new Map<string, ThreadRef>()
 
   constructor(
     private readonly conversation: ChatGptWebConversationService,
@@ -44,25 +60,89 @@ export class ChatGptWebProtocolService {
    * refused on the HTTP one rather than answered without them — an agent left
    * waiting for a call that can never arrive is worse than a clear error.
    */
-  private run(
+  private async *run(
     model: string,
     messages: readonly ChatGptWebMessage[],
     hasTools: boolean,
-    requestedDepth?: string,
+    requestedDepth: string | undefined,
+    thread: ThreadRef,
     signal?: AbortSignal
   ): AsyncGenerator<ChatGptWebEvent> {
     const slug = ChatGptWebTransportSelector.stripPrefix(model)
     const thinkingEffort = webGptThinkingEffort(slug, requestedDepth)
-    if (this.transports.resolve(model) === "browser") {
-      return this.transports.stream(model, messages, thinkingEffort, signal)
+    const source =
+      this.transports.resolve(model) === "browser"
+        ? this.transports.stream(model, messages, thinkingEffort, signal)
+        : this.startHttpTurn(slug, messages, thinkingEffort, thread, signal)
+    if (this.transports.resolve(model) !== "browser") {
+      this.rejectToolUse(hasTools)
     }
-    this.rejectToolUse(hasTools)
+    for await (const event of await source) {
+      if (event.kind === "done") {
+        // Kept even when the caller ignores the event: it is what the next
+        // turn needs to land in the same thread.
+        if (event.conversationId) thread.conversationId = event.conversationId
+        if (event.messageId) thread.messageId = event.messageId
+      }
+      yield event
+    }
+  }
+
+  /**
+   * Start an HTTP turn, continuing a named conversation when there is one.
+   *
+   * Continuing means upstream already holds the history, so only the newest
+   * user message is sent — repeating the rest would say it all twice in the
+   * thread. The message it answers is read from upstream rather than from
+   * memory, so a conversation carried on by hand in the web UI is picked up
+   * where the person left it.
+   */
+  private async startHttpTurn(
+    slug: string,
+    messages: readonly ChatGptWebMessage[],
+    thinkingEffort: string | null,
+    thread: ThreadRef,
+    signal?: AbortSignal
+  ): Promise<AsyncGenerator<ChatGptWebEvent>> {
+    const continuing = thread.conversationId
+      ? await this.conversation.currentNode(thread.conversationId)
+      : null
+    if (thread.conversationId && !continuing) {
+      this.logger.warn(
+        `Could not read conversation ${thread.conversationId}; starting a new one`
+      )
+      thread.conversationId = undefined
+    }
     return this.conversation.stream({
       model: slug,
-      messages,
+      messages: continuing ? lastUserMessage(messages) : messages,
       thinkingEffort,
+      conversationId: continuing ? thread.conversationId : undefined,
+      parentMessageId: continuing,
       signal,
     })
+  }
+
+  /** The thread a request asked to continue, if it named one. */
+  private threadFromRequest(req: Record<string, unknown>): ThreadRef {
+    const conversation = req.conversation
+    if (typeof conversation === "string" && conversation.trim()) {
+      return { conversationId: conversation.trim() }
+    }
+    const previous = req.previous_response_id
+    if (typeof previous === "string" && previous.trim()) {
+      return { ...this.threads.get(previous.trim()) }
+    }
+    return {}
+  }
+
+  private rememberThread(responseId: string, thread: ThreadRef): void {
+    if (!thread.conversationId) return
+    this.threads.set(responseId, { ...thread })
+    if (this.threads.size > REMEMBERED_RESPONSES) {
+      const oldest = this.threads.keys().next().value
+      if (oldest) this.threads.delete(oldest)
+    }
   }
 
   listModelSlugs(): Promise<string[]> {
@@ -86,6 +166,8 @@ export class ChatGptWebProtocolService {
     req: OpenAiChatCompletionRequest
   ): Promise<OpenAiChatCompletionResponse> {
     const messages = normalizeChatMessages(req.messages)
+    const thread = this.threadFromRequest(req)
+    const id = `chatcmpl-${randomId()}`
 
     let text = ""
     let reasoning = ""
@@ -93,17 +175,22 @@ export class ChatGptWebProtocolService {
       req.model,
       messages,
       (req.tools?.length ?? 0) > 0,
-      requestedDepth(req.model, req.reasoning_effort)
+      requestedDepth(req.model, req.reasoning_effort),
+      thread
     )) {
       if (event.kind === "text") text += event.delta
       else if (event.kind === "reasoning") reasoning += event.delta
     }
+    this.rememberThread(id, thread)
 
     return {
-      id: `chatcmpl-${randomId()}`,
+      id,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1_000),
       model: req.model,
+      // Additive, and the only way a chat-completions caller learns which
+      // conversation to name next time.
+      ...(thread.conversationId ? { conversation: thread.conversationId } : {}),
       choices: [
         {
           index: 0,
@@ -128,6 +215,7 @@ export class ChatGptWebProtocolService {
     req: OpenAiChatCompletionRequest
   ): AsyncGenerator<string, void, unknown> {
     const messages = normalizeChatMessages(req.messages)
+    const thread = this.threadFromRequest(req)
     const id = `chatcmpl-${randomId()}`
     const created = Math.floor(Date.now() / 1_000)
 
@@ -145,12 +233,14 @@ export class ChatGptWebProtocolService {
       req.model,
       messages,
       (req.tools?.length ?? 0) > 0,
-      requestedDepth(req.model, req.reasoning_effort)
+      requestedDepth(req.model, req.reasoning_effort),
+      thread
     )) {
       if (event.kind === "text") yield frame({ content: event.delta }, null)
       else if (event.kind === "reasoning")
         yield frame({ reasoning_content: event.delta }, null)
     }
+    this.rememberThread(id, thread)
     yield frame({}, "stop")
     yield "data: [DONE]\n\n"
   }
@@ -161,20 +251,27 @@ export class ChatGptWebProtocolService {
     req: OpenAiResponsesRequest
   ): Promise<Record<string, unknown>> {
     const messages = normalizeResponsesInput(req)
+    const thread = this.threadFromRequest(
+      req as unknown as Record<string, unknown>
+    )
+    const id = `resp_${randomId()}`
 
     let text = ""
     for await (const event of this.run(
       req.model,
       messages,
       (req.tools?.length ?? 0) > 0,
-      requestedDepth(req.model, undefined, req.reasoning)
+      requestedDepth(req.model, undefined, req.reasoning),
+      thread
     )) {
       if (event.kind === "text") text += event.delta
     }
+    this.rememberThread(id, thread)
 
     return {
-      id: `resp_${randomId()}`,
+      id,
       object: "response",
+      ...(thread.conversationId ? { conversation: thread.conversationId } : {}),
       created_at: Math.floor(Date.now() / 1_000),
       status: "completed",
       model: req.model,
@@ -196,6 +293,9 @@ export class ChatGptWebProtocolService {
     signal?: AbortSignal
   ): AsyncGenerator<string, void, unknown> {
     const messages = normalizeResponsesInput(req)
+    const thread = this.threadFromRequest(
+      req as unknown as Record<string, unknown>
+    )
     const responseId = `resp_${randomId()}`
     const itemId = `msg_${randomId()}`
     const createdAt = Math.floor(Date.now() / 1_000)
@@ -253,6 +353,7 @@ export class ChatGptWebProtocolService {
       messages,
       (req.tools?.length ?? 0) > 0,
       requestedDepth(req.model, undefined, req.reasoning),
+      thread,
       signal
     )) {
       if (event.kind !== "text") continue
@@ -287,6 +388,7 @@ export class ChatGptWebProtocolService {
         content: [{ type: "output_text", text, annotations: [] }],
       },
     })
+    this.rememberThread(responseId, thread)
     yield emit("response.completed", { response: envelope("completed", text) })
   }
 }
@@ -302,6 +404,17 @@ export class ChatGptWebProtocolService {
  * vocabulary may be OpenAI's, Cursor's or ChatGPT's own — `webGptThinkingEffort`
  * is what settles that, and what checks the answer against the model.
  */
+/** Only what is new, for a thread that already holds the rest. */
+function lastUserMessage(
+  messages: readonly ChatGptWebMessage[]
+): ChatGptWebMessage[] {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!
+    if (message.role === "user") return [message]
+  }
+  return messages.length ? [messages[messages.length - 1]!] : []
+}
+
 function requestedDepth(
   model: string,
   explicit?: string,

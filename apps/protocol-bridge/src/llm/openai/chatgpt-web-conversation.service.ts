@@ -58,13 +58,27 @@ export interface ChatGptWebRequest {
    * `max`. Left out, upstream applies the model's default.
    */
   readonly thinkingEffort?: string | null
+  /**
+   * The conversation to continue. Left out, the turn starts a new one.
+   *
+   * Continuing means upstream already holds the history, so `messages` should
+   * carry only what is new — anything else is said twice in the thread.
+   */
+  readonly conversationId?: string | null
+  /** The message the new one answers; required to continue a thread. */
+  readonly parentMessageId?: string | null
   readonly signal?: AbortSignal
 }
 
 export type ChatGptWebEvent =
   | { readonly kind: "text"; readonly delta: string }
   | { readonly kind: "reasoning"; readonly delta: string }
-  | { readonly kind: "done"; readonly conversationId?: string }
+  | {
+      readonly kind: "done"
+      readonly conversationId?: string
+      /** The assistant message the next turn should answer. */
+      readonly messageId?: string
+    }
 
 interface CachedCatalog {
   slugs: Set<string>
@@ -161,6 +175,51 @@ export class ChatGptWebConversationService {
    * Slugs upstream currently offers. Cached briefly — the list changes when
    * OpenAI ships a model, not between requests.
    */
+  /**
+   * The message a new turn in this conversation should answer.
+   *
+   * ChatGPT calls it `current_node`: the leaf of the thread as it stands right
+   * now. Asking upstream rather than trusting what was last seen here is what
+   * lets a conversation be carried on by hand in the web UI and then picked up
+   * again from this side — the next turn follows what was actually said, not
+   * what this process happens to remember.
+   *
+   * Null when it cannot be read: the caller then starts a fresh conversation
+   * rather than grafting a turn onto a branch nobody asked for.
+   */
+  async currentNode(conversationId: string): Promise<string | null> {
+    const id = conversationId.trim()
+    if (!id) return null
+    const lease = await this.lease()
+    try {
+      const base = await this.sessions.baseHeaders(
+        lease.accountKey,
+        lease.accessToken,
+        accountIdFromToken(lease.accessToken)
+      )
+      const response = await fetch(
+        `${ORIGIN}/backend-api/conversation/${encodeURIComponent(id)}`,
+        {
+          headers: { ...base, accept: "application/json" },
+          dispatcher: this.proxyDispatcher(lease),
+          signal: AbortSignal.timeout(this.sessions.settings.requestTimeoutMs),
+        } as RequestInit
+      )
+      if (!response.ok) {
+        lease.reject(response.status, "conversation read rejected")
+        return null
+      }
+      lease.accept()
+      const payload = (await response.json()) as { current_node?: unknown }
+      return typeof payload.current_node === "string"
+        ? payload.current_node
+        : null
+    } catch (error) {
+      lease.reject(502, describe(error))
+      return null
+    }
+  }
+
   async listModelSlugs(): Promise<string[]> {
     if (
       this.catalog &&
@@ -248,7 +307,10 @@ export class ChatGptWebConversationService {
     }
 
     const lease = await this.lease()
-    const body = this.buildPayload(slug, req.messages, req.thinkingEffort)
+    const body = this.buildPayload(slug, req.messages, req.thinkingEffort, {
+      conversationId: req.conversationId,
+      parentMessageId: req.parentMessageId,
+    })
 
     let response: Response
     try {
@@ -291,7 +353,11 @@ export class ChatGptWebConversationService {
   private buildPayload(
     slug: string,
     messages: readonly ChatGptWebMessage[],
-    thinkingEffort?: string | null
+    thinkingEffort?: string | null,
+    thread?: {
+      conversationId?: string | null
+      parentMessageId?: string | null
+    }
   ): Record<string, unknown> {
     const now = Date.now() / 1_000
     return {
@@ -303,7 +369,13 @@ export class ChatGptWebConversationService {
         content: { content_type: "text", parts: [message.content] },
         metadata: { serialization_metadata: { custom_symbol_offsets: [] } },
       })),
-      parent_message_id: crypto.randomUUID(),
+      // A new conversation has nothing to answer, and upstream accepts any id
+      // as the root. Continuing one has to name the message it follows, or the
+      // turn is grafted onto the wrong branch.
+      parent_message_id: thread?.parentMessageId || crypto.randomUUID(),
+      ...(thread?.conversationId
+        ? { conversation_id: thread.conversationId }
+        : {}),
       model: slug,
       timezone_offset_min: this.sessions.settings.timezoneOffsetMinutes,
       timezone: this.sessions.settings.timezone,
@@ -335,6 +407,7 @@ export class ChatGptWebConversationService {
     const decoder = new TextDecoder()
     const emitted = new Map<string, number>()
     let conversationId: string | undefined
+    let messageId: string | undefined
     let buffer = ""
 
     for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
@@ -346,7 +419,7 @@ export class ChatGptWebConversationService {
         if (!line.startsWith("data: ")) continue
         const raw = line.slice(6).trim()
         if (raw === "[DONE]") {
-          yield { kind: "done", conversationId }
+          yield { kind: "done", conversationId, messageId }
           return
         }
 
@@ -372,6 +445,7 @@ export class ChatGptWebConversationService {
         if (!content) continue
 
         const id = typeof message.id === "string" ? message.id : "anonymous"
+        if (id !== "anonymous") messageId = id
         const text = extractText(content)
         if (!text) continue
 
@@ -386,7 +460,7 @@ export class ChatGptWebConversationService {
       }
     }
 
-    yield { kind: "done", conversationId }
+    yield { kind: "done", conversationId, messageId }
   }
 }
 
