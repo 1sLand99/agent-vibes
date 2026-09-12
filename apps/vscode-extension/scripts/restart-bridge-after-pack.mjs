@@ -140,6 +140,24 @@ function resolveConfig() {
     }
   }
 
+  // Values passed through verbatim — a URL or a secret, not a path to resolve.
+  // Without these a bridge restarted after packing comes up with the MCP relay
+  // and the ChatGPT Web backend switched off, which looks exactly like the
+  // feature being broken.
+  const verbatimOverrides = [
+    ["agentVibes.mcp.relayUrl", "MCP_RELAY_URL"],
+    ["agentVibes.mcp.apiKey", "MCP_API_KEY"],
+    ["agentVibes.chatGptWeb.connectorId", "CHATGPT_WEB_CONNECTOR_ID"],
+    ["agentVibes.chatGptWeb.browserProfile", "CHATGPT_WEB_BROWSER_PROFILE"],
+  ]
+
+  for (const [settingKey, envKey] of verbatimOverrides) {
+    const value = settings[settingKey]
+    if (typeof value === "string" && value.trim()) {
+      env[envKey] = value.trim()
+    }
+  }
+
   if (settings["agentVibes.debugMode"] === true) {
     env.LOG_DEBUG = "true"
   }
