@@ -58,6 +58,7 @@ describe("ChatGptWebCursorBridge", () => {
     )
     const stream = bridge.stream({
       conversationId: "c1",
+      model: "gpt-5-6-thinking",
       prompt: "hi",
       toolResults: [],
     })
@@ -76,6 +77,7 @@ describe("ChatGptWebCursorBridge", () => {
     const frames: string[] = []
     for await (const frame of bridge.stream({
       conversationId: "c1",
+      model: "gpt-5-6-thinking",
       prompt: "hi",
       toolResults: [],
     })) {
@@ -106,6 +108,7 @@ describe("ChatGptWebCursorBridge", () => {
     const reading = (async () => {
       for await (const frame of bridge.stream({
         conversationId: "c1",
+        model: "gpt-5-6-thinking",
         prompt: "read it",
         toolResults: [],
       })) {
@@ -127,6 +130,7 @@ describe("ChatGptWebCursorBridge", () => {
     const second: string[] = []
     for await (const frame of bridge.stream({
       conversationId: "c1",
+      model: "gpt-5-6-thinking",
       prompt: "ignored on resume",
       toolResults: [
         { toolCallId, result: { content: [{ type: "text", text: "body" }] } },
@@ -160,6 +164,7 @@ describe("ChatGptWebCursorBridge", () => {
     )
     for await (const _ of bridge.stream({
       conversationId: "c1",
+      model: "gpt-5-6-thinking",
       prompt: "first",
       toolResults: [],
     })) {
@@ -167,6 +172,7 @@ describe("ChatGptWebCursorBridge", () => {
     }
     for await (const _ of bridge.stream({
       conversationId: "c2",
+      model: "gpt-5-6-thinking",
       prompt: "second",
       toolResults: [],
     })) {
@@ -188,11 +194,113 @@ describe("ChatGptWebCursorBridge", () => {
     const frames: string[] = []
     for await (const frame of bridge.stream({
       conversationId: "c1",
+      model: "gpt-5-6-thinking",
       prompt: "hi",
       toolResults: [{ toolCallId: "toolu_stale", result: { content: [] } }],
     })) {
       frames.push(frame)
     }
     expect(collect(frames).at(-1)!.event).toBe("message_stop")
+  })
+
+  describe("the tool host", () => {
+    /**
+     * A conversation started in ChatGPT's own UI has no Cursor turn behind it,
+     * and a Cursor tool can only run inside one. The host turn is that turn.
+     */
+    const hostBridge = () => {
+      const tools = new McpCursorToolsProvider(new McpService())
+      const { browser, prompts } = browserEmitting([])
+      return {
+        tools,
+        prompts,
+        bridge: new ChatGptWebCursorBridge(configWith({}), browser, tools),
+      }
+    }
+
+    it("parks instead of answering, and drives no browser", async () => {
+      const { bridge, prompts, tools } = hostBridge()
+      const controller = new AbortController()
+      const frames: string[] = []
+      const parked = (async () => {
+        for await (const frame of bridge.stream({
+          conversationId: "host",
+          model: "tool-host",
+          prompt: "host",
+          toolResults: [],
+          signal: controller.signal,
+        })) {
+          frames.push(frame)
+        }
+      })()
+
+      // Give the segment a moment to open and then sit there.
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(prompts).toEqual([])
+      expect(tools.attached).toBe(true)
+      expect(collect(frames).map((f) => f.event)).toEqual(["message_start"])
+
+      controller.abort()
+      await parked
+      expect(collect(frames).at(-1)!.event).toBe("message_stop")
+    })
+
+    it("needs no connector, because the ChatGPT side already carries one", async () => {
+      // The browser path refuses without CHATGPT_WEB_CONNECTOR_ID; a host turn
+      // opens no conversation of its own, so it has nothing to attach.
+      const { bridge } = hostBridge()
+      const controller = new AbortController()
+      const first = bridge.stream({
+        conversationId: "host",
+        model: "tool-host",
+        prompt: "host",
+        toolResults: [],
+        signal: controller.signal,
+      })
+      await expect(first.next()).resolves.toMatchObject({ done: false })
+      controller.abort()
+      await first.return(undefined)
+    })
+
+    it("hands a call arriving from ChatGPT to the editor", async () => {
+      const { bridge, tools } = hostBridge()
+      const controller = new AbortController()
+      const frames: string[] = []
+      const parked = (async () => {
+        for await (const frame of bridge.stream({
+          conversationId: "host",
+          model: "tool-host",
+          prompt: "host",
+          toolResults: [],
+          signal: controller.signal,
+        })) {
+          frames.push(frame)
+        }
+      })()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+
+      const call = tools.callTool("read_file", { target_file: "a.ts" })
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      await parked
+
+      const events = collect(frames)
+      const start = events.find(
+        (f) =>
+          f.event === "content_block_start" &&
+          (f.data.content_block as { type?: string } | undefined)?.type ===
+            "tool_use"
+      )
+      expect(start).toBeDefined()
+      expect((start!.data.content_block as { name: string }).name).toBe(
+        "read_file"
+      )
+
+      // The segment ended at the call; the MCP request is still waiting for
+      // the editor, which is what keeps ChatGPT's connector call open. Ending
+      // the host turn is what finally releases it.
+      bridge.release("host", "test over")
+      await expect(call).rejects.toThrow("test over")
+      controller.abort()
+    })
   })
 })

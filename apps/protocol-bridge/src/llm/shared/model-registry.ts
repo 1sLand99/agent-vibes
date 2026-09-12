@@ -1141,31 +1141,46 @@ export const CODEX_CURSOR_DISPLAY_MODELS = BASE_CODEX_CURSOR_DISPLAY_MODELS
  * Names match the slugs chatgpt.com's own catalogue returns; `*-pro` and
  * `research` have no Codex equivalent at all.
  */
-export const WEB_GPT_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = (
-  [
-    ["gpt-5-6-thinking", "GPT-5.6 Thinking", true],
-    ["gpt-5-6", "GPT-5.6", false],
-    ["gpt-5-5-thinking", "GPT-5.5 Thinking", true],
-    ["gpt-5-5", "GPT-5.5", false],
-    ["gpt-6-pro", "GPT-6 Pro", true],
-    ["gpt-5-6-pro", "GPT-5.6 Pro", true],
-    ["gpt-5-5-pro", "GPT-5.5 Pro", true],
-    ["o3-pro", "o3-pro", true],
-    ["gpt-5-6-mini", "GPT-5.6 Mini", false],
-    ["gpt-5-5-mini", "GPT-5.5 Mini", false],
-  ] as const
-).map(([slug, label, isThinking]) => ({
-  name: `web-gpt/${slug}`,
-  displayName: `${label} (Web)`,
-  shortName: `${label} Web`,
-  family: "gpt" as const,
-  isThinking,
-  supportsAgent: true,
-  // The transport flattens a turn down to the text chatgpt.com's composer
-  // accepts, so an attached image would be dropped without a word. Saying so
-  // here means the editor never offers to attach one.
-  supportsImages: false,
-}))
+export const WEB_GPT_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
+  ...(
+    [
+      ["gpt-5-6-thinking", "GPT-5.6 Thinking", true],
+      ["gpt-5-6", "GPT-5.6", false],
+      ["gpt-5-5-thinking", "GPT-5.5 Thinking", true],
+      ["gpt-5-5", "GPT-5.5", false],
+      ["gpt-6-pro", "GPT-6 Pro", true],
+      ["gpt-5-6-pro", "GPT-5.6 Pro", true],
+      ["gpt-5-5-pro", "GPT-5.5 Pro", true],
+      ["o3-pro", "o3-pro", true],
+      ["gpt-5-6-mini", "GPT-5.6 Mini", false],
+      ["gpt-5-5-mini", "GPT-5.5 Mini", false],
+    ] as const
+  ).map(([slug, label, isThinking]) => ({
+    name: `web-gpt/${slug}`,
+    displayName: `${label} (Web)`,
+    shortName: `${label} Web`,
+    family: "gpt" as const,
+    isThinking,
+    supportsAgent: true,
+    // The transport flattens a turn down to the text chatgpt.com's composer
+    // accepts, so an attached image would be dropped without a word. Saying so
+    // here means the editor never offers to attach one.
+    supportsImages: false,
+  })),
+  // Not a model at all: the parked turn that lets a conversation started in
+  // ChatGPT's own UI reach this editor. It is listed here because picking a
+  // model is how a Cursor turn gets started, and a turn is the only place a
+  // Cursor tool can run. It answers nothing on its own.
+  {
+    name: "web-gpt/tool-host",
+    displayName: "ChatGPT Tool Host",
+    shortName: "Tool Host",
+    family: "gpt",
+    isThinking: false,
+    supportsAgent: true,
+    supportsImages: false,
+  },
+]
 
 /** The chatgpt.com model behind a `web-gpt/` (or `web-gpt:`) prefix, if any. */
 export function readWebGptModel(modelId: string): string | null {

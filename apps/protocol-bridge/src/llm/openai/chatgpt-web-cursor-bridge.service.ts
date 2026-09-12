@@ -28,6 +28,18 @@ import { ChatGptWebTurnSession } from "./chatgpt-web-turn-session"
 
 const IDLE_SESSION_MS = 10 * 60 * 1_000
 
+/**
+ * The model that parks a Cursor turn as a tool host.
+ *
+ * A tool call can only run inside a live Cursor turn — the editor executes its
+ * tools in the stream it opened, and nothing can push one in from outside. So
+ * a conversation started in ChatGPT's own web UI, which has no Cursor turn
+ * behind it, needs one held open on its behalf: pick this model, send
+ * anything, and the turn parks with the sink attached, handing each incoming
+ * call to the editor until it is stopped or goes idle.
+ */
+export const CHATGPT_WEB_TOOL_HOST_MODEL = "tool-host"
+
 interface ActiveTurn {
   readonly conversationId: string
   readonly session: ChatGptWebTurnSession
@@ -70,6 +82,7 @@ export class ChatGptWebCursorBridge {
    */
   async *stream(params: {
     conversationId: string
+    model: string
     prompt: string
     toolResults: { toolCallId: string; result: McpToolResult }[]
     signal?: AbortSignal
@@ -117,16 +130,23 @@ export class ChatGptWebCursorBridge {
 
   private begin(params: {
     conversationId: string
+    model: string
     prompt: string
     signal?: AbortSignal
   }): ActiveTurn {
-    const connectorId = this.connectorId()
+    // A host turn drives no browser and needs no connector of its own: the
+    // conversation it serves lives in ChatGPT's UI and already carries one.
+    // Its source never yields, so the segment parks in the reader until a tool
+    // call arrives or the turn is aborted.
+    const host = isToolHost(params.model)
     const session = new ChatGptWebTurnSession({
-      source: this.browser.streamTurn({
-        prompt: params.prompt,
-        connectorId,
-        signal: params.signal,
-      }),
+      source: host
+        ? parked(params.signal)
+        : this.browser.streamTurn({
+            prompt: params.prompt,
+            connectorId: this.connectorId(),
+            signal: params.signal,
+          }),
     })
 
     const turn: ActiveTurn = {
@@ -139,7 +159,8 @@ export class ChatGptWebCursorBridge {
     }
     this.active = turn
     this.logger.warn(
-      `ChatGPT Web turn started for ${params.conversationId.slice(0, 8)}…`
+      `${host ? "Tool host" : "ChatGPT Web turn"} started for ` +
+        `${params.conversationId.slice(0, 8)}…`
     )
     return turn
   }
@@ -163,4 +184,30 @@ export class ChatGptWebCursorBridge {
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Whether this backend model asks for a parked tool host. */
+function isToolHost(model: string): boolean {
+  return model.trim().toLowerCase() === CHATGPT_WEB_TOOL_HOST_MODEL
+}
+
+/**
+ * A source that yields nothing and ends only when the turn is abandoned.
+ *
+ * The session treats the end of its source as the end of the turn, so this is
+ * what keeps a host segment open: Cursor's stream stays parked, kept alive by
+ * the heartbeat wrapper every other backend relies on, until the editor aborts
+ * it.
+ */
+// Yielding nothing is the point: the turn produces no assistant output, it
+// only stays open.
+// eslint-disable-next-line require-yield
+async function* parked(signal?: AbortSignal): AsyncGenerator<string> {
+  await new Promise<void>((resolve) => {
+    if (signal?.aborted) {
+      resolve()
+      return
+    }
+    signal?.addEventListener("abort", () => resolve(), { once: true })
+  })
 }

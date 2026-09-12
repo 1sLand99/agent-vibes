@@ -5586,6 +5586,7 @@ export class CursorConnectStreamService {
       )
       yield* this.chatGptWebCursor.stream({
         conversationId: turnConversationId,
+        model: route.model,
         prompt: promptFromPreparedRequest(prepared),
         toolResults: toolResultsFromPreparedRequest(prepared),
         signal: attemptSignal,
