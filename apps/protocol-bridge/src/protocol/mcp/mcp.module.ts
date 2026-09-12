@@ -1,6 +1,7 @@
 import { Module } from "@nestjs/common"
 import { McpAuthGuard } from "./mcp-auth.guard"
 import { McpController } from "./mcp.controller"
+import { McpCursorToolsProvider } from "./mcp-cursor-tools.provider"
 import { McpDiagnosticProvider } from "./mcp-diagnostic.provider"
 import { McpRelayGateway } from "./mcp-relay.gateway"
 import { McpWorkspaceAgent } from "./mcp-workspace.agent"
@@ -20,7 +21,8 @@ import { McpService } from "./mcp.service"
     McpDiagnosticProvider,
     McpRelayGateway,
     McpWorkspaceAgent,
+    McpCursorToolsProvider,
   ],
-  exports: [McpService],
+  exports: [McpService, McpCursorToolsProvider],
 })
 export class McpModule {}
