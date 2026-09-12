@@ -1,6 +1,6 @@
 import { Injectable, Logger, type OnModuleDestroy } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
-import { spawn, type ChildProcess } from "node:child_process"
+import { execFile, spawn, type ChildProcess } from "node:child_process"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
@@ -78,6 +78,22 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
     return path.join(base, "chatgpt-browser-profile")
   }
 
+  /**
+   * Whether the window should be where a person can see it.
+   *
+   * Off by default: the turn is machinery, not something to watch, and a
+   * window that steals the screen on every turn is worse than no feature. It
+   * is still a real window — see `ensureChrome` — just placed out of the way.
+   * Turn it on to sign in the first time, or to see what the page is doing.
+   */
+  private get visible(): boolean {
+    const raw = this.configService
+      .get<string>("CHATGPT_WEB_BROWSER_VISIBLE", "")
+      .trim()
+      .toLowerCase()
+    return raw === "1" || raw === "true" || raw === "yes"
+  }
+
   private get chromeBinary(): string {
     const configured = this.configService
       .get<string>("CHATGPT_WEB_BROWSER_BINARY", "")
@@ -111,7 +127,27 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
     fs.mkdirSync(this.profileDir, { recursive: true, mode: 0o700 })
 
     // Headless is rejected by the Cloudflare check that fronts chatgpt.com, so
-    // this window is real. It is also where a human signs in the first time.
+    // this window is real whether or not anyone can see it. Unless asked for,
+    // it is put out of the way: a browser that takes the screen on every turn
+    // is not something to live with, and the page is driven over CDP, which
+    // does not care where the window is or whether it is on screen at all.
+    //
+    // What Chrome does care about is whether anyone is looking: it slows
+    // timers and stops rendering for windows it thinks are hidden, which would
+    // stall the very stream this is here to read. The three backgrounding
+    // behaviours are turned off so a turn runs at full speed out of sight.
+    //
+    // The off-screen position works on Linux and Windows; macOS clamps a
+    // window back onto the screen, which is what `hideOnMacOs` is for.
+    const placement = this.visible
+      ? ["--window-size=1280,900"]
+      : [
+          "--window-size=1280,900",
+          "--window-position=-32000,-32000",
+          "--disable-background-timer-throttling",
+          "--disable-backgrounding-occluded-windows",
+          "--disable-renderer-backgrounding",
+        ]
     this.chrome = spawn(
       binary,
       [
@@ -119,7 +155,7 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
         `--user-data-dir=${this.profileDir}`,
         "--no-first-run",
         "--no-default-browser-check",
-        "--window-size=1280,900",
+        ...placement,
         "https://chatgpt.com/",
       ],
       { stdio: "ignore", detached: false }
@@ -132,7 +168,10 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
 
     const deadline = Date.now() + 60_000
     while (Date.now() < deadline) {
-      if (await this.devToolsReachable()) return
+      if (await this.devToolsReachable()) {
+        if (!this.visible) await this.hideOnMacOs(this.chrome?.pid)
+        return
+      }
       await delay(POLL_MS)
     }
     throw new ChatGptWebBrowserError(
@@ -140,6 +179,40 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
       "chatgpt_web_browser_unavailable",
       "Chrome did not expose its DevTools port in time"
     )
+  }
+
+  /**
+   * Hide the browser the way ⌘H does, so it leaves the screen and the Dock's
+   * window list entirely.
+   *
+   * macOS refuses to place a window off-screen — a position far outside the
+   * display is clamped back to a sliver at the edge — so this is the only way
+   * to be rid of it. It is addressed by process id: hiding "Google Chrome" by
+   * name would take the user's own browser with it.
+   *
+   * Hiding the app suspends `requestAnimationFrame` for the page, which a turn
+   * does not need: text is inserted and the send button clicked through CDP,
+   * and timers, network and the response stream all keep running.
+   *
+   * Best-effort. The first attempt may raise a macOS automation prompt, and a
+   * refusal only means the window stays where it was.
+   */
+  private hideOnMacOs(pid?: number): Promise<void> {
+    if (process.platform !== "darwin" || !pid) return Promise.resolve()
+    const script =
+      'tell application "System Events" to set visible of ' +
+      `(first process whose unix id is ${pid}) to false`
+    return new Promise<void>((resolve) => {
+      execFile("osascript", ["-e", script], (error) => {
+        if (error) {
+          this.logger.warn(
+            `Could not hide the ChatGPT window (${error.message.trim()}); ` +
+              "it stays on screen"
+          )
+        }
+        resolve()
+      })
+    })
   }
 
   private async devToolsReachable(): Promise<boolean> {
@@ -215,8 +288,10 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
     throw new ChatGptWebBrowserError(
       503,
       "chatgpt_web_not_signed_in",
-      "The ChatGPT tab never showed a composer — sign in once in the browser " +
-        "window this service opened, then retry"
+      "The ChatGPT tab never showed a composer, which is what a signed-out or " +
+        "challenged page looks like. Set CHATGPT_WEB_BROWSER_VISIBLE=1 " +
+        "(agentVibes.chatGptWeb.showBrowser) so the window is on screen, sign " +
+        "in there once, then turn it back off"
     )
   }
 

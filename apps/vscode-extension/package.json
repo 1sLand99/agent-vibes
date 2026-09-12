@@ -396,6 +396,11 @@
           "type": "string",
           "default": "",
           "description": "Chrome profile directory the ChatGPT tab runs in. Empty uses ~/.agent-vibes/chatgpt-browser-profile. Sign in there once; the session persists."
+        },
+        "agentVibes.chatGptWeb.showBrowser": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the ChatGPT browser window. Off by default: the window is real because Cloudflare rejects headless, not because it needs watching. Turn it on to sign in the first time."
         }
       }
     }

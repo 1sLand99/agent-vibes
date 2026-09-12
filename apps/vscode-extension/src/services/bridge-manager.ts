@@ -176,6 +176,9 @@ export class BridgeManager extends EventEmitter {
       if (this.config.chatGptWebBrowserProfile) {
         env.CHATGPT_WEB_BROWSER_PROFILE = this.config.chatGptWebBrowserProfile
       }
+      if (this.config.chatGptWebShowBrowser) {
+        env.CHATGPT_WEB_BROWSER_VISIBLE = "1"
+      }
 
       // Stability first: Kiro warmup sends one request per account on every
       // bridge start. On account pools this can trigger 429 cooldowns and a

@@ -158,6 +158,10 @@ function resolveConfig() {
     }
   }
 
+  if (settings["agentVibes.chatGptWeb.showBrowser"] === true) {
+    env.CHATGPT_WEB_BROWSER_VISIBLE = "1"
+  }
+
   if (settings["agentVibes.debugMode"] === true) {
     env.LOG_DEBUG = "true"
   }
