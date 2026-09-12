@@ -187,6 +187,19 @@ export const BACKEND_CAPABILITY: Record<BackendType, BackendCapability> = {
       advertisedToCC: ANTHROPIC_DEFAULT_WINDOW,
     },
   },
+  // The web app exposes no thinking blocks and carries no signature: the
+  // browser stream only yields rendered text, so there is nothing to continue
+  // a reasoning chain from between turns.
+  "chatgpt-web": {
+    wireSupportsThinkingBlock: false,
+    wireSupportsSignature: false,
+    disabledIntentRespected: true,
+    continuityStrategy: "none",
+    contextWindow: {
+      maxInputTokens: ANTHROPIC_DEFAULT_WINDOW,
+      advertisedToCC: ANTHROPIC_DEFAULT_WINDOW,
+    },
+  },
 }
 
 export function getBackendCapability(backend: BackendType): BackendCapability {

@@ -18,6 +18,8 @@ import {
  * - openai-compat: Third-party OpenAI-compatible API (Chat Completions)
  * - claude-api: Anthropic-compatible Claude API with third-party key/account pool
  * - kiro: AWS CodeWhisperer / Kiro-IDE backend serving Claude models via AWS Event Stream
+ * - chatgpt-web: chatgpt.com's web app, driven through a browser so a
+ *   connector can supply tools; drawn on a different quota than codex
  */
 export type BackendType =
   | "google"
@@ -26,6 +28,7 @@ export type BackendType =
   | "openai-compat"
   | "claude-api"
   | "kiro"
+  | "chatgpt-web"
 
 /**
  * Model routing result
@@ -468,6 +471,20 @@ export class ModelRouterService {
    * Uses unified model-registry for all name resolution.
    */
   resolveModel(cursorModel: string): ModelRouteResult {
+    // An explicit `web-gpt/` prefix is the only way into the browser-backed
+    // path. It is never inferred from a model name: that transport spends a
+    // different quota and needs a signed-in browser, so asking for it has to
+    // be deliberate.
+    const webGptModel = readWebGptPrefix(cursorModel)
+    if (webGptModel) {
+      this.logger.log(`[ROUTE] ${cursorModel} -> chatgpt-web | ${webGptModel}`)
+      return {
+        backend: "chatgpt-web",
+        model: webGptModel,
+        isThinking: /thinking|reasoning/i.test(webGptModel),
+      }
+    }
+
     const stripped = this.stripVendorPrefix(cursorModel)
     const normalized = stripped.toLowerCase().trim()
     const family = detectModelFamily(normalized)
@@ -600,4 +617,10 @@ export class ModelRouterService {
       `Unknown model ${cursorModel}. Supported families: gemini, claude, gpt/o-series.`
     )
   }
+}
+
+/** The model behind a `web-gpt/` (or `web-gpt:`) prefix, if there is one. */
+function readWebGptPrefix(cursorModel: string): string | null {
+  const match = /^web-gpt[/:](.+)$/i.exec(cursorModel.trim())
+  return match ? match[1]!.trim() : null
 }

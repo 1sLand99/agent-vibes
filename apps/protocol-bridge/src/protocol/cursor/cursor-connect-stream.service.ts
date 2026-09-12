@@ -251,6 +251,7 @@ import {
   type ProviderAttemptAbandonReason,
   type ProviderAttemptIdentity,
   type PreparedProviderRequest,
+  type ProviderRequestCandidate,
   ProviderAttemptCoordinator,
   type ProviderAttemptLifecycleHooks,
   type ProviderRequestPreparer,
@@ -259,6 +260,7 @@ import {
   decidePendingWorkLog,
   type PendingWorkLogState,
 } from "./pending-work-log-policy"
+import { ChatGptWebCursorBridge } from "../../llm/openai/chatgpt-web-cursor-bridge.service"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
 import {
   parseCursorSseEvent,
@@ -1928,6 +1930,7 @@ export class CursorConnectStreamService {
     private readonly toolUseSummary: ToolUseSummaryService,
     private readonly openaiCompatService: OpenaiCompatService,
     private readonly modelRouter: ModelRouterService,
+    private readonly chatGptWebCursor: ChatGptWebCursorBridge,
     private readonly kvStorageService: KvStorageService,
     private readonly contextManager: ContextManagerService,
     private readonly contextProjection: ContextProjectionService,
@@ -5559,6 +5562,34 @@ export class CursorConnectStreamService {
     const attemptSignal = options.abortSignal
     if (!attemptSignal) {
       throw new Error("Backend provider attempts require an owned AbortSignal")
+    }
+
+    // chatgpt-web leaves this path immediately. It has no provider request to
+    // retry or fall back from: the turn lives in a browser tab that is already
+    // open, and one Cursor request reads one segment of it. Running it through
+    // the attempt machinery would re-prompt ChatGPT on every retry.
+    if (route.backend === "chatgpt-web") {
+      if (!turnConversationId) {
+        throw new Error("chatgpt-web requires a conversation-bound stream")
+      }
+      const prepared = await options.prepareProviderRequest(
+        route,
+        activeHintsForWebGpt(options),
+        {
+          scope: "chatgpt-web",
+          ordinal: 1,
+          backend: route.backend,
+          model: route.model,
+        },
+        attemptSignal
+      )
+      yield* this.chatGptWebCursor.stream({
+        conversationId: turnConversationId,
+        prompt: promptFromPreparedRequest(prepared),
+        toolResults: toolResultsFromPreparedRequest(prepared),
+        signal: attemptSignal,
+      })
+      return
     }
     let emittedAny = false
     let buffer: string[] = []
@@ -12777,6 +12808,13 @@ export class CursorConnectStreamService {
           case "codex":
             throw new Error(
               "Codex compact must use the Codex context adapter and Responses compact endpoint."
+            )
+          case "chatgpt-web":
+            // Compaction is a side call made while a turn is in flight, and the
+            // browser transport holds one tab for one turn. Summarising would
+            // have to queue behind the turn it is trying to shorten.
+            throw new Error(
+              "chatgpt-web cannot serve compaction; it has no side channel."
             )
         }
       },
@@ -43626,4 +43664,98 @@ function flattenAssistantTurnBlocks(
     }
   }
   return out
+}
+
+/**
+ * The prompt for a ChatGPT turn.
+ *
+ * A browser turn is one composer submission, so the conversation Cursor built
+ * is folded into a single message. Only the newest user text matters on a
+ * resume — the browser turn still holds everything before it.
+ */
+function promptFromPreparedRequest(prepared: ProviderRequestCandidate): string {
+  if (prepared.kind !== "standard") return ""
+  const messages = prepared.request.messages ?? []
+  const parts: string[] = []
+  for (const message of messages) {
+    if (message.role !== "user") continue
+    const content = message.content
+    if (typeof content === "string") {
+      parts.push(content)
+      continue
+    }
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (
+        block &&
+        typeof block === "object" &&
+        (block as { type?: string }).type === "text" &&
+        typeof (block as { text?: unknown }).text === "string"
+      ) {
+        parts.push((block as { text: string }).text)
+      }
+    }
+  }
+  return parts.join("\n\n")
+}
+
+/**
+ * Tool outcomes Cursor is returning for the previous segment.
+ *
+ * Each one releases an MCP request that has been holding ChatGPT's connector
+ * open since the tool was asked for.
+ */
+function toolResultsFromPreparedRequest(prepared: ProviderRequestCandidate): {
+  toolCallId: string
+  result: { content: { type: "text"; text: string }[] }
+}[] {
+  if (prepared.kind !== "standard") return []
+  const results: {
+    toolCallId: string
+    result: { content: { type: "text"; text: string }[] }
+  }[] = []
+  for (const message of prepared.request.messages ?? []) {
+    const content = message.content
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue
+      const typed = block as {
+        type?: string
+        tool_use_id?: string
+        content?: unknown
+      }
+      if (typed.type !== "tool_result" || !typed.tool_use_id) continue
+      results.push({
+        toolCallId: typed.tool_use_id,
+        result: {
+          content: [{ type: "text", text: flattenToolResult(typed.content) }],
+        },
+      })
+    }
+  }
+  return results
+}
+
+function flattenToolResult(content: unknown): string {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  return content
+    .map((block) =>
+      block &&
+      typeof block === "object" &&
+      typeof (block as { text?: unknown }).text === "string"
+        ? (block as { text: string }).text
+        : ""
+    )
+    .filter(Boolean)
+    .join("\n")
+}
+
+/** Hints carried into the single chatgpt-web attempt. */
+function activeHintsForWebGpt(
+  options: BackendStreamOptions
+): BackendStreamHints | undefined {
+  return options.maxOutputTokensOverride
+    ? { maxOutputTokensOverride: options.maxOutputTokensOverride }
+    : undefined
 }

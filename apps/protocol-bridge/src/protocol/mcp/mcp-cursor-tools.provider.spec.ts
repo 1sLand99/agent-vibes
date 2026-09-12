@@ -1,11 +1,12 @@
 import { McpCursorToolsProvider } from "./mcp-cursor-tools.provider"
+import { McpService } from "./mcp.service"
 import type { McpToolResult } from "./mcp-types"
 
 describe("McpCursorToolsProvider", () => {
   let provider: McpCursorToolsProvider
 
   beforeEach(() => {
-    provider = new McpCursorToolsProvider()
+    provider = new McpCursorToolsProvider(new McpService())
   })
 
   it("advertises Cursor's own tools under their own names", () => {
@@ -26,9 +27,23 @@ describe("McpCursorToolsProvider", () => {
   })
 
   describe("with no editor attached", () => {
-    it("still lists the tools, so a client can see what a session would offer", () => {
+    it("knows the tools even before a session claims them", () => {
+      // listTools stays pure; what changes with a sink is whether the endpoint
+      // advertises them at all.
       expect(provider.attached).toBe(false)
       expect(provider.listTools().length).toBeGreaterThan(0)
+    })
+
+    it("only advertises them on the endpoint while a sink is attached", () => {
+      const mcp = new McpService()
+      const scoped = new McpCursorToolsProvider(mcp)
+      expect(mcp.providerCount).toBe(0)
+      const detach = scoped.attach({
+        dispatch: () => Promise.resolve({ content: [] }),
+      })
+      expect(mcp.providerCount).toBe(1)
+      detach()
+      expect(mcp.providerCount).toBe(0)
     })
 
     it("refuses to run one, and says why", async () => {

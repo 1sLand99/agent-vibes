@@ -59,6 +59,15 @@ export class ChatGptWebTurnSession {
   private wake: (() => void) | null = null
   private reading = false
   private sourceDone = false
+  /**
+   * Set when the turn's end has been handed out, which is not the same as the
+   * source iterator finishing: a segment can consume the end marker before the
+   * reader's cleanup runs, and a caller asking `finished` in between would be
+   * told the turn is still live.
+   */
+  private ended = false
+  /** The end marker is queued once, whoever notices the end first. */
+  private endQueued = false
   private failure: Error | null = null
 
   constructor(options: ChatGptWebTurnSessionOptions) {
@@ -68,7 +77,11 @@ export class ChatGptWebTurnSession {
 
   /** True once the browser turn ended and nothing is left to hand out. */
   get finished(): boolean {
-    return this.sourceDone && this.queue.length === 0 && this.pending.size === 0
+    return (
+      (this.ended || this.sourceDone) &&
+      this.queue.length === 0 &&
+      this.pending.size === 0
+    )
   }
 
   /**
@@ -229,16 +242,24 @@ export class ChatGptWebTurnSession {
           for (const event of this.decoder.push(chunk)) {
             if (event.kind === "text")
               this.push({ kind: "text", delta: event.delta })
-            else if (event.kind === "done") this.push({ kind: "end" })
+            else if (event.kind === "done") this.queueEnd()
           }
         }
       } catch (error) {
         this.failure = error instanceof Error ? error : new Error(String(error))
       } finally {
         this.sourceDone = true
-        this.push({ kind: "end" })
+        // The decoder usually saw [DONE] first; queueing a second end would
+        // leave one behind and make the turn look unfinished forever.
+        this.queueEnd()
       }
     })()
+  }
+
+  private queueEnd(): void {
+    if (this.endQueued) return
+    this.endQueued = true
+    this.push({ kind: "end" })
   }
 
   private push(segment: Segment): void {
@@ -251,8 +272,15 @@ export class ChatGptWebTurnSession {
     for (;;) {
       if (this.failure) throw this.failure
       const next = this.queue.shift()
-      if (next) return next.kind === "end" ? null : next
-      if (this.sourceDone) return null
+      if (next) {
+        if (next.kind !== "end") return next
+        this.ended = true
+        return null
+      }
+      if (this.sourceDone) {
+        this.ended = true
+        return null
+      }
       await new Promise<void>((resolve) => {
         this.wake = () => {
           this.wake = null

@@ -4,6 +4,7 @@ import {
   getFrozenCursorToolDefinition,
   resolveCursorToolDefinitionKey,
 } from "../cursor/tools/cursor-tool-mapper"
+import { McpService } from "./mcp.service"
 import type { McpTool, McpToolProvider, McpToolResult } from "./mcp-types"
 
 /**
@@ -20,10 +21,11 @@ import type { McpTool, McpToolProvider, McpToolResult } from "./mcp-types"
  * which is exactly an MCP tool, so nothing is translated — they are passed
  * through.
  *
- * Execution belongs to whoever attached a sink. Without one this provider
- * advertises the tools but refuses every call, which keeps the endpoint's
- * inert-by-default property: an MCP client can see what a workspace would
- * offer without anything being able to run.
+ * Execution belongs to whoever attaches a sink, and the tools are advertised
+ * only while one is. Registering them permanently would mean the endpoint
+ * offered 53 editor tools that always fail whenever no Cursor turn is running
+ * — and it would bury the workspace agent's own tools, which is what serves
+ * the browser-driven flow.
  */
 
 export interface CursorToolSink {
@@ -43,18 +45,21 @@ export class McpCursorToolsProvider implements McpToolProvider {
   private sink: CursorToolSink | null = null
   private cached: McpTool[] | null = null
 
+  constructor(private readonly mcp: McpService) {}
+
   /**
    * Attach the editor. Returns a function that detaches it, so a turn can
    * claim the tools for its lifetime and give them back when it ends.
    */
   attach(sink: CursorToolSink): () => void {
     this.sink = sink
+    this.mcp.registerProvider(this)
     this.logger.warn("Cursor tool sink attached")
     return () => {
-      if (this.sink === sink) {
-        this.sink = null
-        this.logger.warn("Cursor tool sink detached")
-      }
+      if (this.sink !== sink) return
+      this.sink = null
+      this.mcp.unregisterProvider(this.id)
+      this.logger.warn("Cursor tool sink detached")
     }
   }
 
