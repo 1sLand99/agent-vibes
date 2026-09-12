@@ -400,7 +400,7 @@
         "agentVibes.chatGptWeb.showBrowser": {
           "type": "boolean",
           "default": false,
-          "description": "Show the ChatGPT browser window. Off by default: the window is real because Cloudflare rejects headless, not because it needs watching. Turn it on to sign in the first time."
+          "description": "Open the ChatGPT browser in a window you can see and use. Off by default, which runs it headless. Turn it on to sign in the first time."
         }
       }
     }

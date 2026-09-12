@@ -79,12 +79,12 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
   }
 
   /**
-   * Whether the window should be where a person can see it.
+   * Whether to open a window a person can see and use.
    *
-   * Off by default: the turn is machinery, not something to watch, and a
-   * window that steals the screen on every turn is worse than no feature. It
-   * is still a real window — see `ensureChrome` — just placed out of the way.
-   * Turn it on to sign in the first time, or to see what the page is doing.
+   * Off by default, which means headless: the turn is machinery, not something
+   * to watch, and a browser that takes the screen on every turn is worse than
+   * no feature. Turn it on to sign in the first time, or to watch what the
+   * page is doing when something breaks.
    */
   private get visible(): boolean {
     const raw = this.configService
@@ -126,27 +126,21 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
     }
     fs.mkdirSync(this.profileDir, { recursive: true, mode: 0o700 })
 
-    // Headless is rejected by the Cloudflare check that fronts chatgpt.com, so
-    // this window is real whether or not anyone can see it. Unless asked for,
-    // it is put out of the way: a browser that takes the screen on every turn
-    // is not something to live with, and the page is driven over CDP, which
-    // does not care where the window is or whether it is on screen at all.
+    // Headless unless someone asked to watch. The page is driven over CDP,
+    // which does not need a window, and the alternative — a browser opening on
+    // top of whatever you were doing, once per session — is not something to
+    // live with.
     //
-    // What Chrome does care about is whether anyone is looking: it slows
-    // timers and stops rendering for windows it thinks are hidden, which would
-    // stall the very stream this is here to read. The three backgrounding
-    // behaviours are turned off so a turn runs at full speed out of sight.
-    //
-    // The off-screen position works on Linux and Windows; macOS clamps a
-    // window back onto the screen, which is what `hideOnMacOs` is for.
-    const placement = this.visible
+    // The one thing headless has to hide is that it is headless: Chrome puts
+    // `HeadlessChrome` in its User-Agent, and the Cloudflare check in front of
+    // chatgpt.com reads it. The override says the same version the browser
+    // would otherwise claim, so nothing else about the request changes.
+    const mode = this.visible
       ? ["--window-size=1280,900"]
       : [
+          "--headless=new",
           "--window-size=1280,900",
-          "--window-position=-32000,-32000",
-          "--disable-background-timer-throttling",
-          "--disable-backgrounding-occluded-windows",
-          "--disable-renderer-backgrounding",
+          ...(await this.headlessUserAgentArgs(binary)),
         ]
     this.chrome = spawn(
       binary,
@@ -155,7 +149,7 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
         `--user-data-dir=${this.profileDir}`,
         "--no-first-run",
         "--no-default-browser-check",
-        ...placement,
+        ...mode,
         "https://chatgpt.com/",
       ],
       { stdio: "ignore", detached: false }
@@ -168,10 +162,7 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
 
     const deadline = Date.now() + 60_000
     while (Date.now() < deadline) {
-      if (await this.devToolsReachable()) {
-        if (!this.visible) await this.hideOnMacOs(this.chrome?.pid)
-        return
-      }
+      if (await this.devToolsReachable()) return
       await delay(POLL_MS)
     }
     throw new ChatGptWebBrowserError(
@@ -182,37 +173,39 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
   }
 
   /**
-   * Hide the browser the way ⌘H does, so it leaves the screen and the Dock's
-   * window list entirely.
+   * The `--user-agent` a headless launch should claim, if it can be worked
+   * out.
    *
-   * macOS refuses to place a window off-screen — a position far outside the
-   * display is clamped back to a sliver at the edge — so this is the only way
-   * to be rid of it. It is addressed by process id: hiding "Google Chrome" by
-   * name would take the user's own browser with it.
-   *
-   * Hiding the app suspends `requestAnimationFrame` for the page, which a turn
-   * does not need: text is inserted and the send button clicked through CDP,
-   * and timers, network and the response stream all keep running.
-   *
-   * Best-effort. The first attempt may raise a macOS automation prompt, and a
-   * refusal only means the window stays where it was.
+   * Chrome reports its own version on `--version`, so the override differs
+   * from what this browser would send by exactly one word: `HeadlessChrome`
+   * becomes `Chrome`. If the version cannot be read the launch goes ahead
+   * without an override rather than guessing a version — a wrong one is a
+   * worse tell than an honest one.
    */
-  private hideOnMacOs(pid?: number): Promise<void> {
-    if (process.platform !== "darwin" || !pid) return Promise.resolve()
-    const script =
-      'tell application "System Events" to set visible of ' +
-      `(first process whose unix id is ${pid}) to false`
-    return new Promise<void>((resolve) => {
-      execFile("osascript", ["-e", script], (error) => {
-        if (error) {
-          this.logger.warn(
-            `Could not hide the ChatGPT window (${error.message.trim()}); ` +
-              "it stays on screen"
-          )
-        }
-        resolve()
-      })
+  private async headlessUserAgentArgs(binary: string): Promise<string[]> {
+    const version = await new Promise<string>((resolve) => {
+      execFile(binary, ["--version"], (error, stdout) =>
+        resolve(error ? "" : stdout.trim())
+      )
     })
+    const major = /(\d+)\.\d+\.\d+\.\d+/.exec(version)?.[1]
+    if (!major) {
+      this.logger.warn(
+        `Could not read a version from ${binary}; running headless without a ` +
+          "User-Agent override"
+      )
+      return []
+    }
+    const platform =
+      process.platform === "darwin"
+        ? "Macintosh; Intel Mac OS X 10_15_7"
+        : process.platform === "win32"
+          ? "Windows NT 10.0; Win64; x64"
+          : "X11; Linux x86_64"
+    return [
+      `--user-agent=Mozilla/5.0 (${platform}) AppleWebKit/537.36 ` +
+        `(KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`,
+    ]
   }
 
   private async devToolsReachable(): Promise<boolean> {
