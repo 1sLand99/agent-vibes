@@ -9,6 +9,7 @@ import { ChatGptWebRealtimeService } from "./chatgpt-web-realtime.service"
 import { ChatGptWebVoiceTransport } from "./chatgpt-web-transport"
 import { ChatGptWebSessionStore } from "./chatgpt-web-session"
 import { ChatGptWebConversationService } from "./chatgpt-web-conversation.service"
+import { ChatGptWebBrowserService } from "./chatgpt-web-browser.service"
 
 @Module({
   imports: [UsageStatsModule],
@@ -22,6 +23,7 @@ import { ChatGptWebConversationService } from "./chatgpt-web-conversation.servic
     ChatGptWebRealtimeService,
     ChatGptWebSessionStore,
     ChatGptWebConversationService,
+    ChatGptWebBrowserService,
   ],
   exports: [
     CodexAuthService,
@@ -32,6 +34,7 @@ import { ChatGptWebConversationService } from "./chatgpt-web-conversation.servic
     ChatGptWebRealtimeService,
     ChatGptWebSessionStore,
     ChatGptWebConversationService,
+    ChatGptWebBrowserService,
   ],
 })
 export class CodexModule {}
