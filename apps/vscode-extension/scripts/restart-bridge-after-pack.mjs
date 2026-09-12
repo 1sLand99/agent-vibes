@@ -141,14 +141,16 @@ function resolveConfig() {
   }
 
   // Values passed through verbatim — a URL or a secret, not a path to resolve.
-  // Without these a bridge restarted after packing comes up with the MCP relay
-  // and the ChatGPT Web backend switched off, which looks exactly like the
-  // feature being broken.
+  // A bridge restarted after packing has to come up as the editor would have
+  // started it; anything missing here is a feature that looks broken until the
+  // next time the extension starts the bridge itself.
   const verbatimOverrides = [
     ["agentVibes.mcp.relayUrl", "MCP_RELAY_URL"],
     ["agentVibes.mcp.apiKey", "MCP_API_KEY"],
     ["agentVibes.chatGptWeb.connectorId", "CHATGPT_WEB_CONNECTOR_ID"],
     ["agentVibes.chatGptWeb.browserProfile", "CHATGPT_WEB_BROWSER_PROFILE"],
+    ["agentVibes.proxyApiKey", "PROXY_API_KEY"],
+    ["agentVibes.responseLanguage", "AGENT_VIBES_FORCED_LANGUAGE"],
   ]
 
   for (const [settingKey, envKey] of verbatimOverrides) {
@@ -160,6 +162,19 @@ function resolveConfig() {
 
   if (settings["agentVibes.chatGptWeb.showBrowser"] === true) {
     env.CHATGPT_WEB_BROWSER_VISIBLE = "1"
+  }
+
+  if (settings["agentVibes.thinkingBudgetAuto"] === true) {
+    env.THINKING_BUDGET_AUTO = "true"
+  }
+
+  // These two default to on, so only an explicit false is worth passing.
+  if (settings["agentVibes.antigravitySystemPrompt"] === false) {
+    env.ANTIGRAVITY_SYSTEM_PROMPT = "false"
+  }
+
+  if (settings["agentVibes.antigravityOfficialTools"] === false) {
+    env.ANTIGRAVITY_OFFICIAL_TOOLS = "false"
   }
 
   if (settings["agentVibes.debugMode"] === true) {

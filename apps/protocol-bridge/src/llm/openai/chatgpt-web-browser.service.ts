@@ -27,6 +27,7 @@ import { HOOK_FLAG, PAGE_HOOK_SOURCE } from "./chatgpt-web-page-hook"
  *   - The profile is persistent and signing in is a manual, one-time step.
  */
 
+const ORIGIN = "https://chatgpt.com"
 const DEFAULT_PORT = 9333
 const PAGE_READY_TIMEOUT_MS = 90_000
 const TURN_TIMEOUT_MS = 300_000
@@ -169,7 +170,7 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
         "--no-first-run",
         "--no-default-browser-check",
         ...mode,
-        "https://chatgpt.com/",
+        `${ORIGIN}/`,
       ],
       { stdio: "ignore", detached: false }
     )
@@ -268,10 +269,21 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
     await session.send("Runtime.enable")
     await session.send("Page.enable")
     if (!page.url.includes("chatgpt.com")) {
-      await session.send("Page.navigate", { url: "https://chatgpt.com/" })
+      await session.send("Page.navigate", { url: `${ORIGIN}/` })
     }
     await this.waitForComposer(session)
+    await this.installHook(session)
+    this.session = session
+    return session
+  }
 
+  /**
+   * Put the hook on the page in front of us.
+   *
+   * Idempotent, and has to be repeated after every navigation: a new document
+   * is a new `window`, and the hook that wrapped the old one went with it.
+   */
+  private async installHook(session: CdpSession): Promise<void> {
     const result = await session.evaluate<string>(PAGE_HOOK_SOURCE)
     if (result !== "installed" && result !== "already") {
       throw new ChatGptWebBrowserError(
@@ -280,8 +292,6 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
         `Could not install the page hook: ${String(result)}`
       )
     }
-    this.session = session
-    return session
   }
 
   /**
@@ -364,24 +374,43 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
     session: CdpSession,
     conversationId?: string | null
   ): Promise<void> {
+    const wanted = conversationId ? `/c/${conversationId}` : "/"
     const current = await session
       .evaluate<string>("location.pathname")
       .catch(() => "")
-    const wanted = conversationId ? `/c/${conversationId}` : "/"
     if (current === wanted) return
-    // A new conversation is only "new" until the first turn lands; the app
-    // rewrites the URL itself, and the next turn arrives with an id.
-    if (!conversationId && current !== "/" && current !== "") {
-      await session.send("Page.navigate", { url: "https://chatgpt.com/" })
-      await this.waitForComposer(session)
-      return
+
+    await session.send("Page.navigate", { url: `${ORIGIN}${wanted}` })
+    await this.waitForPath(session, wanted)
+    await this.waitForComposer(session)
+    // The hook wrapped the window that just went away.
+    await this.installHook(session)
+  }
+
+  /**
+   * Wait for the new document to be the one in front of us.
+   *
+   * Without this the composer check can match the page being navigated away
+   * from, and everything after it would be done to a document that is already
+   * gone.
+   */
+  private async waitForPath(
+    session: CdpSession,
+    wanted: string
+  ): Promise<void> {
+    const deadline = Date.now() + PAGE_READY_TIMEOUT_MS
+    while (Date.now() < deadline) {
+      const path = await session
+        .evaluate<string>("location.pathname")
+        .catch(() => "")
+      if (path === wanted) return
+      await delay(POLL_MS)
     }
-    if (conversationId) {
-      await session.send("Page.navigate", {
-        url: `https://chatgpt.com/c/${conversationId}`,
-      })
-      await this.waitForComposer(session)
-    }
+    throw new ChatGptWebBrowserError(
+      504,
+      "chatgpt_web_navigation_timeout",
+      `The tab did not reach ${wanted} in time`
+    )
   }
 
   /** The conversation the tab is on, if it is on one. */
