@@ -180,6 +180,7 @@ import {
   BackendType,
   ModelRouteResult,
   ModelRouterService,
+  routableModelId,
 } from "../../llm/shared/model-router.service"
 import {
   normalizeFlatMessagesForAPI,
@@ -22189,7 +22190,7 @@ ${raw}
         // tool dispatch loop starting on the next iteration.
         this.emit(conversationId, this.grpcService.createHeartbeatResponse())
         const route = this.modelRouter.resolveModel(run.model)
-        const streamModel = route.model
+        const streamModel = routableModelId(route)
         let activeProviderRoute = route
         // This is assigned only after the provider candidate is accepted.
         // A prepared/retried/fallback candidate never authorizes child tools.
@@ -22781,7 +22782,7 @@ ${raw}
     const route = this.modelRouter.resolveModel(args.run.model)
     let activeProviderRoute = route
 
-    const streamModel = route.model
+    const streamModel = routableModelId(route)
     let acceptedRequest: SubagentProviderRequestReceipt | undefined
 
     let sseTurn = new SubAgentSseTurnCollector()
@@ -36939,7 +36940,7 @@ ${raw}
       const createStream = (
         streamOptions?: Pick<BackendStreamOptions, "maxOutputTokensOverride">
       ) =>
-        this.getBackendStream(route.model, {
+        this.getBackendStream(routableModelId(route), {
           maxOutputTokensOverride: streamOptions?.maxOutputTokensOverride,
           prepareProviderRequest: async (
             streamRoute,
@@ -37740,7 +37741,7 @@ ${raw}
     const createContinuationStream = (
       streamOptions?: Pick<BackendStreamOptions, "maxOutputTokensOverride">
     ) =>
-      this.getBackendStream(route.model, {
+      this.getBackendStream(routableModelId(route), {
         maxOutputTokensOverride: streamOptions?.maxOutputTokensOverride,
         prepareProviderRequest: async (streamRoute, hints, attempt, signal) => {
           this.transitionContextRuntime(conversationId, {

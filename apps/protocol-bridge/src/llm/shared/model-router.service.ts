@@ -40,6 +40,21 @@ export interface ModelRouteResult {
   isThinking: boolean
 }
 
+/**
+ * The model id that resolves back to this same route.
+ *
+ * Routing consumes the `web-gpt/` prefix, so `route.model` on its own is a
+ * bare chatgpt.com slug — and asking the router about `gpt-6-pro` gets the
+ * Codex path, which has never heard of it. Anywhere a resolved route is fed
+ * back into `resolveModel` (the stream helpers all do, to re-derive a route
+ * per attempt), ask for this instead of reaching for `route.model`.
+ */
+export function routableModelId(route: ModelRouteResult): string {
+  return route.backend === "chatgpt-web"
+    ? `web-gpt/${route.model}`
+    : route.model
+}
+
 export interface GptBackendCandidates {
   primary: ModelRouteResult
   fallbacks: ModelRouteResult[]
