@@ -16,18 +16,30 @@ const textFrame = (text: string) =>
   `"metadata":{"recipient":"all"},"content":{"content_type":"text","parts":[${JSON.stringify(text)}]}}}}\n`
 
 /** A browser whose stream the test drives. */
-function browserEmitting(chunks: string[]): {
+function browserEmitting(
+  chunks: string[],
+  options: { landsIn?: string } = {}
+): {
   browser: ChatGptWebBrowserService
   prompts: string[]
+  threads: (string | null | undefined)[]
 } {
   const prompts: string[] = []
+  const threads: (string | null | undefined)[] = []
   return {
     prompts,
+    threads,
     browser: {
       // eslint-disable-next-line @typescript-eslint/require-await
-      async *streamTurn(request: { prompt: string }) {
+      async *streamTurn(request: {
+        prompt: string
+        conversationId?: string | null
+        onConversationId?: (id: string) => void
+      }) {
         prompts.push(request.prompt)
+        threads.push(request.conversationId)
         for (const chunk of chunks) yield chunk
+        if (options.landsIn) request.onConversationId?.(options.landsIn)
       },
     } as unknown as ChatGptWebBrowserService,
   }
@@ -302,5 +314,60 @@ describe("ChatGptWebCursorBridge", () => {
       await expect(call).rejects.toThrow("test over")
       controller.abort()
     })
+  })
+})
+
+describe("pairing a Cursor conversation with a ChatGPT thread", () => {
+  const done = () => [textFrame("ok"), "data: [DONE]\n"]
+
+  const run = async (
+    bridge: ChatGptWebCursorBridge,
+    conversationId: string
+  ) => {
+    for await (const _ of bridge.stream({
+      conversationId,
+      model: "gpt-5-6-thinking",
+      prompt: "hi",
+      toolResults: [],
+    })) {
+      // drain
+    }
+  }
+
+  it("starts a new thread for a conversation it has not seen", async () => {
+    const { browser, threads } = browserEmitting(done(), { landsIn: "abc-123" })
+    const bridge = new ChatGptWebCursorBridge(
+      configWith(CONNECTOR),
+      browser,
+      new McpCursorToolsProvider(new McpService())
+    )
+    await run(bridge, "c1")
+    expect(threads).toEqual([null])
+  })
+
+  it("goes back to the same thread on the next turn", async () => {
+    // The tab is shared. Without this the turn lands wherever the last one
+    // left it, which braids two chats together.
+    const { browser, threads } = browserEmitting(done(), { landsIn: "abc-123" })
+    const bridge = new ChatGptWebCursorBridge(
+      configWith(CONNECTOR),
+      browser,
+      new McpCursorToolsProvider(new McpService())
+    )
+    await run(bridge, "c1")
+    await run(bridge, "c1")
+    expect(threads).toEqual([null, "abc-123"])
+  })
+
+  it("keeps a different conversation in a thread of its own", async () => {
+    const { browser, threads } = browserEmitting(done(), { landsIn: "abc-123" })
+    const bridge = new ChatGptWebCursorBridge(
+      configWith(CONNECTOR),
+      browser,
+      new McpCursorToolsProvider(new McpService())
+    )
+    await run(bridge, "c1")
+    await run(bridge, "c2")
+    expect(threads).toEqual([null, null])
   })
 })

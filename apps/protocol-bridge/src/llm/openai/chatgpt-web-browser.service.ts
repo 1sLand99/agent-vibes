@@ -55,6 +55,16 @@ export interface BrowserTurnRequest {
   readonly model?: string
   /** ChatGPT's own depth: `min`, `standard`, `extended` or `max`. */
   readonly thinkingEffort?: string
+  /**
+   * The chatgpt.com conversation this turn belongs to.
+   *
+   * Set, the tab is taken there first, so the turn lands in that thread and
+   * reads whatever has been said in it — including anything typed by hand in
+   * the web UI. Unset, the turn starts a new conversation.
+   */
+  readonly conversationId?: string | null
+  /** Called with the conversation the turn ended up in, new or continued. */
+  readonly onConversationId?: (conversationId: string) => void
   readonly signal?: AbortSignal
 }
 
@@ -341,11 +351,55 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
     return waited
   }
 
+  /**
+   * Put the tab on the conversation this turn belongs to.
+   *
+   * The tab is shared, so without this a turn lands wherever the last one left
+   * it: two conversations would braid into one thread, and a new one would
+   * carry on an old one's context. Navigating only when the tab is somewhere
+   * else keeps the common case — turn after turn in the same conversation —
+   * free.
+   */
+  private async openConversation(
+    session: CdpSession,
+    conversationId?: string | null
+  ): Promise<void> {
+    const current = await session
+      .evaluate<string>("location.pathname")
+      .catch(() => "")
+    const wanted = conversationId ? `/c/${conversationId}` : "/"
+    if (current === wanted) return
+    // A new conversation is only "new" until the first turn lands; the app
+    // rewrites the URL itself, and the next turn arrives with an id.
+    if (!conversationId && current !== "/" && current !== "") {
+      await session.send("Page.navigate", { url: "https://chatgpt.com/" })
+      await this.waitForComposer(session)
+      return
+    }
+    if (conversationId) {
+      await session.send("Page.navigate", {
+        url: `https://chatgpt.com/c/${conversationId}`,
+      })
+      await this.waitForComposer(session)
+    }
+  }
+
+  /** The conversation the tab is on, if it is on one. */
+  private async currentConversationId(
+    session: CdpSession
+  ): Promise<string | undefined> {
+    const path = await session
+      .evaluate<string>("location.pathname")
+      .catch(() => "")
+    const match = /^\/c\/([0-9a-f-]{8,})$/i.exec(path || "")
+    return match?.[1]
+  }
+
   private async *runTurnExclusive(
     request: BrowserTurnRequest
   ): AsyncGenerator<string, void, unknown> {
     const session = await this.ensurePage()
-    await session.send("Page.bringToFront")
+    await this.openConversation(session, request.conversationId)
 
     const armed = await session.evaluate<string>(
       `window.${HOOK_FLAG}.arm(` +
@@ -391,7 +445,13 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
             `The page reported: ${progress.failed.slice(0, 200)}`
           )
         }
-        if (progress.done) return
+        if (progress.done) {
+          // The app rewrites the URL to /c/<id> once the turn lands, so this
+          // is where a new conversation gets its name.
+          const landed = await this.currentConversationId(session)
+          if (landed) request.onConversationId?.(landed)
+          return
+        }
         if (Date.now() > deadline) {
           throw new ChatGptWebBrowserError(
             504,

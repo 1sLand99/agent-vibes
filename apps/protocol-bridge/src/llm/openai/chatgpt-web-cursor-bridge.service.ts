@@ -47,10 +47,32 @@ interface ActiveTurn {
   touchedAt: number
 }
 
+/**
+ * How long a Cursor conversation keeps its ChatGPT thread.
+ *
+ * Long enough that coming back to a chat after lunch continues where it left
+ * off, rather than starting a thread that repeats everything.
+ */
+const THREAD_MEMORY_MS = 24 * 60 * 60 * 1_000
+
 @Injectable()
 export class ChatGptWebCursorBridge {
   private readonly logger = new Logger(ChatGptWebCursorBridge.name)
   private active: ActiveTurn | null = null
+  /**
+   * Which ChatGPT thread each Cursor conversation is having.
+   *
+   * One tab serves every conversation, so without this a turn would land in
+   * whichever thread the last one left open: two chats would braid together
+   * and a new one would inherit an old one's context. It is also what makes
+   * the pairing usable by hand — the thread is a real conversation on the
+   * account, so it can be opened in the web UI and carried on there, and the
+   * next Cursor turn picks up everything that was said.
+   */
+  private readonly threads = new Map<
+    string,
+    { chatGptConversationId: string; touchedAt: number }
+  >()
 
   constructor(
     private readonly configService: ConfigService,
@@ -150,6 +172,9 @@ export class ChatGptWebCursorBridge {
             connectorId: this.connectorId(),
             model: params.model,
             thinkingEffort: params.thinkingEffort ?? undefined,
+            conversationId: this.threadFor(params.conversationId),
+            onConversationId: (chatGptConversationId) =>
+              this.rememberThread(params.conversationId, chatGptConversationId),
             signal: params.signal,
           }),
     })
@@ -168,6 +193,42 @@ export class ChatGptWebCursorBridge {
         `${params.conversationId.slice(0, 8)}…`
     )
     return turn
+  }
+
+  /** The ChatGPT thread this Cursor conversation has been using, if recent. */
+  private threadFor(conversationId: string): string | null {
+    const known = this.threads.get(conversationId)
+    if (!known) return null
+    if (Date.now() - known.touchedAt > THREAD_MEMORY_MS) {
+      this.threads.delete(conversationId)
+      return null
+    }
+    return known.chatGptConversationId
+  }
+
+  private rememberThread(
+    conversationId: string,
+    chatGptConversationId: string
+  ): void {
+    const known = this.threads.get(conversationId)
+    if (known?.chatGptConversationId !== chatGptConversationId) {
+      this.logger.warn(
+        `${conversationId.slice(0, 8)}… is thread ${chatGptConversationId}`
+      )
+    }
+    this.threads.set(conversationId, {
+      chatGptConversationId,
+      touchedAt: Date.now(),
+    })
+    // Bounded by hand: a long-lived bridge would otherwise remember every
+    // conversation it ever served.
+    if (this.threads.size > 200) {
+      for (const [key, value] of this.threads) {
+        if (Date.now() - value.touchedAt > THREAD_MEMORY_MS) {
+          this.threads.delete(key)
+        }
+      }
+    }
   }
 
   private end(turn: ActiveTurn, reason: string): void {

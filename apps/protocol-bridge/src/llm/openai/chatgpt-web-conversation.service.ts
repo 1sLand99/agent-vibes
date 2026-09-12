@@ -307,7 +307,11 @@ export class ChatGptWebConversationService {
       model: slug,
       timezone_offset_min: this.sessions.settings.timezoneOffsetMinutes,
       timezone: this.sessions.settings.timezone,
-      history_and_training_disabled: true,
+      // Kept in history on purpose. A turn run from here is a conversation on
+      // the account like any other: it belongs in the sidebar, where it can be
+      // opened, read and carried on by hand. Hiding it would make this line
+      // the one place a conversation goes to disappear.
+      history_and_training_disabled: false,
       conversation_mode: { kind: "primary_assistant" },
       force_paragen: false,
       force_rate_limit: false,
