@@ -40,15 +40,21 @@ export class McpService {
   private readonly logger = new Logger(McpService.name)
   private readonly providers = new Map<string, McpToolProvider>()
 
+  // Capability changes and tool calls are logged at warn, not log. The bridge
+  // runs at "warn" and above unless LOG_DEBUG is set, so a log-level line is
+  // invisible on a normal deployment — and this endpoint is reachable from the
+  // internet and reaches a workspace, so its audit trail cannot depend on a
+  // debug switch being on.
+
   /** Attach a tool source. Called when a local session connects. */
   registerProvider(provider: McpToolProvider): void {
     this.providers.set(provider.id, provider)
-    this.logger.log(`MCP provider attached: ${provider.id}`)
+    this.logger.warn(`MCP provider attached: ${provider.id}`)
   }
 
   unregisterProvider(id: string): void {
     if (this.providers.delete(id)) {
-      this.logger.log(`MCP provider detached: ${id}`)
+      this.logger.warn(`MCP provider detached: ${id}`)
     }
   }
 
@@ -155,9 +161,9 @@ export class McpService {
     for (const provider of this.providers.values()) {
       const offered = await provider.listTools()
       if (!offered.some((tool) => tool.name === params.name)) continue
-      // Logged because a tool call is the one MCP operation with an outside
-      // effect; the arguments are not, since they carry workspace content.
-      this.logger.log(`MCP tools/call ${params.name} via ${provider.id}`)
+      // A tool call is the one MCP operation with an outside effect, so it is
+      // always recorded. The arguments are not: they carry workspace content.
+      this.logger.warn(`MCP tools/call ${params.name} via ${provider.id}`)
       const result: McpToolResult = await provider.callTool(
         params.name,
         (args as Record<string, unknown>) ?? {}

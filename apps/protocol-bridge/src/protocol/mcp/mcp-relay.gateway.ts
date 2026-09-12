@@ -73,7 +73,7 @@ export class McpRelayGateway implements OnModuleInit {
     server.on("upgrade", (request, socket, head) =>
       this.handleUpgrade(request, socket, head, secret)
     )
-    this.logger.log(`MCP workspace relay listening on ${RELAY_PATH}`)
+    this.logger.warn(`MCP workspace relay listening on ${RELAY_PATH}`)
   }
 
   private handleUpgrade(
@@ -130,7 +130,7 @@ export class McpRelayGateway implements OnModuleInit {
           callTool: (name, args) => this.dispatch(ws, pending, name, args),
         }
         this.mcp.registerProvider(provider)
-        this.logger.log(
+        this.logger.warn(
           `Workspace session attached: ${frame.label} (${tools.length} tools)`
         )
         return
@@ -161,7 +161,7 @@ export class McpRelayGateway implements OnModuleInit {
     ws.on("close", () => {
       clearInterval(heartbeat)
       detach()
-      this.logger.log("Workspace session detached")
+      this.logger.warn("Workspace session detached")
     })
     ws.on("error", (error) => {
       this.logger.warn(`Workspace socket error: ${error.message}`)

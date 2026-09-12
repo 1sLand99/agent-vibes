@@ -66,7 +66,7 @@ export class McpWorkspaceAgent implements OnModuleInit {
     this.writable = flag(this.configService, "MCP_WORKSPACE_WRITABLE")
     this.execEnabled = flag(this.configService, "MCP_WORKSPACE_EXEC")
 
-    this.logger.log(
+    this.logger.warn(
       `Workspace agent: root=${this.root} writable=${this.writable} exec=${this.execEnabled}`
     )
     this.connect(url)
@@ -216,7 +216,9 @@ export class McpWorkspaceAgent implements OnModuleInit {
     name: string,
     args: Record<string, unknown>
   ): Promise<McpToolResult> {
-    this.logger.log(`Workspace tool: ${name}`)
+    // warn, not log: this is the record that something outside the machine
+    // touched the workspace, and it has to survive the default log level.
+    this.logger.warn(`Workspace tool: ${name}`)
     switch (name) {
       case "read_file":
         return this.readFile(str(args.path))
