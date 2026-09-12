@@ -46,6 +46,15 @@ export class ChatGptWebBrowserError extends Error {
 export interface BrowserTurnRequest {
   readonly prompt: string
   readonly connectorId: string
+  /**
+   * chatgpt.com's own model slug, e.g. `gpt-5-6-thinking`.
+   *
+   * Left out, the turn runs on whatever the tab happens to be set to — which
+   * is how a request for one model quietly got answered by another.
+   */
+  readonly model?: string
+  /** ChatGPT's own depth: `min`, `standard`, `extended` or `max`. */
+  readonly thinkingEffort?: string
   readonly signal?: AbortSignal
 }
 
@@ -339,7 +348,11 @@ export class ChatGptWebBrowserService implements OnModuleDestroy {
     await session.send("Page.bringToFront")
 
     const armed = await session.evaluate<string>(
-      `window.${HOOK_FLAG}.arm(${JSON.stringify(`plugin:${request.connectorId}`)}, ${JSON.stringify(request.prompt)})`
+      `window.${HOOK_FLAG}.arm(` +
+        `${JSON.stringify(`plugin:${request.connectorId}`)}, ` +
+        `${JSON.stringify(request.prompt)}, ` +
+        `${JSON.stringify(request.model ?? null)}, ` +
+        `${JSON.stringify(request.thinkingEffort ?? null)})`
     )
     if (armed !== "armed") {
       throw new ChatGptWebBrowserError(

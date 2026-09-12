@@ -28,6 +28,8 @@ export const PAGE_HOOK_SOURCE = `
     done: false,
     failed: null,
     active: false,
+    model: null,
+    thinkingEffort: null,
   };
   window.${HOOK_FLAG} = state;
   const originalFetch = window.fetch;
@@ -41,6 +43,10 @@ export const PAGE_HOOK_SOURCE = `
       try {
         const body = JSON.parse(init.body);
         body.system_hints = [state.hint];
+        // Only ever added, never invented: an unset field leaves whatever the
+        // app itself chose, which is the tab's current model and depth.
+        if (state.model) body.model = state.model;
+        if (state.thinkingEffort) body.thinking_effort = state.thinkingEffort;
         const message = body.messages ? body.messages[0] : body.partial_query;
         if (message) {
           message.metadata = message.metadata || {};
@@ -98,8 +104,10 @@ export const PAGE_HOOK_SOURCE = `
    * from the browser's own input pipeline (CDP Input), because a synthetic
    * event does not drive the app's send handler.
    */
-  window.${HOOK_FLAG}.arm = (hint, prompt) => {
+  window.${HOOK_FLAG}.arm = (hint, prompt, model, thinkingEffort) => {
     state.hint = hint;
+    state.model = model || null;
+    state.thinkingEffort = thinkingEffort || null;
     state.chunks = [];
     state.done = false;
     state.failed = null;
@@ -139,6 +147,8 @@ export const PAGE_HOOK_SOURCE = `
   window.${HOOK_FLAG}.release = () => {
     state.active = false;
     state.hint = null;
+    state.model = null;
+    state.thinkingEffort = null;
     state.chunks = [];
   };
 

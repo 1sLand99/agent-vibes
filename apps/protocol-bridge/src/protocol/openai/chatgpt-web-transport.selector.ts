@@ -74,16 +74,21 @@ export class ChatGptWebTransportSelector {
    * HTTP transport emits so callers do not branch on transport.
    */
   async *stream(
+    model: string,
     messages: readonly ChatGptWebMessage[],
     signal?: AbortSignal
   ): AsyncGenerator<ChatGptWebEvent> {
     const connectorId = this.connectorId()
     const decoder = new ChatGptWebV1Decoder()
     let conversationId: string | undefined
+    const slug = ChatGptWebTransportSelector.stripPrefix(model)
 
     for await (const chunk of this.browser.streamTurn({
       prompt: flatten(messages),
       connectorId,
+      model: slug,
+      // This surface has no depth of its own to express — an OpenAI-shaped
+      // request carries no Cursor effort — so the model's own default stands.
       signal,
     })) {
       for (const event of decoder.push(chunk)) {

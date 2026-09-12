@@ -26,6 +26,7 @@ import {
   isWebGptModel,
   resolveCloudCodeModel,
   resolveModelThinkingCapability,
+  webGptCursorEffortLevels,
   type CursorDisplayModel,
 } from "../../llm/shared/model-registry"
 import { parseModelRequest } from "../../llm/shared/model-request"
@@ -89,6 +90,10 @@ function formatFallbackModelName(modelName: string): string {
 }
 
 function resolveEffortValues(modelName: string): string[] {
+  // A ChatGPT Web model resolves to nothing in the registry — the slug behind
+  // the prefix is chatgpt.com's — so its depths come from the catalogue the
+  // web app itself publishes rather than from a thinking capability.
+  if (isWebGptModel(modelName)) return webGptCursorEffortLevels(modelName)
   const capability = resolveModelThinkingCapability(modelName)
   if (!capability) {
     return []

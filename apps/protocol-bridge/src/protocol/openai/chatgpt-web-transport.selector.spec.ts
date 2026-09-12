@@ -67,7 +67,7 @@ describe("ChatGptWebTransportSelector", () => {
         browserYielding([fixture])
       )
       const events = []
-      for await (const event of selector.stream([
+      for await (const event of selector.stream("gpt-5-6", [
         { role: "user", content: "hi" },
       ])) {
         events.push(event)
@@ -84,10 +84,12 @@ describe("ChatGptWebTransportSelector", () => {
         configWith({}),
         browserYielding([fixture])
       )
-      const iterator = selector.stream([{ role: "user", content: "hi" }])
+      const iterator = selector.stream("gpt-5-6", [
+        { role: "user", content: "hi" },
+      ])
       await expect(iterator.next()).rejects.toThrow(ChatGptWebError)
       await expect(
-        selector.stream([{ role: "user", content: "hi" }]).next()
+        selector.stream("gpt-5-6", [{ role: "user", content: "hi" }]).next()
       ).rejects.toThrow(/CHATGPT_WEB_CONNECTOR_ID/)
     })
 
@@ -104,7 +106,7 @@ describe("ChatGptWebTransportSelector", () => {
         configWith({ CHATGPT_WEB_CONNECTOR_ID: "asdk_app_x" }),
         browser
       )
-      for await (const _ of selector.stream([
+      for await (const _ of selector.stream("gpt-5-6", [
         { role: "user", content: "just this" },
       ])) {
         // drain
@@ -125,7 +127,7 @@ describe("ChatGptWebTransportSelector", () => {
         configWith({ CHATGPT_WEB_CONNECTOR_ID: "asdk_app_x" }),
         browser
       )
-      for await (const _ of selector.stream([
+      for await (const _ of selector.stream("gpt-5-6", [
         { role: "system", content: "be terse" },
         { role: "user", content: "hello" },
       ])) {

@@ -83,6 +83,8 @@ export class ChatGptWebCursorBridge {
   async *stream(params: {
     conversationId: string
     model: string
+    /** ChatGPT's own depth for this turn, if Cursor asked for one. */
+    thinkingEffort?: string | null
     prompt: string
     toolResults: { toolCallId: string; result: McpToolResult }[]
     signal?: AbortSignal
@@ -131,6 +133,7 @@ export class ChatGptWebCursorBridge {
   private begin(params: {
     conversationId: string
     model: string
+    thinkingEffort?: string | null
     prompt: string
     signal?: AbortSignal
   }): ActiveTurn {
@@ -145,6 +148,8 @@ export class ChatGptWebCursorBridge {
         : this.browser.streamTurn({
             prompt: params.prompt,
             connectorId: this.connectorId(),
+            model: params.model,
+            thinkingEffort: params.thinkingEffort ?? undefined,
             signal: params.signal,
           }),
     })

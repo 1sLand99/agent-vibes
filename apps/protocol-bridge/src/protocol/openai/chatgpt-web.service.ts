@@ -49,7 +49,7 @@ export class ChatGptWebProtocolService {
     signal?: AbortSignal
   ): AsyncGenerator<ChatGptWebEvent> {
     if (this.transports.resolve(model) === "browser") {
-      return this.transports.stream(messages, signal)
+      return this.transports.stream(model, messages, signal)
     }
     this.rejectToolUse(hasTools)
     return this.conversation.stream({

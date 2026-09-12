@@ -174,6 +174,7 @@ import {
   doesModelSupportThinking,
   getCursorDisplayModel,
   resolveCodexRequestCapabilities,
+  webGptThinkingEffort,
 } from "../../llm/shared/model-registry"
 import { buildStableLanguageDirective } from "../../llm/shared/language-directive"
 import {
@@ -5587,6 +5588,10 @@ export class CursorConnectStreamService {
       yield* this.chatGptWebCursor.stream({
         conversationId: turnConversationId,
         model: route.model,
+        thinkingEffort: webGptThinkingEffort(
+          route.model,
+          thinkingLevelFromPreparedRequest(prepared)
+        ),
         prompt: promptFromPreparedRequest(prepared),
         toolResults: toolResultsFromPreparedRequest(prepared),
         signal: attemptSignal,
@@ -43754,6 +43759,26 @@ function flattenToolResult(content: unknown): string {
 }
 
 /** Hints carried into the single chatgpt-web attempt. */
+/**
+ * The effort Cursor asked for, as the backend-agnostic pipeline recorded it.
+ *
+ * `_thinkingIntent` is where Cursor's thinking semantics are captured before
+ * any backend sees them, so reading it here keeps the web path on the same
+ * answer every other backend gets. A turn that expressed no preference leaves
+ * the model's own default alone.
+ */
+function thinkingLevelFromPreparedRequest(
+  prepared: ProviderRequestCandidate
+): string | undefined {
+  if (prepared.kind !== "standard") return undefined
+  const intent = prepared.request._thinkingIntent
+  if (!intent) return undefined
+  if (intent.mode === "explicit_effort" || intent.mode === "adaptive") {
+    return intent.effort
+  }
+  return undefined
+}
+
 function activeHintsForWebGpt(
   options: BackendStreamOptions
 ): BackendStreamHints | undefined {

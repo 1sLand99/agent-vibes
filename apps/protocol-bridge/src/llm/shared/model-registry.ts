@@ -1182,6 +1182,95 @@ export const WEB_GPT_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
   },
 ]
 
+/**
+ * The thinking depths chatgpt.com offers for each model, in its own words.
+ *
+ * Read from `/backend-api/models`, which returns a `thinking_efforts` list per
+ * model: `min` (Light), `standard` (Thinking), `extended` (Extended) and `max`
+ * (Heavy). The Pro models expose fewer, and the instant and mini models none
+ * at all — a depth sent for one of those is a depth the web app itself would
+ * never offer, so it is not offered here either.
+ */
+const WEB_GPT_THINKING_EFFORTS: Record<string, readonly string[]> = {
+  "gpt-5-6-thinking": ["min", "standard", "extended", "max"],
+  "gpt-5-5-thinking": ["min", "standard", "extended", "max"],
+  "gpt-5-5-pro": ["standard", "extended"],
+  "gpt-5-6-pro": ["standard"],
+  "gpt-6-pro": ["standard"],
+}
+
+/**
+ * ChatGPT's depths against Cursor's effort ladder.
+ *
+ * Cursor's picker speaks low/medium/high/xhigh for the GPT family, so the two
+ * ladders are lined up in order rather than by name. `standard` is the middle
+ * rung because it is what the web app itself defaults to.
+ */
+const CURSOR_LEVELS_LOW_TO_HIGH = ["low", "medium", "high", "xhigh"] as const
+
+const WEB_GPT_EFFORT_BY_CURSOR_LEVEL: Record<string, string> = {
+  low: "min",
+  medium: "standard",
+  high: "extended",
+  xhigh: "max",
+  max: "max",
+  ultra: "max",
+  minimal: "min",
+}
+
+/**
+ * The effort levels Cursor should offer for a ChatGPT Web model.
+ *
+ * Empty when the model has at most one depth: a picker with a single choice is
+ * a picker that only takes up room.
+ */
+export function webGptCursorEffortLevels(modelId: string): string[] {
+  const slug = readWebGptModel(modelId)
+  const efforts = slug
+    ? WEB_GPT_THINKING_EFFORTS[slug.toLowerCase()]
+    : undefined
+  if (!efforts || efforts.length < 2) return []
+  // Ordered by ChatGPT's own list, so the picker reads the way its UI does.
+  const levels: string[] = []
+  for (const effort of efforts) {
+    const level = CURSOR_LEVELS_LOW_TO_HIGH.find(
+      (candidate) => WEB_GPT_EFFORT_BY_CURSOR_LEVEL[candidate] === effort
+    )
+    if (level && !levels.includes(level)) levels.push(level)
+  }
+  return levels
+}
+
+/**
+ * The `thinking_effort` to send for a model, given what Cursor asked for.
+ *
+ * Null means "say nothing", which leaves the web app's own default in place —
+ * the right answer both for a model with no depths to choose from and for a
+ * request that expressed no preference.
+ */
+export function webGptThinkingEffort(
+  modelId: string,
+  cursorLevel: string | undefined
+): string | null {
+  const slug = readWebGptModel(modelId) ?? modelId.trim()
+  const efforts = WEB_GPT_THINKING_EFFORTS[slug.toLowerCase()]
+  if (!efforts?.length || !cursorLevel) return null
+  const wanted = WEB_GPT_EFFORT_BY_CURSOR_LEVEL[cursorLevel.toLowerCase()]
+  if (!wanted) return null
+  if (efforts.includes(wanted)) return wanted
+  // Asked for more than this model offers: give it the deepest it has rather
+  // than a value the web app would reject.
+  const order = CURSOR_LEVELS_LOW_TO_HIGH.map(
+    (level) => WEB_GPT_EFFORT_BY_CURSOR_LEVEL[level]!
+  )
+  const ceiling = order.indexOf(wanted)
+  for (let index = ceiling; index >= 0; index -= 1) {
+    const candidate = order[index]!
+    if (efforts.includes(candidate)) return candidate
+  }
+  return null
+}
+
 /** The chatgpt.com model behind a `web-gpt/` (or `web-gpt:`) prefix, if any. */
 export function readWebGptModel(modelId: string): string | null {
   const match = /^web-gpt[/:](.+)$/i.exec(modelId.trim())
