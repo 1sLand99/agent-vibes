@@ -159,6 +159,28 @@ describe("thinking depth on a ChatGPT Web model", () => {
     ).toBeNull()
   })
 
+  it("offers no Max toggle, which would be wired to nothing", () => {
+    // Max mode buys a bigger context and a longer leash inside Cursor. The web
+    // transport can ask chatgpt.com for neither.
+    const projected = buildCursorAvailableModel(webModel(), 0)
+    expect(projected.supportsMaxMode).toBe(false)
+    expect(projected.supportsNonMaxMode).toBe(true)
+    expect(projected.variants.every((variant) => !variant.isMaxMode)).toBe(true)
+  })
+
+  it("shows a single-depth model as one entry, not a toggle", () => {
+    // GPT-6 Pro publishes exactly one depth. Two variants differing only by a
+    // switch nothing reads is noise.
+    const pro = WEB_GPT_CURSOR_DISPLAY_MODELS.find(
+      (model) => model.name === "web-gpt/gpt-6-pro"
+    )!
+    const projected = buildCursorAvailableModel(pro, 0)
+    expect(projected.variants).toHaveLength(1)
+    expect(
+      projected.parameterDefinitions.map((definition) => definition.id)
+    ).not.toContain(CURSOR_REASONING_PARAMETER_ID)
+  })
+
   it("reaches Cursor's picker as a reasoning parameter", () => {
     const projected = buildCursorAvailableModel(webModel(), 0)
     const reasoning = projected.parameterDefinitions.find(

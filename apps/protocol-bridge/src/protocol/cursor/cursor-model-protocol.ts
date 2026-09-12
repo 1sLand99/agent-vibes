@@ -815,7 +815,11 @@ function resolveAvailableModelMode(model: CursorDisplayModel): {
   // thinking variants), fall back to the model's isThinking flag so that max
   // mode can still be enabled.
   const supportsThinkingOrIsThinking = supportsThinking || model.isThinking
-  const supportsCursorMaxMode = supportsThinkingOrIsThinking
+  // Max mode is Cursor's own lever — a bigger context window and a longer
+  // leash. Neither is something the ChatGPT Web transport can ask for, so a
+  // Max toggle on one of these models would be a switch wired to nothing.
+  const supportsCursorMaxMode =
+    supportsThinkingOrIsThinking && !isWebGptModel(modelName)
   const supportsFastMode = supportsCursorFastMode(model)
   const parameterDefinitions = [
     ...buildReasoningParameterDefinition(modelName),
@@ -832,6 +836,26 @@ function resolveAvailableModelMode(model: CursorDisplayModel): {
       supportsNonMaxMode: true,
       parameterDefinitions,
       variants: [],
+    }
+  }
+
+  if (!supportsCursorMaxMode && isWebGptModel(modelName)) {
+    return {
+      supportsThinking: supportsThinkingOrIsThinking,
+      supportsMaxMode: false,
+      supportsNonMaxMode: true,
+      parameterDefinitions,
+      variants: supportsThinking
+        ? buildReasoningVariants(model, effortValues, {
+            maxNamedModel: false,
+            supportsCursorMaxMode: false,
+            supportsCursorFastMode: supportsFastMode,
+            standardEffort,
+            defaultMaxEffort,
+          })
+        : buildSimpleThinkingVariants(model, {
+            supportsCursorMaxMode: false,
+          }),
     }
   }
 
