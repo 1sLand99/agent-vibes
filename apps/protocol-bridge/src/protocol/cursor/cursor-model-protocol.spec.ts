@@ -150,6 +150,21 @@ describe("thinking depth on a ChatGPT Web model", () => {
     expect(webGptThinkingEffort("web-gpt/gpt-6-pro", "xhigh")).toBe("standard")
   })
 
+  it("opens Cursor's picker on the deepest rung", () => {
+    // Cursor reads the default off the model's thinking capability, and the
+    // web quota is the reason to pick one of these at all: the slider should
+    // start at Extra High, not in the middle.
+    const projected = buildCursorAvailableModel(webModel(), 0)
+    const chosen = projected.variants.find(
+      (variant) => variant.isDefaultNonMaxConfig
+    )
+    expect(
+      chosen?.parameterValues.find(
+        (value) => value.id === CURSOR_REASONING_PARAMETER_ID
+      )?.value
+    ).toBe("extra-high")
+  })
+
   it("thinks as hard as it can when the turn named no depth", () => {
     // The web quota is the reason to be here; a turn that expressed no
     // preference should not quietly get the shallow default.

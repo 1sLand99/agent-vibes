@@ -793,6 +793,20 @@ export function resolveCodexRequestCapabilities(
 export function resolveModelThinkingCapability(
   modelId: string
 ): ThinkingCapability | null {
+  // A ChatGPT Web model resolves to nothing below — the slug behind the prefix
+  // is chatgpt.com's — so its ladder comes from the catalogue the web app
+  // publishes, expressed in the same low/medium/high/xhigh Cursor already uses
+  // for the GPT family. The default is the deepest rung: the web quota is the
+  // reason to pick one of these, and Cursor's picker opens on whatever this
+  // says.
+  const webLevels = webGptCursorEffortLevels(modelId)
+  if (webLevels.length > 0) {
+    return createLevelThinkingCapability(
+      webLevels,
+      webLevels[webLevels.length - 1]
+    )
+  }
+
   const resolved = resolveCloudCodeModel(modelId)
   if (resolved?.thinking) {
     return resolved.thinking
