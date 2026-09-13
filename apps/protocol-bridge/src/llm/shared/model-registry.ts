@@ -793,6 +793,28 @@ export function resolveCodexRequestCapabilities(
 export function resolveModelThinkingCapability(
   modelId: string
 ): ThinkingCapability | null {
+  // A ChatGPT Web model resolves to nothing below — the slug behind the prefix
+  // is chatgpt.com's — so its ladder comes from the catalogue the web app
+  // publishes, expressed in the same low/medium/high/xhigh Cursor already uses
+  // for the GPT family. The default is the deepest rung: the web quota is the
+  // reason to pick one of these, and Cursor's picker opens on whatever this
+  // says.
+  // Only for ids that actually asked for the web route: the helper reads a
+  // Codex profile for the slug, so without this guard a plain Codex model
+  // would take this branch and lose its own catalogue's default rung.
+  const webLevels = isWebGptModel(modelId)
+    ? webGptCursorEffortLevels(modelId)
+    : []
+  if (webLevels.length > 0) {
+    // Not the deepest rung: `ultra` is a Cursor extension the web app has no
+    // answer for, and it is not a value the variant projection even
+    // recognises — asking for it lands back on the bottom of the ladder.
+    return createLevelThinkingCapability(
+      webLevels,
+      webGptDefaultLevel(modelId) ?? webLevels[webLevels.length - 1]
+    )
+  }
+
   const resolved = resolveCloudCodeModel(modelId)
   if (resolved?.thinking) {
     return resolved.thinking
@@ -1126,10 +1148,246 @@ export const BASE_CODEX_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] =
   listCodexModelProfiles().map(codexDisplayModel)
 export const CODEX_CURSOR_DISPLAY_MODELS = BASE_CODEX_CURSOR_DISPLAY_MODELS
 
+/**
+ * Models served by chatgpt.com's web app rather than the Codex backend.
+ *
+ * They are listed so the editor's picker offers them like any other model —
+ * the route exists either way, but a model nobody can select from a list is a
+ * model nobody uses.
+ *
+ * The `web-gpt/` prefix is part of the name, not a vendor tag to be stripped:
+ * it is what tells the router to spend the web quota and drive a browser, and
+ * that has to be a deliberate choice rather than something inferred from a
+ * model id that also exists on Codex.
+ *
+ * Names match the slugs chatgpt.com's own catalogue returns; `*-pro` and
+ * `research` have no Codex equivalent at all.
+ */
+/** The chatgpt.com model behind a `web-gpt/` (or `web-gpt:`) prefix, if any. */
+export function readWebGptModel(modelId: string): string | null {
+  const match = /^web-gpt[/:](.+)$/i.exec(modelId.trim())
+  return match ? match[1]!.trim() : null
+}
+
+/**
+ * Whether an id asks for the ChatGPT Web route.
+ *
+ * Nothing else in this registry resolves one: the slug behind the prefix
+ * belongs to chatgpt.com's catalogue, not to any local backend, so
+ * `resolveCloudCodeModel` returns null for it and every caller asking "who
+ * serves this model" has to settle this question before consulting the
+ * registry at all.
+ */
+export function isWebGptModel(modelId: string): boolean {
+  return readWebGptModel(modelId) !== null
+}
+
+/**
+ * A ChatGPT Web model, as its own slider presents it.
+ *
+ * The web app shows one model with five stops — Instant, Medium, High, Extra
+ * High, and then Pro — and the last one hands the turn to a different model
+ * rather than sending a deeper effort. Codex names the same five rungs Low,
+ * Medium, High, Extra high, Max, so they line up one for one, with Cursor's
+ * `ultra` left over because nothing sits above Pro.
+ *
+ * `thinking` is the slug the first four rungs go to; `pro` is the slug the top
+ * rung switches to.
+ */
+interface WebGptModel {
+  readonly thinking: string
+  readonly pro?: string
+}
+
+/**
+ * Chat models only, keyed by the slug chatgpt.com uses.
+ *
+ * The catalogue's `-wm` family — Astra, Sol, Terra, Luna and 5.5, under the
+ * names Codex also uses — is ChatGPT's *work* mode: the tab beside Chat, on
+ * the same quota as the Codex CLI. Coming here at all is about the other
+ * quota, so pointing at those was both pointless and why the tab kept landing
+ * in a composer this hook does not know how to drive. `is_work_mode_model` in
+ * the catalogue is what tells them apart.
+ */
+const WEB_GPT_MODELS: Record<string, WebGptModel> = {
+  "gpt-5-6-thinking": { thinking: "gpt-5-6-thinking", pro: "gpt-5-6-pro" },
+  "gpt-5-5-thinking": { thinking: "gpt-5-5-thinking", pro: "gpt-5-5-pro" },
+  // Chat has no non-Pro GPT-6, so it stands alone with no slider.
+  "gpt-6-pro": { thinking: "gpt-6-pro" },
+  // Auto-reasoning and instant: nothing to choose from.
+  "gpt-5-6": { thinking: "gpt-5-6" },
+  "gpt-5-5": { thinking: "gpt-5-5" },
+  "gpt-5-6-mini": { thinking: "gpt-5-6-mini" },
+  "gpt-5-5-mini": { thinking: "gpt-5-5-mini" },
+  "o3-pro": { thinking: "o3-pro" },
+}
+
+/**
+ * The four efforts the web app sends for the non-Pro rungs, in its own words,
+ * against the names Cursor uses for the same four.
+ */
+const WEB_GPT_EFFORTS = [
+  { effort: "min", level: "low" },
+  { effort: "standard", level: "medium" },
+  { effort: "extended", level: "high" },
+  { effort: "max", level: "xhigh" },
+] as const
+
+/** The rung Cursor's `max` means: hand the turn to the Pro model. */
+const WEB_GPT_PRO_LEVEL = "max"
+
+/** What chatgpt.com's own catalogue calls each of them. */
+const WEB_GPT_LABELS: Record<string, string> = {
+  "gpt-5-6-thinking": "GPT-5.6 Sol",
+  "gpt-5-5-thinking": "GPT-5.5 Thinking",
+  "gpt-6-pro": "GPT-6 Pro",
+  "gpt-5-6": "GPT-5.6 Sol Instant",
+  "gpt-5-5": "GPT-5.5 Instant",
+  "gpt-5-6-mini": "GPT-5.6 Mini",
+  "gpt-5-5-mini": "GPT-5.5 Mini",
+  "o3-pro": "o3-pro",
+}
+
+function webGptModel(modelId: string): WebGptModel | undefined {
+  const slug = (readWebGptModel(modelId) ?? modelId).trim().toLowerCase()
+  return WEB_GPT_MODELS[slug]
+}
+
+/**
+ * The rungs Cursor should offer: the web app's four, plus Pro as the fifth
+ * where the model has one.
+ *
+ * Empty when there is nothing to choose — a picker with one option only takes
+ * up room.
+ */
+export function webGptCursorEffortLevels(modelId: string): string[] {
+  const model = webGptModel(modelId)
+  if (!model) return []
+  // A model with no Pro tier has no slider either: those entries are the
+  // standalone ones — o3-pro and the minis — which publish no depths at all.
+  if (!model.pro) return []
+  return [
+    ...WEB_GPT_EFFORTS.map((rung) => rung.level),
+    ...(model.pro ? [WEB_GPT_PRO_LEVEL] : []),
+  ]
+}
+
+/**
+ * The rung a turn gets when it names none: Extra High.
+ *
+ * The deepest the model itself thinks before the slider stops being about
+ * effort and starts being about which model answers.
+ */
+export function webGptDefaultLevel(modelId: string): string | null {
+  const levels = webGptCursorEffortLevels(modelId)
+  if (levels.length === 0) return null
+  return levels.includes("xhigh")
+    ? "xhigh"
+    : (levels[levels.length - 1] ?? null)
+}
+
+/** Which model answers, and how hard it thinks. */
+export interface WebGptTarget {
+  /** The slug chatgpt.com knows this by. */
+  readonly slug: string
+  /** Its `thinking_effort`, or null to leave the web app's own default. */
+  readonly thinkingEffort: string | null
+}
+
+/**
+ * Resolve a Cursor model and rung into the model chatgpt.com should answer
+ * with.
+ *
+ * The two travel together because the top rung changes both: asking for Max is
+ * asking for the Pro model, not for a deeper effort on this one.
+ *
+ * A rung the model does not have is clamped rather than refused — Cursor's
+ * ladder is longer than the web app's, and the OpenAI surface takes whatever
+ * effort a caller cares to send.
+ */
+export function webGptTarget(
+  modelId: string,
+  requestedDepth?: string | null
+): WebGptTarget {
+  const named = (readWebGptModel(modelId) ?? modelId).trim()
+  const model = webGptModel(modelId)
+  if (!model) return { slug: named, thinkingEffort: null }
+
+  const levels = webGptCursorEffortLevels(modelId)
+  const asked = (requestedDepth ?? webGptDefaultLevel(modelId) ?? "")
+    .trim()
+    .toLowerCase()
+
+  // Cursor's ladder is read first, because both ladders have a rung spelled
+  // `max` and they do not mean the same thing: on Cursor's it is the top stop,
+  // which here is Pro; on ChatGPT's it is the deepest effort, which Cursor
+  // calls Extra high. A caller who wants that effort by name asks for `xhigh`.
+  if (model.pro && (asked === WEB_GPT_PRO_LEVEL || asked === "ultra")) {
+    return { slug: model.pro, thinkingEffort: null }
+  }
+  if (!levels.length) return { slug: model.thinking, thinkingEffort: null }
+
+  // Otherwise either vocabulary is accepted: ChatGPT's own words map to the
+  // rung that sends them.
+  const fromEffort = WEB_GPT_EFFORTS.find((rung) => rung.effort === asked)
+  const level = fromEffort?.level ?? asked
+
+  const onLadder = WEB_GPT_EFFORTS.find((rung) => rung.level === level)
+  // Anything else is off the ends of this ladder: `minimal` below it, and a
+  // rung Cursor has above Extra high but short of Pro. Clamp rather than
+  // refuse — the OpenAI surface takes whatever effort a caller sends.
+  const rung =
+    onLadder ??
+    (level === "minimal"
+      ? WEB_GPT_EFFORTS[0]
+      : WEB_GPT_EFFORTS[WEB_GPT_EFFORTS.length - 1])
+  return { slug: model.thinking, thinkingEffort: rung?.effort ?? null }
+}
+
+/** The slug alone, for a caller that has no rung to offer. */
+export function webGptUpstreamSlug(modelId: string): string {
+  return webGptTarget(modelId).slug
+}
+
+export const WEB_GPT_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
+  // One entry per model ChatGPT's Chat tab offers, under the name its own
+  // catalogue gives it. The Pro tiers are not entries of their own: they are
+  // the top rung of the model they belong to.
+  ...Object.keys(WEB_GPT_MODELS).map((slug) => {
+    const label = WEB_GPT_LABELS[slug] || slug
+    return {
+      name: `web-gpt/${slug}`,
+      displayName: `${label} (Web)`,
+      shortName: `${label} Web`,
+      family: "gpt" as const,
+      isThinking: webGptCursorEffortLevels(`web-gpt/${slug}`).length > 0,
+      supportsAgent: true,
+      // The transport flattens a turn down to the text chatgpt.com's composer
+      // accepts, so an attached image would be dropped without a word. Saying
+      // so here means the editor never offers to attach one.
+      supportsImages: false,
+    }
+  }),
+  // Not a model at all: the parked turn that lets a conversation started in
+  // ChatGPT's own UI reach this editor. It is listed here because picking a
+  // model is how a Cursor turn gets started, and a turn is the only place a
+  // Cursor tool can run. It answers nothing on its own.
+  {
+    name: "web-gpt/tool-host",
+    displayName: "ChatGPT Tool Host",
+    shortName: "Tool Host",
+    family: "gpt",
+    isThinking: false,
+    supportsAgent: true,
+    supportsImages: false,
+  },
+]
+
 const ALL_CURSOR_DISPLAY_MODELS: CursorDisplayModel[] = [
   ...CLAUDE_CURSOR_DISPLAY_MODELS,
   ...GEMINI_CURSOR_DISPLAY_MODELS,
   ...CODEX_CURSOR_DISPLAY_MODELS,
+  ...WEB_GPT_CURSOR_DISPLAY_MODELS,
 ]
 
 const CURSOR_DISPLAY_MODEL_BY_NAME = new Map(
@@ -1330,6 +1588,11 @@ export function getCursorDisplayModels(
           excludeMaxNamedModels: options.excludeMaxNamedModels,
         })
       : []),
+    // Listed regardless of `includeCodex`: these are served by chatgpt.com's
+    // web app, so the Codex backend being absent says nothing about them.
+    // Whether one can actually run is the caller's routability check, which is
+    // where the ChatGPT credential is known.
+    ...WEB_GPT_CURSOR_DISPLAY_MODELS,
     ...(options.extraModels || []),
   ]
 

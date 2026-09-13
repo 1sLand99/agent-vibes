@@ -160,6 +160,68 @@ export class ConfigManager {
     ).trim()
   }
 
+  // ── MCP relay ─────────────────────────────────────────────────────────
+  //
+  // When a relay URL is set the bridge dials out to it and carries Cursor's
+  // own tools to whatever MCP client is registered against that relay (in
+  // practice, a ChatGPT connector). Nothing runs on the relay host: a call
+  // travels back to this editor, or it is refused.
+
+  get mcpRelayUrl(): string {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<string>("mcp.relayUrl") ?? ""
+    ).trim()
+  }
+
+  get mcpApiKey(): string {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<string>("mcp.apiKey") ?? ""
+    ).trim()
+  }
+
+  /**
+   * ChatGPT connector whose tools a Cursor turn is offered.
+   *
+   * Only needed for `web-gpt/<model>`: that route runs the turn on ChatGPT
+   * Web, and a connector is the only channel the web model will call tools
+   * through.
+   */
+  get chatGptWebConnectorId(): string {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<string>("chatGptWeb.connectorId") ?? ""
+    ).trim()
+  }
+
+  /**
+   * Whether the ChatGPT window should be on screen.
+   *
+   * Off by default — the turn runs in a real browser because Cloudflare turns
+   * headless away, not because anyone needs to watch it. Turn this on to sign
+   * in the first time.
+   */
+  get chatGptWebShowBrowser(): boolean {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<boolean>("chatGptWeb.showBrowser") ?? false
+    )
+  }
+
+  /** Chrome profile the ChatGPT tab runs in; empty means the default path. */
+  get chatGptWebBrowserProfile(): string {
+    return (
+      vscode.workspace
+        .getConfiguration("agentVibes")
+        .get<string>("chatGptWeb.browserProfile") ?? ""
+    ).trim()
+  }
+
   get antigravitySystemPrompt(): boolean {
     return (
       vscode.workspace

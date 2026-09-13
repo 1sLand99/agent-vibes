@@ -62,6 +62,38 @@ export interface ProviderAttemptTurnOwnership {
   readonly graphTurnId: TurnId
 }
 
+/**
+ * An IDE frame arrived for a turn that no longer owns the conversation.
+ *
+ * Ordinary rather than exceptional: a turn can end while the editor still has
+ * something in flight — a mode switch mid-turn does it — and the frame then
+ * has nowhere to go. Recognised, it is dropped quietly and the scheduler is
+ * allowed to settle; unrecognised, it is an error with a stack trace and a
+ * conversation that never finishes.
+ */
+export class StaleTurnFrameError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "StaleTurnFrameError"
+  }
+}
+
+/**
+ * A prepared attempt outlived the turn that built it.
+ *
+ * Its own class because this is not a failure to report: a newer turn has
+ * taken the conversation over — a mode switch mid-turn does it — and the
+ * attempt simply has nowhere left to land. Told apart from a real error, it
+ * can be abandoned quietly instead of being surfaced as a model request that
+ * failed, which leaves the editor waiting on a turn nobody owns.
+ */
+export class ProviderAttemptSupersededError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "ProviderAttemptSupersededError"
+  }
+}
+
 export function assertProviderAttemptTurnOwnership(input: {
   readonly contextLabel: string
   readonly expected: ProviderAttemptTurnOwnership
@@ -71,7 +103,7 @@ export function assertProviderAttemptTurnOwnership(input: {
     input.current.topLevelTurnId !== input.expected.topLevelTurnId ||
     input.current.graphTurnId !== input.expected.graphTurnId
   ) {
-    throw new Error(
+    throw new ProviderAttemptSupersededError(
       `Prepared provider attempt belongs to a superseded turn (${input.contextLabel}): ` +
         `expected=${input.expected.topLevelTurnId}/${input.expected.graphTurnId}, ` +
         `active=${input.current.topLevelTurnId || "none"}/${input.current.graphTurnId || "none"}`

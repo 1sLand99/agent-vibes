@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common"
 import { UsageStatsModule } from "../../usage"
+import { McpModule } from "../../protocol/mcp/mcp.module"
 import { CodexAuthService } from "./codex-auth.service"
 import { CodexCacheService } from "./codex-cache.service"
 import { CodexClientIdentityService } from "./codex-client-identity.service"
@@ -7,9 +8,13 @@ import { CodexWebSocketService } from "./codex-websocket.service"
 import { CodexService } from "./codex.service"
 import { ChatGptWebRealtimeService } from "./chatgpt-web-realtime.service"
 import { ChatGptWebVoiceTransport } from "./chatgpt-web-transport"
+import { ChatGptWebSessionStore } from "./chatgpt-web-session"
+import { ChatGptWebConversationService } from "./chatgpt-web-conversation.service"
+import { ChatGptWebBrowserService } from "./chatgpt-web-browser.service"
+import { ChatGptWebCursorBridge } from "./chatgpt-web-cursor-bridge.service"
 
 @Module({
-  imports: [UsageStatsModule],
+  imports: [UsageStatsModule, McpModule],
   providers: [
     CodexAuthService,
     CodexCacheService,
@@ -18,6 +23,10 @@ import { ChatGptWebVoiceTransport } from "./chatgpt-web-transport"
     CodexService,
     ChatGptWebVoiceTransport,
     ChatGptWebRealtimeService,
+    ChatGptWebSessionStore,
+    ChatGptWebConversationService,
+    ChatGptWebBrowserService,
+    ChatGptWebCursorBridge,
   ],
   exports: [
     CodexAuthService,
@@ -26,6 +35,10 @@ import { ChatGptWebVoiceTransport } from "./chatgpt-web-transport"
     CodexWebSocketService,
     CodexService,
     ChatGptWebRealtimeService,
+    ChatGptWebSessionStore,
+    ChatGptWebConversationService,
+    ChatGptWebBrowserService,
+    ChatGptWebCursorBridge,
   ],
 })
 export class CodexModule {}

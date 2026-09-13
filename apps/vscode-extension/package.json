@@ -376,6 +376,31 @@
           "type": "string",
           "default": "",
           "description": "Optional absolute path for kiro-accounts.json. If empty, uses <dataDir>/data/kiro-accounts.json"
+        },
+        "agentVibes.mcp.relayUrl": {
+          "type": "string",
+          "default": "",
+          "description": "MCP relay to carry Cursor's tools to, e.g. wss://host/mcp/agent. Leave empty to keep the relay off."
+        },
+        "agentVibes.mcp.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Credential presented to the MCP relay, and required of any MCP client calling in. Must match the relay's MCP_API_KEY."
+        },
+        "agentVibes.chatGptWeb.connectorId": {
+          "type": "string",
+          "default": "",
+          "description": "ChatGPT connector that carries Cursor's tools, e.g. asdk_app_… Required to use a web-gpt/<model> in Cursor; that route runs the turn on ChatGPT Web, where a connector is the only channel the model will call tools through."
+        },
+        "agentVibes.chatGptWeb.browserProfile": {
+          "type": "string",
+          "default": "",
+          "description": "Chrome profile directory the ChatGPT tab runs in. Empty uses ~/.agent-vibes/chatgpt-browser-profile. Sign in there once; the session persists."
+        },
+        "agentVibes.chatGptWeb.showBrowser": {
+          "type": "boolean",
+          "default": false,
+          "description": "Open the ChatGPT browser in a window you can see and use. Off by default, which runs it headless. Turn it on to sign in the first time."
         }
       }
     }

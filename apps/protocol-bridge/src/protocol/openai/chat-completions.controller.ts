@@ -2,6 +2,7 @@ import { once } from "node:events"
 import {
   Body,
   Controller,
+  Get,
   HttpCode,
   HttpException,
   Post,
@@ -13,6 +14,8 @@ import { ApiOperation, ApiSecurity, ApiTags } from "@nestjs/swagger"
 import type { FastifyReply, FastifyRequest } from "fastify"
 import { ApiKeyGuard } from "../../shared/api-key.guard"
 import { ChatCompletionsService } from "./chat-completions.service"
+import { ChatGptWebProtocolService } from "./chatgpt-web.service"
+import { RequiredApiKeyGuard } from "../../shared/required-api-key.guard"
 import { renderOpenAiError } from "./openai-error"
 import type {
   OpenAiChatCompletionRequest,
@@ -44,7 +47,8 @@ import type {
 @ApiSecurity("api-key")
 export class ChatCompletionsController {
   constructor(
-    private readonly chatCompletionsService: ChatCompletionsService
+    private readonly chatCompletionsService: ChatCompletionsService,
+    private readonly chatGptWeb: ChatGptWebProtocolService
   ) {}
 
   private buildMissingModelError(): HttpException {
@@ -158,6 +162,126 @@ export class ChatCompletionsController {
       throw new HttpException(rendered.body, rendered.status)
     } finally {
       res?.raw.off("close", onClose)
+    }
+  }
+
+  /**
+   * ChatGPT Web routes.
+   *
+   * These deliberately bypass the model router: they always target
+   * chatgpt.com's web chat backend, which draws on a different quota than the
+   * Codex-backed `/v1/*` routes and reaches models Codex does not expose.
+   *
+   * Each one carries RequiredApiKeyGuard on top of the controller's
+   * ApiKeyGuard. The class-level guard lets requests through when
+   * PROXY_API_KEY is unset so local development stays frictionless, but these
+   * routes spend a real ChatGPT account's quota, so they follow the Realtime
+   * endpoint's rule instead: no API key configured means 503, never anonymous
+   * access. Adding the guard per method leaves `/v1/chat/completions` and the
+   * other shared routes on the relaxed behavior.
+   */
+  @Post("web-gpt/responses")
+  @UseGuards(RequiredApiKeyGuard)
+  @HttpCode(200)
+  @ApiOperation({ summary: "Create a response via the ChatGPT Web backend" })
+  async createWebGptResponse(
+    @Body() body: Record<string, unknown>,
+    @Res({ passthrough: true }) res?: FastifyReply
+  ) {
+    const req = body as unknown as OpenAiResponsesRequest
+    if (typeof req?.model !== "string" || req.model.trim() === "") {
+      throw this.buildMissingModelError()
+    }
+    if (req.input == null) {
+      throw new HttpException(
+        {
+          error: {
+            message: "you must provide an input parameter",
+            type: "invalid_request_error",
+            param: "input",
+            code: null,
+          },
+        },
+        400
+      )
+    }
+
+    const controller = new AbortController()
+    const onClose = () => {
+      if (!res?.raw.writableEnded) controller.abort()
+    }
+    res?.raw.once("close", onClose)
+
+    if (req.stream && res) {
+      await this.streamResponse(
+        res,
+        this.chatGptWeb.createResponseStream(req, controller.signal),
+        controller,
+        "responses"
+      )
+      res.raw.off("close", onClose)
+      return
+    }
+
+    try {
+      return await this.chatGptWeb.createResponse(req)
+    } catch (error) {
+      const rendered = renderOpenAiError(error)
+      throw new HttpException(rendered.body, rendered.status)
+    } finally {
+      res?.raw.off("close", onClose)
+    }
+  }
+
+  @Post("web-gpt/chat/completions")
+  @UseGuards(RequiredApiKeyGuard)
+  @HttpCode(200)
+  @ApiOperation({
+    summary: "Create a chat completion via the ChatGPT Web backend",
+  })
+  async createWebGptChatCompletion(
+    @Body() body: Record<string, unknown>,
+    @Res({ passthrough: true }) res?: FastifyReply
+  ) {
+    const req = body as unknown as OpenAiChatCompletionRequest
+    if (typeof req?.model !== "string" || req.model.trim() === "") {
+      throw this.buildMissingModelError()
+    }
+
+    if (req.stream && res) {
+      await this.streamResponse(
+        res,
+        this.chatGptWeb.createChatCompletionStream(req)
+      )
+      return
+    }
+
+    try {
+      return await this.chatGptWeb.createChatCompletion(req)
+    } catch (error) {
+      const rendered = renderOpenAiError(error)
+      throw new HttpException(rendered.body, rendered.status)
+    }
+  }
+
+  @Get("web-gpt/models")
+  @UseGuards(RequiredApiKeyGuard)
+  @ApiOperation({ summary: "List models offered by the ChatGPT Web backend" })
+  async listWebGptModels() {
+    try {
+      const slugs = await this.chatGptWeb.listModelSlugs()
+      return {
+        object: "list",
+        data: slugs.map((slug) => ({
+          id: slug,
+          object: "model",
+          created: Math.floor(Date.now() / 1_000),
+          owned_by: "openai",
+        })),
+      }
+    } catch (error) {
+      const rendered = renderOpenAiError(error)
+      throw new HttpException(rendered.body, rendered.status)
     }
   }
 

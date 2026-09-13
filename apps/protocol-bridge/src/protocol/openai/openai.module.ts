@@ -6,6 +6,8 @@ import { RequiredApiKeyGuard } from "../../shared/required-api-key.guard"
 import { AnthropicModule } from "../anthropic/anthropic.module"
 import { ChatCompletionsController } from "./chat-completions.controller"
 import { ChatCompletionsService } from "./chat-completions.service"
+import { ChatGptWebProtocolService } from "./chatgpt-web.service"
+import { ChatGptWebTransportSelector } from "./chatgpt-web-transport.selector"
 import { RealtimeController } from "./realtime.controller"
 
 /**
@@ -21,6 +23,8 @@ import { RealtimeController } from "./realtime.controller"
   controllers: [ChatCompletionsController, RealtimeController],
   providers: [
     ChatCompletionsService,
+    ChatGptWebProtocolService,
+    ChatGptWebTransportSelector,
     CodexResponsesService,
     RequiredApiKeyGuard,
   ],

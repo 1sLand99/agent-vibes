@@ -78,6 +78,7 @@ import { OpenaiCompatService } from "../../../llm/openai/openai-compat.service"
 import {
   canPublicClaudeModelUseGoogle,
   getCursorDisplayModels,
+  isWebGptModel,
   resolveCloudCodeModel,
 } from "../../../llm/shared/model-registry"
 import { ModelRouterService } from "../../../llm/shared/model-router.service"
@@ -273,6 +274,13 @@ export class AiserverMockController {
   }
 
   private isCursorModelCurrentlyRoutable(modelId: string): boolean {
+    // `web-gpt/` is routed by prefix alone: the slug behind it is chatgpt.com's,
+    // so the registry lookup below resolves nothing and would drop the model
+    // from the picker entirely. What it needs is a ChatGPT login to spend.
+    if (isWebGptModel(modelId)) {
+      return this.codexService.getChatGptWebRealtimeAccountCount() > 0
+    }
+
     // Kiro dynamically discovered models are always routable when Kiro is available.
     if (this.kiroService.supportsModel(modelId)) {
       return true

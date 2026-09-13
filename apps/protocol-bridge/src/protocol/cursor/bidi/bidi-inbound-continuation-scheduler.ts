@@ -15,7 +15,13 @@ export interface BidiInboundContinuationSchedulerOptions {
    * pending client executions and blocking interaction queries keep it open.
    */
   shouldEndWhenIdle: () => boolean
-  onTaskError: (label: string, error: Error) => void
+  /**
+   * Reports a continuation that threw. Returning true means the failure was
+   * expected and the Run stays open — a frame belonging to a turn that has
+   * already finished is not a reason to tear down the conversation the next
+   * turn is using.
+   */
+  onTaskError: (label: string, error: Error) => boolean | void
 }
 
 export type BidiInboundRead<T> =
@@ -149,8 +155,8 @@ export class BidiInboundContinuationScheduler {
       .catch((error: unknown) => {
         const normalized =
           error instanceof Error ? error : new Error(String(error))
-        this.requestEnd("continuation-failed")
-        this.options.onTaskError(continuation.label, normalized)
+        const handled = this.options.onTaskError(continuation.label, normalized)
+        if (handled !== true) this.requestEnd("continuation-failed")
       })
       .finally(() => {
         if (this.active !== continuation) return

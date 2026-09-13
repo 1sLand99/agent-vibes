@@ -1,4 +1,6 @@
 import { CodexApiError } from "../../llm/openai/codex-api-error"
+import { ChatGptWebError } from "../../llm/openai/chatgpt-web-conversation.service"
+import { ChatGptWebSessionError } from "../../llm/openai/chatgpt-web-session"
 /**
  * OpenAI-compatible error envelope mapper.
  *
@@ -74,6 +76,27 @@ function openAiErrorCodeFromStatus(status: number): string | null {
  * response and the SSE error writer so they stay in sync.
  */
 export function renderOpenAiError(error: unknown): OpenAiErrorRendering {
+  // The ChatGPT Web backend carries its own diagnosis — which model list it
+  // checked, that upstream ignores `tools`, that every account is cooling
+  // down. The generic taxonomy would flatten those into "request shape is
+  // invalid", so pass the original message and code straight through.
+  if (
+    error instanceof ChatGptWebError ||
+    error instanceof ChatGptWebSessionError
+  ) {
+    return {
+      status: error.statusCode,
+      body: {
+        error: {
+          message: error.message,
+          type: openAiErrorTypeFromStatus(error.statusCode),
+          param: null,
+          code: error.code,
+        },
+      },
+    }
+  }
+
   const anthropic = renderAnthropicError(error)
   const status = anthropic.status
   return {

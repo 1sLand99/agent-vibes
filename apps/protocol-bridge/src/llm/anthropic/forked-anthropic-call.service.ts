@@ -235,8 +235,11 @@ export class ForkedAnthropicCallService {
       case "google-claude":
       case "google":
         return true
+      // chatgpt-web is here because the browser transport serves one turn at
+      // a time on one tab, so it cannot also run the side calls a fork needs.
       case "codex":
       case "openai-compat":
+      case "chatgpt-web":
         return false
       default: {
         // Exhaustiveness check: future BackendType additions force a
@@ -340,6 +343,7 @@ export class ForkedAnthropicCallService {
         })
       case "codex":
       case "openai-compat":
+      case "chatgpt-web":
         // canDispatchClaudeFork() guards against this — both
         // runForkedCall and runForkedSmallFastCall short-circuit before
         // reaching the dispatcher.  Throwing keeps the contract
@@ -440,6 +444,8 @@ export class ForkedAnthropicCallService {
           maxAttempts: 1,
           execute: (dispatch) => this.openaiCompat.sendClaudeMessage(dispatch),
         })
+      case "chatgpt-web":
+        throw new Error("chatgpt-web cannot serve fork calls")
       default: {
         const _exhaustive: never = backend
         throw new Error(`Unknown fork backend: ${String(_exhaustive)}`)

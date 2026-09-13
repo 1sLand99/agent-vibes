@@ -1,0 +1,494 @@
+import { Injectable, Logger } from "@nestjs/common"
+import * as crypto from "node:crypto"
+import { parseModelRequest } from "../../llm/shared/model-request"
+import {
+  ChatGptWebConversationService,
+  ChatGptWebError,
+  type ChatGptWebEvent,
+  type ChatGptWebMessage,
+} from "../../llm/openai/chatgpt-web-conversation.service"
+import { webGptTarget } from "../../llm/shared/model-registry"
+import { ChatGptWebTransportSelector } from "./chatgpt-web-transport.selector"
+import type {
+  OpenAiChatCompletionRequest,
+  OpenAiChatCompletionResponse,
+  OpenAiChatMessage,
+  OpenAiContentPart,
+  OpenAiResponsesRequest,
+} from "./openai-types"
+
+/**
+ * Adapts the ChatGPT Web text backend onto the OpenAI-compatible surface
+ * served at `/v1/web-gpt/*`.
+ *
+ * The upstream conversation API has no native function calling — a `tools`
+ * array in the request is accepted and then ignored by upstream — so requests
+ * carrying tools are rejected here rather than silently answered without
+ * them, which would strand an agent waiting for a tool call that can never
+ * arrive. Text and reasoning stream through unchanged.
+ */
+
+interface ThreadRef {
+  conversationId?: string
+  messageId?: string
+}
+
+/** How many answered turns keep their place in the thread map. */
+const REMEMBERED_RESPONSES = 500
+
+@Injectable()
+export class ChatGptWebProtocolService {
+  private readonly logger = new Logger(ChatGptWebProtocolService.name)
+  /**
+   * Where each answer left its conversation.
+   *
+   * A caller continues by naming one — `conversation` for the thread itself,
+   * or `previous_response_id` for the turn that produced it — and gets back a
+   * thread that is a real conversation on the account, openable in the web UI.
+   */
+  private readonly threads = new Map<string, ThreadRef>()
+
+  constructor(
+    private readonly conversation: ChatGptWebConversationService,
+    private readonly transports: ChatGptWebTransportSelector
+  ) {}
+
+  /**
+   * Route a turn to whichever transport the request asks for.
+   *
+   * Only the browser transport can offer the model any tools, so tool use is
+   * refused on the HTTP one rather than answered without them — an agent left
+   * waiting for a call that can never arrive is worse than a clear error.
+   */
+  private async *run(
+    model: string,
+    messages: readonly ChatGptWebMessage[],
+    hasTools: boolean,
+    requestedDepth: string | undefined,
+    thread: ThreadRef,
+    signal?: AbortSignal
+  ): AsyncGenerator<ChatGptWebEvent> {
+    const named = ChatGptWebTransportSelector.stripPrefix(model)
+    const { slug, thinkingEffort } = webGptTarget(named, requestedDepth)
+    const source =
+      this.transports.resolve(model) === "browser"
+        ? this.transports.stream(model, messages, thinkingEffort, signal)
+        : this.startHttpTurn(slug, messages, thinkingEffort, thread, signal)
+    if (this.transports.resolve(model) !== "browser") {
+      this.rejectToolUse(hasTools)
+    }
+    for await (const event of await source) {
+      if (event.kind === "done") {
+        // Kept even when the caller ignores the event: it is what the next
+        // turn needs to land in the same thread.
+        if (event.conversationId) thread.conversationId = event.conversationId
+        if (event.messageId) thread.messageId = event.messageId
+      }
+      yield event
+    }
+  }
+
+  /**
+   * Start an HTTP turn, continuing a named conversation when there is one.
+   *
+   * Continuing means upstream already holds the history, so only the newest
+   * user message is sent — repeating the rest would say it all twice in the
+   * thread. The message it answers is read from upstream rather than from
+   * memory, so a conversation carried on by hand in the web UI is picked up
+   * where the person left it.
+   */
+  private async startHttpTurn(
+    slug: string,
+    messages: readonly ChatGptWebMessage[],
+    thinkingEffort: string | null,
+    thread: ThreadRef,
+    signal?: AbortSignal
+  ): Promise<AsyncGenerator<ChatGptWebEvent>> {
+    const continuing = thread.conversationId
+      ? await this.conversation.currentNode(thread.conversationId)
+      : null
+    if (thread.conversationId && !continuing) {
+      this.logger.warn(
+        `Could not read conversation ${thread.conversationId}; starting a new one`
+      )
+      thread.conversationId = undefined
+    }
+    return this.conversation.stream({
+      model: slug,
+      messages: continuing ? lastUserMessage(messages) : messages,
+      thinkingEffort,
+      conversationId: continuing ? thread.conversationId : undefined,
+      parentMessageId: continuing,
+      signal,
+    })
+  }
+
+  /** The thread a request asked to continue, if it named one. */
+  private threadFromRequest(req: Record<string, unknown>): ThreadRef {
+    const conversation = req.conversation
+    if (typeof conversation === "string" && conversation.trim()) {
+      return { conversationId: conversation.trim() }
+    }
+    const previous = req.previous_response_id
+    if (typeof previous === "string" && previous.trim()) {
+      return { ...this.threads.get(previous.trim()) }
+    }
+    return {}
+  }
+
+  private rememberThread(responseId: string, thread: ThreadRef): void {
+    if (!thread.conversationId) return
+    this.threads.set(responseId, { ...thread })
+    if (this.threads.size > REMEMBERED_RESPONSES) {
+      const oldest = this.threads.keys().next().value
+      if (oldest) this.threads.delete(oldest)
+    }
+  }
+
+  listModelSlugs(): Promise<string[]> {
+    return this.conversation.listModelSlugs()
+  }
+
+  private rejectToolUse(hasTools: boolean): void {
+    if (!hasTools) return
+    throw new ChatGptWebError(
+      400,
+      "chatgpt_web_tools_unsupported",
+      "ChatGPT Web has no native function calling: upstream ignores the " +
+        "`tools` field, so a tool-using request cannot be served here. Use a " +
+        "Codex-backed model for agent turns."
+    )
+  }
+
+  // ── Chat Completions ──────────────────────────────────────────────────
+
+  async createChatCompletion(
+    req: OpenAiChatCompletionRequest
+  ): Promise<OpenAiChatCompletionResponse> {
+    const messages = normalizeChatMessages(req.messages)
+    const thread = this.threadFromRequest(req)
+    const id = `chatcmpl-${randomId()}`
+
+    let text = ""
+    let reasoning = ""
+    for await (const event of this.run(
+      req.model,
+      messages,
+      (req.tools?.length ?? 0) > 0,
+      requestedDepth(req.model, req.reasoning_effort),
+      thread
+    )) {
+      if (event.kind === "text") text += event.delta
+      else if (event.kind === "reasoning") reasoning += event.delta
+    }
+    this.rememberThread(id, thread)
+
+    return {
+      id,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1_000),
+      model: req.model,
+      // Additive, and the only way a chat-completions caller learns which
+      // conversation to name next time.
+      ...(thread.conversationId ? { conversation: thread.conversationId } : {}),
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: text,
+            ...(reasoning ? { reasoning_content: reasoning } : {}),
+          },
+          finish_reason: "stop",
+          logprobs: null,
+        },
+      ],
+      usage: {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+      },
+    } as OpenAiChatCompletionResponse
+  }
+
+  async *createChatCompletionStream(
+    req: OpenAiChatCompletionRequest
+  ): AsyncGenerator<string, void, unknown> {
+    const messages = normalizeChatMessages(req.messages)
+    const thread = this.threadFromRequest(req)
+    const id = `chatcmpl-${randomId()}`
+    const created = Math.floor(Date.now() / 1_000)
+
+    const frame = (delta: Record<string, unknown>, finish: string | null) =>
+      `data: ${JSON.stringify({
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model: req.model,
+        choices: [{ index: 0, delta, finish_reason: finish }],
+      })}\n\n`
+
+    yield frame({ role: "assistant", content: "" }, null)
+    for await (const event of this.run(
+      req.model,
+      messages,
+      (req.tools?.length ?? 0) > 0,
+      requestedDepth(req.model, req.reasoning_effort),
+      thread
+    )) {
+      if (event.kind === "text") yield frame({ content: event.delta }, null)
+      else if (event.kind === "reasoning")
+        yield frame({ reasoning_content: event.delta }, null)
+    }
+    this.rememberThread(id, thread)
+    yield frame({}, "stop")
+    yield "data: [DONE]\n\n"
+  }
+
+  // ── Responses API ─────────────────────────────────────────────────────
+
+  async createResponse(
+    req: OpenAiResponsesRequest
+  ): Promise<Record<string, unknown>> {
+    const messages = normalizeResponsesInput(req)
+    const thread = this.threadFromRequest(
+      req as unknown as Record<string, unknown>
+    )
+    const id = `resp_${randomId()}`
+
+    let text = ""
+    for await (const event of this.run(
+      req.model,
+      messages,
+      (req.tools?.length ?? 0) > 0,
+      requestedDepth(req.model, undefined, req.reasoning),
+      thread
+    )) {
+      if (event.kind === "text") text += event.delta
+    }
+    this.rememberThread(id, thread)
+
+    return {
+      id,
+      object: "response",
+      ...(thread.conversationId ? { conversation: thread.conversationId } : {}),
+      created_at: Math.floor(Date.now() / 1_000),
+      status: "completed",
+      model: req.model,
+      output: [
+        {
+          type: "message",
+          id: `msg_${randomId()}`,
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text, annotations: [] }],
+        },
+      ],
+      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    }
+  }
+
+  async *createResponseStream(
+    req: OpenAiResponsesRequest,
+    signal?: AbortSignal
+  ): AsyncGenerator<string, void, unknown> {
+    const messages = normalizeResponsesInput(req)
+    const thread = this.threadFromRequest(
+      req as unknown as Record<string, unknown>
+    )
+    const responseId = `resp_${randomId()}`
+    const itemId = `msg_${randomId()}`
+    const createdAt = Math.floor(Date.now() / 1_000)
+    let sequence = 0
+
+    const emit = (type: string, payload: Record<string, unknown>) =>
+      `event: ${type}\ndata: ${JSON.stringify({
+        type,
+        sequence_number: sequence++,
+        ...payload,
+      })}\n\n`
+
+    const envelope = (status: string, text: string) => ({
+      id: responseId,
+      object: "response",
+      created_at: createdAt,
+      status,
+      model: req.model,
+      output: [
+        {
+          type: "message",
+          id: itemId,
+          status: status === "completed" ? "completed" : "in_progress",
+          role: "assistant",
+          content: [{ type: "output_text", text, annotations: [] }],
+        },
+      ],
+      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    })
+
+    yield emit("response.created", { response: envelope("in_progress", "") })
+    yield emit("response.in_progress", {
+      response: envelope("in_progress", ""),
+    })
+    yield emit("response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "message",
+        id: itemId,
+        status: "in_progress",
+        role: "assistant",
+        content: [],
+      },
+    })
+    yield emit("response.content_part.added", {
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      part: { type: "output_text", text: "", annotations: [] },
+    })
+
+    let text = ""
+    for await (const event of this.run(
+      req.model,
+      messages,
+      (req.tools?.length ?? 0) > 0,
+      requestedDepth(req.model, undefined, req.reasoning),
+      thread,
+      signal
+    )) {
+      if (event.kind !== "text") continue
+      text += event.delta
+      yield emit("response.output_text.delta", {
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        delta: event.delta,
+      })
+    }
+
+    yield emit("response.output_text.done", {
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      text,
+    })
+    yield emit("response.content_part.done", {
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      part: { type: "output_text", text, annotations: [] },
+    })
+    yield emit("response.output_item.done", {
+      output_index: 0,
+      item: {
+        type: "message",
+        id: itemId,
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text, annotations: [] }],
+      },
+    })
+    this.rememberThread(responseId, thread)
+    yield emit("response.completed", { response: envelope("completed", text) })
+  }
+}
+
+// ── request normalisation ───────────────────────────────────────────────
+
+/**
+ * The depth a request asked for, wherever it chose to say it.
+ *
+ * Three spellings reach this surface and they all mean the same thing:
+ * `reasoning_effort` on a chat completion, `reasoning.effort` on a response,
+ * and the `model(level)` suffix this bridge accepts everywhere else. The
+ * vocabulary may be OpenAI's, Cursor's or ChatGPT's own — `webGptThinkingEffort`
+ * is what settles that, and what checks the answer against the model.
+ */
+/** Only what is new, for a thread that already holds the rest. */
+function lastUserMessage(
+  messages: readonly ChatGptWebMessage[]
+): ChatGptWebMessage[] {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!
+    if (message.role === "user") return [message]
+  }
+  return messages.length ? [messages[messages.length - 1]!] : []
+}
+
+function requestedDepth(
+  model: string,
+  explicit?: string,
+  fromReasoning?: { effort?: string }
+): string | undefined {
+  const suffix = parseModelRequest(model)
+  const fromSuffix =
+    suffix.hasSuffix && suffix.suffix?.kind === "level"
+      ? suffix.suffix.level
+      : undefined
+  return explicit || fromReasoning?.effort || fromSuffix
+}
+
+/** Flatten OpenAI content parts down to the plain text upstream accepts. */
+function flattenContent(
+  content: string | OpenAiContentPart[] | null | undefined
+): string {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object" || !("text" in part)) return ""
+      const text = (part as { text?: unknown }).text
+      return typeof text === "string" ? text : ""
+    })
+    .filter(Boolean)
+    .join("\n")
+}
+
+function normalizeChatMessages(
+  messages: readonly OpenAiChatMessage[]
+): ChatGptWebMessage[] {
+  const normalized: ChatGptWebMessage[] = []
+  for (const message of messages ?? []) {
+    // `developer` is OpenAI's newer spelling of a system message; `tool`
+    // results cannot occur here because tool use is rejected upstream.
+    const role =
+      message.role === "developer"
+        ? "system"
+        : message.role === "assistant"
+          ? "assistant"
+          : message.role === "system"
+            ? "system"
+            : "user"
+    const content = flattenContent(message.content)
+    if (content) normalized.push({ role, content })
+  }
+  return normalized
+}
+
+function normalizeResponsesInput(
+  req: OpenAiResponsesRequest
+): ChatGptWebMessage[] {
+  const messages: ChatGptWebMessage[] = []
+  if (req.instructions?.trim())
+    messages.push({ role: "system", content: req.instructions })
+
+  if (typeof req.input === "string") {
+    messages.push({ role: "user", content: req.input })
+    return messages
+  }
+
+  for (const item of req.input ?? []) {
+    const record = item as unknown as Record<string, unknown>
+    if (record.type && record.type !== "message") continue
+    const role = record.role === "assistant" ? "assistant" : "user"
+    const content = flattenContent(
+      record.content as string | OpenAiContentPart[] | null
+    )
+    if (content) messages.push({ role, content })
+  }
+  return messages
+}
+
+function randomId(): string {
+  return crypto.randomBytes(12).toString("hex")
+}

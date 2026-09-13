@@ -7,6 +7,7 @@ import {
   detectModelFamily,
   doesModelSupportThinking,
   isOpusModel,
+  readWebGptModel,
   resolveCloudCodeModel,
 } from "./model-registry"
 
@@ -18,6 +19,8 @@ import {
  * - openai-compat: Third-party OpenAI-compatible API (Chat Completions)
  * - claude-api: Anthropic-compatible Claude API with third-party key/account pool
  * - kiro: AWS CodeWhisperer / Kiro-IDE backend serving Claude models via AWS Event Stream
+ * - chatgpt-web: chatgpt.com's web app, driven through a browser so a
+ *   connector can supply tools; drawn on a different quota than codex
  */
 export type BackendType =
   | "google"
@@ -26,6 +29,7 @@ export type BackendType =
   | "openai-compat"
   | "claude-api"
   | "kiro"
+  | "chatgpt-web"
 
 /**
  * Model routing result
@@ -34,6 +38,21 @@ export interface ModelRouteResult {
   backend: BackendType
   model: string
   isThinking: boolean
+}
+
+/**
+ * The model id that resolves back to this same route.
+ *
+ * Routing consumes the `web-gpt/` prefix, so `route.model` on its own is a
+ * bare chatgpt.com slug — and asking the router about `gpt-6-pro` gets the
+ * Codex path, which has never heard of it. Anywhere a resolved route is fed
+ * back into `resolveModel` (the stream helpers all do, to re-derive a route
+ * per attempt), ask for this instead of reaching for `route.model`.
+ */
+export function routableModelId(route: ModelRouteResult): string {
+  return route.backend === "chatgpt-web"
+    ? `web-gpt/${route.model}`
+    : route.model
 }
 
 export interface GptBackendCandidates {
@@ -468,6 +487,20 @@ export class ModelRouterService {
    * Uses unified model-registry for all name resolution.
    */
   resolveModel(cursorModel: string): ModelRouteResult {
+    // An explicit `web-gpt/` prefix is the only way into the browser-backed
+    // path. It is never inferred from a model name: that transport spends a
+    // different quota and needs a signed-in browser, so asking for it has to
+    // be deliberate.
+    const webGptModel = readWebGptModel(cursorModel)
+    if (webGptModel) {
+      this.logger.log(`[ROUTE] ${cursorModel} -> chatgpt-web | ${webGptModel}`)
+      return {
+        backend: "chatgpt-web",
+        model: webGptModel,
+        isThinking: /thinking|reasoning/i.test(webGptModel),
+      }
+    }
+
     const stripped = this.stripVendorPrefix(cursorModel)
     const normalized = stripped.toLowerCase().trim()
     const family = detectModelFamily(normalized)

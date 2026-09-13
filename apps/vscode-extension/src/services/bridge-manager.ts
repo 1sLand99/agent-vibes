@@ -156,6 +156,30 @@ export class BridgeManager extends EventEmitter {
         env.PROXY_API_KEY = this.config.proxyApiKey
       }
 
+      // The relay carries Cursor's own tools out to a public MCP endpoint, so
+      // there is nothing to scope: what a caller can reach is whatever the
+      // editor implements, executed by the editor.
+      if (this.config.mcpRelayUrl) {
+        env.MCP_RELAY_URL = this.config.mcpRelayUrl
+      }
+
+      // ChatGPT Web as a Cursor backend. MCP_API_KEY is shared with the relay
+      // above: the relay requires the same secret of the agent attaching and
+      // of any MCP client calling in, so one value avoids a deployment where
+      // the agent connects but the connector is turned away.
+      if (this.config.chatGptWebConnectorId) {
+        env.CHATGPT_WEB_CONNECTOR_ID = this.config.chatGptWebConnectorId
+      }
+      if (this.config.mcpApiKey) {
+        env.MCP_API_KEY = this.config.mcpApiKey
+      }
+      if (this.config.chatGptWebBrowserProfile) {
+        env.CHATGPT_WEB_BROWSER_PROFILE = this.config.chatGptWebBrowserProfile
+      }
+      if (this.config.chatGptWebShowBrowser) {
+        env.CHATGPT_WEB_BROWSER_VISIBLE = "1"
+      }
+
       // Stability first: Kiro warmup sends one request per account on every
       // bridge start. On account pools this can trigger 429 cooldowns and a
       // memory spike before the first real turn.

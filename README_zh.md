@@ -684,16 +684,19 @@ agent-vibes/
 
 ## API 端点
 
-| 路径                         | 方法 | 协议                     | 说明                     |
-| ---------------------------- | ---- | ------------------------ | ------------------------ |
-| `/v1/messages`               | POST | Anthropic API (SSE)      | Claude Code CLI          |
-| `/v1/messages/count_tokens`  | POST | Anthropic API            | 请求 token 计数          |
-| `/v1/realtime/calls`         | POST | WebRTC SDP               | ChatGPT OAuth 语音       |
-| `/agent.v1.AgentService/Run` | POST | ConnectRPC (HTTP/2 BiDi) | Cursor IDE（Agent 模式） |
-| `/v1/models`                 | GET  | REST JSON                | Anthropic 模型列表       |
-| `/v1/anthropic/models`       | GET  | REST JSON                | 可用模型列表             |
-| `/health`                    | GET  | REST JSON                | 健康检查                 |
-| `/docs`                      | GET  | Swagger UI               | API 文档                 |
+| 路径                           | 方法 | 协议                     | 说明                     |
+| ------------------------------ | ---- | ------------------------ | ------------------------ |
+| `/v1/messages`                 | POST | Anthropic API (SSE)      | Claude Code CLI          |
+| `/v1/messages/count_tokens`    | POST | Anthropic API            | 请求 token 计数          |
+| `/v1/web-gpt/chat/completions` | POST | OpenAI Chat API          | ChatGPT 网页额度（文本） |
+| `/v1/web-gpt/responses`        | POST | OpenAI Responses API     | ChatGPT 网页额度（文本） |
+| `/v1/web-gpt/models`           | GET  | REST JSON                | 网页端模型列表           |
+| `/v1/realtime/calls`           | POST | WebRTC SDP               | ChatGPT OAuth 语音       |
+| `/agent.v1.AgentService/Run`   | POST | ConnectRPC (HTTP/2 BiDi) | Cursor IDE（Agent 模式） |
+| `/v1/models`                   | GET  | REST JSON                | Anthropic 模型列表       |
+| `/v1/anthropic/models`         | GET  | REST JSON                | 可用模型列表             |
+| `/health`                      | GET  | REST JSON                | 健康检查                 |
+| `/docs`                        | GET  | Swagger UI               | API 文档                 |
 
 `/v1/realtime/calls` 使用已配置的 ChatGPT OAuth 账号，将浏览器 WebRTC SDP
 offer 交换为 SDP answer。该接口不使用 Platform API key，并强制要求配置

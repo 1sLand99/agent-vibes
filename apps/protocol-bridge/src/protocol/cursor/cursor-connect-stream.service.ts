@@ -180,6 +180,7 @@ import {
   BackendType,
   ModelRouteResult,
   ModelRouterService,
+  routableModelId,
 } from "../../llm/shared/model-router.service"
 import {
   normalizeFlatMessagesForAPI,
@@ -247,10 +248,13 @@ import { KvStorageService } from "./kv-storage.service"
 import {
   asProviderPhysicalDispatch,
   assertProviderAttemptTurnOwnership,
+  ProviderAttemptSupersededError,
+  StaleTurnFrameError,
   type BackendStreamHints,
   type ProviderAttemptAbandonReason,
   type ProviderAttemptIdentity,
   type PreparedProviderRequest,
+  type ProviderRequestCandidate,
   ProviderAttemptCoordinator,
   type ProviderAttemptLifecycleHooks,
   type ProviderRequestPreparer,
@@ -259,6 +263,7 @@ import {
   decidePendingWorkLog,
   type PendingWorkLogState,
 } from "./pending-work-log-policy"
+import { ChatGptWebCursorBridge } from "../../llm/openai/chatgpt-web-cursor-bridge.service"
 import { SemanticSearchProviderService } from "./semantic-search-provider.service"
 import {
   parseCursorSseEvent,
@@ -857,6 +862,17 @@ interface BackendStreamOptions {
     prepared: PreparedProviderRequest
   ) => void
   abortSignal?: AbortSignal
+  /**
+   * What the user just typed, as the request parser read it.
+   *
+   * Only the ChatGPT Web path uses it, and only because it is the one backend
+   * where the conversation also exists somewhere else: its thread already
+   * holds the history, so a turn has to type this and nothing else.
+   * Reconstructing it from the projected messages does not work — Cursor packs
+   * a chat's turns into one user message as several text blocks, and what sits
+   * in front of them changes from turn to turn.
+   */
+  userPrompt?: string
   /** Owned by getBackendStream so iterator.return can cancel pending next(). */
   consumerCancellation?: { isCancelled: () => boolean }
   streamAbortBinding?: {
@@ -1928,6 +1944,7 @@ export class CursorConnectStreamService {
     private readonly toolUseSummary: ToolUseSummaryService,
     private readonly openaiCompatService: OpenaiCompatService,
     private readonly modelRouter: ModelRouterService,
+    private readonly chatGptWebCursor: ChatGptWebCursorBridge,
     private readonly kvStorageService: KvStorageService,
     private readonly contextManager: ContextManagerService,
     private readonly contextProjection: ContextProjectionService,
@@ -3427,6 +3444,9 @@ export class CursorConnectStreamService {
       conversationId,
       safeReason
     )
+    // A web turn outlives the provider request that started it, so stopping
+    // one is the only thing that closes the browser turn behind it.
+    this.chatGptWebCursor.release(conversationId, safeReason)
     this.logger.warn(
       `Cancel action received for conversation ${conversationId}: reason=${safeReason}, ` +
         `cancelledTurns=${cancelledTurnCount}, emittedExecAborts=${emittedExecAbortCount}, ` +
@@ -5559,6 +5579,36 @@ export class CursorConnectStreamService {
     const attemptSignal = options.abortSignal
     if (!attemptSignal) {
       throw new Error("Backend provider attempts require an owned AbortSignal")
+    }
+
+    // chatgpt-web leaves this path immediately. It has no provider request to
+    // retry or fall back from: the turn lives in a browser tab that is already
+    // open, and one Cursor request reads one segment of it. Running it through
+    // the attempt machinery would re-prompt ChatGPT on every retry.
+    if (route.backend === "chatgpt-web") {
+      if (!turnConversationId) {
+        throw new Error("chatgpt-web requires a conversation-bound stream")
+      }
+      const prepared = await options.prepareProviderRequest(
+        route,
+        activeHintsForWebGpt(options),
+        {
+          scope: "chatgpt-web",
+          ordinal: 1,
+          backend: route.backend,
+          model: route.model,
+        },
+        attemptSignal
+      )
+      yield* this.chatGptWebCursor.stream({
+        conversationId: turnConversationId,
+        model: route.model,
+        newMessage: options.userPrompt,
+        thinkingLevel: thinkingLevelFromPreparedRequest(prepared),
+        promptBlocks: userTextBlocksFromPreparedRequest(prepared),
+        toolResults: toolResultsFromPreparedRequest(prepared),
+      })
+      return
     }
     let emittedAny = false
     let buffer: string[] = []
@@ -12777,6 +12827,13 @@ export class CursorConnectStreamService {
           case "codex":
             throw new Error(
               "Codex compact must use the Codex context adapter and Responses compact endpoint."
+            )
+          case "chatgpt-web":
+            // Compaction is a side call made while a turn is in flight, and the
+            // browser transport holds one tab for one turn. Summarising would
+            // have to queue behind the turn it is trying to shorten.
+            throw new Error(
+              "chatgpt-web cannot serve compaction; it has no side channel."
             )
         }
       },
@@ -22151,7 +22208,7 @@ ${raw}
         // tool dispatch loop starting on the next iteration.
         this.emit(conversationId, this.grpcService.createHeartbeatResponse())
         const route = this.modelRouter.resolveModel(run.model)
-        const streamModel = route.model
+        const streamModel = routableModelId(route)
         let activeProviderRoute = route
         // This is assigned only after the provider candidate is accepted.
         // A prepared/retried/fallback candidate never authorizes child tools.
@@ -22743,7 +22800,7 @@ ${raw}
     const route = this.modelRouter.resolveModel(args.run.model)
     let activeProviderRoute = route
 
-    const streamModel = route.model
+    const streamModel = routableModelId(route)
     let acceptedRequest: SubagentProviderRequestReceipt | undefined
 
     let sseTurn = new SubAgentSseTurnCollector()
@@ -33743,6 +33800,22 @@ ${raw}
         )
       },
       onTaskError: (label, error) => {
+        if (error instanceof StaleTurnFrameError) {
+          // The turn this frame belonged to is gone — superseded, cancelled,
+          // or already finished. There is nothing to deliver it to and nothing
+          // wrong; say so once and let the scheduler settle rather than
+          // leaving the conversation looking like it is still working.
+          this.logger.warn(
+            `BiDi inbound frame dropped for a finished turn: ` +
+              `conversation=${conversationId ?? "(unbound)"} label=${label} ` +
+              `${error.message}`
+          )
+          // Expected, so the Run stays open: the conversation belongs to
+          // whichever turn is live now, and tearing its stream down because a
+          // frame from the previous one arrived late is what left the editor
+          // waiting on nothing.
+          return true
+        }
         this.logger.error(
           `BiDi inbound continuation failed: conversation=${conversationId ?? "(unbound)"} ` +
             `label=${label} error=${error.message}`,
@@ -36229,7 +36302,7 @@ ${raw}
     const fromContext = this.turnContext.getStore()
     if (fromContext) {
       if (!this.isActiveTurnOwner(conversationId, fromContext)) {
-        throw new Error(
+        throw new StaleTurnFrameError(
           `IDE frame has stale or mismatched ALS owner: ` +
             `conversation=${conversationId} turn=${fromContext.turnId}`
         )
@@ -36238,7 +36311,7 @@ ${raw}
     }
     const umbrella = this.umbrellaHandleByConversation.get(conversationId)
     if (umbrella && !this.isActiveTurnOwner(conversationId, umbrella)) {
-      throw new Error(
+      throw new StaleTurnFrameError(
         `IDE frame has stale umbrella owner: ` +
           `conversation=${conversationId} turn=${umbrella.turnId}`
       )
@@ -36901,8 +36974,9 @@ ${raw}
       const createStream = (
         streamOptions?: Pick<BackendStreamOptions, "maxOutputTokensOverride">
       ) =>
-        this.getBackendStream(route.model, {
+        this.getBackendStream(routableModelId(route), {
           maxOutputTokensOverride: streamOptions?.maxOutputTokensOverride,
+          userPrompt: parsed.newMessage,
           prepareProviderRequest: async (
             streamRoute,
             hints,
@@ -37702,7 +37776,7 @@ ${raw}
     const createContinuationStream = (
       streamOptions?: Pick<BackendStreamOptions, "maxOutputTokensOverride">
     ) =>
-      this.getBackendStream(route.model, {
+      this.getBackendStream(routableModelId(route), {
         maxOutputTokensOverride: streamOptions?.maxOutputTokensOverride,
         prepareProviderRequest: async (streamRoute, hints, attempt, signal) => {
           this.transitionContextRuntime(conversationId, {
@@ -37849,6 +37923,23 @@ ${raw}
           details: {
             error: error.message,
           },
+        })
+        return
+      }
+
+      if (error instanceof ProviderAttemptSupersededError) {
+        // A newer turn owns the conversation now — a mode switch mid-turn is
+        // the usual way — so this continuation has nowhere to land. Reporting
+        // it as a failed model request would leave the editor waiting on a
+        // turn nobody is driving.
+        this.logger.warn(
+          `${continuationLabel} abandoned for ${conversationId}: ${error.message}`
+        )
+        this.transitionContextRuntime(conversationId, {
+          phase: "aborted",
+          reason: "superseded_stream",
+          streamId,
+          details: { context: `${continuationLabel} superseded` },
         })
         return
       }
@@ -43626,4 +43717,131 @@ function flattenAssistantTurnBlocks(
     }
   }
   return out
+}
+
+/**
+ * The prompt for a ChatGPT turn.
+ *
+ * A browser turn is one composer submission, so the conversation Cursor built
+ * is folded into a single message. Only the newest user text matters on a
+ * resume — the browser turn still holds everything before it.
+ */
+/**
+ * Everything the user has said in this conversation, one block per thing.
+ *
+ * Not joined here, because the caller has to decide how much of it to send:
+ * the conversation also lives on chatgpt.com, so a turn continuing an existing
+ * thread must type only what that thread has not heard yet. Cursor packs the
+ * history into whatever shape it likes — the second turn of a chat arrives as
+ * a single user message holding both turns' text as separate blocks — so the
+ * blocks are what to count, not the messages.
+ */
+function userTextBlocksFromPreparedRequest(
+  prepared: ProviderRequestCandidate
+): string[] {
+  if (prepared.kind !== "standard") return []
+  const blocks: string[] = []
+  for (const message of prepared.request.messages ?? []) {
+    if (message.role !== "user") continue
+    const content = message.content
+    if (typeof content === "string") {
+      const text = content.trim()
+      if (text) blocks.push(text)
+      continue
+    }
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (
+        block &&
+        typeof block === "object" &&
+        (block as { type?: string }).type === "text" &&
+        typeof (block as { text?: unknown }).text === "string"
+      ) {
+        const text = (block as { text: string }).text.trim()
+        if (text) blocks.push(text)
+      }
+    }
+  }
+  return blocks
+}
+
+/**
+ * Tool outcomes Cursor is returning for the previous segment.
+ *
+ * Each one releases an MCP request that has been holding ChatGPT's connector
+ * open since the tool was asked for.
+ */
+function toolResultsFromPreparedRequest(prepared: ProviderRequestCandidate): {
+  toolCallId: string
+  result: { content: { type: "text"; text: string }[] }
+}[] {
+  if (prepared.kind !== "standard") return []
+  const results: {
+    toolCallId: string
+    result: { content: { type: "text"; text: string }[] }
+  }[] = []
+  for (const message of prepared.request.messages ?? []) {
+    const content = message.content
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue
+      const typed = block as {
+        type?: string
+        tool_use_id?: string
+        content?: unknown
+      }
+      if (typed.type !== "tool_result" || !typed.tool_use_id) continue
+      results.push({
+        toolCallId: typed.tool_use_id,
+        result: {
+          content: [{ type: "text", text: flattenToolResult(typed.content) }],
+        },
+      })
+    }
+  }
+  return results
+}
+
+function flattenToolResult(content: unknown): string {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  return content
+    .map((block) =>
+      block &&
+      typeof block === "object" &&
+      typeof (block as { text?: unknown }).text === "string"
+        ? (block as { text: string }).text
+        : ""
+    )
+    .filter(Boolean)
+    .join("\n")
+}
+
+/** Hints carried into the single chatgpt-web attempt. */
+/**
+ * The effort Cursor asked for, as the backend-agnostic pipeline recorded it.
+ *
+ * `_thinkingIntent` is where Cursor's thinking semantics are captured before
+ * any backend sees them, so reading it here keeps the web path on the same
+ * answer every other backend gets. A turn that expressed no preference leaves
+ * the model's own default alone.
+ */
+function thinkingLevelFromPreparedRequest(
+  prepared: ProviderRequestCandidate
+): string | undefined {
+  if (prepared.kind !== "standard") return undefined
+  const intent = prepared.request._thinkingIntent
+  if (!intent) return undefined
+  if (intent.mode === "explicit_effort" || intent.mode === "adaptive") {
+    return intent.effort
+  }
+  return undefined
+}
+
+function activeHintsForWebGpt(
+  options: BackendStreamOptions
+): BackendStreamHints | undefined {
+  return options.maxOutputTokensOverride
+    ? { maxOutputTokensOverride: options.maxOutputTokensOverride }
+    : undefined
 }
