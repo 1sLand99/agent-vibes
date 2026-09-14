@@ -1,10 +1,12 @@
 import { Injectable, Logger } from "@nestjs/common"
+import { ConfigService } from "@nestjs/config"
 import * as crypto from "node:crypto"
 import { HttpProxyAgent } from "http-proxy-agent"
 import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
 import { CodexService } from "./codex.service"
 import type { CodexRealtimeAccountLease } from "./codex-realtime-account"
+import { UpstreamRequestAbortedError } from "../shared/abort-signal"
 import {
   ChatGptWebSessionError,
   ChatGptWebSessionStore,
@@ -103,8 +105,26 @@ export class ChatGptWebConversationService {
 
   constructor(
     private readonly codex: CodexService,
-    private readonly sessions: ChatGptWebSessionStore
+    private readonly sessions: ChatGptWebSessionStore,
+    private readonly configService: ConfigService
   ) {}
+
+  /**
+   * The connector that carries Cursor's tools, if one is configured.
+   *
+   * Naming it in the payload is what makes the model able to call those tools.
+   * It was believed this only worked for a request the web app itself built —
+   * measured otherwise: a request with a body of our own construction
+   * activated the connector, and the tool call reached this bridge. What the
+   * app does provide is a fresh single-use sentinel and a session the edge
+   * trusts, both of which this transport already obtains for every turn.
+   */
+  private connectorHint(): string | undefined {
+    const id = this.configService
+      .get<string>("CHATGPT_WEB_CONNECTOR_ID", "")
+      .trim()
+    return id ? `plugin:${id}` : undefined
+  }
 
   /**
    * Lease an account from the shared Codex pool. The caller owns the lease and
@@ -297,6 +317,13 @@ export class ChatGptWebConversationService {
    * downstream translators can forward it as a delta unchanged.
    */
   async *stream(req: ChatGptWebRequest): AsyncGenerator<ChatGptWebEvent> {
+    yield* this.readStream(await this.openTurn(req))
+  }
+
+  /** Send one turn and hand back its response body, or throw trying. */
+  private async openTurn(
+    req: ChatGptWebRequest
+  ): Promise<ReadableStream<Uint8Array>> {
     const slug = await this.resolveSlug(req.model)
     if (!slug) {
       throw new ChatGptWebError(
@@ -322,6 +349,15 @@ export class ChatGptWebConversationService {
         signal: req.signal,
       } as RequestInit)
     } catch (error) {
+      // A cancelled turn aborts this fetch, and that abort surfaces here
+      // looking exactly like an unreachable upstream. Charging it to the
+      // account is how one cancel used to take the whole pool down for a
+      // minute, so the request that followed a second later had no account
+      // left to lease.
+      if (req.signal?.aborted) {
+        lease.abandon()
+        throw new UpstreamRequestAbortedError(describe(error))
+      }
       lease.reject(502, describe(error))
       throw new ChatGptWebError(
         502,
@@ -347,7 +383,7 @@ export class ChatGptWebConversationService {
     }
 
     lease.accept()
-    yield* this.readStream(response.body)
+    return response.body
   }
 
   private buildPayload(
@@ -360,14 +396,19 @@ export class ChatGptWebConversationService {
     }
   ): Record<string, unknown> {
     const now = Date.now() / 1_000
+    const hint = this.connectorHint()
     return {
       action: "next",
+      ...(hint ? { system_hints: [hint] } : {}),
       messages: messages.map((message) => ({
         id: crypto.randomUUID(),
         author: { role: message.role },
         create_time: now,
         content: { content_type: "text", parts: [message.content] },
-        metadata: { serialization_metadata: { custom_symbol_offsets: [] } },
+        metadata: {
+          serialization_metadata: { custom_symbol_offsets: [] },
+          ...(hint ? { system_hints: [hint] } : {}),
+        },
       })),
       // A new conversation has nothing to answer, and upstream accepts any id
       // as the root. Continuing one has to name the message it follows, or the

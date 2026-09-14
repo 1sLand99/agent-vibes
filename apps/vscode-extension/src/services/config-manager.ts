@@ -205,22 +205,8 @@ export class ConfigManager {
    * headless away, not because anyone needs to watch it. Turn this on to sign
    * in the first time.
    */
-  get chatGptWebShowBrowser(): boolean {
-    return (
-      vscode.workspace
-        .getConfiguration("agentVibes")
-        .get<boolean>("chatGptWeb.showBrowser") ?? false
-    )
-  }
 
   /** Chrome profile the ChatGPT tab runs in; empty means the default path. */
-  get chatGptWebBrowserProfile(): string {
-    return (
-      vscode.workspace
-        .getConfiguration("agentVibes")
-        .get<string>("chatGptWeb.browserProfile") ?? ""
-    ).trim()
-  }
 
   get antigravitySystemPrompt(): boolean {
     return (

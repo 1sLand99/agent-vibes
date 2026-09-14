@@ -148,7 +148,6 @@ function resolveConfig() {
     ["agentVibes.mcp.relayUrl", "MCP_RELAY_URL"],
     ["agentVibes.mcp.apiKey", "MCP_API_KEY"],
     ["agentVibes.chatGptWeb.connectorId", "CHATGPT_WEB_CONNECTOR_ID"],
-    ["agentVibes.chatGptWeb.browserProfile", "CHATGPT_WEB_BROWSER_PROFILE"],
     ["agentVibes.proxyApiKey", "PROXY_API_KEY"],
     ["agentVibes.responseLanguage", "AGENT_VIBES_FORCED_LANGUAGE"],
   ]
@@ -158,10 +157,6 @@ function resolveConfig() {
     if (typeof value === "string" && value.trim()) {
       env[envKey] = value.trim()
     }
-  }
-
-  if (settings["agentVibes.chatGptWeb.showBrowser"] === true) {
-    env.CHATGPT_WEB_BROWSER_VISIBLE = "1"
   }
 
   if (settings["agentVibes.thinkingBudgetAuto"] === true) {
@@ -480,6 +475,13 @@ function formatBusyRuntimeSession(session) {
 }
 
 function hasInterruptibleRuntimeWork(session) {
+  // A session the bridge has not loaded — one reported straight off disk —
+  // has nothing a restart could interrupt: no stream, no turn, no provider
+  // request. Whatever it left open is durable and survives the restart
+  // untouched, and it is reported through pendingRecoverySessionCount. An
+  // abandoned conversation with an open tool call would otherwise block every
+  // restart from here on, which is exactly what it did.
+  if (session.persistedOnly === true) return false
   // Async user interactions are restart-safe: their resolution and
   // continuation claim are durable and the bridge recovers them on resume.
   return (

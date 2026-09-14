@@ -174,6 +174,17 @@ export function normalizeCursorAskQuestionArgs(
   }
 }
 
+/**
+ * Which surface a question is asked on.
+ *
+ * The queued surface works, but only if the Run is then allowed to end. The
+ * IDE settles a questionnaire locally and sends nothing while a conversation
+ * action manager is live — `isLiveInteractionOpen()` — and only builds the
+ * `asyncAskQuestionCompletionAction` when none is, opening a fresh Run to
+ * carry it. Holding the Run open to wait for that answer is what stops it
+ * being sent; see the async suspension in the stream service, which now ends
+ * the Run instead of parking it.
+ */
 export function resolveCursorAskQuestionExecution(
   input: Record<string, unknown>
 ): CursorAskQuestionExecution {

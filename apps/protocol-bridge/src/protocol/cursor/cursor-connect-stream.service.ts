@@ -330,6 +330,8 @@ import {
 } from "./session/background-command-store.service"
 import {
   AsyncUserInteractionStore,
+  fingerprintAsyncAskQuestionResolution,
+  renderAsyncAskQuestionContinuationPayload,
   type AsyncAskQuestionResolution,
   type DurableAsyncUserInteraction,
   type OpenAsyncAskQuestionInput,
@@ -732,6 +734,35 @@ const DEFERRED_INTERACTION_QUERY_FAMILIES: ReadonlySet<DeferredToolFamily> =
     // InteractionQuery 补齐
     "pr_management",
   ])
+
+/**
+ * Cancel reasons that mean "this turn is superseded", not "abandon what the
+ * conversation is still waiting for".
+ *
+ * Answering an async ask question is, to Cursor, submitting a message: it
+ * cancels the parked Run and delivers the answer on a fresh one as an
+ * `asyncAskQuestionCompletionAction`. A durable async question deliberately
+ * outlives the turn that asked it, so cancelling it on this reason destroys
+ * the interaction that the very next frame resolves — the answer then arrives
+ * for a cancelled question and is discarded as a conflict.
+ */
+const TURN_SUPERSEDING_CANCEL_REASONS: ReadonlySet<string> = new Set([
+  "new_message_submitted",
+])
+
+/**
+ * How long a redelivered answer waits for the conversation to fall quiet
+ * before giving up. Long enough for a cancelled stream to finish tearing down,
+ * short enough that a Run never sits open on a conversation that stays busy.
+ */
+const REDELIVERED_ASK_RESUME_QUIET_TIMEOUT_MS = 20_000
+
+/**
+ * The families whose query is answered by a person rather than by the client,
+ * and which therefore run without a deadline.
+ */
+const HUMAN_ANSWERED_DEFERRED_TOOL_FAMILIES: ReadonlySet<DeferredToolFamily> =
+  new Set<DeferredToolFamily>(["ask_question", "request_user_input"])
 
 const UNSUPPORTED_DEFERRED_TOOL_MESSAGES: Partial<
   Record<DeferredToolFamily, string>
@@ -2083,6 +2114,9 @@ export class CursorConnectStreamService {
     // only thing that resumes them.
     this.sessionManager.registerPendingWorkBecameIdleHandler(
       (conversationId) => {
+        // The edge a Run cannot see for itself. Without this a Run that found
+        // the conversation busy stays open forever.
+        this.reevaluateOpenRunsForIdleConversation(conversationId)
         // Fire-and-forget: drain runs on its own microtask so the
         // consume site (e.g. consumePendingToolCall, called from
         // synchronous tool-result-finalize paths) does not block
@@ -2098,9 +2132,302 @@ export class CursorConnectStreamService {
     this.sessionManager.setPendingToolTurnIdResolver((conversationId) =>
       this.getCurrentParentTurnId(conversationId)
     )
+    // An expired interaction query has no client response to carry it into the
+    // tool-result write, so the sweeper hands it here instead. It arrives on a
+    // timer rather than on the stream, so it takes the conversation's
+    // continuation lane to keep it off an inbound continuation's toes.
+    this.sessionStream.setExpiredInteractionQueryDispatcher(async (expired) => {
+      const toolCallId =
+        this.pickFirstString(expired.payload ?? {}, ["toolCallId"]) || ""
+      await this.topLevelAgentTurnRunner.runExclusive(
+        {
+          conversationId: expired.conversationId,
+          continuationLabel: "interaction query expiry",
+          toolCallId,
+        },
+        async () => {
+          const handledRecovery =
+            await this.handleCloudCodeProtocolRecoveryInteractionResponse(
+              expired.conversationId,
+              expired.payload,
+              expired.rawResponse
+            )
+          if (handledRecovery) return
+          await this.handleDeferredToolInteractionResponse(
+            expired.conversationId,
+            expired.payload,
+            expired.rawResponse
+          )
+        }
+      )
+    })
+  }
+
+  /**
+   * Answers already resumed from, per conversation and tool call. Cursor sends
+   * the same completion frame several times; only the first may start a turn.
+   */
+  private readonly resumedRedeliveredAskAnswers = new Map<
+    string,
+    Map<string, string>
+  >()
+
+  /**
+   * Conversations that have already spent their one resume from a redelivered
+   * answer.
+   *
+   * One submission makes Cursor replay every answer it holds, each naming a
+   * different ask, so deduplicating by tool call let each of them start its own
+   * turn — four turns for one click, the last aborting the stream the previous
+   * one was still using. A submission earns one turn. The mark is released when
+   * the agent asks something new, which is the next time an answer could
+   * legitimately drive one.
+   */
+  private readonly redeliveredAskResumeInFlight = new Set<string>()
+
+  /**
+   * Every open Run's inbound scheduler, with the conversation it is bound to.
+   *
+   * A Run decides whether to close by asking whether its conversation still
+   * has work, and it only ever asks at its own edges: a frame arriving, or one
+   * of its continuations finishing. The conversation going idle is neither —
+   * it happens inside whichever Run was doing the work. A Run that asked once
+   * while another was still busy therefore never asks again and stays open for
+   * good, holding a live turn handle that makes the conversation look busy to
+   * everything downstream.
+   */
+  private readonly openInboundSchedulers = new Set<{
+    readonly conversationId: () => string | undefined
+    readonly scheduler: BidiInboundContinuationScheduler
+  }>()
+
+  /**
+   * Re-ask every open Run on this conversation whether it is done, and wake
+   * anything waiting for the conversation to fall quiet. Called at the idle
+   * edge, which is the answer none of them can observe for itself.
+   */
+  private reevaluateOpenRunsForIdleConversation(conversationId: string): void {
+    this.notifyConversationQuietIfReady(conversationId)
+    for (const entry of this.openInboundSchedulers) {
+      if (entry.conversationId() !== conversationId) continue
+      entry.scheduler.evaluateIdle()
+    }
+  }
+
+  /** Waiters for a conversation with nothing left running. */
+  private readonly conversationQuietWaiters = new Map<string, Set<() => void>>()
+
+  /**
+   * Nothing is carrying this conversation forward: no response streaming, no
+   * result owed by the client, no question on screen.
+   */
+  private isConversationQuiet(conversationId: string): boolean {
+    return (
+      !this.isBackendStreamActive(conversationId) &&
+      this.sessionManager.pendingToolCallCount(conversationId) === 0 &&
+      !this.sessionStream.hasBlockingInteractionQueries(conversationId) &&
+      this.asyncUserInteractions.listActive(conversationId).length === 0
+    )
+  }
+
+  private notifyConversationQuietIfReady(conversationId: string): void {
+    const waiters = this.conversationQuietWaiters.get(conversationId)
+    if (!waiters || !this.isConversationQuiet(conversationId)) return
+    this.conversationQuietWaiters.delete(conversationId)
+    for (const wake of waiters) wake()
+  }
+
+  /**
+   * Wait for the conversation to fall quiet.
+   *
+   * Whether a redelivered answer may start a turn cannot be decided when its
+   * frame arrives: the stream the cancel killed is still tearing down, the
+   * results of the turn that asked are still settling, and the only turn handle
+   * on the conversation belongs to the very Run holding the frame. Every one of
+   * those reads "busy" for something that is on its way out. Waiting for the
+   * edge costs a moment and makes the answer unambiguous.
+   *
+   * Resolves false if the conversation has not fallen quiet within the timeout,
+   * so a wait can never hold a Run open indefinitely.
+   */
+  private awaitConversationQuiet(
+    conversationId: string,
+    timeoutMs: number
+  ): Promise<boolean> {
+    if (this.isConversationQuiet(conversationId)) return Promise.resolve(true)
+    return new Promise<boolean>((resolve) => {
+      let settled = false
+      const wake = (): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(true)
+      }
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        this.conversationQuietWaiters.get(conversationId)?.delete(wake)
+        resolve(false)
+      }, timeoutMs)
+      if (typeof timer.unref === "function") timer.unref()
+      let waiters = this.conversationQuietWaiters.get(conversationId)
+      if (!waiters) {
+        waiters = new Set()
+        this.conversationQuietWaiters.set(conversationId, waiters)
+      }
+      waiters.add(wake)
+    })
+  }
+
+  /**
+   * Cursor delivers an ask answer twice. The InteractionResponse resolves a
+   * blocking question inline, and the same answer arrives again as a
+   * ConversationAction, because answering a card is a composer submission:
+   * Cursor cancels the run first and then replays every answer it holds.
+   *
+   * The cancel tears down the continuation the inline answer started, so the
+   * replay is the delivery that has to drive the turn. Dropping it — which is
+   * what "no durable interaction" did — leaves the conversation idle with the
+   * answer recorded and nothing running.
+   *
+   * Returns what to continue with, and only once per answer: the same frame
+   * arrives up to three times, and each must not start its own turn.
+   */
+  /**
+   * Cursor names a completion by the tool call it is answering, but an async
+   * question surfaced through a card also carries the id of the question it
+   * originated from. When the named one matches nothing and the original is
+   * what this conversation is parked on, the original is the answer's target —
+   * taking the name at face value leaves the question waiting forever.
+   */
+  private resolveDurableAsyncAskToolCallId(
+    conversationId: string,
+    toolCallId: string,
+    completion: NonNullable<
+      ParsedCursorRequest["agentControlAsyncAskCompletion"]
+    >
+  ): string {
+    if (this.asyncUserInteractions.get(conversationId, toolCallId)) {
+      return toolCallId
+    }
+    const alternate = (
+      completion.originalArgs?.asyncOriginalToolCallId || ""
+    ).trim()
+    if (
+      alternate &&
+      alternate !== toolCallId &&
+      this.asyncUserInteractions.get(conversationId, alternate)
+    ) {
+      this.logger.log(
+        `Async ask completion named ${toolCallId}, which this conversation is ` +
+          `not waiting on; resolving ${alternate} instead, which it is`
+      )
+      return alternate
+    }
+
+    // The name stands on its own. It was tempting to redirect a completion
+    // that matches nothing onto the one question still parked, on the grounds
+    // that an answer for this conversation can only belong to what it is
+    // waiting for. That is false, and it corrupted the transcript: Cursor
+    // replays an earlier answer verbatim — id and question text both naming a
+    // question already closed — three seconds after a new one is parked, long
+    // before anyone could have read it. Redirecting filed a single-choice
+    // answer as the async question's result, and the model duly reported
+    // being handed an answer to a question it had not asked.
+    //
+    // A completion that matches nothing is a replay of something already
+    // recorded. Leave it alone; the parked question is answered when its own
+    // answer arrives.
+    return toolCallId
+  }
+
+  private planRedeliveredAskAnswerResume(
+    conversationId: string,
+    parsed: ParsedCursorRequest
+  ): { toolCallId: string; payload: string } | undefined {
+    const completion = parsed.agentControlAsyncAskCompletion
+    const toolCallId =
+      completion?.originalToolCallId || parsed.agentControlToolCallId || ""
+    if (!completion || !toolCallId) return undefined
+
+    // Declining is the common case and every reason for it has looked the
+    // same from outside: nothing in the log, and a conversation that stopped.
+    // Each one says which now.
+    const decline = (reason: string): undefined => {
+      this.logger.log(
+        `Not resuming from a redelivered ask answer: ` +
+          `conversation=${conversationId} toolCallId=${toolCallId} ${reason}`
+      )
+      return undefined
+    }
+
+    // A durable interaction means the async path owns this answer already.
+    if (this.asyncUserInteractions.get(conversationId, toolCallId)) {
+      return decline("reason=async-path-owns-it")
+    }
+    // Still open means the blocking question is live and will answer itself.
+    if (this.sessionManager.hasPendingToolCall(conversationId, toolCallId)) {
+      return decline("reason=tool-call-still-open")
+    }
+    const session = this.sessionManager.getSession(conversationId)
+    if (!session) return decline("reason=no-session")
+
+    // Deliberately not asked here: whether a turn is live, whether a stream is
+    // open, whether results are still settling. Every one of those reads busy
+    // for something on its way out when these frames arrive, and the turn
+    // handle they would find belongs to the Run holding the frame — a check
+    // that refuses itself, which is what declined all seven of them. The
+    // decision is made once the conversation falls quiet instead.
+    //
+    // A question already on screen is different: it is not on its way out, and
+    // whatever answers it drives the turn. Nothing to resume from here.
+    if (this.sessionStream.hasBlockingInteractionQueries(conversationId)) {
+      return decline("reason=question-on-screen")
+    }
+    if (this.asyncUserInteractions.listActive(conversationId).length > 0) {
+      return decline("reason=async-question-parked")
+    }
+
+    // Cursor replays every answer it holds, so several frames land together.
+    // They are one submission and must become one turn.
+    if (this.redeliveredAskResumeInFlight.has(conversationId)) {
+      return decline("reason=resume-already-planned")
+    }
+
+    const resolution = this.normalizeAsyncAskQuestionResolution(completion)
+    if (!resolution) {
+      return decline(`reason=non-terminal-result case=${completion.resultCase}`)
+    }
+    const fingerprint = fingerprintAsyncAskQuestionResolution(resolution)
+
+    let resumedForConversation =
+      this.resumedRedeliveredAskAnswers.get(conversationId)
+    if (!resumedForConversation) {
+      resumedForConversation = new Map()
+      this.resumedRedeliveredAskAnswers.set(
+        conversationId,
+        resumedForConversation
+      )
+    }
+    if (resumedForConversation.get(toolCallId) === fingerprint) {
+      this.logger.log(
+        `Redelivered ask answer already resumed from: ` +
+          `conversation=${conversationId} toolCallId=${toolCallId}`
+      )
+      return undefined
+    }
+    resumedForConversation.set(toolCallId, fingerprint)
+    this.redeliveredAskResumeInFlight.add(conversationId)
+
+    return {
+      toolCallId,
+      payload: renderAsyncAskQuestionContinuationPayload(resolution),
+    }
   }
 
   private clearConversationRuntimeState(conversationId: string): void {
+    this.resumedRedeliveredAskAnswers.delete(conversationId)
+    this.redeliveredAskResumeInFlight.delete(conversationId)
     this.codexProjectionStore.clearConversation(
       ConversationId.of(conversationId)
     )
@@ -3440,10 +3767,15 @@ export class CursorConnectStreamService {
             "parent_cancelled"
           )
         : 0
-    const cancelledAsyncInteractions = this.asyncUserInteractions.cancelActive(
-      conversationId,
-      safeReason
+    // The turn dies either way; what survives is what the conversation is
+    // still waiting on. A superseding cancel leaves durable async questions
+    // standing so the answer that follows it still has something to resolve.
+    const supersededByNextMessage = TURN_SUPERSEDING_CANCEL_REASONS.has(
+      safeReason.toLowerCase()
     )
+    const cancelledAsyncInteractions = supersededByNextMessage
+      ? 0
+      : this.asyncUserInteractions.cancelActive(conversationId, safeReason)
     // A web turn outlives the provider request that started it, so stopping
     // one is the only thing that closes the browser turn behind it.
     this.chatGptWebCursor.release(conversationId, safeReason)
@@ -3451,7 +3783,10 @@ export class CursorConnectStreamService {
       `Cancel action received for conversation ${conversationId}: reason=${safeReason}, ` +
         `cancelledTurns=${cancelledTurnCount}, emittedExecAborts=${emittedExecAbortCount}, ` +
         `abortedCurrentStream=${abortedPendingCount}, ` +
-        `cancelledAsyncInteractions=${cancelledAsyncInteractions}`
+        `cancelledAsyncInteractions=${cancelledAsyncInteractions}` +
+        (supersededByNextMessage
+          ? ` (superseding cancel; ${this.asyncUserInteractions.listActive(conversationId).length} async question(s) kept)`
+          : "")
     )
 
     return true
@@ -4472,20 +4807,35 @@ export class CursorConnectStreamService {
       )
       return undefined
     }
+    const durableToolCallId = this.resolveDurableAsyncAskToolCallId(
+      conversationId,
+      toolCallId,
+      completion
+    )
     const accepted = await this.runCommittedProjectionMutation({
       owner: createMainProjectionOwner(ConversationId.of(conversationId)),
-      label: `resolve async ask: ${conversationId}/${toolCallId}`,
+      label: `resolve async ask: ${conversationId}/${durableToolCallId}`,
       operation: () =>
         this.contextState.resolveAsyncAskQuestion(
           conversationId,
-          toolCallId,
+          durableToolCallId,
           resolution
         ),
     })
     if (accepted.kind === "missing") {
+      // Name what this conversation is actually waiting on. A completion that
+      // matches nothing while a question is still parked is the difference
+      // between a harmless replay and an answer that never lands.
+      const awaiting = this.asyncUserInteractions
+        .listActive(conversationId)
+        .map((interaction) => `${interaction.toolCallId}:${interaction.state}`)
       this.logger.warn(
         `Async ask completion has no durable interaction: ` +
-          `conversation=${conversationId} toolCallId=${toolCallId}`
+          `conversation=${conversationId} toolCallId=${durableToolCallId} ` +
+          `named=${toolCallId} ` +
+          `asyncOriginalToolCallId=${completion.originalArgs?.asyncOriginalToolCallId || "(none)"} ` +
+          `runAsync=${completion.originalArgs?.runAsync ?? "(none)"} ` +
+          `awaiting=[${awaiting.join(", ")}]`
       )
       return undefined
     }
@@ -4499,14 +4849,16 @@ export class CursorConnectStreamService {
     if (accepted.kind === "conflict") {
       this.logger.warn(
         `Ignored conflicting async ask completion after canonical resolution: ` +
-          `conversation=${conversationId} toolCallId=${toolCallId}`
+          `conversation=${conversationId} toolCallId=${durableToolCallId} ` +
+          `state=${accepted.interaction.state} ` +
+          `terminalReason=${accepted.interaction.terminalReason || "(none)"}`
       )
       return undefined
     }
     if (accepted.kind === "duplicate") {
       this.logger.log(
         `Acknowledged duplicate async ask completion without replay: ` +
-          `conversation=${conversationId} toolCallId=${toolCallId} ` +
+          `conversation=${conversationId} toolCallId=${durableToolCallId} ` +
           `state=${accepted.interaction.state}`
       )
       return undefined
@@ -4523,11 +4875,15 @@ export class CursorConnectStreamService {
     )
     this.logger.log(
       `ConversationAction.asyncAskQuestionCompletion committed: ` +
-        `conversation=${conversationId} toolCallId=${toolCallId} ` +
+        `conversation=${conversationId} toolCallId=${durableToolCallId} ` +
         `case=${completion.resultCase} answers=${completion.answers?.length ?? 0}`
     )
+    // The continuation has to name the interaction that was resolved, not the
+    // one Cursor named. They differ whenever the completion arrived under an
+    // ask this turn had already closed, and looking the wrong one up finds
+    // nothing — the resolution commits and the turn never continues.
     return {
-      toolCallId,
+      toolCallId: durableToolCallId,
       resolutionFingerprint: accepted.interaction.resolutionFingerprint!,
       parsed,
       ...(streamId ? { streamId } : {}),
@@ -10370,8 +10726,12 @@ export class CursorConnectStreamService {
       if (loadedSessionIds.has(conversationId)) continue
       const pendingAsyncUserInteractions =
         this.asyncUserInteractions.listActive(conversationId).length
-      const busy =
-        persisted.openToolCallCount > 0 || pendingAsyncUserInteractions > 0
+      // Busy means "a restart would interrupt this". A session that exists
+      // only on disk is not running: there is no stream, turn or provider
+      // request to interrupt, and what it left open is durable state that a
+      // restart reloads exactly as it found it. It is still reported through
+      // durablePendingToolCalls so recovery state stays visible.
+      const busy = false
       sessions.push({
         conversationId,
         model: persisted.model || "",
@@ -10564,6 +10924,14 @@ export class CursorConnectStreamService {
     }
 
     setImmediate(() => {
+      // A Run that found the conversation busy asks again only at its own
+      // edges, and a backend stream ending is not one of them: the pending-work
+      // idle handler covers tool calls and interaction queries, never this. A
+      // Run opened while the previous turn was still streaming therefore never
+      // learned that it had finished, and stayed open holding a live turn.
+      if (!this.isBackendStreamActive(conversationId)) {
+        this.reevaluateOpenRunsForIdleConversation(conversationId)
+      }
       const session = this.sessionManager.getSession(conversationId)
       const next = session?.deferredControlContinuations[0]
       if (
@@ -13942,19 +14310,24 @@ ${raw}
       conversationId,
       completedTurn.session.model
     )
-    // The provider tool turn is durable, but the physical Run generation must
-    // remain open: Cursor writes the later asyncAskQuestionCompletionAction to
-    // this same ConversationActionManager stream, and frames after turnEnded
-    // are no longer owned by the active generation. Persist the suspended
-    // execution before publishing its checkpoint and keepalive.
+    // The provider tool turn is durable and the Run is now free to end. Cursor
+    // does not write the later asyncAskQuestionCompletionAction to this stream:
+    // it settles the questionnaire locally while a conversation action manager
+    // is live, and only builds the completion once none is, opening a fresh Run
+    // to carry it. Persist the suspended execution before publishing its
+    // checkpoint, then let the scheduler close this Run at its next idle edge.
     this.transitionContextRuntimeToAsyncUserWait(conversationId)
     for (const blobMessage of checkpoint.blobMessages) {
       this.emit(conversationId, blobMessage)
     }
     this.emit(conversationId, checkpoint.checkpoint)
-    this.emit(conversationId, this.grpcService.createServerHeartbeatResponse())
+    // An async question ends the agent turn — that is the protocol's own
+    // description of the flag, and it is also what frees the IDE to send the
+    // answer. A heartbeat used to go here instead, to hold a Run open for a
+    // frame that was never going to arrive while it stayed open.
+    this.emit(conversationId, this.grpcService.createAgentTurnEndedResponse())
     this.logger.log(
-      `Agent Run waiting for asynchronous ask_question completion: ` +
+      `Agent turn ended awaiting an asynchronous ask_question answer: ` +
         `${conversationId} toolCallId=${toolCallId}`
     )
   }
@@ -31120,6 +31493,12 @@ ${raw}
     const normalizedInput: Record<string, unknown> = {
       ...input,
       ...(family === "web_search" ? { query } : {}),
+      // A question that reaches here is being asked synchronously by
+      // definition: the queued surface returns before this point. Saying so in
+      // the args keeps the IDE's channel choice agreeing with ours.
+      ...(HUMAN_ANSWERED_DEFERRED_TOOL_FAMILIES.has(family)
+        ? { run_async: false, runAsync: false }
+        : {}),
     }
 
     const payload = {
@@ -31132,7 +31511,20 @@ ${raw}
     // InteractionQuery tools are synchronous client decisions. Cursor's
     // asynchronous ask-question path returned above and never enters this
     // registry.
-    const deadline = Date.now() + 30 * 60 * 1000
+    //
+    // A question put to a person is the exception: it is answered on human
+    // time, and an answer is worth having however long it took. Giving one a
+    // deadline means a reply that arrives late finds the question already
+    // swept, which is worse than waiting. Every other family here is a client
+    // decision that should not hold a turn open indefinitely.
+    const deadline = HUMAN_ANSWERED_DEFERRED_TOOL_FAMILIES.has(family)
+      ? undefined
+      : Date.now() + 30 * 60 * 1000
+    if (HUMAN_ANSWERED_DEFERRED_TOOL_FAMILIES.has(family)) {
+      // A new question is the next point at which an answer could legitimately
+      // start a turn, so this conversation gets its one resume back.
+      this.redeliveredAskResumeInFlight.delete(conversationId)
+    }
     const iqKind = `deferred_tool:${family}`
     const turnId = this.getCurrentParentTurnId(conversationId)
     const { id: interactionQueryId } =
@@ -31844,8 +32236,15 @@ ${raw}
   private resolveTurnIdForLedger(conversationId: string): TurnId {
     const turnId = this.sessionManager.getActiveGraphTurnId(conversationId)
     if (!turnId) {
-      throw new Error(
-        `resolveTurnIdForLedger: no active graph turn for ${conversationId}`
+      // Not a fault. Cursor ends a Run the moment the user answers a question
+      // and opens a fresh one to deliver the answer, which retires the graph
+      // turn while the response that asked is still streaming. Whatever that
+      // response was part-way through has nowhere to land, and saying so as a
+      // model failure put an error in the transcript for something that is a
+      // normal part of the protocol.
+      throw new ProviderAttemptSupersededError(
+        `no active graph turn for ${conversationId}; the turn was retired ` +
+          `while this response was still being committed`
       )
     }
     return turnId
@@ -33795,7 +34194,12 @@ ${raw}
       runInScope: (work) => this.runWithTurnContext(umbrellaHandle, work),
       shouldEndWhenIdle: () => {
         if (!conversationId) return false
-        return !this.hasPendingStreamWork(
+        // Deliberately execution work only. A parked async question must not
+        // hold this Run open: the IDE settles a questionnaire locally and
+        // sends nothing while a conversation action manager is live, and only
+        // builds the completion action when none is — opening a fresh Run to
+        // carry it. Waiting here is what stopped the answer being sent.
+        return !this.hasPendingStreamExecutionWork(
           this.sessionManager.getSession(conversationId)
         )
       },
@@ -33823,6 +34227,13 @@ ${raw}
         )
       },
     })
+    // Bound by closure rather than by value: the conversation is not known
+    // when the Run opens, and the idle edge has to find this Run afterwards.
+    const openSchedulerEntry = {
+      conversationId: () => conversationId,
+      scheduler: inboundContinuations,
+    }
+    this.openInboundSchedulers.add(openSchedulerEntry)
     const pendingInboundFrames: Array<{
       payload: Buffer
       frameKind: string
@@ -34197,7 +34608,101 @@ ${raw}
                       }
                     }
                   )
+                  continue
+                }
+                // No durable interaction: the question was answered inline and
+                // this is Cursor replaying that answer after its own cancel.
+                // It is the delivery left standing, so the turn resumes from it.
+                const redelivered = this.planRedeliveredAskAnswerResume(
+                  askConversation,
+                  parsed
+                )
+                if (redelivered) {
+                  const redeliveredParsed = parsed
+                  inboundContinuations.enqueue(
+                    `redeliveredAskAnswer:${redelivered.toolCallId}`,
+                    async () => {
+                      // Holding the scheduler busy is what keeps this Run open
+                      // across the wait; a Run with an active continuation does
+                      // not close itself.
+                      const quiet = await this.awaitConversationQuiet(
+                        askConversation,
+                        REDELIVERED_ASK_RESUME_QUIET_TIMEOUT_MS
+                      )
+                      if (!quiet) {
+                        this.logger.warn(
+                          `Not resuming from a redelivered ask answer: ` +
+                            `conversation=${askConversation} ` +
+                            `toolCallId=${redelivered.toolCallId} ` +
+                            `reason=conversation-never-fell-quiet`
+                        )
+                        return
+                      }
+                      // Re-checked on the far side of the wait: a real turn may
+                      // have started in the meantime, and it owns the
+                      // conversation now.
+                      if (
+                        this.sessionStream.hasBlockingInteractionQueries(
+                          askConversation
+                        ) ||
+                        this.asyncUserInteractions.listActive(askConversation)
+                          .length > 0
+                      ) {
+                        this.logger.log(
+                          `Not resuming from a redelivered ask answer: ` +
+                            `conversation=${askConversation} ` +
+                            `toolCallId=${redelivered.toolCallId} ` +
+                            `reason=question-on-screen-after-wait`
+                        )
+                        return
+                      }
+                      this.logger.log(
+                        `Resuming from a redelivered ask answer: ` +
+                          `conversation=${askConversation} ` +
+                          `toolCallId=${redelivered.toolCallId}`
+                      )
+                      try {
+                        await this.topLevelAgentTurnRunner.runExclusive(
+                          {
+                            conversationId: askConversation,
+                            continuationLabel: "redelivered ask answer",
+                            toolCallId: redelivered.toolCallId,
+                          },
+                          () =>
+                            this.continueAgentFromControlContinuation(
+                              askConversation,
+                              redeliveredParsed,
+                              redelivered.payload,
+                              askStream,
+                              "redelivered ask answer",
+                              "async_user_response"
+                            )
+                        )
+                      } finally {
+                        // Deliberately not released here. The mark spans the
+                        // whole replay, not this one resume; releasing it on
+                        // completion let the next parked frame start another
+                        // turn on top of the one just finished.
+                      }
+                      if (
+                        !this.hasPendingStreamWork(
+                          this.sessionManager.getSession(askConversation)
+                        )
+                      ) {
+                        inboundContinuations.requestEnd("turn-terminal")
+                      }
+                    }
+                  )
                 } else {
+                  // Nothing to do with this frame, but the Run it arrived on
+                  // still has to end as a turn rather than as an empty stream:
+                  // Cursor opens one per replayed answer, and a stream that
+                  // closes without a single frame is what it reports as a
+                  // connection failure.
+                  this.emit(
+                    askConversation,
+                    this.grpcService.createAgentTurnEndedResponse()
+                  )
                   inboundContinuations.evaluateIdle()
                 }
               } else if (
@@ -34379,6 +34884,24 @@ ${raw}
                 })
 
               if (!resolvedInteraction) {
+                // A query this conversation already resolved means the
+                // response is merely late — the user answered a question that
+                // had been interrupted or had expired. Tearing the turn down
+                // over it turns a stale answer into a dead conversation.
+                const alreadyResolved =
+                  this.sessionStream.describeRecentlyResolvedInteractionQuery(
+                    conversationId,
+                    id
+                  )
+                if (alreadyResolved) {
+                  this.logger.warn(
+                    `Ignoring late interactionResponse id=${id} case=${resultCase}: ` +
+                      `query was already ${alreadyResolved.resolution} ` +
+                      `${Math.round((Date.now() - alreadyResolved.at) / 1000)}s ago`
+                  )
+                  inboundContinuations.evaluateIdle()
+                  continue
+                }
                 const reason = `unmatched interactionResponse id=${id} case=${resultCase}`
                 this.failPendingToolCallsWithProtocolError(
                   conversationId,
@@ -34488,6 +35011,21 @@ ${raw}
                           error
                         )
                       if (emittedRecovery) return
+                    }
+                    if (
+                      error instanceof StaleTurnFrameError ||
+                      error instanceof ProviderAttemptSupersededError ||
+                      error instanceof UpstreamRequestAbortedError
+                    ) {
+                      // The turn this result belonged to is gone — cancelled,
+                      // superseded, or already finished. Nothing is wrong and
+                      // nothing is owed; calling it a failure put an error in
+                      // the transcript beside a turn the bridge recovered.
+                      this.logger.warn(
+                        `Tool result dropped for a turn that had ended: ` +
+                          `conversation=${toolConversation} ${String(error)}`
+                      )
+                      return
                     }
                     this.logger.error(
                       `Failed to handle tool result: ${String(error)}`
@@ -34970,6 +35508,7 @@ ${raw}
       // and any descendants. The input pump observes the seal via
       // its own writes failing (after the first OutboundForbidden
       // error its catch + finally above run) and exits.
+      this.openInboundSchedulers.delete(openSchedulerEntry)
       inboundContinuations.close("consumer-closed")
       if (typeof inputIterator.return === "function") {
         void inputIterator.return().catch(() => undefined)
@@ -37861,12 +38400,19 @@ ${raw}
         onProviderAttemptPrepared: (streamRoute) => {
           activeProviderRoute = streamRoute
         },
-        streamAbortBinding: streamId
-          ? {
-              conversationId,
-              streamId,
-            }
-          : undefined,
+        // An inline tool result carries no stream of its own — every deferred
+        // tool answered through an InteractionQuery reaches here without one —
+        // so fall back to the stream the conversation is on. Codex never
+        // noticed the gap, since it only uses the binding to register an
+        // abort, but chatgpt-web reads the conversation out of it to find the
+        // browser turn and refused the continuation outright.
+        streamAbortBinding: (() => {
+          const bindingStreamId =
+            streamId ?? this.sessionStream.getCurrentStreamId(conversationId)
+          return bindingStreamId
+            ? { conversationId, streamId: bindingStreamId }
+            : undefined
+        })(),
         recoveryKey: `cursor:${timingLabel}:${conversationId}`,
         timingLabel,
       })

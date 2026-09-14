@@ -7,10 +7,43 @@ import {
 import { SessionStreamService } from "./session-stream.service"
 
 /**
- * Periodically expires interaction queries whose wall-clock deadline passed.
+ * The proto shape `extractInteractionResultCase` walks, carrying an error the
+ * model can read, so an expired query reads like any other failed response.
+ */
+function expiredInteractionRawResponse(kind: string | undefined): unknown {
+  // Kinds read `deferred_tool:web_search`; only the tool half means anything
+  // to the model reading this back.
+  const tool = kind?.split(":").pop()?.trim()
+  const what = tool ? `${tool} ` : ""
+  return {
+    result: {
+      case: "expired",
+      value: {
+        result: {
+          case: "error",
+          value: {
+            error:
+              `the ${what}request expired because it was not answered before ` +
+              `its deadline`,
+          },
+        },
+      },
+    },
+  }
+}
+
+/**
+ * Periodically expires interaction queries whose wall-clock deadline passed,
+ * and hands each expiry to the writer that closes its tool call. Resolving
+ * alone is not enough: a deferred tool's query is emitted and never awaited,
+ * so an expiry that stops at `resolve` leaves the tool call pending forever.
  *
- * Async ask-question calls do not enter this registry: Cursor represents them
- * as completed native ToolCalls and later returns a ConversationAction.
+ * Queries answered by a person carry no deadline and never appear here, which
+ * is why an answer given hours later is still the answer to that question.
+ *
+ * Async ask-question calls do not enter this registry either: Cursor
+ * represents them as completed native ToolCalls and later returns a
+ * ConversationAction.
  *
  * Client Exec messages are deliberately absent: Cursor's official client
  * runtime has no handler for the proto-declared server abort control, so a
@@ -29,7 +62,11 @@ export class InteractionQueryDeadlineSweeper
 
   onModuleInit(): void {
     this.interval = setInterval(() => {
-      void this.sweep()
+      void this.sweep().catch((err: unknown) => {
+        this.logger.error(
+          `interaction query sweep failed: ${(err as Error).message}`
+        )
+      })
     }, this.SWEEP_INTERVAL_MS)
     if (typeof this.interval.unref === "function") {
       // Don't keep the process alive just for this sweeper.
@@ -50,7 +87,7 @@ export class InteractionQueryDeadlineSweeper
   /**
    * Public for tests — production callers go through the timer.
    */
-  sweep(): void {
+  async sweep(): Promise<void> {
     if (this.sweepInProgress) {
       // Sweep tick took longer than interval. Skip rather than pile
       // up — next tick will pick up anything new.
@@ -63,14 +100,14 @@ export class InteractionQueryDeadlineSweeper
 
       for (const iq of overdue) {
         try {
-          this.sessionStream.resolveInteractionQuery(
+          // Resolving is not enough. Nothing awaits the promise a deferred
+          // tool's query hands out, so an expiry has to travel the same route
+          // a real response does and write the tool result itself; otherwise
+          // the query disappears and its tool call waits forever.
+          await this.sessionStream.expireInteractionQuery(
             iq.conversationId,
             iq.queryId,
-            {
-              approved: false,
-              resultCase: "error",
-              rawResponse: { error: "deadline_exceeded" },
-            }
+            expiredInteractionRawResponse(iq.kind)
           )
         } catch (err) {
           this.logger.error(

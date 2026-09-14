@@ -329,6 +329,73 @@ edits 插入逻辑）不在 agent 自测范围内—— agent 是被管理的对
 
 ## 必执行任务
 
+### 任务 0：`ask_question` —— 用户交互完整覆盖（**最先执行**）
+
+放在最前面是因为这一项要等人回答。先把问题抛出来，用户可以一边作答，其余任务一边往下跑；压到最后则整轮都卡在等人。报告里仍按 `任务 0` 单列一行。
+
+`AskQuestionArgs` 协议字段：
+
+- `title: string` —— 整个对话框标题；
+- `questions: Question[]` —— 可以**一次问多个问题**，每个 Question 有：
+  - `id` —— 用于答案回写时关联；
+  - `prompt` —— 问题文本；
+  - `options: Option[]` —— 预设选项列表，每个 Option 有 `id` + `label`；
+  - `allow_multiple: bool` —— 是否允许多选；
+- `run_async: bool` —— **关键 flag**：true 时原生 `AskQuestionToolCall` 立即以 `AskQuestionResult.async`
+  完成，agent turn 结束；该路径不进入同步 `InteractionQuery.askQuestionInteractionQuery`。用户后续回答通过
+  `AsyncAskQuestionCompletionAction` 回送 —— 但**只在承载该 turn 的 Run 关闭之后**，见步骤 4；
+- `async_original_tool_call_id: string` —— 后续已完成答案投影关联原异步 tool call 的 id；首次异步调用不自指。
+
+`AskQuestionResult` 4 态 oneof：
+
+- `success: AskQuestionSuccess` —— 包含 `Answer[]`，每个 Answer 有 `question_id` + `selected_option_ids[]` +
+  `freeform_text`；
+- `error: AskQuestionError` —— 协议错（不要把用户拒答记成 error）；
+- `rejected: AskQuestionRejected` —— **用户主动拒答**（关闭对话框 / 跳过），有 `reason` 字段；
+- `async: AskQuestionAsync` —— `run_async=true` 时 IDE 占位返回，等 `asyncAskQuestionCompletionAction`。
+
+执行步骤（按可见 surface 的 ask 工具实参格式调整 — 协议形状不变）：
+
+1. **同步单选 + 预设选项**：调一次
+   `ask_question`，1 个 question，3 个 option，`allow_multiple=false`，`run_async=false`。验收
+   `AskQuestionResult.success`，answers[0].selected_option_ids 长度 = 1。
+2. **同步多选 + 自由文本**：再调一次，`allow_multiple=true`，引导用户多选并填 freeform_text。验收
+   `selected_option_ids.length >= 2` 且 `freeform_text` 非空。
+3. **多 question 一次性问**：再调一次，questions 至少 2 个，覆盖 IDE 同时渲染多个问题的能力。验收 answers 数组长度等于 questions 数量。
+4. **`run_async=true` 异步路径**（如果 surface 暴露这个 flag）：调一次 `run_async=true`，验收：
+   - 原 tool call 同步 result 是 `AskQuestionResult.async`（**不是 success**）；
+   - **agent turn 随即结束** —— 日志里是
+     `Agent turn ended awaiting an asynchronous ask_question answer`，承载它的 Run 正常收尾。
+     这一点是这条路能走通的前提，见下；
+   - 问卷卡片保持可作答（有 Continue）；
+   - 你作答后，trace 中出现一个 `ConversationAction.asyncAskQuestionCompletionAction`，其
+     `original_tool_call_id` **就是这道异步题自己的 tool call id**，随后
+     `asyncAskQuestionCompletion committed` + turn 续接；
+   - `result` 命中 `success` / `rejected` 之一，**不是再嵌套 async**；
+   - 同一 tool call 的 `async` → `success`/`rejected` 是终态升级，不得记为 duplicate completion；
+     只有同一终态分支再次出现才算重复结算。
+
+   **为什么必须让 Run 结束**（读自 `workbench.desktop.main.js`，非推断）：客户端问卷提交路径三个分支，按序 ——
+   1. `hasPendingDecisionForToolCall(toolCallId)` → `acceptToolCall` / `rejectToolCall`，同步应答；
+   2. `isLiveInteractionOpen()` → 本地 settled，**什么都不发**。它的定义是
+      `!!(handle.data.conversationActionManager && !signal.aborted)`，即**「Run 还开着」**；
+   3. 否则构造 `asyncAskQuestionCompletionAction` 并 `enqueueCompletion` —— 没有活 manager 时走
+      `submitChatMaybeAbortCurrent(…, conversationActionOverride)`，**新开一个 Run** 把答案送过来。
+
+   所以异步答案是 Cursor 在**没有 Run 打开时**才回送的。桥早期把 Run 停住等这一帧，恰恰保证了它不会被发出来。
+
+   两个会误导的字段，别拿来做判断：
+   - `originalArgs.runAsync` 由 `x8f()` **硬编码 false**，说明不了原调用是否异步；
+   - Run 关闭后 `L8f()` 会把**上一条 HUMAN 消息之后所有 `submitted` 的问卷气泡**各重发一帧，
+     所以会看到若干条命名不同旧 ask 的完成动作。它们是重放，不是本次调用的结果；
+     桥对这些帧不做处理，但会以 `turnEnded` 收尾——Run 若一帧不发，编辑器会弹 Connection Error。
+
+5. **`rejected` 路径**（可选，依赖用户配合）：调一次后由用户**主动关闭/跳过对话框**。验收 result 是 `rejected`，且
+   `reason` 非空。
+
+如果 surface 上 `ask_question` 不暴露 `run_async` / 多 question / freeform_text 等高级字段，分别记
+`not_directly_invokable: <字段名>` 并继续测试其它字段；不要硬凑参数让 surface 校验报错。
+
 ### 任务 1：基础终端与流式输出
 
 调用客户端可见工具 `run_terminal_command` 执行一个安全命令，完成以下目标：确认当前项目工作目录，展示 `<SMOKE>`
@@ -679,53 +746,7 @@ plan 模式启动了本次会话），在 Coverage Checklist Summary 里记录�
 
 ### 任务 9：可选 IDE/外部集成能力
 
-`ask_question` 协议复杂度（多种 result 形态、run_async 异步路径）跟其它 IDE 集成工具不是一个量级，分两段执行。
-
-#### 9a. `ask_question` —— 用户交互完整覆盖
-
-`AskQuestionArgs` 协议字段：
-
-- `title: string` —— 整个对话框标题；
-- `questions: Question[]` —— 可以**一次问多个问题**，每个 Question 有：
-  - `id` —— 用于答案回写时关联；
-  - `prompt` —— 问题文本；
-  - `options: Option[]` —— 预设选项列表，每个 Option 有 `id` + `label`；
-  - `allow_multiple: bool` —— 是否允许多选；
-- `run_async: bool` —— **关键 flag**：true 时原生 `AskQuestionToolCall` 立即以 `AskQuestionResult.async` 完成，agent
-  turn 结束；该路径不进入同步
-  `InteractionQuery.askQuestionInteractionQuery`；承载该 turn 的 Run 双向流保持可写，用户后续回答通过
-  `AsyncAskQuestionCompletionAction` 异步回送，不在原 tool call 同步 result 里；
-- `async_original_tool_call_id: string` —— 后续已完成答案投影关联原异步 tool call 的 id；首次异步调用不自指。
-
-`AskQuestionResult` 4 态 oneof：
-
-- `success: AskQuestionSuccess` —— 包含 `Answer[]`，每个 Answer 有 `question_id` + `selected_option_ids[]` +
-  `freeform_text`；
-- `error: AskQuestionError` —— 协议错（不要把用户拒答记成 error）；
-- `rejected: AskQuestionRejected` —— **用户主动拒答**（关闭对话框 / 跳过），有 `reason` 字段；
-- `async: AskQuestionAsync` —— `run_async=true` 时 IDE 占位返回，等 `asyncAskQuestionCompletionAction`。
-
-执行步骤（按可见 surface 的 ask 工具实参格式调整 — 协议形状不变）：
-
-1. **同步单选 + 预设选项**：调一次
-   `ask_question`，1 个 question，3 个 option，`allow_multiple=false`，`run_async=false`。验收
-   `AskQuestionResult.success`，answers[0].selected_option_ids 长度 = 1。
-2. **同步多选 + 自由文本**：再调一次，`allow_multiple=true`，引导用户多选并填 freeform_text。验收
-   `selected_option_ids.length >= 2` 且 `freeform_text` 非空。
-3. **多 question 一次性问**：再调一次，questions 至少 2 个，覆盖 IDE 同时渲染多个问题的能力。验收 answers 数组长度等于 questions 数量。
-4. **`run_async=true` 异步路径**（如果 surface 暴露这个 flag）：调一次 `run_async=true`，验收：
-   - 原 tool call 同步 result 是 `AskQuestionResult.async`（**不是 success**），agent turn 立即结束；
-   - 原 Run 双向流保持存活，问卷的 Continue 可提交且不会启动一条新的用户任务；
-   - trace 中后续观察到一个 `ConversationAction.asyncAskQuestionCompletionAction`，里面带
-     `original_tool_call_id`、`original_args`、`result`；
-   - `result` 命中 `success` / `rejected` 之一，**不是再嵌套 async**；
-   - 同一 tool call 的 `async` → `success`/`rejected` 是终态升级，不得记为 duplicate
-     completion；只有同一终态分支再次出现才算重复结算。
-5. **`rejected` 路径**（可选，依赖用户配合）：调一次后由用户**主动关闭/跳过对话框**。验收 result 是 `rejected`，且
-   `reason` 非空。
-
-如果 surface 上 `ask_question` 不暴露 `run_async` / 多 question / freeform_text 等高级字段，分别记
-`not_directly_invokable: <字段名>` 并继续测试其它字段；不要硬凑参数让 surface 校验报错。
+`ask_question` 已提前为**任务 0**（见「必执行任务」开头），因为它要等人回答，越早问越不挡后面的步骤。本节只剩其它 IDE / 外部集成能力。
 
 #### 9b. 其它 IDE / 外部集成能力
 
@@ -940,7 +961,7 @@ delta 和报告材料都完成后设 status=`completed`；如果 trace delta 读
 
 ### Task Results
 
-用 Markdown 列表或表格概述 11 个任务（任务 8 拆为 8a / 8b 共 12 行）。每项至少包含：
+用 Markdown 列表或表格概述 12 个任务（任务 0 单列一行，任务 8 拆为 8a / 8b，共 13 行）。每项至少包含：
 
 - 任务编号和任务名称
 - 状态：`pass | pass_with_gaps | failed | unavailable | not_directly_invokable`

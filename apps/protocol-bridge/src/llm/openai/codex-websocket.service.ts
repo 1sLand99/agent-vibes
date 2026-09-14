@@ -27,6 +27,7 @@ import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
 import WebSocket from "ws"
 import { requireExactDurableIdentifier } from "../../context/durable-identifier"
+import { UpstreamRequestAbortedError } from "../shared/abort-signal"
 import {
   buildCodexBridgeNativeWebSocketHeaders,
   buildCodexWebSocketRequestBody,
@@ -730,7 +731,15 @@ export class CodexWebSocketService implements OnModuleDestroy {
     this.failActiveStream(
       session,
       current,
-      new Error("WebSocket session invalidated before response.completed")
+      // An abort is something the bridge asked for — a cancelled or superseded
+      // turn taking its stream down — so the failure it produces is not the
+      // provider's. Reported as one, it reached the transcript as a model
+      // error for a turn the bridge went on to recover by itself.
+      reason === "abort_signal"
+        ? new UpstreamRequestAbortedError(
+            "WebSocket session aborted before response.completed"
+          )
+        : new Error("WebSocket session invalidated before response.completed")
     )
     session.conn = null
     session.wsUrl = ""

@@ -10,7 +10,6 @@ import { ChatGptWebRealtimeService } from "./chatgpt-web-realtime.service"
 import { ChatGptWebVoiceTransport } from "./chatgpt-web-transport"
 import { ChatGptWebSessionStore } from "./chatgpt-web-session"
 import { ChatGptWebConversationService } from "./chatgpt-web-conversation.service"
-import { ChatGptWebBrowserService } from "./chatgpt-web-browser.service"
 import { ChatGptWebCursorBridge } from "./chatgpt-web-cursor-bridge.service"
 
 @Module({
@@ -25,7 +24,6 @@ import { ChatGptWebCursorBridge } from "./chatgpt-web-cursor-bridge.service"
     ChatGptWebRealtimeService,
     ChatGptWebSessionStore,
     ChatGptWebConversationService,
-    ChatGptWebBrowserService,
     ChatGptWebCursorBridge,
   ],
   exports: [
@@ -37,7 +35,6 @@ import { ChatGptWebCursorBridge } from "./chatgpt-web-cursor-bridge.service"
     ChatGptWebRealtimeService,
     ChatGptWebSessionStore,
     ChatGptWebConversationService,
-    ChatGptWebBrowserService,
     ChatGptWebCursorBridge,
   ],
 })

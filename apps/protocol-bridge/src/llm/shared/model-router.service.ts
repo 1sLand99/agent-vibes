@@ -487,9 +487,9 @@ export class ModelRouterService {
    * Uses unified model-registry for all name resolution.
    */
   resolveModel(cursorModel: string): ModelRouteResult {
-    // An explicit `web-gpt/` prefix is the only way into the browser-backed
-    // path. It is never inferred from a model name: that transport spends a
-    // different quota and needs a signed-in browser, so asking for it has to
+    // An explicit `web-gpt/` prefix is the only way into the ChatGPT Web
+    // path. It is never inferred from a model name: that transport spends the
+    // web subscription's quota rather than the API's, so asking for it has to
     // be deliberate.
     const webGptModel = readWebGptModel(cursorModel)
     if (webGptModel) {

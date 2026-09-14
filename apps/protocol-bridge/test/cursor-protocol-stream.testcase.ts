@@ -27,6 +27,9 @@ function streamFixture() {
     logger: new Logger("stream-fixture"),
     grpcService: new CursorGrpcService(),
     umbrellaHandleByConversation: new Map(),
+    // handleBidiStream registers its scheduler here so the idle edge can reach
+    // it; a bare prototype runs no field initialisers.
+    openInboundSchedulers: new Set(),
     turnSupervisor: {
       spawn(args: { outbound: TurnOutbound }) {
         outbound = args.outbound

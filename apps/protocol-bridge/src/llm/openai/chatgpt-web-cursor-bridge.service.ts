@@ -2,7 +2,10 @@ import { Injectable, Logger } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import { McpCursorToolsProvider } from "../../protocol/mcp/mcp-cursor-tools.provider"
 import type { McpToolResult } from "../../protocol/mcp/mcp-types"
-import { ChatGptWebBrowserService } from "./chatgpt-web-browser.service"
+import {
+  ChatGptWebConversationService,
+  type ChatGptWebEvent,
+} from "./chatgpt-web-conversation.service"
 import { webGptTarget } from "../shared/model-registry"
 import { ChatGptWebError } from "./chatgpt-web-conversation.service"
 import { ChatGptWebTurnSession } from "./chatgpt-web-turn-session"
@@ -10,18 +13,18 @@ import { ChatGptWebTurnSession } from "./chatgpt-web-turn-session"
 /**
  * Runs a Cursor turn on ChatGPT Web.
  *
- * Holds the browser turn across the several provider requests Cursor makes for
+ * Holds the ChatGPT turn across the several provider requests Cursor makes for
  * one exchange, and owns the correspondence between them:
  *
- *   - The first request starts a browser turn and claims the MCP tool sink, so
+ *   - The first request starts a ChatGPT turn and claims the MCP tool sink, so
  *     a tool call arriving from ChatGPT is routed to this conversation.
  *   - A tool call becomes a `tool_use` in the segment Cursor is reading; that
  *     segment ends, Cursor runs the tool, and comes back.
  *   - The next request hands Cursor's result to the waiting MCP call and
- *     returns the next segment of the same browser turn.
+ *     returns the next segment of the same ChatGPT turn.
  *
- * Why a single sink rather than a lookup: the browser transport serialises
- * turns on one tab, so at most one ChatGPT turn is ever in flight. There is
+ * Why a single sink rather than a lookup: the bridge serialises turns, so at
+ * most one ChatGPT turn is ever in flight. There is
  * nothing to disambiguate — and an MCP request carries no Cursor identity to
  * disambiguate with, which is what made every attempt to key this by
  * conversation fail.
@@ -46,12 +49,12 @@ interface ActiveTurn {
   readonly session: ChatGptWebTurnSession
   readonly detachSink: () => void
   /**
-   * Cancels the browser turn, and only the browser turn.
+   * Cancels the ChatGPT turn, and only the ChatGPT turn.
    *
    * It has to be the turn's own, not the signal that came with whichever
    * provider request started it: that one is aborted the moment Cursor
    * finishes reading its segment, which — for a turn with a tool call in it —
-   * is immediately. The browser read would then stop before the editor had
+   * is immediately. The response read would then stop before the editor had
    * even answered.
    */
   readonly abort: AbortController
@@ -80,6 +83,9 @@ export class ChatGptWebCursorBridge {
    * account, so it can be opened in the web UI and carried on there, and the
    * next Cursor turn picks up everything that was said.
    */
+  /** Why the most recent turn ended, for the refusal message below. */
+  private lastEnd: { conversationId: string; reason: string } | null = null
+
   private readonly threads = new Map<
     string,
     {
@@ -101,9 +107,89 @@ export class ChatGptWebCursorBridge {
 
   constructor(
     private readonly configService: ConfigService,
-    private readonly browser: ChatGptWebBrowserService,
+    private readonly conversation: ChatGptWebConversationService,
     private readonly cursorTools: McpCursorToolsProvider
   ) {}
+
+  /**
+   * One ChatGPT turn, as raw SSE, over the plain HTTP transport.
+   *
+   * This used to drive a browser tab, on the belief that a connector activates
+   * only for a request the web app itself built. It does not: a request built
+   * here activates it just as well, and the tool call arrives at this bridge.
+   * What the app supplied was a fresh sentinel and a trusted session, which
+   * this transport already obtains per turn.
+   *
+   * The conversation id still has to be learned from the frames, because a
+   * thread that did not exist before is named by the response rather than by
+   * the request.
+   */
+  private async *turnSource(params: {
+    conversationId: string
+    prompt: string
+    model: string
+    thinkingEffort?: string
+    thread?: string | null
+    signal: AbortSignal
+    /** Called once the thread has demonstrably received the prompt. */
+    onDelivered: () => void
+  }): AsyncGenerator<ChatGptWebEvent> {
+    // Continuing a thread has to name the message it follows, or the turn is
+    // grafted onto the wrong branch.
+    const parentMessageId = params.thread
+      ? await this.conversation.currentNode(params.thread).catch(() => null)
+      : null
+    let delivered = false
+    for await (const event of this.conversation.stream({
+      model: params.model,
+      messages: [{ role: "user", content: params.prompt }],
+      thinkingEffort: params.thinkingEffort ?? null,
+      conversationId: params.thread ?? null,
+      parentMessageId,
+      signal: params.signal,
+    })) {
+      // The first frame is the proof that the post landed. Until one arrives
+      // the prompt is not in the thread — an account on cooldown, a 403, an
+      // abort before the request went out all fail before this point — and
+      // recording it as said would make the retry that follows type nothing.
+      if (!delivered) {
+        delivered = true
+        params.onDelivered()
+      }
+      // The end frame names the thread, which is how a conversation that did
+      // not exist before becomes one the next turn can continue.
+      if (event.kind === "done" && event.conversationId) {
+        this.rememberThread(params.conversationId, event.conversationId)
+      }
+      yield event
+    }
+  }
+
+  /**
+   * Tool call ids this conversation has issued, across turns.
+   *
+   * A turn only knows the calls it made itself, and Cursor keeps resending
+   * every result it holds — so once a turn ends, its answers looked like ids
+   * nobody had ever asked for. The count said "for calls this turn never made"
+   * about fifty replays of calls it had just answered.
+   */
+  private readonly dispatchedByConversation = new Map<string, Set<string>>()
+
+  private noteDispatched(conversationId: string, toolCallId: string): void {
+    let seen = this.dispatchedByConversation.get(conversationId)
+    if (!seen) {
+      seen = new Set()
+      this.dispatchedByConversation.set(conversationId, seen)
+    }
+    seen.add(toolCallId)
+  }
+
+  private everDispatched(conversationId: string, toolCallId: string): boolean {
+    return (
+      this.dispatchedByConversation.get(conversationId)?.has(toolCallId) ??
+      false
+    )
+  }
 
   private connectorId(): string {
     const id = this.configService
@@ -148,15 +234,32 @@ export class ChatGptWebCursorBridge {
   }): AsyncGenerator<string, void, unknown> {
     const turn = this.resume(params) ?? this.begin(params)
 
+    // Cursor resends every result it has accumulated on each continuation, so
+    // most of these are for calls already answered. Ignored rather than
+    // treated as an error — a duplicate must not tear down a healthy turn —
+    // and counted rather than logged one by one, which grew as the square of
+    // the tools in a turn and buried everything else in the log.
+    let released = 0
+    let replayed = 0
+    const unknown: string[] = []
     for (const { toolCallId, result } of params.toolResults) {
-      // A result for a call this turn is not waiting on is ignored rather than
-      // treated as an error: Cursor replays results during recovery, and a
-      // duplicate must not tear down a healthy turn.
-      const released = turn.session.submitToolResult(toolCallId, result)
+      if (turn.session.submitToolResult(toolCallId, result)) {
+        released += 1
+        this.noteDispatched(params.conversationId, toolCallId)
+      } else if (this.everDispatched(params.conversationId, toolCallId)) {
+        replayed += 1
+      } else {
+        unknown.push(toolCallId.slice(0, 14))
+      }
+    }
+    if (released > 0 || unknown.length > 0) {
       this.logger.warn(
-        `Tool result ${toolCallId.slice(0, 14)}… ${
-          released ? "released the waiting MCP call" : "matched nothing"
-        }`
+        `Tool results for ${params.conversationId.slice(0, 8)}…: ` +
+          `${released} released, ${replayed} replayed` +
+          (unknown.length > 0
+            ? `, ${unknown.length} for calls this turn never made ` +
+              `(${unknown.slice(0, 5).join(", ")}…)`
+            : "")
       )
     }
 
@@ -188,10 +291,10 @@ export class ChatGptWebCursorBridge {
     const turn = this.active
     if (!turn) return null
     if (turn.conversationId !== params.conversationId) {
-      // Another conversation wants the tab. The browser transport cannot serve
-      // both, so the older turn is ended rather than left half-read with MCP
-      // requests hanging off it.
-      this.end(turn, "another conversation took the browser")
+      // Another conversation wants the sink, which only one turn can hold.
+      // The older turn is ended rather than left half-read with MCP requests
+      // hanging off it.
+      this.end(turn, "another conversation took the tool sink")
       return null
     }
     if (Date.now() - turn.touchedAt > IDLE_SESSION_MS) {
@@ -214,7 +317,7 @@ export class ChatGptWebCursorBridge {
     newMessage?: string
     promptBlocks: readonly string[]
   }): ActiveTurn {
-    // A host turn drives no browser and needs no connector of its own: the
+    // A host turn opens no ChatGPT turn and needs no connector of its own: the
     // conversation it serves lives in ChatGPT's UI and already carries one.
     // Its source never yields, so the segment parks in the reader until a tool
     // call arrives or the turn is aborted.
@@ -241,25 +344,45 @@ export class ChatGptWebCursorBridge {
           ? [params.newMessage]
           : params.promptBlocks.slice(known?.sentBlocks ?? 0)
       : params.promptBlocks
-    this.noteSentBlocks(
-      params.conversationId,
-      params.promptBlocks.length,
-      params.newMessage
-    )
+    if (!host && blocks.every((block) => !block.trim())) {
+      // Nothing new to say and no live turn to continue. Posting this would
+      // put an empty message in the thread and come back with nothing, which
+      // the editor reports as a provider that completed without assistant
+      // content — the same symptom with none of the cause in it. The shape
+      // that gets here is a continuation for a turn already torn down.
+      throw new ChatGptWebError(
+        409,
+        "chatgpt_web_no_live_turn",
+        `The ChatGPT turn for ${params.conversationId.slice(0, 8)}… has ` +
+          `already ended, and this request carries nothing new to ask` +
+          (this.lastEnd?.conversationId === params.conversationId
+            ? ` (it ended: ${this.lastEnd.reason})`
+            : "") +
+          "."
+      )
+    }
+    // What the thread has heard is recorded only once it has actually heard
+    // it. A host turn types nothing at all, so it records immediately.
+    const markSent = () =>
+      this.noteSentBlocks(
+        params.conversationId,
+        params.promptBlocks.length,
+        params.newMessage
+      )
+    if (host) markSent()
     const session = new ChatGptWebTurnSession({
       source: host
         ? parked(abort.signal)
-        : this.browser.streamTurn({
+        : this.turnSource({
+            conversationId: params.conversationId,
             prompt: blocks.join("\n\n"),
-            connectorId: this.connectorId(),
             // Which model answers and how hard it thinks travel together:
             // the top rung asks for the Pro model, not a deeper effort.
             model: target.slug,
             thinkingEffort: target.thinkingEffort ?? undefined,
-            conversationId: thread,
-            onConversationId: (chatGptConversationId) =>
-              this.rememberThread(params.conversationId, chatGptConversationId),
+            thread,
             signal: abort.signal,
+            onDelivered: markSent,
           }),
     })
 
@@ -271,21 +394,14 @@ export class ChatGptWebCursorBridge {
       detachSink: this.cursorTools.attach({
         dispatch: (name, args) => {
           this.logger.warn(`ChatGPT asked for ${name}; waiting on the editor`)
-          return session.dispatchTool(name, args)
+          return session.dispatchTool(name, args, (id) =>
+            this.noteDispatched(params.conversationId, id)
+          )
         },
       }),
     }
     this.active = turn
     const typed = blocks.join("\n\n")
-    if (!typed) {
-      // Nothing new to say and no live turn to continue: the thread has heard
-      // everything this request carries. Worth seeing in the log, because it
-      // is the shape that ends as "provider completed without assistant
-      // content".
-      this.logger.warn(
-        `Nothing left to type for ${params.conversationId.slice(0, 8)}…`
-      )
-    }
     this.logger.warn(
       `${host ? "Tool host" : "ChatGPT Web turn"} started for ` +
         `${params.conversationId.slice(0, 8)}… — typing ${typed.length} chars ` +
@@ -349,6 +465,9 @@ export class ChatGptWebCursorBridge {
   }
 
   private end(turn: ActiveTurn, reason: string): void {
+    // Kept so that a later request refused for having nothing to ask can name
+    // the failure that actually stranded it, rather than only its own symptom.
+    this.lastEnd = { conversationId: turn.conversationId, reason }
     if (this.active === turn) this.active = null
     turn.detachSink()
     turn.abort.abort(new Error(reason))
@@ -386,7 +505,7 @@ function isToolHost(model: string): boolean {
 // Yielding nothing is the point: the turn produces no assistant output, it
 // only stays open.
 // eslint-disable-next-line require-yield
-async function* parked(signal?: AbortSignal): AsyncGenerator<string> {
+async function* parked(signal?: AbortSignal): AsyncGenerator<ChatGptWebEvent> {
   await new Promise<void>((resolve) => {
     if (signal?.aborted) {
       resolve()

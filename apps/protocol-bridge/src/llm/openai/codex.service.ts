@@ -633,6 +633,9 @@ export class CodexService implements OnModuleInit, ProviderAdapter {
           settled = true
           markAccountSuccess(slot, CHATGPT_WEB_REALTIME_POOL_MODEL)
         },
+        abandon: () => {
+          settled = true
+        },
         reject: (statusCode, detail, retryAfterSeconds) => {
           if (settled) return
           settled = true

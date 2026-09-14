@@ -11,6 +11,15 @@ export interface CodexRealtimeAccountLease {
   refreshAccessToken(reason: string): Promise<string | null>
   accept(): void
   reject(statusCode: number, detail?: string, retryAfterSeconds?: number): void
+  /**
+   * Settle the lease without a verdict on the account.
+   *
+   * For a request *we* abandoned — the editor cancelled the turn, say — where
+   * upstream never got the chance to answer. Reporting that as a failure puts
+   * a healthy account on cooldown, and with a single-account pool the very
+   * next request then has nowhere to go.
+   */
+  abandon(): void
 }
 
 /**

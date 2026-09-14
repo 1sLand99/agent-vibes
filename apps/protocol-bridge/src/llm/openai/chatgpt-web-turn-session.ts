@@ -1,5 +1,5 @@
 import * as crypto from "node:crypto"
-import { ChatGptWebV1Decoder } from "./chatgpt-web-v1-stream"
+import type { ChatGptWebEvent } from "./chatgpt-web-conversation.service"
 import type { McpToolResult } from "../../protocol/mcp/mcp-types"
 
 /**
@@ -8,11 +8,11 @@ import type { McpToolResult } from "../../protocol/mcp/mcp-types"
  * The two protocols disagree about how long a turn lasts. ChatGPT keeps a
  * single response open across every tool call it makes. Cursor's assistant
  * turn ends *at* the tool call: the IDE runs the tool and comes back with a
- * fresh provider request carrying the result. So one browser turn has to be
- * handed out in segments, one per Cursor request, with the browser stream
+ * fresh provider request carrying the result. So one ChatGPT turn has to be
+ * handed out in segments, one per Cursor request, with the response stream
  * still open in between.
  *
- * The tool call itself does not arrive on the browser stream — ChatGPT calls
+ * The tool call itself does not arrive on the response stream — ChatGPT calls
  * the MCP connector, which reaches the bridge over HTTP. `dispatchTool` is
  * that entry point: it emits a `tool_use` into the segment Cursor is currently
  * reading, ends the segment, and blocks until the IDE's result arrives through
@@ -27,8 +27,14 @@ import type { McpToolResult } from "../../protocol/mcp/mcp-types"
 const IDLE_SEGMENT_END_MS = 250
 
 export interface ChatGptWebTurnSessionOptions {
-  /** Raw browser SSE for one ChatGPT turn. */
-  readonly source: AsyncIterable<string>
+  /**
+   * One ChatGPT turn, already decoded.
+   *
+   * Only text and the end of the turn are read from here. A tool call does not
+   * arrive on this stream at all — it reaches the bridge as an MCP request
+   * from the connector, which is why the raw frames are not needed.
+   */
+  readonly source: AsyncIterable<ChatGptWebEvent>
   /** Bounds how long a tool call may wait for the editor. */
   readonly toolTimeoutMs?: number
 }
@@ -51,11 +57,12 @@ type Segment =
   | { readonly kind: "end" }
 
 export class ChatGptWebTurnSession {
-  private readonly decoder = new ChatGptWebV1Decoder()
   private readonly toolTimeoutMs: number
-  private readonly source: AsyncIterable<string>
+  private readonly source: AsyncIterable<ChatGptWebEvent>
   private readonly queue: Segment[] = []
   private readonly pending = new Map<string, PendingTool>()
+  /** Every tool call id this turn has issued, released or not. */
+  private readonly dispatched = new Set<string>()
   private wake: (() => void) | null = null
   private reading = false
   private sourceDone = false
@@ -75,7 +82,7 @@ export class ChatGptWebTurnSession {
     this.toolTimeoutMs = options.toolTimeoutMs ?? 300_000
   }
 
-  /** True once the browser turn ended and nothing is left to hand out. */
+  /** True once the turn ended and nothing is left to hand out. */
   get finished(): boolean {
     return (
       (this.ended || this.sourceDone) &&
@@ -93,9 +100,11 @@ export class ChatGptWebTurnSession {
    */
   dispatchTool(
     name: string,
-    input: Record<string, unknown>
+    input: Record<string, unknown>,
+    onDispatched?: (toolCallId: string) => void
   ): Promise<McpToolResult> {
     const toolCallId = `toolu_${crypto.randomBytes(12).toString("hex")}`
+    onDispatched?.(toolCallId)
     return new Promise<McpToolResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(toolCallId)
@@ -105,12 +114,25 @@ export class ChatGptWebTurnSession {
           )
         )
       }, this.toolTimeoutMs)
+      this.dispatched.add(toolCallId)
       this.pending.set(toolCallId, { toolCallId, resolve, reject, timer })
       this.push({ kind: "tool", toolCallId, name, input })
     })
   }
 
   /** The editor answered; release the MCP request that was waiting. */
+  /**
+   * Whether this id was ever dispatched by this turn.
+   *
+   * Cursor resends every result it has accumulated on each continuation, so a
+   * result that matches no waiter is almost always one already released. That
+   * is worth telling apart from an id this turn never issued, which would mean
+   * the two sides disagree about whose call it is.
+   */
+  hasDispatched(toolCallId: string): boolean {
+    return this.dispatched.has(toolCallId)
+  }
+
   submitToolResult(toolCallId: string, result: McpToolResult): boolean {
     const waiter = this.pending.get(toolCallId)
     if (!waiter) return false
@@ -135,7 +157,7 @@ export class ChatGptWebTurnSession {
    * Anthropic SSE for one Cursor provider request.
    *
    * Ends after a tool call, because that is where Cursor's turn ends; the next
-   * call continues the same browser turn.
+   * call continues the same ChatGPT turn.
    */
   async *segment(): AsyncGenerator<string, void, unknown> {
     this.startReading()
@@ -230,20 +252,18 @@ export class ChatGptWebTurnSession {
     yield frame("message_stop", { type: "message_stop" })
   }
 
-  // ── browser stream ────────────────────────────────────────────────────
+  // ── upstream turn ─────────────────────────────────────────────────────
 
-  /** Drain the browser stream once, in the background, into the queue. */
+  /** Drain the turn once, in the background, into the queue. */
   private startReading(): void {
     if (this.reading) return
     this.reading = true
     void (async () => {
       try {
-        for await (const chunk of this.source) {
-          for (const event of this.decoder.push(chunk)) {
-            if (event.kind === "text")
-              this.push({ kind: "text", delta: event.delta })
-            else if (event.kind === "done") this.queueEnd()
-          }
+        for await (const event of this.source) {
+          if (event.kind === "text")
+            this.push({ kind: "text", delta: event.delta })
+          else if (event.kind === "done") this.queueEnd()
         }
       } catch (error) {
         this.failure = error instanceof Error ? error : new Error(String(error))

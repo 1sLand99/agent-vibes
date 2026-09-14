@@ -14,6 +14,35 @@ import {
 } from "./background-command-store.service"
 
 /**
+ * Dispatches an interaction query that no client response will ever resolve.
+ *
+ * The live response path resolves a query and then writes the tool result
+ * itself. A deadline expiry has no such caller: the promise handed out by
+ * `registerInteractionQuery` is never awaited for a deferred tool, so expiring
+ * one without this hook drops the tool call on the floor and the turn waits
+ * forever on a question that is already gone.
+ */
+export type ExpiredInteractionQueryDispatcher = (expired: {
+  conversationId: string
+  queryId: number
+  queryType: string
+  payload?: Record<string, unknown>
+  rawResponse: unknown
+}) => Promise<void>
+
+/** How many resolved query ids to remember per conversation. */
+const RESOLVED_INTERACTION_QUERY_MEMORY = 32
+
+/** The resolution label to remember a query by; responses are untyped here. */
+function readInteractionResultCase(response: unknown): string {
+  if (response && typeof response === "object") {
+    const resultCase = (response as { resultCase?: unknown }).resultCase
+    if (typeof resultCase === "string" && resultCase !== "") return resultCase
+  }
+  return "resolved"
+}
+
+/**
  * Sole owner of per-conversation streaming and client-execution state:
  *
  *   - shell stream stdout/stderr accumulation
@@ -31,6 +60,19 @@ export class SessionStreamService {
   private readonly logger = new Logger(SessionStreamService.name)
 
   private readonly streamRecords = new Map<string, SessionStreamRecord>()
+
+  private expiredInteractionDispatcher:
+    | ExpiredInteractionQueryDispatcher
+    | undefined
+
+  /**
+   * Query ids that were already resolved, kept so a response that arrives
+   * after the fact is recognisable as late rather than as a protocol fault.
+   */
+  private readonly resolvedInteractionQueries = new Map<
+    string,
+    Map<number, { resolution: string; at: number }>
+  >()
 
   constructor(
     @Inject(forwardRef(() => SessionLifecycleService))
@@ -53,6 +95,7 @@ export class SessionStreamService {
   }
 
   deleteRecord(conversationId: string): boolean {
+    this.resolvedInteractionQueries.delete(conversationId)
     return this.streamRecords.delete(conversationId)
   }
 
@@ -646,6 +689,7 @@ export class SessionStreamService {
           interruptedAt,
         },
       })
+      this.noteInteractionQueryResolved(conversationId, queryId, "interrupted")
     }
 
     session.lastActivityAt = new Date()
@@ -690,6 +734,11 @@ export class SessionStreamService {
     )
     pending.resolve(response)
     stream!.pendingInteractionQueries.delete(queryId)
+    this.noteInteractionQueryResolved(
+      conversationId,
+      queryId,
+      readInteractionResultCase(response)
+    )
     session.lastActivityAt = new Date()
     this.sessionLifecycle.markSessionDirty(conversationId)
     this.sessionLifecycle.notifyIfBecameIdleAfter(session, wasPending)
@@ -697,6 +746,81 @@ export class SessionStreamService {
       queryType: pending.queryType,
       payload: pending.payload,
     }
+  }
+
+  setExpiredInteractionQueryDispatcher(
+    dispatcher: ExpiredInteractionQueryDispatcher
+  ): void {
+    this.expiredInteractionDispatcher = dispatcher
+  }
+
+  /**
+   * Resolve a query whose deadline passed, and hand the result to the same
+   * writer a real response would have reached, so the tool call it belongs to
+   * is closed instead of being left pending on a question nobody can answer.
+   */
+  async expireInteractionQuery(
+    conversationId: string,
+    queryId: number,
+    rawResponse: unknown
+  ): Promise<boolean> {
+    const resolved = this.resolveInteractionQuery(conversationId, queryId, {
+      approved: false,
+      resultCase: "error",
+      rawResponse,
+    })
+    if (!resolved) return false
+
+    const dispatcher = this.expiredInteractionDispatcher
+    if (!dispatcher) {
+      this.logger.warn(
+        `Expired InteractionQuery id=${queryId} type=${resolved.queryType} ` +
+          `has no dispatcher; its tool call stays pending on ${conversationId}`
+      )
+      return false
+    }
+
+    await dispatcher({
+      conversationId,
+      queryId,
+      queryType: resolved.queryType,
+      payload: resolved.payload,
+      rawResponse,
+    })
+    return true
+  }
+
+  private noteInteractionQueryResolved(
+    conversationId: string,
+    queryId: number,
+    resolution: string
+  ): void {
+    let resolvedForConversation =
+      this.resolvedInteractionQueries.get(conversationId)
+    if (!resolvedForConversation) {
+      resolvedForConversation = new Map()
+      this.resolvedInteractionQueries.set(
+        conversationId,
+        resolvedForConversation
+      )
+    }
+    resolvedForConversation.set(queryId, { resolution, at: Date.now() })
+    while (resolvedForConversation.size > RESOLVED_INTERACTION_QUERY_MEMORY) {
+      const oldest = resolvedForConversation.keys().next()
+      if (oldest.done) break
+      resolvedForConversation.delete(oldest.value)
+    }
+  }
+
+  /**
+   * Whether this query was already resolved here. A response for one is late,
+   * not unmatched — the difference decides whether the turn survives it.
+   */
+  describeRecentlyResolvedInteractionQuery(
+    conversationId: string,
+    queryId: number
+  ): { resolution: string; at: number } | undefined {
+    return this.resolvedInteractionQueries.get(conversationId)?.get(queryId)
   }
 
   // ── cross-session interaction-query sweeps ────

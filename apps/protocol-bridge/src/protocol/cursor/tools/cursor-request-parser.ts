@@ -1778,7 +1778,7 @@ export class CursorRequestParser {
           )
 
           this.logger.log(
-            `收到 conversationAction.asyncAskQuestionCompletionAction toolCallId=${completion?.originalToolCallId || "(none)"} case=${completion?.resultCase || "unknown"} answers=${completion?.answers?.length ?? 0}`
+            `收到 conversationAction.asyncAskQuestionCompletionAction toolCallId=${completion?.originalToolCallId || "(none)"} asyncOriginalToolCallId=${completion?.originalArgs?.asyncOriginalToolCallId || "(none)"} runAsync=${completion?.originalArgs?.runAsync ?? "(none)"} question="${(completion?.originalQuestionText || completion?.originalArgs?.title || "").slice(0, 60)}" case=${completion?.resultCase || "unknown"} answers=${completion?.answers?.length ?? 0}`
           )
           return makeControlMessage("asyncAskQuestionCompletionAction", {
             ...triggeringFields,
@@ -3016,7 +3016,7 @@ export class CursorRequestParser {
                 action.action.value
               )
               this.logger.log(
-                `AgentRunRequest asyncAskQuestionCompletionAction: conversationId=${conversationId || "(none)"} toolCallId=${completion?.originalToolCallId || "(none)"} case=${completion?.resultCase || "unknown"} answers=${completion?.answers?.length ?? 0}`
+                `AgentRunRequest asyncAskQuestionCompletionAction: conversationId=${conversationId || "(none)"} toolCallId=${completion?.originalToolCallId || "(none)"} asyncOriginalToolCallId=${completion?.originalArgs?.asyncOriginalToolCallId || "(none)"} runAsync=${completion?.originalArgs?.runAsync ?? "(none)"} question="${(completion?.originalQuestionText || completion?.originalArgs?.title || "").slice(0, 60)}" case=${completion?.resultCase || "unknown"} answers=${completion?.answers?.length ?? 0}`
               )
               return makeControlMessage("asyncAskQuestionCompletionAction", {
                 conversationId,

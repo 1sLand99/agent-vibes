@@ -8,7 +8,6 @@ import {
   type ChatGptWebMessage,
 } from "../../llm/openai/chatgpt-web-conversation.service"
 import { webGptTarget } from "../../llm/shared/model-registry"
-import { ChatGptWebTransportSelector } from "./chatgpt-web-transport.selector"
 import type {
   OpenAiChatCompletionRequest,
   OpenAiChatCompletionResponse,
@@ -48,10 +47,7 @@ export class ChatGptWebProtocolService {
    */
   private readonly threads = new Map<string, ThreadRef>()
 
-  constructor(
-    private readonly conversation: ChatGptWebConversationService,
-    private readonly transports: ChatGptWebTransportSelector
-  ) {}
+  constructor(private readonly conversation: ChatGptWebConversationService) {}
 
   /**
    * Route a turn to whichever transport the request asks for.
@@ -68,15 +64,16 @@ export class ChatGptWebProtocolService {
     thread: ThreadRef,
     signal?: AbortSignal
   ): AsyncGenerator<ChatGptWebEvent> {
-    const named = ChatGptWebTransportSelector.stripPrefix(model)
+    const named = stripLegacyBrowserPrefix(model)
     const { slug, thinkingEffort } = webGptTarget(named, requestedDepth)
-    const source =
-      this.transports.resolve(model) === "browser"
-        ? this.transports.stream(model, messages, thinkingEffort, signal)
-        : this.startHttpTurn(slug, messages, thinkingEffort, thread, signal)
-    if (this.transports.resolve(model) !== "browser") {
-      this.rejectToolUse(hasTools)
-    }
+    this.rejectToolUse(hasTools)
+    const source = this.startHttpTurn(
+      slug,
+      messages,
+      thinkingEffort,
+      thread,
+      signal
+    )
     for await (const event of await source) {
       if (event.kind === "done") {
         // Kept even when the caller ignores the event: it is what the next
@@ -491,4 +488,13 @@ function normalizeResponsesInput(
 
 function randomId(): string {
   return crypto.randomBytes(12).toString("hex")
+}
+
+/**
+ * Tolerate a `browser/` prefix from a configuration written when there were
+ * two transports. There is one now, so the prefix names nothing — but a model
+ * id carrying it should still resolve rather than 404.
+ */
+function stripLegacyBrowserPrefix(model: string): string {
+  return parseModelRequest(model.trim().replace(/^browser[/:]/i, "")).baseModel
 }
